@@ -58,6 +58,14 @@ export const SETTING_COPY: Record<string, Copy> = {
 		label: m.setting_max_fps,
 		hint: m.setting_max_fps_hint,
 	},
+	vdisplay_hz_mult: {
+		label: m.setting_vdisplay_hz_mult,
+		hint: m.setting_vdisplay_hz_mult_hint,
+	},
+	vdisplay_resolutions: {
+		label: m.setting_vdisplay_resolutions,
+		hint: m.setting_vdisplay_resolutions_hint,
+	},
 	audio_output_mode: {
 		label: m.setting_audio_output_mode,
 		options: {
@@ -213,10 +221,6 @@ export const SETTING_COPY: Record<string, Copy> = {
 		label: m.setting_dualsense_usbip,
 		hint: m.setting_dualsense_usbip_hint,
 	},
-	gamescope_attach: {
-		label: m.setting_gamescope_attach,
-		hint: m.setting_gamescope_attach_hint,
-	},
 	gamescope_hdr: {
 		label: m.setting_gamescope_hdr,
 		hint: m.setting_gamescope_hdr_hint,
@@ -275,6 +279,34 @@ export const SETTING_COPY: Record<string, Copy> = {
 		label: m.setting_update_apply,
 		hint: m.setting_update_apply_hint,
 	},
+	steam_prewarm: {
+		label: m.setting_steam_prewarm,
+		hint: m.setting_steam_prewarm_hint,
+	},
+	seat_idle_stop: {
+		label: m.setting_seat_idle_stop,
+		hint: m.setting_seat_idle_stop_hint,
+	},
+	seat_end_on_game_exit: {
+		label: m.setting_seat_end_on_game_exit,
+		hint: m.setting_seat_end_on_game_exit_hint,
+	},
+	seat_max_mode: {
+		label: m.setting_seat_max_mode,
+		hint: m.setting_seat_max_mode_hint,
+	},
+	seat_library_writable: {
+		label: m.setting_seat_library_writable,
+		hint: m.setting_seat_library_writable_hint,
+	},
+	seat_background_input: {
+		label: m.setting_seat_background_input,
+		hint: m.setting_seat_background_input_hint,
+	},
+	tray_autostart: {
+		label: m.setting_tray_autostart,
+		hint: m.setting_tray_autostart_hint,
+	},
 };
 
 export const GROUP_LABEL: Record<SettingGroup, () => string> = {
@@ -285,5 +317,6 @@ export const GROUP_LABEL: Record<SettingGroup, () => string> = {
 	network: m.settings_group_network,
 	game_mode: m.settings_group_game_mode,
 	session: m.settings_group_session,
+	seats: m.settings_group_seats,
 	system: m.settings_group_system,
 };

@@ -40,6 +40,22 @@ final class GamepadEscapeChordTests: XCTestCase {
         XCTAssertEqual(GamepadCapture.escapeChordElements, pairing.map(\.alias))
     }
 
+    /// A lone Select held past `guideHold`: an escape-chord partner joining keeps it a Select,
+    /// however late, so the chord never presses guide; any other press or its release makes it
+    /// the guide; earlier, everything keeps it a Select.
+    func testAnEscapeChordPartnerKeepsAHeldSelectASelect() {
+        let late = GamepadCapture.guideHold + 0.25
+        let becomes = GamepadCapture.pendingSelectBecomes
+        for partner in [GamepadWire.leftShoulder, GamepadWire.rightShoulder, GamepadWire.start] {
+            XCTAssertEqual(becomes(late, partner), GamepadWire.back, "partner \(partner)")
+        }
+        XCTAssertEqual(becomes(late, GamepadWire.a | GamepadWire.start), GamepadWire.back)
+        XCTAssertEqual(becomes(late, GamepadWire.a), GamepadWire.guide)
+        XCTAssertEqual(becomes(late, 0), GamepadWire.guide, "a release past the hold")
+        XCTAssertEqual(becomes(0.1, GamepadWire.a), GamepadWire.back)
+        XCTAssertEqual(becomes(0.1, 0), GamepadWire.back, "a tap")
+    }
+
     /// The claim list is a strict subset of what a forwarding slot takes — it is a NARROWING of
     /// the full sweep, never an extra grab, and it must not be empty (that would be "skip", which
     /// is the behaviour this deliberately avoids).

@@ -53,6 +53,7 @@ pf_gamepad.dll=1
 %DeviceDescEdge%=pfGamepad, pf_dualsenseedge
 %DeviceDescDeck%=pfGamepad, pf_steamdeck
 %DeviceDescTriton%=pfGamepad, pf_triton
+%DeviceDescSteamCtrl%=pfGamepad, pf_steamcontroller
 %DeviceDescSwitchPro%=pfGamepad, pf_switchpro
 %DeviceDescJoyConL%=pfGamepad, pf_joycon_left
 %DeviceDescJoyConR%=pfGamepad, pf_joycon_right
@@ -197,12 +198,13 @@ ManufacturerString ="Punktfunk"
 ClassName          ="HID device"
 Disk_Description   ="Punktfunk Gamepad Installation Disk"
 ; One per hardware id — these are what Device Manager shows. Keep them aligned with the product
-; strings the driver serves per device_type (src/lib.rs `on_get_string`).
+; strings the driver serves per device_type (`pf_driver_proto::pad_kind`).
 DeviceDesc         ="Punktfunk Virtual DualSense"
 DeviceDescDS4      ="Punktfunk Virtual DualShock 4"
 DeviceDescEdge     ="Punktfunk Virtual DualSense Edge"
 DeviceDescDeck     ="Punktfunk Virtual Steam Deck Controller"
 DeviceDescTriton   ="Punktfunk Virtual Steam Controller"
+DeviceDescSteamCtrl="Punktfunk Virtual Steam Controller (2015)"
 DeviceDescSwitchPro="Punktfunk Virtual Pro Controller"
 DeviceDescJoyConL  ="Punktfunk Virtual Joy-Con (L)"
 DeviceDescJoyConR  ="Punktfunk Virtual Joy-Con (R)"

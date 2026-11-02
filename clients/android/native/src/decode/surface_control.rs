@@ -121,6 +121,8 @@ type TxnSetBufferDataSpaceFn =
     unsafe extern "C" fn(*mut ASurfaceTransaction, *mut ASurfaceControl, i32);
 type TxnSetFrameRateFn =
     unsafe extern "C" fn(*mut ASurfaceTransaction, *mut ASurfaceControl, f32, i8);
+type TxnSetFrameRateStrategyFn =
+    unsafe extern "C" fn(*mut ASurfaceTransaction, *mut ASurfaceControl, f32, i8, i8);
 
 #[repr(C)]
 struct AColorXy {
@@ -180,6 +182,8 @@ struct Api {
     txn_set_dataspace: Option<TxnSetBufferDataSpaceFn>,
     /// `setFrameRate` is **API 30** — optional, `None` on API 29.
     txn_set_frame_rate: Option<TxnSetFrameRateFn>,
+    /// `setFrameRateWithChangeStrategy` is **API 31** — optional like `setFrameRate`.
+    txn_set_frame_rate_strategy: Option<TxnSetFrameRateStrategyFn>,
     /// The HDR10 static metadata setters (API 29), optional like `setBufferDataSpace`.
     txn_set_hdr_smpte2086: Option<TxnSetHdrSmpte2086Fn>,
     txn_set_hdr_cta861_3: Option<TxnSetHdrCta8613Fn>,
@@ -215,6 +219,10 @@ impl Api {
                 txn_set_present_time: sym(lib, c"ASurfaceTransaction_setDesiredPresentTime")?,
                 txn_set_dataspace: sym(lib, c"ASurfaceTransaction_setBufferDataSpace"),
                 txn_set_frame_rate: sym(lib, c"ASurfaceTransaction_setFrameRate"),
+                txn_set_frame_rate_strategy: sym(
+                    lib,
+                    c"ASurfaceTransaction_setFrameRateWithChangeStrategy",
+                ),
                 txn_set_hdr_smpte2086: sym(lib, c"ASurfaceTransaction_setHdrMetadata_smpte2086"),
                 txn_set_hdr_cta861_3: sym(lib, c"ASurfaceTransaction_setHdrMetadata_cta861_3"),
                 txn_set_on_complete: sym(lib, c"ASurfaceTransaction_setOnComplete")?,
@@ -257,7 +265,7 @@ impl Drop for ScHandle {
 /// One presented transaction's real feedback, posted from the completion callback (a binder thread)
 /// into the decode loop's event channel. The loop matches `seq` to the buffer it retired and frees
 /// it once `prev_release_fence` signals.
-pub(super) struct PresentComplete {
+pub(crate) struct PresentComplete {
     /// The presenter's monotonically increasing submit sequence for this transaction.
     pub seq: u64,
     /// SurfaceFlinger's latch instant for this frame (`CLOCK_MONOTONIC` ns) — the truthful present
@@ -342,7 +350,7 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ASurfaceTrans
 
 /// One `ASurfaceControl` layer, a child of a SurfaceView's window, that the presenter composites
 /// decoded buffers onto. Owns nothing thread-shared; lives on and is dropped by the decode loop.
-pub(super) struct Layer {
+pub(crate) struct Layer {
     api: Api,
     sc: Arc<ScHandle>,
     /// The SurfaceView's LIVE pixel size, packed by `pack_surface_size` and re-read before every
@@ -355,6 +363,9 @@ pub(super) struct Layer {
     /// view when video started): the window's own buffer geometry, the best remaining guess.
     fallback_w: i32,
     fallback_h: i32,
+    /// The frame-rate vote may switch the panel non-seamlessly
+    /// ([`super::DecodeOptions::force_rate_switch`]).
+    force_switch: bool,
     /// `true` once the first transaction has made the layer visible + set its z-order + frame rate.
     configured: bool,
 }
@@ -372,10 +383,11 @@ impl Layer {
     /// screen hides the system bars and switches on cutout drawing a frame or two after
     /// `surfaceCreated`, and each one grows it. An empty `surface_size` (Kotlin hadn't measured the
     /// view yet) falls back to the buffer size as the best remaining guess.
-    pub(super) fn create(
+    pub(crate) fn create(
         window: &NativeWindow,
         surface_size: Arc<AtomicU64>,
         src_crop: Arc<AtomicU64>,
+        force_switch: bool,
     ) -> Option<Layer> {
         let api = Api::resolve()?;
         // SAFETY: `window.ptr()` is the live `ANativeWindow` the decode thread owns; the name is a
@@ -402,8 +414,14 @@ impl Layer {
             src_crop,
             fallback_w,
             fallback_h,
+            force_switch,
             configured: false,
         })
+    }
+
+    /// Whether this layer's frame-rate vote may switch the panel non-seamlessly.
+    pub(crate) fn force_switch(&self) -> bool {
+        self.force_switch
     }
 
     /// The destination rectangle for this present: the live view size, or the window's buffer
@@ -467,14 +485,17 @@ impl Layer {
             if !self.configured {
                 (self.api.txn_set_visibility)(txn, sc, VISIBILITY_SHOW);
                 (self.api.txn_set_z_order)(txn, sc, 0);
-                // Declare the layer as fixed-rate video at the source rate (compatibility 1 =
-                // FIXED_SOURCE) so a compliant display aligns its refresh to it. Best-effort: an
-                // LTPO governor may still run "video" content below its own floor for power (the
-                // NP3 does — no app-side rate hint raises its render-range floor; the display's
-                // Minimum-refresh-rate system setting is the only lever there).
+                // Fixed-rate video at the source rate (compatibility 1 = FIXED_SOURCE; strategy
+                // 1 = ALWAYS). An LTPO governor may still run it below its own floor (the NP3:
+                // only its Minimum-refresh-rate system setting moves that).
                 if frame_rate > 0.0 {
-                    if let Some(f) = self.api.txn_set_frame_rate {
-                        f(txn, sc, frame_rate, 1);
+                    match (
+                        self.api.txn_set_frame_rate_strategy,
+                        self.api.txn_set_frame_rate,
+                    ) {
+                        (Some(f), _) if self.force_switch => f(txn, sc, frame_rate, 1, 1),
+                        (_, Some(f)) => f(txn, sc, frame_rate, 1),
+                        _ => {}
                     }
                 }
                 self.configured = true;
@@ -485,7 +506,7 @@ impl Layer {
     /// Take the layer off the screen; the next [`present`] that includes it shows it again.
     /// Dropping it does not hide it: a released child stays on display as long as its parent
     /// does, over whatever layer replaced it.
-    pub(super) fn hide(&mut self) {
+    pub(crate) fn hide(&mut self) {
         // SAFETY: a fresh transaction or null, this layer's live `sc`, applied and deleted once.
         unsafe {
             let txn = (self.api.txn_create)();
@@ -511,7 +532,7 @@ impl Layer {
 /// HDR10 volume for SurfaceFlinger's tone-mapper. `frame_rate` votes once per layer (`0.0`
 /// skips). `false` means the caller still owns the buffer and fence.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn present(
+pub(crate) fn present(
     layers: &mut [&mut Layer],
     buffer: &HardwareBuffer,
     src_w: i32,
@@ -637,9 +658,10 @@ fn merge_fences(a: OwnedFd, b: OwnedFd) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(fd) }
 }
 
-/// The instant `fence` signalled (`CLOCK_MONOTONIC` ns), or `None` while it is still pending, on
-/// an invalid fence, or where libsync is missing. Never blocks.
-pub(super) fn fence_signal_ns(fence: BorrowedFd<'_>) -> Option<i64> {
+/// One read of `fence`'s sync_file record: its status (1 signalled, 0 pending, below 0 error)
+/// and the latest signal instant (`CLOCK_MONOTONIC` ns) among its sync points. `None` on an
+/// invalid fence or where libsync is missing. Never blocks.
+fn sync_file_read(fence: BorrowedFd<'_>) -> Option<(i32, u64)> {
     let api = sync_api()?;
     // SAFETY: `sync_file_info` returns a malloc'd record (or null) that `sync_file_info_free`
     // releases; `sync_fence_info` points at `num_fences` records inside that allocation.
@@ -648,9 +670,9 @@ pub(super) fn fence_signal_ns(fence: BorrowedFd<'_>) -> Option<i64> {
         if info.is_null() {
             return None;
         }
-        let signalled = (*info).status == 1;
+        let status = (*info).status;
         let mut latest = 0u64;
-        if signalled {
+        if status == 1 {
             let fences = (*info).sync_fence_info as usize as *const SyncFenceInfo;
             for i in 0..(*info).num_fences as usize {
                 let f = &*fences.add(i);
@@ -660,8 +682,23 @@ pub(super) fn fence_signal_ns(fence: BorrowedFd<'_>) -> Option<i64> {
             }
         }
         (api.free)(info);
-        (signalled && latest > 0).then_some(latest as i64)
+        Some((status, latest))
     }
+}
+
+/// The instant `fence` signalled, or `None` while it is still pending, in error, invalid, or
+/// unreadable.
+pub(super) fn fence_signal_ns(fence: BorrowedFd<'_>) -> Option<i64> {
+    match sync_file_read(fence)? {
+        (1, latest) if latest > 0 => Some(latest as i64),
+        _ => None,
+    }
+}
+
+/// Whether `fence` resolved in error: its producer gave the buffer up (a decoder's dropped or
+/// flushed frame), and a consumer that waited on it read unfinished pixels.
+pub(super) fn fence_errored(fence: BorrowedFd<'_>) -> bool {
+    sync_file_read(fence).is_some_and(|(status, _)| status < 0)
 }
 
 /// The buffer rect for a crop in frame fractions, at least one pixel on each axis.

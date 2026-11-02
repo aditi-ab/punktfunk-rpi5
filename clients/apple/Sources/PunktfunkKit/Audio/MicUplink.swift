@@ -76,7 +76,8 @@ private final class FoldScratch: @unchecked Sendable {
     /// Fold `frames` frames of `list`, from frame `offset`, into `mono`. False when the list
     /// holds less than that, which a well-formed callback never does.
     func fold(
-        _ list: UnsafeMutableAudioBufferListPointer, offset: Int, frames: Int, pinned: Int?
+        _ list: UnsafeMutableAudioBufferListPointer, offset: Int, frames: Int, pinned: Int?,
+        skip: [Int]
     ) -> Bool {
         guard let head = list.first, let data = head.mData else { return false }
         let width = MemoryLayout<Float>.size
@@ -86,7 +87,7 @@ private final class FoldScratch: @unchecked Sendable {
             planes[0] = data.assumingMemoryBound(to: Float.self) + offset * packed
             SessionAudio.foldToMono(
                 input: planes, frames: frames, channels: packed, interleaved: true,
-                pinned: pinned, out: mono)
+                pinned: pinned, skip: skip, out: mono)
             return true
         }
         let channels = min(list.count, Self.channels)
@@ -98,7 +99,7 @@ private final class FoldScratch: @unchecked Sendable {
         }
         SessionAudio.foldToMono(
             input: planes, frames: frames, channels: channels, interleaved: false,
-            pinned: pinned, out: mono)
+            pinned: pinned, skip: skip, out: mono)
         return true
     }
 }
@@ -111,9 +112,10 @@ final class MicUplink: @unchecked Sendable {
     private let wake: DispatchSemaphore
     private let stopped = StopFlag()
 
-    /// `pinned` is the 0-based input channel to take; nil sums them all. One second of ring at
-    /// 192 kHz: a worker stalled for longer than that has lost the audio anyway.
-    init(pinned: Int?) {
+    /// `pinned` is the 0-based input channel to take; nil sums them all but the 0-based `skip`
+    /// (loopback inputs). One second of ring at 192 kHz: a worker stalled for longer than that
+    /// has lost the audio anyway.
+    init(pinned: Int?, skip: [Int] = []) {
         let ring = MicRing(capacity: 192_000)
         let wake = DispatchSemaphore(value: 0)
         let scratch = FoldScratch()
@@ -125,7 +127,8 @@ final class MicUplink: @unchecked Sendable {
             var done = 0
             while done < total {
                 let step = min(total - done, FoldScratch.frames)
-                guard scratch.fold(list, offset: done, frames: step, pinned: pinned) else { break }
+                guard scratch.fold(list, offset: done, frames: step, pinned: pinned, skip: skip)
+                else { break }
                 ring.write(scratch.mono, count: step)
                 done += step
             }

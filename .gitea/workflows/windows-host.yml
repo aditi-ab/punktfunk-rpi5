@@ -10,7 +10,7 @@
 # Why an installer and not MSIX (like the client): the host installs a LocalSystem SCM service that
 # CreateProcessAsUserW's into the interactive session for secure-desktop capture, and bundles a
 # kernel/IDD driver — neither is expressible in MSIX's sandbox. The real install logic already lives
-# in `punktfunk-host service install` (crates/punktfunk-host/src/service.rs); the installer just lays
+# in `punktfunk-host service install` (crates/host/punktfunk-host/src/service.rs); the installer just lays
 # the exe down and calls it elevated. Packaging internals: packaging/windows/README.md.
 #
 # Registry (public reads, unom org): https://git.unom.io/unom/-/packages  (generic group)
@@ -68,30 +68,36 @@ on:
     # The crate lines are the Windows host + tray build closure. scripts/ci/check-workflow-paths.py
     # fails CI when one is missing, in either leg.
     paths:
-      - 'crates/punktfunk-host/**'
-      - 'crates/punktfunk-core/**'
-      - 'crates/punktfunk-ffi/**'
-      - 'crates/punktfunk-tray/**'
-      - 'crates/pf-bitstream/**'
-      - 'crates/pf-encode/**'
-      - 'crates/pf-encode-core/**'
-      - 'crates/pf-encode-win/**'
-      - 'crates/libvpl-sys/**'
-      - 'crates/pf-frame/**'
-      - 'crates/pf-gpu/**'
-      - 'crates/pf-zerocopy/**'
-      - 'crates/pf-host-config/**'
-      - 'crates/pf-capture/**'
-      - 'crates/pf-win-display/**'
-      - 'crates/pf-vdisplay/**'
-      - 'crates/pf-inject/**'
-      - 'crates/pf-audio/**'
-      - 'crates/pf-paths/**'
-      - 'crates/pf-paths-win/**'
-      - 'crates/pf-driver-proto/**'
-      - 'crates/pf-clipboard/**'
-      - 'crates/pf-update-check/**'
-      - 'crates/pyrowave-sys/**'
+      - 'crates/client/punktfunk-ffi/**'
+      - 'crates/codec/libvpl-sys/**'
+      - 'crates/codec/pf-bitstream/**'
+      - 'crates/codec/pyrowave-sys/**'
+      - 'crates/core/pf-update-check/**'
+      - 'crates/core/punktfunk-core/**'
+      - 'crates/host/pf-audio/**'
+      - 'crates/host/pf-capture/**'
+      - 'crates/host/pf-clipboard/**'
+      - 'crates/host/pf-driver-proto/**'
+      - 'crates/host/pf-encode/**'
+      - 'crates/host/pf-encode-core/**'
+      - 'crates/host/pf-encode-session/**'
+      - 'crates/host/pf-encode-win/**'
+      - 'crates/host/pf-frame/**'
+      - 'crates/host/pf-gpu/**'
+      - 'crates/host/pf-host-config/**'
+      - 'crates/host/pf-inject/**'
+      - 'crates/host/pf-paths/**'
+      - 'crates/host/pf-paths-win/**'
+      - 'crates/host/pf-portal/**'
+      - 'crates/host/pf-seat-audio/**'
+      - 'crates/host/pf-seat-keeper/**'
+      - 'crates/host/pf-seats/**'
+      - 'crates/host/pf-vdisplay/**'
+      - 'crates/host/pf-win-display/**'
+      - 'crates/host/pf-zerocopy/**'
+      - 'crates/host/punktfunk-capture-worker/**'
+      - 'crates/host/punktfunk-host/**'
+      - 'crates/install/punktfunk-tray/**'
       - 'tools/display-disturb/**'
       - 'packaging/windows/**'
       - 'scripts/windows/**'
@@ -105,30 +111,36 @@ on:
   # code meets a compiler before merge.
   pull_request:
     paths:
-      - 'crates/punktfunk-host/**'
-      - 'crates/punktfunk-core/**'
-      - 'crates/punktfunk-ffi/**'
-      - 'crates/punktfunk-tray/**'
-      - 'crates/pf-bitstream/**'
-      - 'crates/pf-encode/**'
-      - 'crates/pf-encode-core/**'
-      - 'crates/pf-encode-win/**'
-      - 'crates/libvpl-sys/**'
-      - 'crates/pf-frame/**'
-      - 'crates/pf-gpu/**'
-      - 'crates/pf-zerocopy/**'
-      - 'crates/pf-host-config/**'
-      - 'crates/pf-capture/**'
-      - 'crates/pf-win-display/**'
-      - 'crates/pf-vdisplay/**'
-      - 'crates/pf-inject/**'
-      - 'crates/pf-audio/**'
-      - 'crates/pf-paths/**'
-      - 'crates/pf-paths-win/**'
-      - 'crates/pf-driver-proto/**'
-      - 'crates/pf-clipboard/**'
-      - 'crates/pf-update-check/**'
-      - 'crates/pyrowave-sys/**'
+      - 'crates/client/punktfunk-ffi/**'
+      - 'crates/codec/libvpl-sys/**'
+      - 'crates/codec/pf-bitstream/**'
+      - 'crates/codec/pyrowave-sys/**'
+      - 'crates/core/pf-update-check/**'
+      - 'crates/core/punktfunk-core/**'
+      - 'crates/host/pf-audio/**'
+      - 'crates/host/pf-capture/**'
+      - 'crates/host/pf-clipboard/**'
+      - 'crates/host/pf-driver-proto/**'
+      - 'crates/host/pf-encode/**'
+      - 'crates/host/pf-encode-core/**'
+      - 'crates/host/pf-encode-session/**'
+      - 'crates/host/pf-encode-win/**'
+      - 'crates/host/pf-frame/**'
+      - 'crates/host/pf-gpu/**'
+      - 'crates/host/pf-host-config/**'
+      - 'crates/host/pf-inject/**'
+      - 'crates/host/pf-paths/**'
+      - 'crates/host/pf-paths-win/**'
+      - 'crates/host/pf-portal/**'
+      - 'crates/host/pf-seat-audio/**'
+      - 'crates/host/pf-seat-keeper/**'
+      - 'crates/host/pf-seats/**'
+      - 'crates/host/pf-vdisplay/**'
+      - 'crates/host/pf-win-display/**'
+      - 'crates/host/pf-zerocopy/**'
+      - 'crates/host/punktfunk-capture-worker/**'
+      - 'crates/host/punktfunk-host/**'
+      - 'crates/install/punktfunk-tray/**'
       - 'tools/display-disturb/**'
       - 'packaging/windows/**'
       - 'scripts/windows/**'
@@ -179,14 +191,12 @@ jobs:
         run: ./scripts/ci/ensure-windows-toolchain.ps1
 
       - name: Configure
-        # Same two knobs the package job sets, and for the same reasons: CARGO_TARGET_DIR=C:\t
-        # dodges the MAX_PATH wall in the CMake-from-source crates, and CMake 4.x refuses the
-        # vendored opus' `cmake_minimum_required < 3.5` without the policy floor. Reusing C:\t
+        # Same knob the package job sets, for the same reason: CARGO_TARGET_DIR=C:\t dodges the
+        # MAX_PATH wall in the CMake-from-source crates. Reusing C:\t
         # rather than a lint-only tree is deliberate — a second dep tree on this runner is the
         # C1069 disk-exhaustion trigger, and cargo's own lock serialises us against a `main` build.
         run: |
           "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CMAKE_POLICY_VERSION_MINIMUM=3.5" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Carry source mtimes (unchanged crates stay fresh)
         shell: pwsh
@@ -213,23 +223,29 @@ jobs:
       - name: Clippy (Windows host subsystem)
         # --release and --locked for the same reasons as the package job: reuse C:\t\release
         # instead of spawning a second dep tree, and resolve the graph that is committed.
-        # pf-encode-core, pf-encode-win, pf-inject, pf-audio, pf-win-display and display-disturb are
-        # here because no other workflow's -p list type-checks their Windows code or tests.
+        # pf-encode-core, pf-encode-win, pf-inject, pf-audio, pf-win-display, pf-clipboard, pf-frame
+        # and display-disturb are here because no other workflow's -p list type-checks their
+        # Windows code or tests.
         # The encode crates take nvenc,qsv and not pyrowave: this lane never builds the PyroWave
         # C++ tree, and the drivers lane already compiles that backend. Two runs, not eight:
         # every extra feature set re-checks the crates the runs share.
         run: |
           cargo clippy --release --locked -p punktfunk-host -p punktfunk-tray --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
-          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p display-disturb --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p pf-seat-audio -p pf-clipboard -p pf-frame -p display-disturb --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+          # The seat keeper is its own workspace (IronRDP's lockfile); see its Cargo.toml.
+          cargo clippy --release --locked --manifest-path crates/host/pf-seat-keeper/Cargo.toml --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "seat keeper clippy" }
 
       - name: Format check
         # Cheap, needs no compile, and the Linux lane cannot see these crates' Windows modules.
-        run: cargo fmt -p punktfunk-host -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p punktfunk-tray --check
+        run: |
+          cargo fmt -p punktfunk-host -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p pf-seat-audio -p pf-clipboard -p pf-frame -p punktfunk-tray -p punktfunk-capture-worker --check; if ($LASTEXITCODE) { throw "fmt" }
+          cargo fmt --manifest-path crates/host/pf-seat-keeper/Cargo.toml --check; if ($LASTEXITCODE) { throw "seat keeper fmt" }
 
-      - name: Test (pf-capture + pf-vdisplay + pf-win-display, Windows)
+      - name: Test (subsystem crates, Windows)
         # The crates whose Windows test binaries link against nothing this runner lacks —
         # settled empirically when the package job's equivalents were added. The host and
-        # pf-encode(-win) stay clippy-only: nvidia-video-codec-sdk cannot link on MSVC.
+        # pf-encode stay clippy-only: nvidia-video-codec-sdk cannot link on MSVC. pf-encode-win
+        # runs featureless, so no encoder SDK is in its graph.
         #
         # pf-win-display joins them for the same reason as pf-capture: its manifest is
         # punktfunk-core (default-features off), pf-paths, tracing and windows — no encoder in
@@ -241,6 +257,19 @@ jobs:
           cargo test --release --locked -p pf-capture --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-capture tests" }
           cargo test --release --locked -p pf-vdisplay --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-vdisplay tests" }
           cargo test --release --locked -p pf-win-display --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-win-display tests" }
+          # The seat ledger, accounts and pipe. The pipe test opens a SYSTEM/Administrators pipe.
+          cargo test --release --locked -p pf-seats --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-seats tests" }
+          # The pad and mouse hardware ids against the INF, the SendInput tables, the minted
+          # audio devnodes, and the encode session's pixel targets (WARP when no GPU exists).
+          # A test that needs a device or a session is `#[ignore]`d with its reason.
+          cargo test --release --locked -p pf-inject --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-inject tests" }
+          cargo test --release --locked -p pf-audio --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-audio tests" }
+          cargo test --release --locked -p pf-encode-session --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-encode-session tests" }
+          # The AMF and Media Foundation tests that need a GPU are `#[ignore]`d with their reason.
+          cargo test --release --locked -p pf-encode-win --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-encode-win tests" }
+          # The D3D11 map guard on a WARP device, and a clipboard block the clipboard refuses.
+          cargo test --release --locked -p pf-frame --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-frame tests" }
+          cargo test --release --locked -p pf-clipboard --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-clipboard tests" }
 
   package:
     runs-on: windows-amd64
@@ -248,6 +277,11 @@ jobs:
     # the PR lane above covers the compile question without touching a secret.
     if: github.event_name != 'pull_request'
     timeout-minutes: 90
+    env:
+      # Every binary the installer ships links the C runtime statically: a fresh Windows Server
+      # has no Visual C++ runtime, and setup itself has to start there. Opus still compiles
+      # against the runtime DLL; the linker serves its imports from the static library.
+      RUSTFLAGS: ${{ matrix.rustflags }}
     # The arm64 leg must never hold back the x64 canary (and its update manifest) while it is
     # unproven on hardware; drop the override once a Snapdragon box has run it.
     continue-on-error: ${{ matrix.arch == 'arm64' }}
@@ -261,16 +295,20 @@ jobs:
             host_flags: '--features nvenc,qsv'
             encode_flags: '--features nvenc,qsv'
             bun_ship_zip: bun-windows-x64-baseline.zip
-            bun_ship_sha: 78c221c2376f79731ccf4e4af0b3bb46d81fefa3296c5abee09ad8a1b21e68c6
+            bun_ship_sha: 0f20ce6674d4f2dbcc8c5d59fdf99f7ba45f8c3b367e0f5781cbfa30a1c78d99
             suffix: ''
+            rustflags: '-C target-feature=+crt-static'
           - arch: arm64
             target: aarch64-pc-windows-msvc
             td: C:\t-a64
             host_flags: '--no-default-features --features gamestream'
             encode_flags: ''
             bun_ship_zip: bun-windows-aarch64.zip
-            bun_ship_sha: a7a16b876a305fd1029c66dbd27007b4f6112ae896532f675878731a21e50cfd
+            bun_ship_sha: 2d57a0eec0cb44d95c918c3f9734f60455a1306ae5085d76fc68f44e3ee30d09
             suffix: '_arm64'
+            # Nothing but Opus names lrintf or floor on arm64, and the linker only serves an
+            # import from a function already in the link.
+            rustflags: '-C target-feature=+crt-static -C link-arg=/INCLUDE:lrintf -C link-arg=/INCLUDE:floor'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -301,12 +339,6 @@ jobs:
           # opus) the host pulls; via GITHUB_ENV (pwsh Out-File utf8 = no BOM, unlike Windows
           # PowerShell 5.1 — keeps the first line clean).
           "CARGO_TARGET_DIR=${{ matrix.td }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # audiopus_sys' vendored opus declares cmake_minimum_required < 3.5, which CMake 4.x
-          # refuses outright. Green runs today only survive on the cached configure output — a
-          # target-dir purge (the runner's disk-cleanup task) would fail the fresh configure, as
-          # observed on a clean build on this very runner (2026-07-17). No-op for compliant
-          # projects (libvpl-sys pins 3.13+).
-          "CMAKE_POLICY_VERSION_MINIMUM=3.5" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           # No FFMPEG_DIR: neither the host nor the client links libav* any more. A runner
           # provisioned before that still has the tree and the daemon env var; both are inert.
           # LIBCLANG_PATH is in the runner daemon env.
@@ -375,6 +407,19 @@ jobs:
         # The per-user notification-area companion the installer bundles (punktfunk-tray.exe).
         run: cargo build --release --locked -p punktfunk-tray --target ${{ matrix.target }}
 
+      - name: Build (release, seat keeper)
+        shell: pwsh
+        # punktfunk-seat-keeper.exe, from its own workspace into the same CARGO_TARGET_DIR, so
+        # it lands beside punktfunk-host.exe where the pack script takes it.
+        run: cargo build --release --locked --manifest-path crates/host/pf-seat-keeper/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Build (release, capture worker)
+        shell: pwsh
+        # punktfunk-capture-worker.exe: captures and encodes a monitor the host did not create, as
+        # the signed-in user. The installer places it beside the host. Its backends follow the
+        # target, as the driver's do, so it takes no feature flags.
+        run: cargo build --release --locked -p punktfunk-capture-worker --target ${{ matrix.target }}
+
       - name: Clippy (host + tray, Windows)
         shell: pwsh
         # --release reuses the tree the Build steps made. A debug clippy builds a second one, and
@@ -386,20 +431,21 @@ jobs:
         run: |
           $t = '${{ matrix.target }}'
           cargo clippy --release --locked -p punktfunk-host -p punktfunk-tray ${{ matrix.host_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
-          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p display-disturb --all-targets ${{ matrix.encode_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+          cargo clippy --release --locked -p punktfunk-capture-worker --target $t -- -D warnings; if ($LASTEXITCODE) { throw "capture worker clippy" }
+          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p display-disturb --all-targets ${{ matrix.encode_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+          cargo clippy --release --locked --manifest-path crates/host/pf-seat-keeper/Cargo.toml --target $t -- -D warnings; if ($LASTEXITCODE) { throw "seat keeper clippy" }
 
-      - name: Test (pf-capture, Windows)
+      - name: Test (subsystem crates, Windows)
         if: matrix.arch == 'x64'
         shell: pwsh
-        # The only Rust tests that RUN on Windows CI. pf-capture's `#[cfg(target_os = "windows")]`
-        # test modules cover code no Linux job compiles, let alone executes: 19 declared, of which
-        # 18 execute here — the IDD-push StallWatch state machine and ring-generation masking
-        # (idd_push.rs), the cursor shape→wire truth table (idd_push/cursor_poll.rs), and
-        # `f32_to_f16` including the rounding-carry / saturation edges the HDR P010 path depends on
-        # (dxgi/selftest.rs). All 18 are pure — no Win32, no device, no desktop. The 19th,
-        # `hdr_p010_selftest_intel_1080_live`, is `#[ignore]`d because it needs a real Intel
-        # adapter; it stays a manual `-- --ignored` run on the validation boxes. Until this step
-        # the whole set was type-checked by the clippy line above and nothing more.
+        # pf-capture's `#[cfg(target_os = "windows")]`
+        # test modules cover code no Linux job compiles, let alone executes: 6 declared, all 6
+        # execute here — the CCD key packing (idd/mod.rs), the cursor section's publish and bounds
+        # (idd/cursor.rs, over a pagefile section) and the ETW flow windows (idd/dxgkrnl_etw.rs).
+        # None needs a device or a desktop. The `f32_to_f16` tests and the `#[ignore]`d
+        # `hdr_p010_selftest_intel_1080_live` live in pf-encode-win/src/convert/selftest.rs and
+        # run in the pf-encode-win test step above. Until this step the whole set was
+        # type-checked by the clippy line above and nothing more.
         #
         # --release for the same reason as the clippy step: it reuses C:\t\release instead of
         # spawning a second debug dep tree (the C1069 disk-exhaustion trigger). If this step ever
@@ -413,6 +459,12 @@ jobs:
           # Same argument, same tree shape: pf-win-display has no encoder dependency either, and
           # its 29 CCD path/mode transform tests were compiled by clippy and run nowhere.
           cargo test --release --locked -p pf-win-display --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-win-display tests" }
+          cargo test --release --locked -p pf-seats --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-seats tests" }
+          # Same tree shape: pf-encode-session takes pf-encode-win featureless, so no encoder
+          # SDK import library is asked for.
+          cargo test --release --locked -p pf-inject --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-inject tests" }
+          cargo test --release --locked -p pf-audio --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-audio tests" }
+          cargo test --release --locked -p pf-encode-session --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-encode-session tests" }
 
       - name: Test (pf-vdisplay, Windows)
         if: matrix.arch == 'x64'
@@ -469,13 +521,13 @@ jobs:
           # x64 ships `-baseline`, which starts on CPUs without AVX2 (the plain build exits 255). The .output is self-contained (Nitro
           # noExternals — deps bundled + tree-shaken, no node_modules), so the installer ships just
           # bun + a ~75-file .output instead of node + a node_modules forest.
-          $ver = 'bun-v1.4.2'
+          $ver = 'bun-v1.4.4'
           # SHA-256 of each exact asset, pinned. GitHub release assets are MUTABLE at a fixed URL, so
           # the tag alone vouches for nothing — this binary is Authenticode-signed into our installer
           # and its hash published in the Ed25519 update manifest, i.e. our signature vouches for bytes
           # we downloaded. Verify them. On a bun bump, update $ver, this hash AND the matrix's
           # bun_ship_sha pair (from the release's SHASUMS256.txt). security-review 2026-08-15 finding 12.
-          $sha = 'ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405'
+          $sha = 'cd2c0fccc78f3ede1f50ca827a15f063eda13d4d150a3d0674f4f6e323d864a5'
           $td = '${{ matrix.td }}'
           New-Item -ItemType Directory -Force -Path $td | Out-Null
           function Get-Bun([string]$asset, [string]$pin, [string]$dst) {
@@ -813,7 +865,7 @@ jobs:
           else
             echo "no arm64 installer for ${VER} - publishing the x64 leg only"; A64_URL=""; A64_SHA=""
           fi
-          CHANNEL=canary VERSION="$VER" CI_RUN="${GITHUB_RUN_NUMBER}" \
+          CHANNEL=canary VERSION="$VER" CI_RUN="${GITHUB_RUN_NUMBER}" COMMIT="${GITHUB_SHA}" \
             WINDOWS_URL="$URL" WINDOWS_SHA256="$SHA" \
             WINDOWS_ARM64_URL="$A64_URL" WINDOWS_ARM64_SHA256="$A64_SHA" \
             NOTES_URL="https://git.unom.io/unom/punktfunk/releases" \

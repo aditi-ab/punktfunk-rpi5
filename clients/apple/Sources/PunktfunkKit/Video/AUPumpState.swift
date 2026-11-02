@@ -1,11 +1,12 @@
-// The per-access-unit bookkeeping both VideoToolbox pumps do: the straggler filter, the format
-// and decoded-size tracking, the keyframe WANT that only an IDR's parameter sets can end, and
-// which post-loss AUs never reach the decoder.
+// The per-access-unit bookkeeping both VideoToolbox pumps do: the format and decoded-size
+// tracking, the keyframe WANT that only an IDR's parameter sets can end, and which post-loss
+// AUs never reach the decoder.
 //
 // No I/O: the caller reads the connection and applies what `note` returns, so the rules are
 // testable without a host. Which post-loss AUs reach VideoToolbox is the core's receiver rule
 // (`punktfunk_au_admission_*`), strict: one reference-damaged delta can make VideoToolbox
-// refuse every later non-IDR AU, the anchor too. What stays on glass is `ReanchorGate`'s.
+// refuse every later non-IDR AU, the anchor too. Which AUs are stragglers and what stays on
+// glass are the core's too (`PunktfunkConnection.recoveryOnFrame`, `recoveryOnDecoded`).
 
 import CoreMedia
 import Foundation
@@ -16,19 +17,14 @@ struct AUPumpState {
     private(set) var format: CMVideoFormatDescription?
     /// The last size reported upward, so a loss-recovery IDR at the same size stays quiet.
     private var lastDims: CMVideoDimensions?
-    /// Newest submitted frame index, for the straggler filter.
-    private var newestIndex: UInt32?
     /// Persistent WANT for the two states only parameter sets can end: no decodable format yet,
-    /// or a decoder reset. The caller re-asks (throttled) while it is true.
+    /// or a decoder reset. The caller re-asks while it is true; the core throttles.
     private(set) var awaitingIDR = false
     /// The core's receiver rule. A copy of this state shares it; each pump owns one.
     private let admission = Admission()
 
     /// What the caller should do about this access unit.
     struct Step: Equatable {
-        /// Arrived behind one already submitted: decoding it rewinds the reference buffer, so
-        /// skip it entirely.
-        var straggler = false
         /// The decoded size changed — report it (a new-mode IDR, not a same-size recovery one).
         var newSize: Size?
         /// This AU ended a recovery the pump was waiting on.
@@ -37,7 +33,7 @@ struct AUPumpState {
         var startedFormatWait = false
         /// Do not hand this AU to the decoder: it references a lost picture.
         var withhold = false
-        /// Ask the host for a keyframe (the caller throttles).
+        /// Ask the host for a keyframe.
         var askKeyframe = false
 
         struct Size: Equatable {
@@ -64,28 +60,15 @@ struct AUPumpState {
         }
     }
 
-    /// Whether `note` skips this index as a straggler. Work the decoder never sees must not
-    /// happen on one — the concealer mirrors the decoder's DPB.
-    func isStraggler(frameIndex: UInt32) -> Bool {
-        // Wraparound-safe: the index is a 32-bit counter, so compare the difference as signed.
-        newestIndex.map { Int32(bitPattern: frameIndex &- $0) <= 0 } ?? false
-    }
-
-    /// Fold one access unit in. `idrFormat` is what the codec made of its parameter sets, or nil
-    /// for a delta frame; `lossAhead` says a frame-index gap precedes this AU; `flags` are its
-    /// wire flags (`AccessUnit.flags`); `concealed` is the concealer's verdict on it. Parsed
-    /// parameter sets re-anchor like the wire IDR bit.
+    /// Fold one admitted access unit in, in receive order. `idrFormat` is what the codec made of
+    /// its parameter sets, or nil for a delta frame; `lossAhead` says a frame-index gap precedes
+    /// this AU; `flags` are its wire flags (`AccessUnit.flags`); `concealed` is the concealer's
+    /// verdict on it. Parsed parameter sets re-anchor like the wire IDR bit.
     mutating func note(
         frameIndex: UInt32, idrFormat: CMVideoFormatDescription?, lossAhead: Bool = false,
         flags: UInt32 = 0, concealed: Concealment = .none
     ) -> Step {
         var step = Step()
-        if isStraggler(frameIndex: frameIndex) {
-            step.straggler = true
-            return step
-        }
-        newestIndex = frameIndex
-
         let idr = idrFormat != nil ? PunktfunkConnection.flagSOF : 0
         _ = punktfunk_au_admission_note(
             admission.ptr, frameIndex, lossAhead ? 1 : 0, flags | idr, true, concealed.core,

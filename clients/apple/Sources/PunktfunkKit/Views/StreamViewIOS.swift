@@ -27,17 +27,41 @@ import os
 import AVKit // AVDisplayManager — the per-session display-mode (HDR10/refresh) request
 #endif
 
+#if os(visionOS)
+/// One pinch on the curved screen, in host-mode pixels.
+struct CurvePinch {
+    /// A wire contact id no finger in the window takes while the picture is on the curve.
+    static let touchID: UInt32 = 15
+    /// Travel under this many host pixels, under `tapSeconds`, is a click, not a drag.
+    static let tapSlop: CGFloat = 16
+    static let tapSeconds: CFTimeInterval = 0.35
+    let route: TouchInputMode
+    let start: CGPoint
+    var last: CGPoint
+    let at: CFTimeInterval
+    /// Sub-pixel travel not yet sent.
+    var carry = CGPoint.zero
+
+    func isTap(at end: CGPoint) -> Bool {
+        hypot(end.x - start.x, end.y - start.y) < Self.tapSlop
+            && CACurrentMediaTime() - at < Self.tapSeconds
+    }
+}
+#endif
+
 /// Same diagnostic switch as InputCapture (PUNKTFUNK_INPUT_DEBUG=1): on iOS we log the
 /// resolved pointer-lock state each time capture engages, so the user can see whether the
 /// scene actually locked (GCMouse only delivers deltas while it did) or whether we're on
 /// the touch fallback.
 private let iosInputLog = ClientLog(category: "input")
+private let sceneLog = ClientLog(category: "present")
 private let iosInputDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_INPUT_DEBUG"] == "1"
 
 public struct StreamView: UIViewControllerRepresentable {
     private let connection: PunktfunkConnection
     private let captureEnabled: Bool
     private let onCaptureChange: ((Bool) -> Void)?
+    private let onDisconnectRequest: (() -> Void)?
     private let onDial: ((DialEvent) -> Void)?
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
     private let onSessionEnd: (@Sendable () -> Void)?
@@ -45,16 +69,16 @@ public struct StreamView: UIViewControllerRepresentable {
     private let onDecodedSize: (@Sendable (Int, Int) -> Void)?
     private let endToEndMeter: LatencyMeter?
     #if os(visionOS)
-    private var theaterRenderers: TheaterRenderers?
+    private var curveTarget: CurveTarget?
     #endif
 
-    /// `onDisconnectRequest` exists for call-site parity with the macOS StreamView (the
-    /// captured-state ⌃⌥⇧D combo is detected by the macOS NSEvent monitor only); on iOS a
-    /// hardware keyboard reaches Disconnect through the Stream menu's key equivalent instead,
-    /// so the parameter is accepted and unused here.
+    /// `onDisconnectRequest` (main queue) is the captured-state ⌃⌥⇧D from an iPad keyboard,
+    /// as on the macOS StreamView; released, the Stream menu's key equivalent disconnects.
     public init(
         connection: PunktfunkConnection,
         captureEnabled: Bool = true,
+        // Call-site parity with macOS, whose Direct gate reads it; the touch platforms don't.
+        overlayShown: Bool = false,
         onCaptureChange: ((Bool) -> Void)? = nil,
         onDisconnectRequest: (() -> Void)? = nil,
         onDial: ((DialEvent) -> Void)? = nil,
@@ -67,6 +91,7 @@ public struct StreamView: UIViewControllerRepresentable {
         self.connection = connection
         self.captureEnabled = captureEnabled
         self.onCaptureChange = onCaptureChange
+        self.onDisconnectRequest = onDisconnectRequest
         self.onDial = onDial
         self.onFrame = onFrame
         self.onSessionEnd = onSessionEnd
@@ -76,10 +101,10 @@ public struct StreamView: UIViewControllerRepresentable {
     }
 
     #if os(visionOS)
-    /// Present into a theater's renderers instead of this view while `renderers` is set.
-    public func theater(_ renderers: TheaterRenderers?) -> StreamView {
+    /// Draw the picture on `target`'s curved screen instead of this view while it is set.
+    public func curve(_ target: CurveTarget?) -> StreamView {
         var view = self
-        view.theaterRenderers = renderers
+        view.curveTarget = target
         return view
     }
     #endif
@@ -87,9 +112,10 @@ public struct StreamView: UIViewControllerRepresentable {
     public func makeUIViewController(context: Context) -> StreamViewController {
         let controller = StreamViewController()
         #if os(visionOS)
-        controller.setTheater(theaterRenderers)
+        controller.setCurve(curveTarget)
         #endif
         controller.onCaptureChange = onCaptureChange
+        controller.onDisconnectRequest = onDisconnectRequest
         controller.onDial = onDial
         controller.captureEnabled = captureEnabled
         controller.endToEndMeter = endToEndMeter
@@ -101,13 +127,14 @@ public struct StreamView: UIViewControllerRepresentable {
 
     public func updateUIViewController(_ controller: StreamViewController, context: Context) {
         controller.onCaptureChange = onCaptureChange
+        controller.onDisconnectRequest = onDisconnectRequest
         controller.onDial = onDial
         controller.captureEnabled = captureEnabled
         controller.endToEndMeter = endToEndMeter
         controller.onResizeTarget = onResizeTarget
         controller.onDecodedSize = onDecodedSize
         #if os(visionOS)
-        controller.setTheater(theaterRenderers)
+        controller.setCurve(curveTarget)
         #endif
         if controller.connection !== connection {
             controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
@@ -149,6 +176,8 @@ public final class StreamViewController: StreamViewControllerBase {
     /// The window's display manager the session's mode request was set on — held weakly so
     /// stop() can clear the request even after the view has left the window.
     private weak var sessionDisplayManager: AVDisplayManager?
+    /// Watches the mode switch our criteria asked for; its end is the HDR output signal.
+    private var displayModeObservation: NSKeyValueObservation?
     /// The decoded frames are HDR — what the display-mode request follows.
     private var frameHDR = false
     #endif
@@ -159,11 +188,10 @@ public final class StreamViewController: StreamViewControllerBase {
     /// Capture state at the last resign, restored on the next foreground — otherwise the
     /// mouse/keyboard stay released after navigating out and nothing re-grabs them.
     private var wasCapturedOnResign = false
-    /// Match-window resize follower (C3) — non-nil while a session is active AND the `matchWindow`
-    /// setting is on (DEFAULT on, for pixel-exact scene streaming); fed the view's physical-pixel
-    /// size from `viewDidLayoutSubviews` so an iPad Stage Manager / Split View scene resize
-    /// renegotiates the host mode (1:1, no presenter resample). iOS only (iPhone naturally no-ops
-    /// its fixed full-screen scene; tvOS drives display modes via AVDisplayManager instead).
+    /// Match window's follower, non-nil while a session is active and enabled by the `matchWindow`
+    /// setting. `viewDidLayoutSubviews` feeds it the view's pixel size, so a scene resize, a
+    /// rotation, a fold or the upright half of a half-open one renegotiates the host mode 1:1.
+    /// tvOS drives display modes through AVDisplayManager instead.
     private var matchFollower: MatchWindowFollower?
     /// The picture's surface on an attached monitor (see `ExternalDisplay`), and whether the
     /// stream presents there now. Input and the HUD stay on the phone either way.
@@ -173,23 +201,25 @@ public final class StreamViewController: StreamViewControllerBase {
         view.onLayout = { [weak self] in self?.layoutMetalLayer() }
         return view
     }()
+    /// The session's monitor accessory (`UISceneAccessoryRegistration`, iOS 27+). From iOS 27 the
+    /// monitor's scene connects only while one is registered.
+    private var monitorAccessory: AnyObject?
+    /// This screen's native mode at the last layout pass, and the request a change of it queued.
+    private var lastNativeMode: (width: Int, height: Int, hz: Int)?
+    private var screenModeWork: DispatchWorkItem?
     #endif
     private var onExternal = false
-    // `prefersPointerLocked` mirrors `wantsPointerLock`; SpringBoard grants or drops on its own
-    // terms. `requestPointerLock` re-asks only on an event that can change its answer: a drop
-    // while wanted, a click while unlocked, the scene going active, the window filling the screen
-    // again. Each is one false→true edge — re-asserting a value it already holds is ignored.
-
-    /// True while a re-ask holds `prefersPointerLocked` at false for `pointerLockEdgeHold`.
-    private var pointerLockSuppressed = false
-    /// Long enough for UIKit to push the false pass to the scene before the true one follows.
-    private static let pointerLockEdgeHold: TimeInterval = 0.05
-    /// When the last drop-triggered re-ask was scheduled. A grant SpringBoard revokes at once
-    /// would otherwise re-ask on every revoke; one a second keeps that bounded.
-    private var pointerLockDropRelockAt: CFTimeInterval = -.infinity
-    /// Whether the window filled its screen at the last layout pass (assumed so until a pass says
-    /// otherwise) — the pass that makes it fill again, a re-maximise, is the one that re-asks.
-    private var windowFilledScreen = true
+    /// The re-ask edge and its clocks; `prefersPointerLocked` mirrors `wantsPointerLock` outside
+    /// an edge. SpringBoard grants or drops on its own terms.
+    private var pointerLock = PointerLock()
+    /// The quick-action ring is up, so the mouse is UIKit's: a locked pointer cannot click a
+    /// button above the video. Only the lock yields. The keyboard stays captured, or ⌃⌥⇧O
+    /// could not close the ring.
+    private var ringHoldsPointer = false
+    #endif
+    #if os(visionOS)
+    /// The scene `fitWindowToPicture` restricted; `stop()` hands it back free-resizing.
+    private weak var fittedScene: UIWindowScene?
     #endif
 
     /// Reads whether the scene's pointer is actually locked right now; nil = state
@@ -204,6 +234,8 @@ public final class StreamViewController: StreamViewControllerBase {
     }
 
     var onCaptureChange: ((Bool) -> Void)?
+    /// The captured-state ⌃⌥⇧D (see `StreamView.init`).
+    var onDisconnectRequest: (() -> Void)?
     /// The two-finger twist turning the quick-action ring (forwarded from the stream view).
     var onDial: ((DialEvent) -> Void)?
     /// Resize-overlay START: forwarded to the Match-window follower so a scene resize drives the
@@ -237,6 +269,7 @@ public final class StreamViewController: StreamViewControllerBase {
 
     public override func loadView() {
         view = StreamLayerUIView()
+        presenter.surfaceState = { [weak self] in self?.surfaceLine() ?? "-" }
         #if os(tvOS)
         // Kill the pad/remote → UIKit press path at the source for the whole session (see the
         // GCEventViewController typealias above). GC delivery is untouched: GamepadCapture
@@ -259,6 +292,13 @@ public final class StreamViewController: StreamViewControllerBase {
         view.addInteraction(interaction)
         pointerInteraction = interaction
         #endif
+        #if os(visionOS)
+        // visionOS turns a pad press into a pinch on whatever the eyes rest on. The pad is the
+        // game's: every press goes to GameController, so GamepadCapture forwards all of it.
+        let pad = GCEventInteraction()
+        pad.handledEventTypes = .gamepad
+        view.addInteraction(pad)
+        #endif
     }
 
     #if os(iOS) || os(visionOS)
@@ -271,19 +311,23 @@ public final class StreamViewController: StreamViewControllerBase {
         connection?.settings.pointerCapture ?? true
     }
 
-    /// Whether the pointer should be CAPTURED right now: iPad, capture engaged, and the user
-    /// hasn't opted into the absolute (desktop) pointer. The system additionally requires
-    /// full-screen + frontmost and may drop the lock (Slide Over/Stage Manager/backgrounding) —
-    /// syncPointerLock() handles the actual grant/drop and falls back to absolute when unlocked.
+    /// Whether the pointer should be CAPTURED right now: iPad, capture engaged, the quick-action
+    /// ring down, and the user hasn't opted into the absolute (desktop) pointer. The system
+    /// additionally requires full-screen + frontmost and may drop the lock (Slide Over/Stage
+    /// Manager/backgrounding) — syncPointerLock() handles the actual grant/drop and falls back
+    /// to absolute when unlocked.
     private var wantsPointerLock: Bool {
         // The trailing grant test is per-client access §7 — no pointer lock without the
         // POINTER bit (a Controller-only guest's trackpad stays a normal local pointer);
         // read live, so a mid-session re-grant lets the next resolve pass lock.
-        captured && pointerCaptureEnabled && UIDevice.current.userInterfaceIdiom == .pad
+        captured && !ringHoldsPointer && pointerCaptureEnabled
+            && UIDevice.current.userInterfaceIdiom == .pad
             && connection?.canSendPointer == true
     }
 
-    public override var prefersPointerLocked: Bool { wantsPointerLock && !pointerLockSuppressed }
+    public override var prefersPointerLocked: Bool {
+        pointerLock.prefersLocked(wanted: wantsPointerLock)
+    }
     public override var prefersHomeIndicatorAutoHidden: Bool { true }
 
     // NOTE: we deliberately do NOT override `childViewControllerForPointerLock`. The default
@@ -494,11 +538,12 @@ public final class StreamViewController: StreamViewControllerBase {
         streamView.onPointerButton = { [weak self] button, down in
             guard let self else { return }
             // Released → a primary press into the video re-engages capture, like macOS's
-            // `engageCapture(fromClick:)`. It is the local gesture, never forwarded: InputCapture's
-            // latch swallows its release. Only button 1 has that latch; another button would send
-            // a lone release and eat the next click. Captured → the absolute path forwards it.
+            // `engageCapture(fromClick:)`. It is the local gesture, never forwarded.
+            // Captured → the absolute path forwards it.
             if !self.captured {
-                if down, button == 1, self.captureEnabled { self.setCaptured(true, fromClick: true) }
+                if PointerLock.clickEngagesCapture(button: button, down: down), self.captureEnabled {
+                    self.setCaptured(true, fromClick: true)
+                }
                 return
             }
             guard self.inputCapture?.gcMouseForwarding == false else { return }
@@ -506,7 +551,7 @@ public final class StreamViewController: StreamViewControllerBase {
             // Captured but unlocked: the click is the user gesture SpringBoard wants before it
             // hands a declined or dropped lock back. On the UP, so the click has fully forwarded
             // on one transport — a grant mid-click would strand the release on the GCMouse path.
-            if !down { self.requestPointerLock() }
+            if !down { self.stepPointerLock(.reask) }
         }
         // Every scroll, wheel and trackpad, locked or not: UIKit applies Natural Scrolling, which
         // GCMouse's raw wheel does not, so the direction never changes with the lock.
@@ -526,39 +571,59 @@ public final class StreamViewController: StreamViewControllerBase {
         capture.onReleaseCapture = { [weak self] in
             self?.setCaptured(false)
         }
-        // ⌃⌥⇧A mutes/unmutes the mic uplink. Session state this controller doesn't own, so it
-        // posts to the app exactly as the macOS chord does, naming its session so only that
-        // window's stream toggles.
+        // ⌃⌥⇧A mutes the mic uplink and ⌃⌥⇧C flips clipboard sharing: session state this
+        // controller doesn't own, posted as the macOS chords are, naming the session.
         capture.onToggleMicMute = { [weak connection] in
             NotificationCenter.default.post(name: .punktfunkToggleMicMute, object: connection)
+        }
+        capture.onToggleClipboard = { [weak connection] in
+            NotificationCenter.default.post(name: .punktfunkToggleClipboard, object: connection)
         }
         // ⌃⌥⇧O toggles the quick-action ring, posted the way the Mac's chord is.
         capture.onQuickActions = { [weak connection] in
             NotificationCenter.default.post(name: .punktfunkToggleQuickActions, object: connection)
         }
+        // ⌃⌥⇧D and ⌃⌥⇧S take the Mac's routes: the session's disconnect, and this session's
+        // stats cycle.
+        capture.onDisconnect = { [weak self] in self?.onDisconnectRequest?() }
+        capture.onCycleStats = { [weak connection] in StatsVerbosity.requestCycle(for: connection) }
         capture.onPreempted = { [weak self] in
             self?.setCaptured(false)
         }
         capture.start()
         inputCapture = capture
-        // Match-window (C3): when ON, follow the scene's pixel size so a resizable iPad scene
-        // streams 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into it.
-        // `viewDidLayoutSubviews` feeds it — covers Stage Manager / Split View resizes and rotation.
-        // iPhone is a fixed full-screen scene, so this naturally no-ops (reports the device mode).
-        // OPT-IN — `?? false` matches the Settings toggle (which also defaults off); an unset
-        // default keeps the explicit mode.
+        // Match window: follow the picture's own pixel size, so a resized scene, a fold or the
+        // upright half of a half-open one streams 1:1. `viewDidLayoutSubviews` feeds it. Off by
+        // default, like the Settings toggle.
         let follower = MatchWindowFollower(
             connection: connection,
             enabled: connection.settings.matchWindow,
             renderScale: connection.settings.renderScale,
             maxDimension: RenderScale.maxDimension(codec: connection.settings.codec))
         follower.onResizeTarget = onResizeTarget
+        #if os(iOS)
+        // A native rate follows the screen the picture is on.
+        follower.refreshHz = { [weak self] in
+            guard let self, self.connection?.settings.refreshHz == 0 else { return nil }
+            return UInt32(clamping: max(self.nativeMode.hz, 30))
+        }
+        // What the connect asked for: a session that starts on a half-open fold differs at once.
+        lastNativeMode = NativeDisplay.mode
+        #endif
         matchFollower = follower
         #endif
         #if os(iOS)
         // A monitor attached before the session starts shows the picture from the first frame.
         onExternal = ExternalDisplay.shared.screen != nil
         if onExternal { ExternalDisplay.shared.show(externalVideo) }
+        // iOS 27 connects the monitor's scene only for this; `routeVideo` takes it when it lands.
+        if #available(iOS 27, *) {
+            let config = UISceneConfiguration(
+                name: nil, sessionRole: .windowExternalDisplayNonInteractive)
+            config.delegateClass = ExternalDisplaySceneDelegate.self
+            let accessory = UISceneAccessory.externalNonInteractive(sceneConfiguration: config)
+            monitorAccessory = registerSceneAccessory(accessory)
+        }
         #endif
 
         // Presenter choice + lifecycle live in SessionPresenter (shared with macOS): stage-2
@@ -610,26 +675,20 @@ public final class StreamViewController: StreamViewControllerBase {
             } else {
                 // Captured before the scene was active (a launch straight into a stream): the
                 // first ask found no frontmost scene, so ask again now there is one.
-                self.requestPointerLock()
+                self.stepPointerLock(.reask)
             }
         })
         // The system grants or drops the lock on its own terms (Slide Over, Stage Manager, the
         // window leaving screen size). Re-resolve the routing on every change; a drop while the
-        // lock is still wanted asks once more, a turn later, so a drop that precedes the app's own
-        // resign finds `captured` already cleared and does nothing.
+        // lock is still wanted asks once more (`PointerLock`).
         observers.append(NotificationCenter.default.addObserver(
             forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard let self else { return }
             self.syncPointerLock()
-            guard (note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene)
-                === self.view.window?.windowScene,
-                self.wantsPointerLock, self.pointerLockEngaged() == false
-            else { return }
-            let now = CACurrentMediaTime()
-            guard now - self.pointerLockDropRelockAt >= 1 else { return }
-            self.pointerLockDropRelockAt = now
-            DispatchQueue.main.async { [weak self] in self?.requestPointerLock() }
+            let scene = note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene
+            self.stepPointerLock(
+                .lockChanged(ours: scene === self.view.window?.windowScene, at: CACurrentMediaTime()))
         })
         // The Stream menu's "Release Mouse" (⌃⌥⇧Q) posts this — the discoverable menu surface for
         // the RELEASED state. While CAPTURED the combo is recognized from the HID stream in
@@ -644,15 +703,44 @@ public final class StreamViewController: StreamViewControllerBase {
                   self.view.window?.windowScene?.activationState == .foregroundActive else { return }
             self.setCaptured(false)
         })
+        // The quick-action ring is SwiftUI above this layer. Unlock the pointer for as long as it
+        // is up, and take the lock back when it closes: the false→true edge is the ask. A close
+        // is honoured from any scene state, or a ring that outlived its scene's focus would
+        // leave the pointer unlocked for the rest of the session.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .punktfunkRingOpen, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let open = (note.object as? NSNumber)?.boolValue == true
+            if open, self.view.window?.windowScene?.activationState != .foregroundActive { return }
+            guard self.ringHoldsPointer != open else { return }
+            self.ringHoldsPointer = open
+            self.setNeedsUpdateOfPrefersPointerLocked()
+            self.updatePointerLockChain()
+            self.syncPointerLock()
+        })
         // The ring's Keyboard slot shows the soft keyboard, and hides it when it is up. iPhone's
         // keyboard has no dismiss key, and passthrough has no three-finger swipe. The slot names
-        // its session: every visionOS window is foreground-active at once.
+        // its session: every visionOS window is foreground-active at once. A trackpad half's
+        // swipe says which way it went. On the curve the volume's anchor takes the keyboard.
         observers.append(NotificationCenter.default.addObserver(
             forName: .punktfunkToggleSoftKeyboard, object: connection, queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] note in
             guard let self,
                   self.view.window?.windowScene?.activationState == .foregroundActive else { return }
-            self.streamView.setSoftKeyboardVisible(!self.streamView.isFirstResponder)
+            let show = note.userInfo?[SoftKeyboardNote.show] as? Bool
+            #if os(visionOS)
+            if self.showsElsewhere, let anchor = self.presenter.curve?.anchor {
+                anchor.keys = self.streamView
+                if show ?? !anchor.isFirstResponder {
+                    anchor.becomeFirstResponder()
+                } else {
+                    anchor.resignFirstResponder()
+                }
+                return
+            }
+            #endif
+            self.streamView.setSoftKeyboardVisible(show ?? !self.streamView.isFirstResponder)
         })
         #if os(iOS)
         // A monitor plugged in or pulled mid-session takes the picture or hands it back.
@@ -664,16 +752,17 @@ public final class StreamViewController: StreamViewControllerBase {
         #endif
         #if os(visionOS)
         // Several windows can stream at once and none is "in front": input follows the window
-        // the player last pinched into. Another app window's scene taking it (a host list being
-        // typed into) releases this one; this scene's ornaments and the theater's space do not.
+        // or curved screen the player last pinched into. Another app window's scene taking it
+        // (a host list being typed into) releases this one; this scene's ornaments do not.
         observers.append(NotificationCenter.default.addObserver(
             forName: UIWindow.didBecomeKeyNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard let self, let window = note.object as? UIWindow else { return }
-            if window === self.view.window {
+            if window === self.view.window || window === self.presenter.curve?.anchor?.window {
                 self.setCaptured(true)
             } else if let scene = window.windowScene, scene !== self.view.window?.windowScene,
-                      scene.session.role == .windowApplication {
+                      [.windowApplication, .windowApplicationVolumetric]
+                          .contains(scene.session.role) {
                 self.setCaptured(false)
             }
         })
@@ -702,6 +791,32 @@ public final class StreamViewController: StreamViewControllerBase {
         observers.append(NotificationCenter.default.addObserver(
             forName: UIScreen.modeDidChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.layoutMetalLayer() })
+        // Every transition tvOS makes around the window, with the surface state at that
+        // moment: a bundle then shows what the system did when the picture stopped.
+        let witnessed: [Notification.Name] = [
+            UIApplication.willResignActiveNotification, UIApplication.didBecomeActiveNotification,
+            UIApplication.didEnterBackgroundNotification,
+            UIApplication.willEnterForegroundNotification,
+            UIWindow.didBecomeHiddenNotification, UIWindow.didBecomeVisibleNotification,
+            UIWindow.didResignKeyNotification, UIWindow.didBecomeKeyNotification,
+            UIScreen.modeDidChangeNotification, .AVDisplayManagerModeSwitchStart,
+            .AVDisplayManagerModeSwitchEnd, .AVDisplayManagerModeSwitchSettingsChanged,
+            ProcessInfo.thermalStateDidChangeNotification,
+        ]
+        for name in witnessed {
+            observers.append(NotificationCenter.default.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] note in
+                guard let self else { return }
+                let short = note.name.rawValue
+                    .replacingOccurrences(of: "Notification", with: "")
+                    .replacingOccurrences(of: "UIApplication", with: "app.")
+                    .replacingOccurrences(of: "UIWindow", with: "window.")
+                    .replacingOccurrences(of: "UIScreen", with: "screen.")
+                    .replacingOccurrences(of: "AVDisplayManager", with: "display.")
+                sceneLog.info("scene \(short, privacy: .public) — \(self.surfaceLine(), privacy: .public)")
+            })
+        }
         #endif
     }
 
@@ -729,11 +844,19 @@ public final class StreamViewController: StreamViewControllerBase {
         streamView.currentHostMode = nil
         matchFollower = nil
         #endif
+        #if os(visionOS)
+        fittedScene?.requestGeometryUpdate(.Vision(resizingRestrictions: .freeform))
+        fittedScene = nil
+        #endif
         #if os(iOS)
         if onExternal {
             ExternalDisplay.shared.hide(externalVideo) // the monitor mirrors the phone again
             onExternal = false
         }
+        if #available(iOS 27, *), let accessory = monitorAccessory as? UISceneAccessoryRegistration {
+            unregisterSceneAccessory(accessory)
+        }
+        monitorAccessory = nil
         #endif
         #if os(tvOS)
         inputCapture?.stop()
@@ -742,6 +865,8 @@ public final class StreamViewController: StreamViewControllerBase {
         // session's HDR10/refresh mode.
         sessionDisplayManager?.preferredDisplayCriteria = nil
         sessionDisplayManager = nil
+        displayModeObservation = nil
+        presenter.setHDROutput(false)
         frameHDR = false
         #endif
         presenter.stop()
@@ -753,12 +878,13 @@ public final class StreamViewController: StreamViewControllerBase {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
         #if os(iOS) || os(visionOS)
-        // The theater's panel is not the picture's size, so Match window sits it out.
-        if !onExternal, presenter.theater == nil { noteMatchWindowSize() }
+        // The curve's screen is not the window's size: Match window sits it out.
+        if !onExternal, !showsElsewhere { noteMatchWindowSize() }
+        #if os(iOS)
+        noteScreen()
+        #endif
         // The window back at screen size (a windowed scene re-maximised) can hold the lock again.
-        let fills = windowFillsScreen
-        if fills, !windowFilledScreen { requestPointerLock() }
-        windowFilledScreen = fills
+        stepPointerLock(.layout(fills: windowFillsScreen))
         #endif
         #if os(tvOS)
         applyDisplayCriteriaIfNeeded()
@@ -785,15 +911,22 @@ public final class StreamViewController: StreamViewControllerBase {
             if sessionDisplayManager != nil {
                 manager.preferredDisplayCriteria = nil
                 sessionDisplayManager = nil
+                displayModeObservation = nil
+                presenter.setHDROutput(false)
             }
             return
         }
         guard manager.preferredDisplayCriteria == nil else { return }
         let mode = connection.currentMode()
         guard mode.width > 0, mode.height > 0, mode.refreshHz > 0 else { return }
-        // A synthetic HDR10-HEVC format description carrying the negotiated mode — what the
-        // stream decodes to. AVDisplayCriteria(refreshRate:formatDescription:) matches the
-        // display to it (tvOS 17+, our deployment floor).
+        // A synthetic HEVC format description of what the stream decodes to: BT.2020 PQ at 10
+        // bits WITH an HDR10 grade. tvOS reads the range off the static metadata; tagged PQ
+        // alone counts as SDR, and the box never switched. A 1000-nit BT.2020 grade stands in
+        // until the host's own arrives — the mode is the same.
+        let grade = PunktfunkConnection.HdrMeta(
+            primariesX: [8500, 6550, 35400], primariesY: [39850, 2300, 14600],
+            whitePointX: 15635, whitePointY: 16450,
+            maxMasteringLuminance: 10_000_000, minMasteringLuminance: 1, maxCLL: 1000, maxFALL: 400)
         let ext: [CFString: Any] = [
             kCMFormatDescriptionExtension_ColorPrimaries:
                 kCMFormatDescriptionColorPrimaries_ITU_R_2020,
@@ -801,6 +934,11 @@ public final class StreamViewController: StreamViewControllerBase {
                 kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ,
             kCMFormatDescriptionExtension_YCbCrMatrix:
                 kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+            kCMFormatDescriptionExtension_BitsPerComponent: 10,
+            kCMFormatDescriptionExtension_MasteringDisplayColorVolume:
+                grade.masteringDisplayColorVolume() as CFData,
+            kCMFormatDescriptionExtension_ContentLightLevelInfo:
+                grade.contentLightLevelInfo() as CFData,
         ]
         var desc: CMFormatDescription?
         CMVideoFormatDescriptionCreate(
@@ -811,19 +949,46 @@ public final class StreamViewController: StreamViewControllerBase {
         manager.preferredDisplayCriteria = AVDisplayCriteria(
             refreshRate: Float(mode.refreshHz), formatDescription: desc)
         sessionDisplayManager = manager
+        // The switch runs for a second or two; its end means the output is in our HDR mode.
+        // `UIScreen`'s EDR headroom stays 1 on tvOS whatever the mode, so this is the signal.
+        displayModeObservation = manager.observe(\.isDisplayModeSwitchInProgress, options: [.old, .new]) {
+            [weak self] _, change in
+            guard change.oldValue == true, change.newValue == false else { return }
+            DispatchQueue.main.async { self?.presenter.setHDROutput(true) }
+        }
+        // PUNKTFUNK_PRESENT_DEBUG: whether the box takes the request, now and as the switch lands.
+        if presentDebug {
+            for delay in [0.0, 1.0, 2.0, 3.0, 5.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak manager, weak self] in
+                    let screen = self?.view.window?.screen ?? UIScreen.main
+                    print(String(
+                        format: "pf-tvdisplay t+%.2f matching=%d switching=%d criteria=%d headroom=%.2f "
+                            + "potential=%.2f gamut=%d mode=%dx%d maxFps=%d",
+                        delay, manager?.isDisplayCriteriaMatchingEnabled == true ? 1 : 0,
+                        manager?.isDisplayModeSwitchInProgress == true ? 1 : 0,
+                        manager?.preferredDisplayCriteria != nil ? 1 : 0,
+                        screen.currentEDRHeadroom, screen.potentialEDRHeadroom,
+                        screen.traitCollection.displayGamut.rawValue,
+                        Int(screen.currentMode?.size.width ?? 0), Int(screen.currentMode?.size.height ?? 0),
+                        screen.maximumFramesPerSecond))
+                }
+            }
+        }
     }
     #endif
 
-    /// The display scale to render the metal drawable at. `traitCollection.displayScale` is the
-    /// canonical render scale and is reliable once the controller is in the hierarchy;
-    /// `view.contentScaleFactor` can read 1.0 before the view attaches to a window/screen, which
-    /// would size the drawable at point resolution → a pixelated, upscaled mess. Falls back to the
-    /// main screen scale if the trait is still unspecified.
+    /// The scale to render the metal drawable at: the panel's pixels per point, not the logical
+    /// `displayScale`. Under Display Zoom (an iPad's "More Space", a phone's "Larger Text") the
+    /// two differ, and a drawable at the logical scale is resampled twice — up by the shader,
+    /// down by the display. The stream is negotiated from `nativeBounds`, so the panel's scale
+    /// makes decoded, drawable and panel 1:1. Falls back to the trait, then the main screen.
     private var renderScale: CGFloat {
         let s = traitCollection.displayScale
         #if os(visionOS)
         return s > 0 ? s : 2 // visionOS windows render at 2x
         #else
+        let native = (view.window?.windowScene?.screen ?? NativeDisplay.screen).nativeScale
+        if native > 0 { return native }
         return s > 0 ? s : UIScreen.main.scale
         #endif
     }
@@ -847,6 +1012,35 @@ public final class StreamViewController: StreamViewControllerBase {
         presenter.layout(in: streamView.bounds, contentsScale: renderScale)
     }
 
+    /// The window, scene and display around the picture, for the presenter's wedge line: a
+    /// hidden window, an inactive scene, a modal over the view or a display mode switch in
+    /// flight each name the level that stopped taking frames. Main thread.
+    private func surfaceLine() -> String {
+        let window = view.window
+        let app = UIApplication.shared
+        var line = "app=\(app.applicationState.rawValue) idleTimerOff=\(app.isIdleTimerDisabled) "
+            + "window=\(window.map { "key=\($0.isKeyWindow) hidden=\($0.isHidden) level=\($0.windowLevel.rawValue)" } ?? "none") "
+            + "scene=\(window?.windowScene?.activationState.rawValue ?? -9) "
+            + "view=\(view.bounds.size) hidden=\(view.isHidden) alpha=\(view.alpha) attached=\(view.superview != nil) "
+            + "modal=\(presentedViewController != nil || window?.rootViewController?.presentedViewController != nil) "
+            + "plane=\(streamView.displayLayer.status.rawValue) "
+            + "thermal=\(ProcessInfo.processInfo.thermalState.rawValue)"
+        #if !os(visionOS)
+        if let screen = window?.screen {
+            line += " screen=\(screen.bounds.size)@\(screen.maximumFramesPerSecond)"
+        }
+        #endif
+        #if os(tvOS)
+        if let manager = window?.avDisplayManager {
+            line += " modeSwitch=\(manager.isDisplayModeSwitchInProgress) "
+                + "matching=\(manager.isDisplayCriteriaMatchingEnabled) "
+                + "criteria=\(manager.preferredDisplayCriteria != nil)"
+        }
+        line += " headroom=\(UIScreen.main.currentEDRHeadroom)"
+        #endif
+        return line
+    }
+
     /// The display layer the picture presents into: the monitor's while one shows it.
     private var videoLayer: AVSampleBufferDisplayLayer {
         #if os(iOS)
@@ -854,30 +1048,6 @@ public final class StreamViewController: StreamViewControllerBase {
         #endif
         return streamView.displayLayer
     }
-
-    #if os(visionOS)
-    /// The window's size before the theater shrank it.
-    private var sizeBeforeTheater: CGSize?
-    /// The window while the picture is on the theater's screen: a panel below its sightline.
-    private static let theaterPanel = CGSize(width: 480, height: 270)
-
-    /// Move the picture into a theater's renderers, or back here with nil. The window shrinks
-    /// to a panel meanwhile, then gets its size back. Main thread.
-    func setTheater(_ renderers: TheaterRenderers?) {
-        guard renderers !== presenter.theater else { return }
-        presenter.setTheater(renderers)
-        if let scene = view.window?.windowScene {
-            if renderers != nil, sizeBeforeTheater == nil {
-                sizeBeforeTheater = view.window?.bounds.size
-                scene.requestGeometryUpdate(.Vision(size: Self.theaterPanel))
-            } else if renderers == nil, let size = sizeBeforeTheater {
-                sizeBeforeTheater = nil
-                scene.requestGeometryUpdate(.Vision(size: size))
-            }
-        }
-        if connection != nil { layoutMetalLayer() }
-    }
-    #endif
 
     /// The decoded frames turned HDR or SDR. tvOS follows them with the display mode. Main thread.
     private func noteFrameHDR(_ hdr: Bool) {
@@ -890,14 +1060,55 @@ public final class StreamViewController: StreamViewControllerBase {
     /// A new decoded size landed (a scene/mode resize's new IDR, or the first frame): push it to the
     /// presenter's aspect-fit and re-layout NOW. A resize-END triggers no `viewDidLayoutSubviews`, so
     /// this is what makes the metal sublayer track the new content aspect instead of stretching the
-    /// new frame into the pre-resize box. Deduped so a same-size repeat is a no-op. Main thread.
+    /// new frame into the pre-resize box. On visionOS the window then takes the picture's shape.
+    /// Deduped so a same-size repeat is a no-op. Main thread.
     private func noteDecodedContentSize(width: Int, height: Int) {
         let size = CGSize(width: width, height: height)
         guard size.width > 0, size.height > 0, size != lastDecodedContentSize else { return }
         lastDecodedContentSize = size
         presenter.setContentSize(size)
         layoutMetalLayer()
+        #if os(visionOS)
+        fitWindowToPicture(size)
+        #endif
     }
+
+    /// The picture shows in the curve's volume, not in this view's window.
+    private var showsElsewhere: Bool {
+        #if os(visionOS)
+        return presenter.curve?.curved == true
+        #else
+        return false
+        #endif
+    }
+
+    #if os(visionOS)
+    /// Draw the picture on a curved screen, or back here with nil. Main thread.
+    func setCurve(_ target: CurveTarget?) {
+        guard target !== presenter.curve else { return }
+        target?.pointer = self
+        presenter.setCurve(target)
+        if connection != nil { layoutMetalLayer() }
+    }
+
+    /// The window takes the picture's shape: a fixed mode need not match the window, and a bar is
+    /// picture no one sees. Match window drives the mode from the window instead, so it resizes
+    /// free. A new shape keeps the window's width.
+    private func fitWindowToPicture(_ picture: CGSize) {
+        guard let window = view.window, let scene = window.windowScene else { return }
+        let prefs = UIWindowScene.GeometryPreferences.Vision()
+        if connection?.settings.matchWindow == true {
+            prefs.resizingRestrictions = .freeform
+        } else {
+            let width = window.bounds.width
+            let height = (width * picture.height / picture.width).rounded()
+            if abs(window.bounds.height - height) > 1 { prefs.size = CGSize(width: width, height: height) }
+            prefs.resizingRestrictions = .uniform
+        }
+        scene.requestGeometryUpdate(prefs)
+        fittedScene = scene
+    }
+    #endif
 
     #if os(iOS) || os(visionOS)
     #if os(iOS)
@@ -921,6 +1132,37 @@ public final class StreamViewController: StreamViewControllerBase {
         matchFollower?.setEnabled(follows)
         if follows { noteMatchWindowSize() } else { requestSurfaceMode() }
     }
+
+    /// The native mode of what the picture fills: the screen this view is on, or the view's own
+    /// pixels while it holds only the upper part of its window (the upright half of a half-open
+    /// fold).
+    private var nativeMode: (width: Int, height: Int, hz: Int) {
+        let mode = NativeDisplay.mode(on: view.window?.windowScene?.screen ?? NativeDisplay.screen)
+        guard let window = view.window, streamView.bounds.height < window.bounds.height - 1
+        else { return mode }
+        let scale = renderScale
+        return (
+            Int((streamView.bounds.width * scale).rounded()),
+            Int((streamView.bounds.height * scale).rounded()), mode.hz)
+    }
+
+    /// The picture's native mode changed: it moved to another screen (a fold or unfold), or onto
+    /// or off the upright half of a half-open fold. A session streaming Native takes the new
+    /// mode. 0.4 s lets the hinge settle, so a flap costs the host no rebuild. Match window
+    /// follows the view's size on its own.
+    private func noteScreen() {
+        let native = nativeMode
+        defer { lastNativeMode = native }
+        guard let last = lastNativeMode, last != native else { return }
+        screenModeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.onExternal, self.connection?.settings.matchWindow == false
+            else { return }
+            self.requestSurfaceMode()
+        }
+        screenModeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
     #endif
 
     /// Match-window (C3): feed the follower the view's physical-pixel size (points × scale).
@@ -933,14 +1175,14 @@ public final class StreamViewController: StreamViewControllerBase {
             heightPx: Int((b.height * scale).rounded()))
     }
 
-    /// Ask the host for the mode that fits where the picture is: the monitor's pixels at its top
-    /// refresh, or the session's own mode back on the phone. Skipped when it already streams that.
+    /// Ask the host for the session's mode where the picture is: Native is the monitor's pixels at
+    /// its top refresh, or the phone's back on the phone. Skipped when it already streams that.
     private func requestSurfaceMode() {
         guard let connection else { return }
         let settings = connection.settings
         #if os(iOS)
         let target = (onExternal ? ExternalDisplay.streamMode(settings) : nil)
-            ?? settings.streamMode(native: NativeDisplay.mode)
+            ?? settings.streamMode(native: nativeMode)
         #else
         let target = settings.streamMode(native: NativeDisplay.mode)
         #endif
@@ -1029,25 +1271,30 @@ public final class StreamViewController: StreamViewControllerBase {
         view.window?.windowScene?.activationState == .foregroundActive && windowFillsScreen
     }
 
-    /// Ask again for a lock SpringBoard declined or dropped, while the scene can hold one: one
-    /// false→true edge, with the chain re-anchored in case a reparent broke the walk to us. A call
-    /// during the edge folds into it. No-op when the lock is held or no longer wanted. Main queue.
-    private func requestPointerLock() {
-        guard wantsPointerLock, pointerLockEngaged() != true, sceneCanHoldPointerLock,
-              !pointerLockSuppressed
-        else { return }
-        pointerLockSuppressed = true
-        updatePointerLockChain()
-        setNeedsUpdateOfPrefersPointerLocked()
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.pointerLockEdgeHold) { [weak self] in
-            guard let self else { return }
-            self.pointerLockSuppressed = false
-            self.setNeedsUpdateOfPrefersPointerLocked()
+    /// Step the lock's state with what the scene says now, and do what it returns. Main queue.
+    private func stepPointerLock(_ event: PointerLock.Event) {
+        let facts = PointerLock.Facts(
+            wanted: wantsPointerLock, granted: pointerLockEngaged(),
+            sceneCanHold: sceneCanHoldPointerLock)
+        switch pointerLock.step(event, facts) {
+        case .none:
+            break
+        case .beginEdge:
+            // Re-anchored in case a reparent broke the walk to us.
+            updatePointerLockChain()
+            setNeedsUpdateOfPrefersPointerLocked()
+            DispatchQueue.main.asyncAfter(deadline: .now() + PointerLock.edgeHold) { [weak self] in
+                self?.stepPointerLock(.edgeEnded)
+            }
+        case .endEdge:
+            setNeedsUpdateOfPrefersPointerLocked()
+        case .reaskNextTurn:
+            DispatchQueue.main.async { [weak self] in self?.stepPointerLock(.reask) }
         }
     }
     #endif
 
-    deinit {
+    isolated deinit {
         observers.forEach(NotificationCenter.default.removeObserver(_:))
         presenter.stop() // invalidate the display link + stop the pipeline if stop() was missed
     }
@@ -1139,6 +1386,10 @@ final class StreamLayerUIView: UIView {
         mouse.onDial = { [weak self] event in self?.onDial?(event) }
         return mouse
     }()
+    #if os(visionOS)
+    /// The curved screen's pinch in progress, latched to the route it started in.
+    var curve: CurvePinch?
+    #endif
     /// The finger route latched at gesture start — a Settings change mid-gesture applies to
     /// the NEXT touch, so one gesture never splits across input models.
     private var fingerRoute: TouchInputMode?
@@ -1484,6 +1735,85 @@ final class StreamLayerUIView: UIView {
     }
     #endif
 }
+
+#if os(visionOS)
+extension StreamViewController: CurvePointerSink {
+    public func curvePointer(u: Double, v: Double, phase: CurvePointerPhase) {
+        if phase == .began, captureEnabled { setCaptured(true) }
+        streamView.curvePointer(u: u, v: v, phase: phase)
+    }
+
+    /// Match window follows the curved screen as it does this view: its pixels at render scale.
+    public func curveSize(width: Double, height: Double) {
+        guard showsElsewhere, width > 0, height > 0 else { return }
+        let scale = Double(renderScale)
+        matchFollower?.noteSize(
+            widthPx: Int((width * scale).rounded()), heightPx: Int((height * scale).rounded()))
+    }
+
+    /// Back in the window, Match window follows the window again.
+    public func curveShown(_ shown: Bool) {
+        if !shown, !onExternal { noteMatchWindowSize() }
+    }
+}
+
+extension StreamLayerUIView {
+    /// A pinch on the curved screen, in the session's touch model like a finger here: touch
+    /// is one wire contact, pointer moves the cursor and holds the left button, and trackpad
+    /// drags the cursor by the pinch's travel or, short and still, clicks where it is.
+    func curvePointer(u: Double, v: Double, phase: CurvePointerPhase) {
+        guard let mode = currentHostMode?(), mode.width > 0, mode.height > 0 else { return }
+        let point = CGPoint(
+            x: (u * mode.width).clamped(to: 0...(mode.width - 1)),
+            y: (v * mode.height).clamped(to: 0...(mode.height - 1)))
+        let host = HostPoint(
+            x: Int32(point.x.rounded()), y: Int32(point.y.rounded()),
+            w: UInt32(mode.width), h: UInt32(mode.height))
+        if phase == .began {
+            var route = TouchInputMode.current(settings)
+            if route == .touch, !touchPassthroughEnabled { route = .trackpad }
+            curve = CurvePinch(route: route, start: point, last: point, at: CACurrentMediaTime())
+        }
+        guard var pinch = curve else { return }
+        switch pinch.route {
+        case .touch:
+            switch phase {
+            case .began:
+                onTouchEvent?(.touchDown(
+                    id: CurvePinch.touchID, x: host.x, y: host.y,
+                    surfaceWidth: host.w, surfaceHeight: host.h))
+            case .moved:
+                onTouchEvent?(.touchMove(
+                    id: CurvePinch.touchID, x: host.x, y: host.y,
+                    surfaceWidth: host.w, surfaceHeight: host.h))
+            case .ended:
+                onTouchEvent?(.touchUp(id: CurvePinch.touchID))
+            }
+        case .pointer:
+            onTouchEvent?(.mouseMoveAbs(
+                x: host.x, y: host.y, surfaceWidth: host.w, surfaceHeight: host.h))
+            if phase != .moved { onTouchEvent?(.mouseButton(1, down: phase == .began)) }
+        case .trackpad:
+            pinch.carry.x += point.x - pinch.last.x
+            pinch.carry.y += point.y - pinch.last.y
+            pinch.last = point
+            let dx = pinch.carry.x.rounded(.towardZero), dy = pinch.carry.y.rounded(.towardZero)
+            if dx != 0 || dy != 0 {
+                onTouchEvent?(.mouseMove(dx: Int32(dx), dy: Int32(dy)))
+                pinch.carry.x -= dx
+                pinch.carry.y -= dy
+            }
+            if phase == .ended, pinch.isTap(at: point) {
+                onTouchEvent?(.mouseButton(1, down: true))
+                onTouchEvent?(.mouseButton(1, down: false))
+            }
+        case .off:
+            break
+        }
+        curve = phase == .ended ? nil : pinch
+    }
+}
+#endif
 
 #if os(iOS) || os(visionOS)
 // The soft keyboard's output → wire key events. UIKeyInput is deliberately minimal (no

@@ -18,6 +18,17 @@ import AppKit
 public typealias ConsolePlatformView = NSView
 #endif
 
+/// The console layer's format: 10-bit like the video's SDR drawable, since the backdrop's
+/// gradients band in 8. Skia rates every Mac as GPU family 1, where it renders into RGB10A2
+/// but not BGR10A2. `PUNKTFUNK_SDR10_DRAWABLE=8` keeps BGRA8 everywhere.
+let consoleDrawable: MTLPixelFormat = {
+    #if os(macOS)
+    return sdr10Drawable == .bgr10a2Unorm ? .rgb10a2Unorm : sdr10Drawable
+    #else
+    return sdr10Drawable
+    #endif
+}()
+
 /// What the view hands back to its owner. The view itself knows nothing about hosts.
 @MainActor
 public protocol ConsoleViewDelegate: AnyObject {
@@ -35,10 +46,14 @@ public final class ConsoleMetalView: ConsolePlatformView {
     private var link: CADisplayLink?
     /// Touch state: the console takes one finger, the first one down.
     private var tracked: ObjectIdentifier?
+    /// Where a trackpad scroll landed as a finger, while it drags.
+    private var scrollFrom: CGPoint?
     /// Where the remote's swipe last stepped from.
     private var swipeFrom: CGPoint?
-    /// A held remote direction and the timer that repeats it.
-    private var held: (press: ObjectIdentifier, timer: Timer)?
+    #if canImport(UIKit)
+    /// A held remote direction or keyboard key, and the timer that repeats it.
+    private var held: (press: UIPress, event: ConsoleBridge.Menu?, timer: Timer)?
+    #endif
     /// Presses taken on the way down. Their release stays ours, even when the Back one carried
     /// reached the root in between.
     private var claimed = Set<ObjectIdentifier>()
@@ -51,14 +66,13 @@ public final class ConsoleMetalView: ConsolePlatformView {
         #if os(iOS) || os(visionOS)
         // The console takes one finger; a second would only fight the first for the cursor.
         isMultipleTouchEnabled = false
+        addPointerInput()
         #elseif canImport(AppKit)
         wantsLayer = true
         #endif
         let metal = metalLayer
         metal.device = device
-        // 10-bit like the video's SDR drawable: the backdrop's gradients band in 8. Skia wraps
-        // the texture as BGRA1010102, or BGRA8888 under the `PUNKTFUNK_SDR10_DRAWABLE=8` lever.
-        metal.pixelFormat = sdr10Drawable
+        metal.pixelFormat = consoleDrawable
         // Skia reads back while blending, so the drawable cannot be write-only.
         metal.framebufferOnly = false
         metal.isOpaque = true
@@ -92,8 +106,10 @@ public final class ConsoleMetalView: ConsolePlatformView {
     public func stop() {
         link?.invalidate()
         link = nil
+        #if canImport(UIKit)
         held?.timer.invalidate()
         held = nil
+        #endif
     }
 
     @objc private func tick() {
@@ -146,8 +162,11 @@ public final class ConsoleMetalView: ConsolePlatformView {
         #endif
     }
 
-    /// Design units per pixel, as Android's shell computes them: a TV takes the shell's own
-    /// couch formula (`0`), everything else the larger of the couch fit and the device scale.
+    /// Design units per pixel. A TV takes the shell's own couch formula (`0`). A phone or
+    /// tablet in the hand takes the device scale alone, rather than stretching the Deck's
+    /// 800-unit field over an iPad's height: a unit is 0.75 pt on a phone and a point on a
+    /// tablet, which sits further from the eye. A Mac or visionOS window takes the larger of
+    /// the couch fit and the device scale, as Android does.
     private var designScale: Double {
         #if os(tvOS)
         return 0
@@ -157,9 +176,14 @@ public final class ConsoleMetalView: ConsolePlatformView {
         #else
         let scale = window?.backingScaleFactor ?? 2
         #endif
+        #if os(iOS)
+        let perPoint = traitCollection.userInterfaceIdiom == .pad ? 1.0 : 0.75
+        return min(max(scale * perPoint, 0.75), 3)
+        #else
         let pixels = min(bounds.width, bounds.height) * scale
         guard pixels > 0 else { return 0 }
         return min(max(max(pixels / 800, scale * 0.75), 0.75), 3)
+        #endif
         #endif
     }
 
@@ -170,7 +194,7 @@ public final class ConsoleMetalView: ConsolePlatformView {
     // that start at the screen's centre, so on tvOS they are only a swipe's travel.
     #if os(iOS) || os(visionOS)
     public override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard tracked == nil, let touch = touches.first else { return }
+        guard tracked == nil, scrollFrom == nil, let touch = touches.first else { return }
         tracked = ObjectIdentifier(touch)
         send(.touchDown, touch)
     }
@@ -193,9 +217,72 @@ public final class ConsoleMetalView: ConsolePlatformView {
     }
 
     private func send(_ kind: ConsoleBridge.Pointer, _ touch: UITouch) {
+        send(kind, at: touch.location(in: self))
+    }
+
+    private func send(_ kind: ConsoleBridge.Pointer, at p: CGPoint, wheel: Float = 0) {
         let scale = pixelScale
-        let p = touch.location(in: self)
-        bridge.pointer(kind, x: Float(p.x * scale), y: Float(p.y * scale))
+        bridge.pointer(kind, x: Float(p.x * scale), y: Float(p.y * scale), wheel: wheel)
+    }
+
+    // MARK: - mouse and trackpad
+
+    /// A pointer that has not clicked sends no touches: its movement is hover and its scroll
+    /// is a pan that takes no finger. One recognizer per scroll type, so UIKit names the device.
+    private func addPointerInput() {
+        addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(hover)))
+        for (mask, action) in [
+            (UIScrollTypeMask.continuous, #selector(trackpadScroll)),
+            (UIScrollTypeMask.discrete, #selector(wheelScroll)),
+        ] {
+            let pan = UIPanGestureRecognizer(target: self, action: action)
+            pan.allowedScrollTypesMask = mask
+            pan.allowedTouchTypes = []
+            addGestureRecognizer(pan)
+        }
+    }
+
+    @objc private func hover(_ g: UIHoverGestureRecognizer) {
+        // While a finger or a scroll is down the shell reads a move as its drag.
+        guard tracked == nil, scrollFrom == nil, g.state == .began || g.state == .changed
+        else { return }
+        send(.move, at: g.location(in: self))
+    }
+
+    /// Each wheel report is one scroll step. UIKit has applied Natural Scrolling, so + is up.
+    @objc private func wheelScroll(_ g: UIPanGestureRecognizer) {
+        let t = g.translation(in: self)
+        g.setTranslation(.zero, in: self)
+        let step = abs(t.y) >= abs(t.x) ? t.y : t.x
+        if step != 0 { send(.wheel, at: g.location(in: self), wheel: Float(step)) }
+    }
+
+    /// A two-finger scroll drags the console as a finger on the glass does, so it tracks and
+    /// flings the same way. The finger lands once the scroll has left the shell's 12-unit tap
+    /// slop with room to spare: a finger that lifts inside it is a tap.
+    @objc private func trackpadScroll(_ g: UIPanGestureRecognizer) {
+        let t = g.translation(in: self)
+        switch g.state {
+        case .began, .changed:
+            if scrollFrom == nil {
+                guard tracked == nil, hypot(t.x, t.y) * pixelScale >= 16 * designScale
+                else { return }
+                let from = g.location(in: self)
+                scrollFrom = from
+                send(.touchDown, at: from)
+            }
+            if let from = scrollFrom { send(.move, at: CGPoint(x: from.x + t.x, y: from.y + t.y)) }
+        case .ended:
+            guard let from = scrollFrom else { return }
+            scrollFrom = nil
+            send(.up, at: CGPoint(x: from.x + t.x, y: from.y + t.y))
+        case .cancelled, .failed:
+            guard scrollFrom != nil else { return }
+            scrollFrom = nil
+            bridge.pointer(.cancel, x: 0, y: 0)
+        default:
+            break
+        }
     }
     #elseif os(tvOS)
     public override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -272,9 +359,18 @@ public final class ConsoleMetalView: ConsolePlatformView {
             return [.select, .upArrow, .downArrow, .leftArrow, .rightArrow, .playPause, .menu]
                 .contains(press.type)
         }
+        let typed = typed(press)
         if let key = key(for: press) {
             let shift = press.key?.modifierFlags.contains(.shift) ?? false
             bridge.key(key, shift: shift, repeated: repeated)
+            // Space, Y and X are characters too: an open field types them and drops the key.
+            if let typed { bridge.text(typed) }
+            if !repeated { hold(press) }
+            return true
+        }
+        if let typed {
+            bridge.text(typed)
+            if !repeated { hold(press) }
             return true
         }
         let event: ConsoleBridge.Menu
@@ -294,23 +390,44 @@ public final class ConsoleMetalView: ConsolePlatformView {
         return true
     }
 
-    /// Repeat a held direction at the pad poller's pace until its press ends.
-    private func hold(_ press: UIPress, _ event: ConsoleBridge.Menu) {
+    /// Repeat a held remote direction (`event`) or keyboard key at the pad poller's pace until
+    /// its press ends. UIKit sends no key repeats: a key goes back through `claim` marked
+    /// repeated, and the shell drops the ones that must not repeat.
+    private func hold(_ press: UIPress, _ event: ConsoleBridge.Menu? = nil) {
         held?.timer.invalidate()
         let timer = Timer(
             fire: Date() + GamepadMenuInput.initialRepeatDelay,
             interval: GamepadMenuInput.repeatInterval, repeats: true
         ) { [weak self] _ in
-            MainActor.assumeIsolated { _ = self?.bridge.menu(event, from: .keys) }
+            MainActor.assumeIsolated { self?.repeatHeld() }
         }
         RunLoop.main.add(timer, forMode: .common)
-        held = (ObjectIdentifier(press), timer)
+        held = (press, event, timer)
+    }
+
+    private func repeatHeld() {
+        guard let held else { return }
+        if let event = held.event {
+            _ = bridge.menu(event, from: .keys)
+        } else {
+            _ = claim(held.press, repeated: true)
+        }
     }
 
     private func release(_ presses: Set<UIPress>) {
-        guard let held, presses.contains(where: { ObjectIdentifier($0) == held.press }) else { return }
+        guard let held, presses.contains(where: { $0 === held.press }) else { return }
         held.timer.invalidate()
         self.held = nil
+    }
+
+    /// The character a hardware key types. A named key reports its name (`UIKeyInputF1`)
+    /// and a chord is not typing, so neither is text.
+    private func typed(_ press: UIPress) -> String? {
+        guard let key = press.key, key.modifierFlags.isDisjoint(with: [.command, .control]),
+            key.characters.count == 1,
+            key.characters.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value != 0x7F })
+        else { return nil }
+        return key.characters
     }
 
     /// A hardware keyboard's key, when the console has a use for it.

@@ -1,54 +1,21 @@
-// Captured Steam Controller 2 pads — the glue between a transport link and the punktfunk wire,
-// modeled on Android's `Sc2Capture.kt` with Apple idioms per `GamepadCapture`.
+// Captured Steam Controller 2 pads: the glue between a transport link and the punktfunk wire.
+// Exactly one transport runs (`startTransport`): `Sc2UsbLink` for a wired pad or a Puck (macOS
+// only), else `Sc2BleLink`. Running both would double-feed a pad that is charging and paired.
+// A 2015 pad (`Sc1Device`), on a Mac's USB or on Bluetooth, rides the same path as pref 5.
 //
-// Two transports, exactly one live at a time (`startTransport`): `Sc2UsbLink` for wired pads or
-// a Puck dongle (macOS only — IOKit HID is not available to apps on iOS), and `Sc2BleLink` for a
-// directly-paired controller (iOS and macOS). USB wins when a pad is attached, because running
-// both would double-feed a controller that is simultaneously charging and paired.
+// Each HID source (a USB collection or the BLE link) is its own `PadSource` with its own wire
+// slot, so a Puck with four pads claims four. A slot is claimed on the source's first state report
+// (arrival pref 9, or 10 for a Puck slot) and released on link drop, suspend, stop or a Puck
+// disconnect; the index comes from `GamepadManager.reserveExternalPadIndex()`.
 //
-// One capture handles EVERY pad on the live transport. Each HID source — a USB collection (a
-// Puck slot or a wired pad) or the one BLE link — gets its own `PadSource`: its own wire slot,
-// typed-mirror diff state, IMU gate and pending wireless edge, keyed by the link's source id.
-// A Puck hosting four powered-on pads therefore claims four wire slots, and the host mints four
-// virtual controllers. The feedback plane stays a single sink: `onHidRaw` routes each host write
-// to the source that claimed that wire index.
+// - Raw plane: every report goes to core (`sendHidReport`), which gates it (`setSc2Gate`).
+// - Typed mirror: buttons, sticks and triggers also go out typed, for a host that degraded the kind.
+// - Local chords: escape, stats and the ring read the HARDWARE mask, so no gate hides the way out.
+// - Raw return: host writes arrive through `GamepadFeedback` → `onHidRaw` → the link.
 //
-// - **Raw plane (the point):** every input report is forwarded byte-for-byte
-//   (`PunktfunkConnection.sendHidReport` → the host's as-is virtual 28DE:1302 pad, which Steam
-//   Input drives like the physical controller) — with ONE exception: `Sc2ImuGate` zeroes a
-//   frozen (gyro-off) IMU block out of state reports, so a stale resting sample can't drive
-//   Steam's desktop gyro-mouse (the cursor-fly the bench debugged 2026-06-08).
-// - **Typed mirror:** buttons/sticks/triggers are ALSO diffed onto the ordinary per-transition
-//   plane, so a host that degraded the kind still gets a playable controller. No rich
-//   Motion/Touchpad is ever sent for an SC2 — its IMU rides inside the opaque raw report; the
-//   capture never uses the motion plane.
-// - **Local chords:** the exit chord, the stats chord and the quick-action ring are read off a
-//   per-source HARDWARE mask, never the forwarded one, so no client-side gate can hide the way
-//   out of a stream. What the ring consumes is held out of BOTH planes until it releases, and
-//   while the ring owns the pad the host is sent neutral state at the same cadence rather than
-//   nothing — a frozen last frame is a held sprint that survives the menu.
-// - **Raw return:** the host's hidraw writes (Steam's 0x80 rumble outputs, lizard/IMU feature
-//   settings) arrive via `GamepadFeedback`'s hidRaw sink → `onHidRaw` → the link, landing on the
-//   real controller's motors/firmware.
-//
-// Each source's wire slot is claimed LAZILY on its first parsed state report (`GamepadArrival`
-// pref 9 — `GamepadPref::SteamController2` — or pref 10 for a Puck slot, before any input; an
-// idle radio and a dongle with no pad powered on both stay invisible to the host) and released
-// on link drop / suspend / stop / Puck disconnect, so pad indices never leak. The index comes
-// from `GamepadManager.reserveExternalPadIndex()` — the SAME lowest-free allocator the
-// GameController slots use, so an SC2 and a GC pad can never collide.
-//
-// macOS DOES surface a captured pad to GameController (on-glass 2026-08-31, vendorName "Steam
-// Controller Puck"), so without help the host is handed the same hardware twice. The answer is
-// the per-plane source-drop (the DeviceGyro precedent), never a global "SC2 is active" flag —
-// that design mutes every other pad's normal feed too. `syncShadowSuppression` drops the twin
-// only while a slot is claimed, so a pad this capture cannot open keeps the ordinary path.
-//
-// Threading: reports arrive on the link's serial queue; the host's hidRaw replay arrives on
-// the feedback drain thread; start/stop/suspend run on the main actor. All mutable state sits
-// behind one lock (the Android port's slot-table contract); the pad-index reservation hops to
-// the main actor, and a source's reports are dropped until its claim lands (a few frames at
-// ~66 Hz — idempotent state, nothing missed).
+// macOS also shows the pad to GameController; `syncShadowSuppression` drops that twin only while a
+// slot is claimed. Reports arrive on the link queue, host writes on the feedback thread, lifecycle
+// on the main actor; all mutable state sits behind `lock`.
 
 #if !os(macOS)
 import UIKit
@@ -81,8 +48,8 @@ public final class Sc2Capture {
     /// is never 0 for a real device, so the spaces cannot collide.
     private static let bleSource: UInt64 = 0
 
-    /// Everything one physical pad owns: its wire slot, typed-mirror diff state, IMU gate,
-    /// escape-chord timer and stashed wireless edge. One per live HID source, in `sources`.
+    /// Everything one physical pad owns: its wire slot, typed-mirror diff state and escape-chord
+    /// timer. One per live HID source, in `sources`.
     /// All fields are guarded by the capture's `lock`.
     private final class PadSource {
         var padIndex: UInt8?
@@ -94,15 +61,11 @@ public final class Sc2Capture {
         /// escape chord reads.
         let ring = Sc2RingGate()
         var lastAxis = [Int32](repeating: Int32.min, count: 6)
-        let imuGate = Sc2ImuGate()
         /// Reusable up-path buffer: the gated report is copied in and sent from here, so the
         /// raw plane costs no per-report allocation beyond the link's own framing.
         var rawBuf = [UInt8](repeating: 0, count: 64)
         /// Armed while the escape chord is held (fires `onDisconnectRequest` on main).
         var chordWork: DispatchWorkItem?
-        /// A Puck slot's wireless-CONNECT report, held until a wire slot exists to replay it
-        /// on — see `handleWireless`. Nil on every other transport.
-        var pendingWireless: [UInt8]?
     }
 
     /// Guards every field below (see the threading note in the header).
@@ -138,12 +101,14 @@ public final class Sc2Capture {
     /// wire slot lands (the host is building a virtual SC2 — at stream start, or whenever a
     /// pad powers on mid-session); `released` only when the LAST claimed slot goes away, so a
     /// badge over a multi-pad Puck does not flicker off while other pads are still captured.
-    /// Delivered ON MAIN, like `onDisconnectRequest` — the capture otherwise leaves no UI
-    /// trace at all, since the device never enters the GameController world the Controllers
-    /// page lists.
+    /// `refused`: macOS would not open an attached pad, so it plays through GameController with
+    /// its lizard keyboard and mouse still live. Delivered ON MAIN, like `onDisconnectRequest` —
+    /// the capture otherwise leaves no UI trace at all, since the device never enters the
+    /// GameController world the Controllers page lists.
     public enum Phase: Equatable {
         case captured(pad: UInt8)
         case released
+        case refused
     }
     /// Fired ON MAIN on `Phase` edges — the session owner surfaces the passthrough badge.
     public var onPhaseChange: ((Phase) -> Void)?
@@ -167,11 +132,21 @@ public final class Sc2Capture {
             lock.lock()
             ringOpenLocked = newValue
             // Every live pad, plus whatever arrives while the dial is up (`sourceLocked`).
-            for src in sources.values { src.ring.ringOpen = newValue }
+            for src in sources.values {
+                src.ring.ringOpen = newValue
+                if let pad = src.padIndex { pushGateLocked(pad: pad) }
+            }
             lock.unlock()
         }
     }
     private var ringOpenLocked = false
+
+    /// Core holds back of this pad's raw reports what the ring gate holds back of the typed
+    /// plane. Steam and QAM always go to the host's Steam. Caller holds `lock`.
+    private func pushGateLocked(pad: UInt8) {
+        connection.setSc2Gate(
+            pad: pad, masked: ringOpenLocked, systemLocal: false, chords: onRingChord != nil)
+    }
 
     public init(connection: PunktfunkConnection, manager: GamepadManager) {
         self.connection = connection
@@ -196,6 +171,9 @@ public final class Sc2Capture {
             },
             onSourceClosed: { [weak self] source in
                 self?.releaseSource(source, reason: "usb collection removed")
+            },
+            onRefused: { [weak self] in
+                DispatchQueue.main.async { self?.onPhaseChange?(.refused) }
             })
         #endif
     }
@@ -216,6 +194,27 @@ public final class Sc2Capture {
         return source != Self.bleSource && usbLink.isDongle(source: source)
         #else
         return false
+        #endif
+    }
+
+    /// Whether `source` is a 2015 Steam Controller. Safe from any thread; never call with `lock` held.
+    private func isClassicSource(_ source: UInt64) -> Bool {
+        if source == Self.bleSource { return link.isClassic }
+        #if os(macOS)
+        return usbLink.isClassic(source: source)
+        #else
+        return false
+        #endif
+    }
+
+    /// Hold the SC2 twins back before `GamepadCapture` starts forwarding. On a Mac that can open
+    /// an attached USB SC2 the claim lands within a second (the identity read included); its twin
+    /// would otherwise reach the host first as an Xbox pad and push the SC2 to the next pad index.
+    @MainActor
+    public static func holdTwins(manager: GamepadManager) {
+        #if os(macOS)
+        guard Sc2UsbLink.canOpenAttached() else { return }
+        manager.holdSteamController2Twins(for: 3)
         #endif
     }
 
@@ -343,26 +342,41 @@ public final class Sc2Capture {
         let source = sources.first(where: { $0.value.padIndex == pad })?.key
         lock.unlock()
         guard let source else { return } // addressed to some other controller
+        write(source: source, kind: kind, frame: data)
+    }
+
+    /// One id-first frame to `source`'s transport, on its link queue.
+    private func write(source: UInt64, kind: UInt8, frame: [UInt8]) {
         #if os(macOS)
         if source != Self.bleSource {
-            usbLink.writeRaw(source: source, kind: kind, frame: data)
+            usbLink.writeRaw(source: source, kind: kind, frame: frame)
             return
         }
         #endif
-        link.writeRaw(kind: kind, frame: data)
+        link.writeRaw(kind: kind, frame: frame)
     }
+
+    /// A zero `0x80` rumble. The firmware holds the last level it got, so a stream that ends
+    /// mid-rumble would leave the motors running.
+    private static let rumbleStop: [UInt8] = [0x80] + [UInt8](repeating: 0, count: 9)
 
     // MARK: - Report path (link queue)
 
     private func handleReport(source: UInt64, _ framed: [UInt8]) {
         guard let id = framed.first else { return }
-        if id == Sc2Device.idWireless || id == Sc2Device.idWirelessX {
-            handleWireless(source: source, framed)
+        let classic = isClassicSource(source)
+        let wireless = classic
+            ? Sc1Device.isFrame(framed, type: Sc1Device.typeWireless)
+            : id == Sc2Device.idWireless || id == Sc2Device.idWirelessX
+        if wireless {
+            handleWireless(source: source, framed, classic: classic)
             return
         }
         var state = Sc2Device.State()
         var report = framed
-        let isState = Sc2Device.parseState(report, into: &state)
+        let isState = classic
+            ? Sc1Device.parseState(report, into: &state)
+            : Sc2Device.parseState(report, into: &state)
         lock.lock()
         if stopped || suspended {
             lock.unlock()
@@ -390,7 +404,7 @@ public final class Sc2Capture {
         // a press the client consumed never reaches the game.
         deliver(src.ring.read(state))
         updateChordLocked(src)
-        src.ring.apply(&report, &state)
+        src.ring.apply(&state)
         forwardRawLocked(src, &report, pad: pad)
         mirrorTypedLocked(src, state, pad: pad)
         lock.unlock()
@@ -432,28 +446,20 @@ public final class Sc2Capture {
     /// Android's first on-glass run. SDL's wired path likewise marks the controller connected
     /// unconditionally and reconnects on any state report.
     ///
-    /// A connect arrives BEFORE the pad's first state report, and therefore before a wire slot
-    /// exists, so it is held and replayed by `claimSlot` — the host's virtual Puck must see the
-    /// same connect edge ahead of state, exactly as the physical dongle emits it.
-    private func handleWireless(source: UInt64, _ framed: [UInt8]) {
-        guard isDongleSource(source), framed.count >= 2 else { return }
-        switch framed[1] {
-        case Sc2Device.wirelessConnect:
-            lock.lock()
-            sourceLocked(source).pendingWireless = Sc2Device.wirelessReplay(framed)
-            lock.unlock()
-        case Sc2Device.wirelessDisconnect:
-            log.info("SC2: Puck reports controller powered off — releasing wire slot")
-            releaseSource(source, reason: "puck wireless disconnect")
-        default:
-            break
-        }
+    /// A connect needs nothing: the first state report claims the slot, and the host's virtual
+    /// Puck queues its own connect edge.
+    private func handleWireless(source: UInt64, _ framed: [UInt8], classic: Bool) {
+        let off = classic
+            ? Sc1Device.isWirelessDisconnect(framed)
+            : framed.count >= 2 && framed[1] == Sc2Device.wirelessDisconnect
+        guard isDongleSource(source), off else { return }
+        log.info("SC2: dongle reports controller powered off — releasing wire slot")
+        releaseSource(source, reason: "puck wireless disconnect")
     }
 
-    /// Forward one id-first report on the raw plane: IMU-gate in place, copy into the source's
-    /// reusable buffer, send. Caller holds `lock`.
+    /// Forward one id-first report on the raw plane: copy into the source's reusable buffer,
+    /// send. Caller holds `lock`.
     private func forwardRawLocked(_ src: PadSource, _ report: inout [UInt8], pad: UInt8) {
-        src.imuGate.apply(&report)
         let n = min(report.count, src.rawBuf.count)
         src.rawBuf.replaceSubrange(0 ..< n, with: report[0 ..< n])
         src.rawBuf.withUnsafeBytes { buf in
@@ -513,6 +519,27 @@ public final class Sc2Capture {
     /// success sends `gamepadArrival` (pref 9, or 10 for a Puck slot) — the declaration the
     /// host builds the virtual SC2 from — before any input can flow on that index.
     private func claimSlot(source: UInt64) {
+        // The host builds the virtual pad from the identity, so it is read before the arrival.
+        readIdentity(source: source) { [weak self] identity in
+            self?.finishClaim(source: source, identity: identity)
+        }
+    }
+
+    /// `source`'s identity, read on the link queue: synchronously over USB, as a GATT exchange
+    /// over Bluetooth. `done` runs on the link queue.
+    private func readIdentity(
+        source: UInt64, _ done: @escaping (PunktfunkConnection.PadIdentity?) -> Void
+    ) {
+        #if os(macOS)
+        if source != Self.bleSource {
+            done(usbLink.identity(source: source))
+            return
+        }
+        #endif
+        link.readIdentity(done)
+    }
+
+    private func finishClaim(source: UInt64, identity: PunktfunkConnection.PadIdentity?) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             MainActor.assumeIsolated {
@@ -526,8 +553,8 @@ public final class Sc2Capture {
                 // four controller slots; a Windows host folds it onto the wired identity), so
                 // it declares its own kind — a wired or BLE pad stays `.steamController2`.
                 let dongle = self.isDongleSource(source)
-                let kind: PunktfunkConnection.GamepadType =
-                    dongle ? .steamController2Puck : .steamController2
+                let kind: PunktfunkConnection.GamepadType = self.isClassicSource(source)
+                    ? .steamController : dongle ? .steamController2Puck : .steamController2
                 #if os(macOS)
                 let serial = source == Sc2Capture.bleSource
                     ? nil : self.usbLink.serial(source: source)
@@ -560,14 +587,10 @@ public final class Sc2Capture {
                 }
                 src.padIndex = index
                 // Under the lock, like the link queue's own sends: a report must not reach the
-                // host before the arrival that creates its pad.
+                // host before the arrival that creates its pad, nor the arrival before its identity.
+                if let identity { self.connection.sendPadIdentity(pad: index, identity) }
                 self.connection.send(.gamepadArrival(pref: kind.rawValue, pad: UInt32(index)))
-                // Replay the connect edge the Puck emitted before this slot existed, ahead of
-                // any state — see `handleWireless`.
-                if var pending = src.pendingWireless {
-                    src.pendingWireless = nil
-                    self.forwardRawLocked(src, &pending, pad: index)
-                }
+                self.pushGateLocked(pad: index)
                 self.lock.unlock()
                 // This pad is ours now, so its GameController twin must stop being forwarded.
                 self.syncShadowSuppression()
@@ -582,7 +605,7 @@ public final class Sc2Capture {
 
     /// Free one source's wire slot: `gamepadRemove` (the host tears its virtual pad down — no
     /// stuck last frame), typed-diff state dropped with the source entry, index handed back to
-    /// the shared allocator; whatever connects next re-proves its IMU live on a fresh gate.
+    /// the shared allocator. The removal restarts core's gate for that index.
     /// `.released` fires only when no other source still holds a slot, so the badge survives a
     /// single pad of several powering off. Safe from any thread; no-op for an unseen source.
     private func releaseSource(_ source: UInt64, reason: String) {
@@ -597,6 +620,8 @@ public final class Sc2Capture {
         lock.unlock()
         chord?.cancel()
         guard let index else { return }
+        // A 2015 pad's haptics are finite pulse trains; `0x80` means something else to it.
+        if !isClassicSource(source) { write(source: source, kind: 0, frame: Self.rumbleStop) }
         connection.send(.gamepadRemove(pad: UInt32(index)))
         DispatchQueue.main.async { [weak self, manager] in
             MainActor.assumeIsolated {

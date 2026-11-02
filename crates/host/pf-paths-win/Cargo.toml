@@ -1,0 +1,25 @@
+# The Windows owner and DACL checks pf-paths cannot host: pf-paths is `forbid(unsafe_code)` and
+# pure std by design, and these need the security API. A leaf so the host, the update path and
+# the setup engine ask the same question of a directory or secret file before trusting it.
+[package]
+name = "pf-paths-win"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Windows file-owner and DACL checks: is this admin-owned, is it mine, may anyone else write here."
+publish = false
+
+[dependencies]
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

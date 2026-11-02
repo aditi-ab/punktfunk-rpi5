@@ -15,7 +15,8 @@ final class AudioChannelFoldTests: XCTestCase {
     ///   - interleaved: a single inner array already interleaved (c0f0, c1f0, …), with the real
     ///     channel count passed separately.
     private func fold(
-        _ planes: [[Float]], frames: Int, channels: Int, interleaved: Bool, pinned: Int?
+        _ planes: [[Float]], frames: Int, channels: Int, interleaved: Bool, pinned: Int?,
+        skip: [Int] = []
     ) -> [Float] {
         // One C buffer per plane + a table of pointers to them — the shape of floatChannelData.
         let buffers: [UnsafeMutablePointer<Float>] = planes.map { plane in
@@ -34,7 +35,7 @@ final class AudioChannelFoldTests: XCTestCase {
         }
         SessionAudio.foldToMono(
             input: table, frames: frames, channels: channels,
-            interleaved: interleaved, pinned: pinned, out: out)
+            interleaved: interleaved, pinned: pinned, skip: skip, out: out)
         return (0..<frames).map { out[$0] }
     }
 
@@ -78,6 +79,29 @@ final class AudioChannelFoldTests: XCTestCase {
         let result = fold(
             [[0.25, -0.5, 0.75]], frames: 3, channels: 1, interleaved: false, pinned: nil)
         XCTAssertEqual(result, [0.25, -0.5, 0.75])
+    }
+
+    // Scarlett Solo 4th Gen: Input 1, Input 2, Loopback 1, Loopback 2. The loopback pair carries
+    // the stream the Mac plays; mixing it in sends the game back up as the mic.
+    func testAutoLeavesLoopbackInputsOut() {
+        let interleaved: [Float] = [
+            0.2, 0, 0.5, 0.5,
+            -0.2, 0, -0.5, -0.5,
+        ]
+        let result = fold(
+            [interleaved], frames: 2, channels: 4, interleaved: true, pinned: nil, skip: [2, 3])
+        XCTAssertEqual(result, [0.2, -0.2])
+    }
+
+    // A device whose every input is named loopback still sends something; a pick still wins.
+    func testLoopbackSkipYieldsToAllSkippedAndToAPin() {
+        let planes: [[Float]] = [[0.25, 0.25], [0.5, 0.5]]
+        XCTAssertEqual(
+            fold(planes, frames: 2, channels: 2, interleaved: false, pinned: nil, skip: [0, 1]),
+            [0.75, 0.75])
+        XCTAssertEqual(
+            fold(planes, frames: 2, channels: 2, interleaved: false, pinned: 1, skip: [1]),
+            [0.5, 0.5])
     }
 
     // Belt-and-suspenders: an out-of-range pin (the tap already guards, but the setting is

@@ -292,7 +292,6 @@ pub fn run(
         pinned = rate_pinned(bitrate_kbps, client.codec),
         codec = client.codec,
         mode = ?client.mode(),
-        wire = client.wire(),
         "trajectory session open"
     );
 
@@ -428,8 +427,14 @@ mod tests {
                 encode_mean_us: None,
                 actual_kbps: rate_kbps * 9 / 10,
                 flushed: false,
+                backlog: false,
                 recovery_kf: 0,
+                starved_kf: 0,
                 activity: punktfunk_core::abr::WindowActivity::Active(30),
+                head: 0,
+                mid: 0,
+                tail: 0,
+                sock_drops: 0,
             },
             discarded: false,
             reason: Reason::Clean,

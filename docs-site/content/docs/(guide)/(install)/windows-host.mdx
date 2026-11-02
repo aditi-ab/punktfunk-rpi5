@@ -18,8 +18,11 @@ network and read [Security & Safe Use](/docs/security).
   canary build only, with video but no audio, and Media Foundation as its only encoder.
 - **A GPU with a hardware encoder:** NVIDIA (NVENC), AMD (AMF) or Intel (QSV), picked
   automatically. Windows has no software encoder.
-- **Steam installed** for game audio and the microphone. It never has to run. Without it the host
-  streams video only, and picks Steam up once you install it.
+- **Steam installed and opened once** for game audio and the microphone. After that it never has
+  to run. Without it the host streams video only, and picks Steam up within minutes of its first
+  start.
+- **Windows Server 2025** takes the same setup, for [seats](/docs/windows-seats).
+  [Prepare the server](/docs/windows-seats#prepare-windows-server) first.
 
 ## Install
 
@@ -39,7 +42,7 @@ The wizard's **Configure** step lists what it sets up. The defaults suit most PC
 | **Moonlight compat** | GameStream for stock [Moonlight](/docs/moonlight). Trusted LAN only. | off | `gamestream` |
 | **Public-network firewall rules** | Opens the firewall on networks marked Public too. | off | `allowpublicfw` |
 | **Start the service** | Streams as soon as setup finishes. | on | `startservice` |
-| **Tray autostart** | The status icon next to the clock. | on | `trayicon` |
+| **Tray autostart** | The status icon next to the clock. The console can change it later. | on | `trayicon` |
 | **Web console reachable from** | Your network, this PC only, or one address. | your network | — |
 | **Web console password** | Keep the generated one or type your own. | generated | — |
 
@@ -93,10 +96,11 @@ The drivers carry a separate self-signed certificate (`CN=punktfunk-driver`, SHA
 ## Good to know
 
 - **Status icon.** It shows whether the host is running. Its menu opens the console and the logs
-  folder, approves pairing, and starts, stops or restarts the host, each behind a UAC prompt. The
-  service restarts the icon if it closes; [`punktfunk-host tray`](/docs/host-cli#tray-windows)
-  controls it by hand. **Punktfunk Host** in the Start menu opens it and starts a stopped host.
-- **Settings.** Change them in the console under **Host** → **Settings**; Moonlight compat is
+  folder, approves pairing, and starts, stops or restarts the host, each behind a UAC prompt.
+  While **Tray autostart** is on, the service restarts the icon if it closes;
+  [`punktfunk-host tray`](/docs/host-cli#tray-windows) controls it by hand. **Punktfunk Host** in
+  the Start menu opens it and starts a stopped host.
+- **Settings.** Change them in the console under **Host**; Moonlight compat is
   **GameStream** there. A line in `%ProgramData%\punktfunk\host.env` pins a setting. After editing
   it, run `punktfunk-host service restart` from an elevated prompt. See
   [Configuration](/docs/configuration).
@@ -109,6 +113,11 @@ The drivers carry a separate self-signed certificate (`CN=punktfunk-driver`, SHA
 - **Logs.** `%ProgramData%\punktfunk\logs\` holds `service.log` and `host.log`, each rotated at
   10 MB. Only Administrators can read them, so use an elevated PowerShell or the console's
   **Troubleshooting** page. `RUST_LOG=debug` in `host.env` adds detail.
+- **Several people, taking turns.** Give each person their own account, Steam and saves with a
+  [take-turns profile](/docs/profiles#on-windows) — any edition, no extra licence. Playing at the
+  **same time** is the part that needs **Windows Server** and a Remote Desktop Services CAL per
+  player ([Seats on Windows](/docs/windows-seats)); [Windows 11](/docs/windows-seats#windows-11)
+  runs one desktop at a time.
 - **Two processes.** Task Manager shows two `punktfunk-host.exe`: the service and the worker it
   starts in your session. Ending the worker only makes the service start another; stop the host
   from the status icon or with `punktfunk-host service stop`.
@@ -122,8 +131,9 @@ run a newer setup over the old one. All three keep your config, pairings and con
 ## Uninstalling
 
 Open **Settings** → **Apps** → **Installed apps** → **Punktfunk Host** → **Uninstall**, or run
-`winget uninstall unom.PunktfunkHost`. It removes the service, the status icon and its Start menu
-entry, the virtual display, gamepad and audio devices with the driver certificate, the scheduled
-task, the firewall rules, the HDR layer and the `PATH` entry. `%ProgramData%\punktfunk` stays, so
+`winget uninstall unom.PunktfunkHost`. It turns [seats](/docs/windows-seats) off and removes the
+service, the status icon and its Start menu entry, the virtual display, gamepad and audio devices
+with the driver certificate, the scheduled task, the firewall rules, the HDR layer and the `PATH`
+entry. `%ProgramData%\punktfunk` stays, so
 a reinstall keeps your identity and pairings; [Uninstall → Windows host](/docs/uninstall#windows-host)
 clears it.

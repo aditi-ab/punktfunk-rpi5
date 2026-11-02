@@ -13,7 +13,11 @@ import type { NativePairStatus } from "@/api/gen/model/nativePairStatus";
 import type { PairedClient } from "@/api/gen/model/pairedClient";
 import type { PairingStatus } from "@/api/gen/model/pairingStatus";
 import type { PendingDevice } from "@/api/gen/model/pendingDevice";
+import type { ProfileAdmin } from "@/api/gen/model/profileAdmin";
 import type { RuntimeStatus } from "@/api/gen/model/runtimeStatus";
+import type { Seating } from "@/api/gen/model/seating";
+import type { SeatsDoctor } from "@/api/gen/model/seatsDoctor";
+import type { SessionSummary } from "@/api/gen/model/sessionSummary";
 import type { StatsSample } from "@/api/gen/model/statsSample";
 import type { StatsStatus } from "@/api/gen/model/statsStatus";
 
@@ -21,6 +25,7 @@ export const hostInfo: HostInfo = {
 	abi_version: 2,
 	app_version: "7.1.450.0",
 	codecs: ["h264", "hevc", "av1"],
+	door: false,
 	gamestream: true,
 	gfe_version: "3.23.0.74",
 	hostname: "ENRICOS-DESKTOP",
@@ -44,6 +49,8 @@ export const compositors: AvailableCompositor[] = [
 	{ id: "kwin", label: "KWin (Plasma)", available: true, default: true },
 	{ id: "gamescope", label: "gamescope", available: true, default: false },
 	{ id: "mutter", label: "Mutter (GNOME)", available: false, default: false },
+	{ id: "niri", label: "niri", available: false, default: false },
+	{ id: "umbriel", label: "Umbriel", available: false, default: false },
 	{ id: "wlroots", label: "Sway / wlroots", available: false, default: false },
 ];
 
@@ -59,8 +66,10 @@ export const statusActive: RuntimeStatus = {
 		{
 			id: 1,
 			plane: "native",
+			phase: "streaming",
 			client: "aabbccddeeff",
 			client_name: "Living room TV",
+			profile: { id: "9a3f1c2b7e40", display_name: "Kid" },
 			mode: "5120x1440@240",
 			hdr: true,
 			join: false,
@@ -74,8 +83,10 @@ export const statusActive: RuntimeStatus = {
 		{
 			id: 2,
 			plane: "native",
+			phase: "streaming",
 			client: "112233445566",
 			client_name: "Enrico's phone",
+			profile: { id: "4f1c3a9b0e27", display_name: "Enrico" },
 			mode: "5120x1440@240",
 			hdr: false,
 			join: true,
@@ -120,6 +131,32 @@ export const statusIdle: RuntimeStatus = {
 	session: null,
 	stream: null,
 	games: [],
+};
+
+/** The session that just ended: Home's one line when nothing is live. */
+export const lastSession: SessionSummary = {
+	id: 41,
+	client: "112233445566",
+	client_name: "Enrico's iPad",
+	mode: "2560x1600@120",
+	codec: "av1",
+	bit_depth: 10,
+	chroma: "4:2:0",
+	hdr: true,
+	join: false,
+	bitrate_kbps: 38_000,
+	bitrate: {
+		avg_kbps: 36_500,
+		min_kbps: 20_000,
+		max_kbps: 40_000,
+		adaptive_steps: 3,
+	},
+	bringup_ms: 420,
+	duration_s: 2_520,
+	started_unix: Math.floor(Date.now() / 1000) - 2 * 3600 - 2_520,
+	frames_dropped: 12,
+	input: { events: 18_000, dropped: 0, mic: 0, rich: 40 },
+	ended: "local",
 };
 
 /**
@@ -540,4 +577,308 @@ export const displayPolicy: DisplayPolicy = {
 	preset: "default",
 	game_session: "auto",
 	version: 1,
+};
+
+/** A box with one person: the owner card alone, and the page's only control is Add profile. */
+export const profilesOne: ProfileAdmin[] = [
+	{
+		id: "4f1c3a9b0e27",
+		display_name: "Enrico",
+		accent: "#3b82f6",
+		owner: true,
+		home: "desktop",
+		last_used_unix: accessNowUnix - 3600,
+		default: true,
+	},
+];
+
+/** A Linux box without the door: the owner, two desktop sharers, and the host keeps a Steam for
+ * one of them. */
+export const profilesEvery: ProfileAdmin[] = [
+	...profilesOne,
+	{
+		id: "0b7d5e2a91c4",
+		display_name: "Anna",
+		accent: "#ec4899",
+		owner: false,
+		home: "desktop",
+		last_used_unix: 0,
+		default: false,
+	},
+	{
+		id: "9a3f1c2b7e40",
+		display_name: "Kid",
+		accent: "#f97316",
+		owner: false,
+		home: "desktop",
+		last_used_unix: accessNowUnix - 600,
+		default: false,
+		legacy_device: "ab12cd34",
+		steam_home: true,
+	},
+];
+
+/** A Windows Server host: the owner, a sharer, and a seat in each state; Oma's on her own account. */
+export const profilesWindows: ProfileAdmin[] = [
+	...profilesOne,
+	{
+		id: "0b7d5e2a91c4",
+		display_name: "Anna",
+		accent: "#ec4899",
+		owner: false,
+		home: "desktop",
+		last_used_unix: 0,
+		default: false,
+	},
+	{
+		id: "9a3f1c2b7e40",
+		display_name: "Kid",
+		accent: "#f97316",
+		owner: false,
+		home: "desktop",
+		seat: { state: "ready", port: 9777, kind: "desktop" },
+		last_used_unix: accessNowUnix - 600,
+		default: false,
+	},
+	{
+		id: "7e1f3b5d9a2c",
+		display_name: "Leon",
+		accent: "#22c55e",
+		owner: false,
+		home: "desktop",
+		seat: {
+			state: "occupied",
+			port: 9777,
+			occupant: "Leon's Deck",
+			kind: "desktop",
+		},
+		last_used_unix: accessNowUnix - 60,
+		default: false,
+	},
+	{
+		id: "5a7c9e1b3d5f",
+		display_name: "Mia",
+		accent: "#a855f7",
+		owner: false,
+		home: "desktop",
+		seat: { state: "starting", port: 9777, kind: "desktop" },
+		last_used_unix: accessNowUnix - 86_400,
+		default: false,
+	},
+	{
+		id: "3d5f7b9a1c3e",
+		display_name: "Oma",
+		accent: "#14b8a6",
+		owner: false,
+		home: "desktop",
+		seat: { state: "stopped", port: 9777, kind: "desktop", account: "Oma" },
+		last_used_unix: accessNowUnix - 7 * 86_400,
+		default: false,
+	},
+	{
+		id: "8b0d2f4a6c8e",
+		display_name: "Alice",
+		accent: "#eab308",
+		owner: false,
+		home: "desktop",
+		seat: {
+			kind: "desktop",
+			state: "unavailable",
+			port: 9777,
+			detail: "Remote Desktop licensing has run out for this server.",
+		},
+		last_used_unix: 0,
+		default: false,
+	},
+];
+
+/**
+ * A Linux door: every profile has the owner's seat or one of its own. The owner's own seat is
+ * stopped until a device connects (nobody is logged in), two desktop sharers ride on it, and two
+ * seats of their own are ready and in use.
+ */
+export const profilesDoor: ProfileAdmin[] = [
+	{
+		id: "4f1c3a9b0e27",
+		display_name: "Enrico",
+		accent: "#3b82f6",
+		owner: true,
+		home: "desktop",
+		seat: { state: "stopped", port: 9778, kind: "shared" },
+		last_used_unix: accessNowUnix - 3600,
+		default: true,
+	},
+	{
+		id: "0b7d5e2a91c4",
+		display_name: "Anna",
+		accent: "#ec4899",
+		owner: false,
+		home: "desktop",
+		seat: { state: "stopped", port: 9778, kind: "shared" },
+		last_used_unix: 0,
+		default: false,
+	},
+	{
+		id: "9a3f1c2b7e40",
+		display_name: "Kid",
+		accent: "#f97316",
+		owner: false,
+		home: "desktop",
+		seat: { state: "stopped", port: 9778, kind: "shared" },
+		last_used_unix: accessNowUnix - 600,
+		default: false,
+	},
+	{
+		id: "7e1f3b5d9a2c",
+		display_name: "Leon",
+		accent: "#22c55e",
+		owner: false,
+		home: "desktop",
+		seat: {
+			state: "occupied",
+			port: 9779,
+			occupant: "Leon's Deck",
+			kind: "desktop",
+		},
+		last_used_unix: accessNowUnix - 60,
+		default: false,
+	},
+	{
+		id: "3d5f7b9a1c3e",
+		display_name: "Oma",
+		accent: "#14b8a6",
+		owner: false,
+		home: "desktop",
+		seat: { state: "ready", port: 9780, kind: "desktop" },
+		last_used_unix: accessNowUnix - 7 * 86_400,
+		default: false,
+	},
+];
+
+/** Seats on, every check passing. */
+export const seatingOn: Seating = {
+	enabled: true,
+	platform: "windows",
+	allow_rdp_from_network: false,
+	checks: [
+		{
+			level: "info",
+			code: "windows_server",
+			message: "This is Windows Server.",
+		},
+		{
+			level: "info",
+			code: "rds_role",
+			message: "Remote Desktop Session Host is installed.",
+		},
+		{
+			level: "info",
+			code: "rds_licensing",
+			message: "Remote Desktop licensing is set.",
+		},
+		{ level: "info", code: "gpu", message: "A graphics card is installed." },
+	],
+};
+
+/** A fresh Windows Server: no Session Host role and no licensing, which **Set up Remote Desktop**
+ * clears. */
+export const seatingRefused: Seating = {
+	enabled: false,
+	platform: "windows",
+	allow_rdp_from_network: false,
+	checks: [
+		{
+			level: "info",
+			code: "windows_server",
+			message: "This is Windows Server.",
+		},
+		{
+			level: "error",
+			code: "rds_role",
+			message:
+				"Remote Desktop Session Host isn't installed. Press Set up Remote Desktop in Profiles → Seats to install it; Windows then needs a restart.",
+		},
+		{
+			level: "error",
+			code: "rds_licensing",
+			message:
+				"Remote Desktop licensing isn't set. Press Set up Remote Desktop in Profiles → Seats to set it to Per User.",
+		},
+		{ level: "info", code: "gpu", message: "A graphics card is installed." },
+	],
+};
+
+/** **Doctor** on a box whose second seat lost its display driver and has no Steam yet. */
+export const seatsDoctor: SeatsDoctor = {
+	healthy: false,
+	diagnostics: [
+		{ level: "info", code: "ledger", message: "Seats set up: 2 of 4." },
+		{
+			level: "info",
+			code: "windows_build",
+			message: "This Windows is new enough for seats (build 26100).",
+		},
+		{ level: "info", code: "reservation", message: "Seats are on." },
+		{
+			level: "error",
+			code: "seat_display_driver",
+			message:
+				"The seat display driver isn't installed. Seats put it back when they next start; if this stays, turn seats off and on under Profiles → Seats.",
+		},
+		{
+			level: "info",
+			code: "steam",
+			message:
+				"Steam is installed in C:\\Program Files (x86)\\Steam. Each seat gets a copy of its own.",
+		},
+		{
+			level: "info",
+			code: "account",
+			message: "Its Windows account pf_seat1 is set up.",
+			seat_id: "0123456789abcdef0123456789abcdef",
+			seat_name: "Kid",
+		},
+		{
+			level: "info",
+			code: "steam_client",
+			message: "Has its own Steam. Steam opened on this seat starts that copy.",
+			seat_id: "0123456789abcdef0123456789abcdef",
+			seat_name: "Kid",
+		},
+		{
+			level: "info",
+			code: "child_state",
+			message: "Running, in Windows session 3.",
+			seat_id: "0123456789abcdef0123456789abcdef",
+			seat_name: "Kid",
+		},
+		{
+			level: "warning",
+			code: "steam_client",
+			message:
+				"Its own Steam isn't set up yet. It's copied the first time the seat starts; Steam games start on the seat once that's done.",
+			seat_id: "fedcba9876543210fedcba9876543210",
+			seat_name: "Oma",
+		},
+		{
+			level: "error",
+			code: "runtime_failed",
+			message:
+				"The seat didn't start in time. It stopped while checking the seat's screen and graphics card.",
+			seat_id: "fedcba9876543210fedcba9876543210",
+			seat_name: "Oma",
+		},
+	],
+};
+
+/** A knock from a device that asked to play as a profile. */
+export const pendingWithProfile: PendingDevice = {
+	id: 5,
+	name: "Kid's iPad",
+	fingerprint:
+		"a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+	age_secs: 5,
+	source: "lan",
+	until_disconnect: false,
+	profile: { id: "9a3f1c2b7e40", display_name: "Kid" },
 };

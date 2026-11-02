@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 # The whole protocol/transport/FEC/crypto + the embeddable NativeClient connector. `quic` pulls
 # the punktfunk/1 control plane, whose TLS runs on aws-lc-rs (see punktfunk-core/Cargo.toml) —
 # aws-lc-sys cross-compiles for all three ABIs with the NDK clang cargo-ndk already exports.
-punktfunk-core = { path = "../../../crates/punktfunk-core", features = ["quic"] }
+punktfunk-core = { path = "../../../crates/core/punktfunk-core", features = ["quic"] }
 # 0.22, NOT 0.21 — and the version is load-bearing beyond currency: `rustls-platform-verifier`
 # (via quinn-proto, for Android cert verification) already depends on jni 0.22, so pinning 0.21
 # here compiled TWO jni copies into the one .so. Matching it collapses them and, with them, the
@@ -32,12 +32,14 @@ punktfunk-core = { path = "../../../crates/punktfunk-core", features = ["quic"] 
 # visibility patch, so bumping its deps would mean rewriting the vendor rather than a version edit.
 jni = "0.22"
 log = "0.4"
-# LAN host discovery: browse the host's `_punktfunk._udp` mDNS advert — the SAME crate + service the
-# Linux/Windows clients use (`crates/pf-client-core/src/discovery.rs`), replacing Android's per-OEM
-# `NsdManager` system daemon with one tested browse path. Pure Rust (socket2/if-addrs/mio), so it
-# cross-compiles to the Android targets AND builds on the host (the JNI seam links into
-# `cargo build --workspace`). Kotlin keeps only the Wi-Fi `MulticastLock` + permission UX.
-mdns-sd = "0.21"
+# LAN host discovery: `pf_client_core::discovery::try_browse`, the browse the Linux and Windows
+# clients run, in place of Android's per-OEM `NsdManager`. Shared, not in the Android table below,
+# so the JNI seam and its tests build on the Linux and Windows hosts too. Kotlin keeps only the
+# Wi-Fi `MulticastLock` + permission UX. `async-channel` names the browse's event receiver.
+pf-client-core = { path = "../../../crates/client/pf-client-core", default-features = false, features = [
+    "discovery",
+] }
+async-channel = "2"
 # Shared, NOT in the Android table below: `session::connect` parses the `ConnectRequest`
 # JSON Kotlin hands `nativeConnect`, and that module compiles on the host too — CI's
 # workspace clippy builds this crate as a host cdylib.
@@ -47,7 +49,7 @@ serde_json = "1"
 # ARMv7 TV boxes use software AES. Add the faster streaming backend only to that ABI; arm64 keeps
 # its hardware-accelerated AES path and the emulator does not pay for an unused backend.
 [target.'cfg(all(target_os = "android", target_arch = "arm"))'.dependencies]
-punktfunk-core = { path = "../../../crates/punktfunk-core", features = ["chacha-aws-lc-rs"] }
+punktfunk-core = { path = "../../../crates/core/punktfunk-core", features = ["chacha-aws-lc-rs"] }
 
 # Android-only deps. Gated so `cargo build --workspace` on the Linux/macOS dev boxes + CI still
 # compiles this crate (as a host cdylib) — the Android-framework glue (logging, AMediaCodec + AAudio
@@ -89,39 +91,38 @@ ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-leve
 ndk-sys = { version = "0.6", features = ["media"] }
 # setpriority/gettid to raise the decode thread toward URGENT_DISPLAY (see decode::boost_thread_priority).
 libc = "0.2"
-# Opus decode for pad audio (0xD1); the main audio plane and the mic uplink run in core. Same
-# crate the host + Linux client use. audiopus_sys vendors libopus (pure C) and builds it static via cmake —
-# the cargo-ndk build sets LIBOPUS_STATIC=1/LIBOPUS_NO_PKG=1 so it links the bundled lib, not the host's.
-opus = "0.3"
 # Tier-A pad audio (WP9). Android's audio framework denylists the DualSense's output by VID/PID,
 # so the pad's isochronous endpoint is driven directly on the fd `UsbDeviceConnection` hands over.
 # Our own crates, developed openly because the hole they fill — isochronous USB in Rust — is an
 # ecosystem-wide one: https://github.com/unom-io/usbfs-iso
 # Pinned by revision rather than floating: this is a transport under a real-time deadline and it
 # should move when we choose to. Becomes a plain version dependency once the crates are published.
-uac-host = { git = "https://github.com/unom-io/usbfs-iso", rev = "f3de1fd62cec271d07f45664dc464f23e423e721" }
-usbfs-iso = { git = "https://github.com/unom-io/usbfs-iso", rev = "f3de1fd62cec271d07f45664dc464f23e423e721" }
+uac-host = { git = "https://github.com/unom-io/usbfs-iso", rev = "cb838399ad63c4c34bf47d8f1a920d9042274831" }
+usbfs-iso = { git = "https://github.com/unom-io/usbfs-iso", rev = "cb838399ad63c4c34bf47d8f1a920d9042274831" }
 
 # The Skia console UI (design/android-skia-console-port.md): the SAME `pf-console-ui` shell the
 # Linux/Windows session binary shows, drawn here through Skia's GL backend on an EGL surface
 # (`src/console/`). `default-features = false` turns its Vulkan overlay off — this host owns the
 # surface. `pf-client-core` for the portable types the shell speaks (settings, menu events,
-# overlay actions); `default-features = false` like every other consumer — then `pyrowave` back
-# on by name, which is the ONE piece of the desktop half this client takes: the shared Vulkan
-# wavelet decoder behind `src/pyro/` (design/pyrowave-codec-plan.md). It brings the vendored
-# C++/Vulkan codec into the `.so` on the 64-bit ABIs (arm64-v8a, x86_64) and nothing at all on
-# armeabi-v7a, where pyrowave-sys stubs itself out — see its build.rs.
+# overlay actions). `pf-client-video` with `pyrowave` and without `desktop`: the shared Vulkan
+# wavelet decoder behind `src/pyro/` (design/pyrowave-codec-plan.md) and its colour, queue-lock
+# and SPIR-V modules, no decode ladder. It brings the vendored C++/Vulkan codec into the `.so` on
+# the 64-bit ABIs (arm64-v8a, x86_64) and nothing at all on armeabi-v7a, where pyrowave-sys
+# stubs itself out — see its build.rs.
 #
-# All three shipping ABIs. rust-skia publishes prebuilt Skia archives for aarch64/x86_64/
-# i686-linux-android but NOT armv7-linux-androideabi (the 32-bit TV boxes) — that one comes from
-# OUR mirror through `SKIA_BINARIES_URL` (kit/build.gradle.kts forwards it; the CI variable of
+# All three shipping ABIs. rust-skia publishes prebuilt Skia archives for aarch64/x86_64 but NOT
+# armv7-linux-androideabi (the 32-bit TV boxes) — that one comes from OUR mirror
+# through `SKIA_BINARIES_URL` (kit/build.gradle.kts forwards it; the CI variable of
 # the same name; sha256 table beside it), built once with skia-bindings itself (design
 # android-skia-console-port.md WP6). 🛑 skia-bindings does not fail when no archive matches — it
 # silently builds Skia from source — so an armeabi-v7a build WITHOUT the mirror url is a
 # multi-minute source build, and every ABI's log must show `DOWNLOAD AND INSTALL SUCCEEDED`.
 # (Continues the `cfg(target_os = "android")` table above — TOML allows a table header once.)
-pf-console-ui = { path = "../../../crates/pf-console-ui", default-features = false }
-pf-client-core = { path = "../../../crates/pf-client-core", default-features = false, features = [
+pf-console-ui = { path = "../../../crates/client/pf-console-ui", default-features = false }
+pf-client-core = { path = "../../../crates/client/pf-client-core", default-features = false }
+# AV1 render_size off each keyframe (`decode/async_loop.rs`): MediaCodec may show the coded rows.
+pf-bitstream = { path = "../../../crates/codec/pf-bitstream" }
+pf-client-video = { path = "../../../crates/client/pf-client-video", default-features = false, features = [
     "pyrowave",
 ] }
 # The PyroWave lane's own Vulkan: device bring-up, swapchain on the `SurfaceView`, and the
@@ -129,9 +130,9 @@ pf-client-core = { path = "../../../crates/pf-client-core", default-features = f
 # linking it, which is what keeps the `.so` loading on a device with no Vulkan at all — there
 # the probe simply answers no and the client never advertises the codec.
 ash = { workspace = true, features = ["loaded"] }
-# `gl` + `textlayout` = the prebuilt key `gl-jpegd-jpege-pdf-textlayout` (verify
+# `gl` (implies `ganesh`) + `textlayout` = the key `ganesh-gl-jpegd-jpege-pdf-textlayout` (verify
 # `DOWNLOAD AND INSTALL SUCCEEDED` in the build log on every bump — see pf-console-ui/Cargo.toml).
-skia-safe = { version = "0.99", features = ["gl", "textlayout"] }
+skia-safe = { version = "0.153", features = ["gl", "textlayout"] }
 anyhow = "1"
 
 [lints]

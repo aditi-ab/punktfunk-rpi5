@@ -7,7 +7,8 @@
 //
 // Held by SessionModel from `beginStreaming` to `disconnect`, so it is scoped to the session and
 // never leaks past it (including a host-ended or timed-out background session, which both land in
-// `disconnect`).
+// `disconnect`). With "Keep screen awake" off, the session also drops it while the player's
+// input is quiet and takes it back on their next one.
 
 import Foundation
 

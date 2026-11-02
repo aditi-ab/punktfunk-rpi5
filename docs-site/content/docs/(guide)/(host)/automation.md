@@ -20,11 +20,11 @@ run in the streaming path. The one exception is a launch: a hook with `hold` set
 
 | Kind | Fires when | Carries |
 |---|---|---|
-| `client.connected` / `client.disconnected` | a device connects / goes away | name, fingerprint, plane (`native`, `gamestream`, or `web` for a browser); disconnect adds `reason`: `quit`, `timeout` or `error` |
-| `session.started` / `session.ended` | a session starts / ends | session id, client, fingerprint, plane, mode (`3840x2160@120`), HDR. `session.ended` adds a `summary` (duration, codec, bitrate span, frames, bring-up time, and `ended`: `local`, `game_exited`, `host_ended`, `host_error`, `lost` or `stopped_by_operator`), the same shape as `GET /api/v1/session/last` |
-| `stream.started` / `stream.stopped` | video starts / stops | mode, HDR, client, fingerprint, launched app, plane |
-| `game.launching` | the host is about to start a launched game; not when it picks up one still running | app id, title, store, client, fingerprint, plane, preset |
-| `game.running` | a launched game's own process runs (not just its launcher) | app id, title, store, client, fingerprint, plane |
+| `client.connected` / `client.disconnected` | a device connects / goes away | name, fingerprint, plane (`native`, `gamestream`, or `web` for a browser), the `profile` it plays as (`id`, `display_name`; not on `gamestream`); disconnect adds `reason`: `quit`, `timeout` or `error` |
+| `session.started` / `session.ended` | a session starts / ends | session id, client, fingerprint, plane, mode (`3840x2160@120`), HDR, `profile`. `session.ended` adds a `summary` (duration, codec, bitrate span, frames, bring-up time, and `ended`: `local`, `game_exited`, `host_ended`, `host_error`, `lost`, `stopped_by_operator` or `stolen`), the same shape as `GET /api/v1/session/last` |
+| `stream.started` / `stream.stopped` | video starts / stops | mode, HDR, client, fingerprint, launched app, plane, `profile` |
+| `game.launching` | the host is about to start a launched game; not when it picks up one still running | app id, title, store, client, fingerprint, plane, preset, `profile` |
+| `game.running` | a launched game's own process runs (not just its launcher) | app id, title, store, client, fingerprint, plane, `profile` |
 | `game.window` | the game's window reaches the screen, often 5–40 s after `game.running` | the same, plus the window's `title` and `app_id` |
 | `game.exited` | a launched game is gone | the same, plus `reason`: `exited` (the player quit) or `terminated` (the host closed it, per [these settings](/docs/virtual-displays#when-a-game-ends-and-when-a-session-does)) |
 | `pairing.pending` | an unpaired device knocks, once per device | name, fingerprint, plane (`native` for a browser too: it pairs into the same store) |
@@ -55,7 +55,8 @@ Fields are only ever added, never renamed.
 ```
 
 `preset` names the settings preset the device streamed with; it is absent when the device used
-its plain settings, and on Moonlight.
+its plain settings, and on Moonlight. `profile` names who plays (`id`, `display_name`); it is
+absent on Moonlight.
 
 ## Hooks
 
@@ -86,10 +87,11 @@ The console writes `~/.config/punktfunk/hooks.json` (Windows:
 | `on` | An event kind (`stream.started`) or a domain (`pairing.*`). Required, with `run`, `webhook` or both. |
 | `run` | A shell command. |
 | `webhook` | A URL the event JSON is POSTed to. |
-| `filter` | Optional exact matches, all of which must hold: `fingerprint` (the device), `client` (its name), `plane` (`native`, `gamestream`, `web`), `app`, `preset` (its name or id). |
+| `filter` | Optional exact matches, all of which must hold: `fingerprint` (the device), `client` (its name), `plane` (`native`, `gamestream`, `web`), `app`, `preset` (its name or id), `profile` (its id). |
 | `timeout_s` | Seconds before a command is killed with everything it started. 1–600, default 30. |
 | `debounce_ms` | Minimum gap between firings of this hook. Default 0. |
 | `hold` | Only with `on: game.launching`: the game waits for this hook, up to `timeout_s`. |
+| `elevated` | Windows: runs `run` as administrator. See [Run as administrator](#run-as-administrator). |
 | `hmac_secret_file` | Signs webhooks with `X-Punktfunk-Signature: sha256=<hex HMAC-SHA256 of the body>`. |
 
 Filter on `fingerprint`, not `client`: names aren't unique and change on rename. The console's
@@ -107,8 +109,8 @@ flattened into `PF_EVENT_*` variables:
 [ "$PF_EVENT_KIND" = stream.started ] && makoctl mode -a do-not-disturb
 ```
 
-- **Windows:** the host service runs the command as the signed-in user, never as SYSTEM, with no
-  stdin and no `PF_*` variables. The event arrives as a JSON file path, appended as the last
+- **Windows:** the host service runs the command as the signed-in user, never as SYSTEM, with the
+  `PF_*` variables but no stdin. The event JSON arrives as a file path, appended as the last
   argument.
 - **Linux:** every absolute path in the command, and each directory above it, must be owned by
   you or root and not group- or world-writable, or the host refuses the hook in its log. `~/…`
@@ -117,6 +119,30 @@ flattened into `PF_EVENT_*` variables:
 
 `PUNKTFUNK_ON_CONNECT_CMD` and `PUNKTFUNK_ON_DISCONNECT_CMD` in [`host.env`](/docs/configuration)
 run a command on `client.connected` / `client.disconnected` without a `hooks.json`.
+
+### Run as administrator
+
+On Windows, `"elevated": true` (**Run as administrator** in the console) runs a command with the
+signed-in user's full administrator rights, without a UAC prompt. Turn it on once per host, from
+an administrator PowerShell:
+
+```powershell
+punktfunk-host hooks elevated on
+```
+
+Until then the console can't save an elevated hook, and the host skips one written by hand: the
+console password alone never grants administrator rights. A standard user's session can't elevate
+either; the host skips the hook and logs why. `hooks elevated off` turns it off again.
+
+On Linux, give the script its own sudoers rule and run it with `sudo -n`, which fails at once
+instead of waiting for a password. Keep the script owned by root: whoever can edit it runs as root.
+
+```sh
+# sudo visudo -f /etc/sudoers.d/punktfunk
+me ALL=(root) NOPASSWD: /usr/local/bin/tv-hdr.sh
+```
+
+The hook's `run` is then `sudo -n /usr/local/bin/tv-hdr.sh`.
 
 ### Webhooks
 
@@ -166,8 +192,9 @@ Library form keeps prep steps but can't edit them.
 
 Every step gets the session's mode: `PF_STREAM_WIDTH`, `PF_STREAM_HEIGHT`, `PF_STREAM_REFRESH`,
 `PF_STREAM_HDR` (`1` / `0`), plus `PF_APP_ID` (a Punktfunk client's launch) or `PF_APP_TITLE`
-(Moonlight), and `PF_PRESET_ID` / `PF_PRESET_NAME` when the device streamed with a preset. `undo` sees the same values as its `do`, so one entry serves every device. A
-Windows host service can't pass these variables to its steps.
+(Moonlight), and `PF_PRESET_ID` / `PF_PRESET_NAME` when the device streamed with a preset. `undo` sees the same values as its `do`, so one entry serves every device.
+On Windows, `"elevated": true` on a step runs its `do` and `undo` as administrator, once it is
+[turned on](#run-as-administrator).
 
 An `apps.json` entry; the `prep` array is the same in `library.json`:
 
@@ -195,7 +222,7 @@ esac
 
 ### A launch on its own workspace
 
-On Hyprland and sway, a library launch opens on an empty workspace of the streamed screen instead
+On Hyprland, sway, niri and Umbriel, a library launch opens on an empty workspace of the streamed screen instead
 of on top of your desk, and the host switches back when the game ends. A reconnect returns to that
 game's workspace. KWin, GNOME, gamescope and Windows open it where the screen already is.
 

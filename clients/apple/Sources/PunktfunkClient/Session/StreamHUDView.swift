@@ -1,7 +1,7 @@
 // The streaming overlay HUD: the core formats every stats line (`SessionModel.hudLines`, one
 // vocabulary for every client) and this view paints them by role on one glass card, beside the
 // Apple-only chrome (the tvOS access line, the capture hints, the buttons). `.off` never
-// reaches this view (ContentView gates the overlay on the tier).
+// reaches this view (StreamScene gates the overlay on the tier).
 
 import PunktfunkKit
 import SwiftUI
@@ -20,7 +20,7 @@ struct StreamHUDView: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
-        // .off is gated upstream (ContentView only mounts the HUD when the tier is on) —
+        // .off is gated upstream (StreamScene only mounts the HUD when the tier is on) —
         // render nothing if it ever slips through.
         if verbosity != .off {
             // ONE shared glass card wraps the tier-dependent content, so a verbosity change MORPHS
@@ -80,11 +80,11 @@ struct StreamHUDView: View {
             // couch surface where every extra overlay competes with the picture keeps the
             // fact with the other session facts. Absent for full-and-permanent sessions
             // (every old host): today's overlay must not change there.
-            if model.accessLimited {
-                Text(model.accessRemainingSecs == 0
-                    ? "access \(model.accessLevel.label.lowercased())"
-                    : "access \(model.accessLevel.label.lowercased()) · ends in "
-                        + SessionModel.accessCountdown(model.accessRemainingSecs))
+            if model.notices.accessLimited {
+                Text(model.notices.accessRemainingSecs == 0
+                    ? "access \(model.notices.accessLevel.label.lowercased())"
+                    : "access \(model.notices.accessLevel.label.lowercased()) · ends in "
+                        + SessionModel.accessCountdown(model.notices.accessRemainingSecs))
                     .font(hudFont(.caption2))
                     .foregroundStyle(.secondary)
             }
@@ -256,61 +256,110 @@ struct StreamBadgeStack: View {
     var body: some View {
         VStack(spacing: 8) {
             // How to leave, for a few seconds at stream start.
-            if captureEnabled, model.exitHintShown {
+            if captureEnabled, model.notices.exitHint.isShown {
                 ExitHintBadge(text: model.exitHintText).transition(Self.pop)
             }
+            #if os(macOS)
+            // macOS 26 stutters on an adaptive-sync panel; up until the player answers it.
+            if captureEnabled, model.notices.vrrWarning {
+                VrrWarningBadge(
+                    dismiss: { model.dismissVrrWarning(forever: false) },
+                    mute: { model.dismissVrrWarning(forever: true) }
+                ).transition(Self.pop)
+            }
+            #endif
             // A forwarded pad has a gyro this session's virtual controller cannot carry. Shown
             // briefly at every stats tier, on every platform: the gyro otherwise just does
             // nothing, and the fix is a setting, so the hint has to name it.
-            if captureEnabled, model.motionUnreachableKind != nil {
+            if captureEnabled, model.notices.motionUnreachable.isShown {
                 MotionUnreachableBadge().transition(Self.pop)
             }
             // The SC2 passthrough's claim edge, the capture's only visible trace.
-            if captureEnabled, model.sc2CapturedHint {
+            if captureEnabled, model.notices.sc2Captured.isShown {
                 Sc2CapturedBadge().transition(Self.pop)
+            }
+            // macOS refused the SC2's open; without this the double input has no explanation.
+            if captureEnabled, model.notices.sc2Refused.isShown {
+                AccessWarningBadge(
+                    text: "Couldn't stream the Steam Controller as itself — macOS refused access. "
+                        + "Turn Punktfunk on, or off and on, in Privacy & Security → Input Monitoring.",
+                    icon: "exclamationmark.triangle"
+                ).transition(Self.pop)
             }
             // The Touch (passthrough) model met a host that drops contacts; the fingers run the
             // trackpad engine instead, and this says so once.
-            if captureEnabled, model.touchFallbackNotice {
+            if captureEnabled, model.notices.touchFallback.isShown {
                 TouchFallbackBadge().transition(Self.pop)
             }
             // The expiry warning (T−5 m / T−1 m, per-client access §7), every platform and tier:
             // a dead pad must read as ended access while it can still be fixed.
-            if captureEnabled, let warning = model.accessWarning {
+            if captureEnabled, let warning = model.notices.accessWarning.value {
                 AccessWarningBadge(text: warning).transition(Self.pop)
             }
             // The host's word on a launch that did not give the player their game.
-            if captureEnabled, let notice = model.launchNotice {
+            if captureEnabled, let notice = model.notices.launch.value {
                 AccessWarningBadge(text: notice, icon: "exclamationmark.triangle")
                     .transition(Self.pop)
             }
             #if !os(tvOS)
             // The access chip rides the stats tier for a LIMITED session only; a
             // full-and-permanent one never mounts it. tvOS states it in the stats overlay.
-            if captureEnabled && statsVerbosity != .off && model.accessLimited {
+            if captureEnabled && statsVerbosity != .off && model.notices.accessLimited {
                 AccessChipBadge(
-                    label: model.accessLevel.label, remainingSecs: model.accessRemainingSecs)
+                    label: model.notices.accessLevel.label, remainingSecs: model.notices.accessRemainingSecs)
                     .transition(Self.pop)
             }
-            // Up for as long as the mic is muted, at every stats tier (see MicMutedBadge).
-            if captureEnabled && model.micMuted {
-                MicMutedBadge { model.setMicMuted(false) }.transition(Self.pop)
+            // For a moment after each mute or unmute, at every stats tier (see MicNoticeBadge).
+            if captureEnabled, let muted = model.notices.micMute.value {
+                MicNoticeBadge(muted: muted).transition(Self.pop)
             }
             #endif
         }
         .padding(.bottom, 24)
         // The badges' visibility drivers, the stats tier included (the access chip rides it). A
         // badge whose driver is missing here pops in unanimated.
-        .animation(.easeOut(duration: 0.2), value: model.micMuted)
-        .animation(.easeOut(duration: 0.2), value: model.accessWarning)
-        .animation(.easeOut(duration: 0.2), value: model.launchNotice)
-        .animation(.easeOut(duration: 0.2), value: model.accessLimited)
+        .animation(.easeOut(duration: 0.2), value: model.notices.micMute.value)
+        .animation(.easeOut(duration: 0.2), value: model.notices.accessWarning.value)
+        .animation(.easeOut(duration: 0.2), value: model.notices.launch.value)
+        .animation(.easeOut(duration: 0.2), value: model.notices.accessLimited)
         .animation(.easeOut(duration: 0.2), value: statsVerbosity)
-        .animation(.easeOut(duration: 0.2), value: model.motionUnreachableKind)
-        .animation(.easeOut(duration: 0.2), value: model.sc2CapturedHint)
-        .animation(.easeOut(duration: 0.6), value: model.exitHintShown)
+        .animation(.easeOut(duration: 0.2), value: model.notices.motionUnreachable.value)
+        .animation(.easeOut(duration: 0.2), value: model.notices.sc2Captured.isShown)
+        .animation(.easeOut(duration: 0.2), value: model.notices.sc2Refused.isShown)
+        .animation(.easeOut(duration: 0.6), value: model.notices.exitHint.isShown)
+        .animation(.easeOut(duration: 0.2), value: model.notices.vrrWarning)
     }
 }
+
+#if os(macOS)
+/// The macOS 26 variable-refresh notice with its two answers. Unlike the hints it stays until
+/// answered: the fix is a system setting, not something to glance at.
+struct VrrWarningBadge: View {
+    let dismiss: () -> Void
+    let mute: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.yellow)
+            Text(
+                "macOS 26 stutters with variable refresh rate (ProMotion) on. Turn it off in "
+                    + "System Settings → Displays, or update macOS.")
+                .font(.geist(12, .medium, relativeTo: .caption))
+                .foregroundStyle(.white.opacity(0.9))
+            Button("Dismiss", action: dismiss)
+                .font(.geist(12, relativeTo: .caption))
+            Button("Don't warn again", action: mute)
+                .font(.geist(12, relativeTo: .caption))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassBackground(Capsule())
+        .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
+    }
+}
+#endif
 
 /// The exit hint: one line on how to leave, in the badges' glass language.
 struct ExitHintBadge: View {
@@ -331,7 +380,7 @@ struct ExitHintBadge: View {
 /// meets a session whose virtual controller has no motion plane (an X-Box class pad has no gyro in
 /// its HID contract, so every sample would be decoded and dropped).
 ///
-/// Not a control, unlike `MicMutedBadge`: the fix is the Controller type setting, which is not
+/// Not a control: the fix is the Controller type setting, which is not
 /// reachable mid-stream on every platform, and changing it applies from the next session anyway.
 /// So this states the fact and names the setting, in the HUD's glass language, and gets out of the
 /// way — the alternative is what shipped before, which was a gyro that silently did nothing with
@@ -449,37 +498,33 @@ struct AccessWarningBadge: View {
 }
 
 #if !os(tvOS)
-/// The muted-microphone badge — the mute STATE, as opposed to the buttons that flip it. It rides
-/// over the stream whenever the mic is muted, INDEPENDENT of the stats overlay (which the user
-/// may have cycled off, and which the compact tier reduces to a stat line): "am I muted?" is not a
-/// statistic, and a mute you can't see is how people talk to nobody for a minute. Same glass
-/// language as the HUD, sized like the start-of-stream banner it shares the bottom edge with.
+/// The microphone notice: "Microphone muted" or "Microphone live", for a moment after the
+/// switch, whichever surface made it. It rides over the stream INDEPENDENT of the stats overlay
+/// (which the user may have cycled off), in the HUD's glass language, sized like the
+/// start-of-stream banner it shares the bottom edge with.
 ///
-/// It is also a control: tapping it unmutes. That is the guaranteed way back for a touch user who
-/// muted with the overlay off, and it costs the badge nothing (it is on screen either way).
-struct MicMutedBadge: View {
-    let onUnmute: () -> Void
+/// Not a standing badge and not a control. The state stays readable where it is flipped: the
+/// touch disc and the dial's slot both show it.
+struct MicNoticeBadge: View {
+    let muted: Bool
+
+    private var text: String { muted ? "Microphone muted" : "Microphone live" }
 
     var body: some View {
-        Button(action: onUnmute) {
-            HStack(spacing: 7) {
-                Image(systemName: "mic.slash.fill")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.red)
-                Text("Microphone muted")
-                    .font(.geist(12, .medium, relativeTo: .caption))
-                    .foregroundStyle(.white.opacity(0.9))
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            // interactive: the badge IS the tap target, so the glass reacts to press.
-            .glassBackground(Capsule(), interactive: true)
-            .contentShape(Capsule())
+        HStack(spacing: 7) {
+            Image(systemName: muted ? "mic.slash.fill" : "mic.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(muted ? .red : .green)
+            Text(text)
+                .font(.geist(12, .medium, relativeTo: .caption))
+                .foregroundStyle(.white.opacity(0.9))
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassBackground(Capsule())
         .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
-        .accessibilityLabel("Microphone muted")
-        .accessibilityHint("Unmutes the microphone")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(text)
     }
 }
 #endif

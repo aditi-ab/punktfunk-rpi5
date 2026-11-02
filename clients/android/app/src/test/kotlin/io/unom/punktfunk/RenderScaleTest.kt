@@ -35,6 +35,19 @@ class RenderScaleTest {
             val row = sanitize.getJSONObject(i)
             assertEquals("$row", row.num("want"), RenderScale.sanitize(row.num("raw")), 0.0)
         }
+        val percents = vectors.getJSONArray("percent")
+        for (i in 0 until percents.length()) {
+            val row = percents.getJSONObject(i)
+            val want = row.num("want")
+            assertEquals("$row", want, RenderScale.fromPercent(row.getInt("typed")), 0.0)
+            assertEquals("$row", row.getInt("reads"), RenderScale.percent(want))
+        }
+        val presets = vectors.getJSONArray("preset")
+        for (i in 0 until presets.length()) {
+            val row = presets.getJSONObject(i)
+            val index = if (row.isNull("index")) null else row.getInt("index")
+            assertEquals("$row", index, RenderScale.presetIndex(row.num("scale")))
+        }
         val cases = vectors.getJSONArray("apply")
         assertTrue("the vector file is the contract; keep it rich", cases.length() >= 12)
         for (i in 0 until cases.length()) {

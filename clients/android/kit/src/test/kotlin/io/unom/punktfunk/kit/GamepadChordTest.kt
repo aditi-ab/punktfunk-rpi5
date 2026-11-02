@@ -157,6 +157,31 @@ class GamepadChordTest {
     }
 
     /**
+     * Steam reads Quick Access on a pad without the button as Guide held, then A. The tap keeps
+     * that order on the wire and lets go of A first. A pad with the button taps it.
+     */
+    @Test
+    fun `a quick access tap holds guide before it presses a`() {
+        val tap = GamepadRouter.TAP_PRESS_MS
+        assertEquals(
+            listOf(
+                Triple(Gamepad.BTN_GUIDE, true, 0L),
+                Triple(Gamepad.BTN_A, true, tap),
+                Triple(Gamepad.BTN_A, false, 2 * tap),
+                Triple(Gamepad.BTN_GUIDE, false, 2 * tap),
+            ),
+            GamepadRouter.tapEvents(Gamepad.quickAccessPresses(hasButton = false)),
+        )
+        assertEquals(
+            listOf(
+                Triple(Gamepad.BTN_MISC1, true, 0L),
+                Triple(Gamepad.BTN_MISC1, false, tap),
+            ),
+            GamepadRouter.tapEvents(Gamepad.quickAccessPresses(hasButton = true)),
+        )
+    }
+
+    /**
      * A pad's own mute button (a DualSense's) is a second trigger for the mic toggle, and
      * `slotButton` reads it through the SAME edge rule expressed as a one-button chord.
      *
@@ -224,6 +249,25 @@ class GamepadChordTest {
         for (other in listOf(Gamepad.BTN_B, Gamepad.BTN_X, Gamepad.BTN_Y, Gamepad.BTN_DPAD_UP)) {
             assertFalse("$other opened the ring", opens(Gamepad.BTN_BACK, other))
         }
+    }
+
+    /**
+     * A lone Select held past the guide threshold: an exit-chord partner joining keeps it a
+     * Select, however late, so the exit chord never presses guide; any other press or its
+     * release makes it the guide; earlier, everything keeps it a Select.
+     */
+    @Test
+    fun `an exit chord partner keeps a held Select a Select`() {
+        val late = GamepadRouter.GUIDE_HOLD_MS + 250
+        assertTrue(late < GamepadRouter.GUIDE_COMMIT_MS)
+        for (partner in listOf(Gamepad.BTN_START, Gamepad.BTN_LB, Gamepad.BTN_RB)) {
+            assertTrue(partner and GamepadRouter.EXIT_CHORD != 0)
+            assertEquals("$partner", Gamepad.BTN_BACK, GamepadRouter.pendingSelectBecomes(late, partner))
+        }
+        assertEquals(Gamepad.BTN_GUIDE, GamepadRouter.pendingSelectBecomes(late, Gamepad.BTN_A))
+        assertEquals("release", Gamepad.BTN_GUIDE, GamepadRouter.pendingSelectBecomes(late, 0))
+        assertEquals(Gamepad.BTN_BACK, GamepadRouter.pendingSelectBecomes(100, Gamepad.BTN_A))
+        assertEquals("tap", Gamepad.BTN_BACK, GamepadRouter.pendingSelectBecomes(100, 0))
     }
 
     /** The chord bits are the wire's, so they must stay inside the 32-bit button mask. */

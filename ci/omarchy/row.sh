@@ -49,7 +49,7 @@ grep -q 'Woah partner' /tmp/canary || {
 }
 
 # --channel canary, not the default. Omarchy's install line takes the host AND the client, and
-# on stable those two packages each ship /usr/share/icons/.../io.unom.Punktfunk.svg — pacman
+# on stable those two packages each ship /usr/share/icons/.../io.unom.punktfunk.svg — pacman
 # refuses the transaction with "conflicting files". Canary splits the file into punktfunk-icons,
 # which both depend on, so the line commits. Drop this pin when stable splits it too; until
 # then a stable Omarchy install is broken for reasons no installer can fix.

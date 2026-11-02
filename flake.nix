@@ -33,7 +33,7 @@
       systems = [ "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
 
-      # The workspace version is the single source of truth (crates/*/Cargo.toml inherit it).
+      # The workspace version is the single source of truth (crates/*/*/Cargo.toml inherit it).
       version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
       overlays = [
@@ -42,18 +42,18 @@
         # the deb/rpm/arch/windows pins — bump them together (SHASUMS256.txt, as SRI).
         (final: prev: {
           bun = prev.bun.overrideAttrs (old: {
-            version = "1.4.2";
+            version = "1.4.4";
             # src is read from passthru.sources, so it follows without being set here.
             __intentionallyOverridingVersion = true;
             passthru = old.passthru // {
               sources = {
                 x86_64-linux = final.fetchurl {
-                  url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64-baseline.zip";
-                  hash = "sha256-xngEDxT+BEDrg503y9DOTAUaMtpygGrJfeamqra/co8=";
+                  url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64-baseline.zip";
+                  hash = "sha256-4ERutVmVdy65iUvrrppr42jZhai5Jx7hJEhvmUbu3XY=";
                 };
                 aarch64-linux = final.fetchurl {
-                  url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-aarch64.zip";
-                  hash = "sha256-VDKLvC2cjgyfiSxUTWbFeoO4QTnjSQnl7oF1jxrI/ac=";
+                  url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-aarch64.zip";
+                  hash = "sha256-uqa7NvUdblhWHgK76oJQOKnfRU9nPW13bou/hvjHhQ4=";
                 };
               };
             };
@@ -116,6 +116,7 @@
             punktfunk-client
             punktfunk-web
             punktfunk-scripting
+            punktfunk-seats
             punktfunk-tray
             punktfunk-gamescope
             ;
@@ -166,6 +167,7 @@
             punktfunk-client
             punktfunk-web
             punktfunk-scripting
+            punktfunk-seats
             ;
 
           # The NixOS module, actually evaluated. `nix flake check` does NOT do this for
@@ -177,6 +179,12 @@
           nixos-module = pkgs.callPackage ./packaging/nix/module-check.nix {
             inherit nixpkgs system;
             module = import ./packaging/nix/nixos-module.nix;
+          };
+
+          # The module booted in a VM with the real packages. The eval leg instantiates it; the
+          # `ci:nix-rust` lane builds it.
+          nixos-vm = pkgs.callPackage ./packaging/nix/vm-test.nix {
+            module = self.nixosModules.default;
           };
         }
       );
@@ -205,7 +213,6 @@
             buildInputs = [
               # host
                 pkgs.pipewire
-              pkgs.libopus
               pkgs.wayland
               pkgs.libxkbcommon
               pkgs.libGL
@@ -220,8 +227,6 @@
               pkgs.gsettings-desktop-schemas
               pkgs.adwaita-icon-theme
             ];
-            # CMake ≥ 4 rejects the pre-3.5 minimums some vendored C libs (libopus) still declare.
-            CMAKE_POLICY_VERSION_MINIMUM = "3.5";
             LD_LIBRARY_PATH = "/run/opengl-driver/lib:${
               pkgs.lib.makeLibraryPath [
                 pkgs.vulkan-loader

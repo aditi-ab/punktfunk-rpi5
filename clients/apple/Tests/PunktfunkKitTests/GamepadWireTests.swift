@@ -20,6 +20,19 @@ final class GamepadWireTests: XCTestCase {
         }
     }
 
+    /// Steam reads Quick Access on a pad without the button as Guide held, then A. The tap
+    /// keeps that order on the wire and lets go of A first. A pad with the button taps it.
+    func testAQuickAccessTapHoldsGuideBeforeItPressesA() {
+        let chord = GamepadCapture.tapEvents(GamepadWire.quickAccessPresses(hasButton: false))
+        XCTAssertEqual(chord.map(\.bit), [GamepadWire.guide, GamepadWire.a, GamepadWire.a, GamepadWire.guide])
+        XCTAssertEqual(chord.map(\.down), [true, true, false, false])
+        XCTAssertEqual(chord.map(\.after), [0, 0.05, 0.1, 0.1])
+        let button = GamepadCapture.tapEvents(GamepadWire.quickAccessPresses(hasButton: true))
+        XCTAssertEqual(button.map(\.bit), [GamepadWire.misc1, GamepadWire.misc1])
+        XCTAssertEqual(button.map(\.down), [true, false])
+        XCTAssertEqual(button.map(\.after), [0, 0.05])
+    }
+
     func testPadIndexRidesFlagsOnEveryPerPadEvent() {
         // The wire pad index is the low byte of `flags` (punktfunk_core::input) on button + axis.
         let btn = PunktfunkInputEvent.gamepadButton(GamepadWire.a, down: true, pad: 3)

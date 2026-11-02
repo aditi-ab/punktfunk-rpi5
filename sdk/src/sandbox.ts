@@ -19,8 +19,12 @@ export interface PluginManifest {
 	schema?: number;
 	id?: string;
 	reads?: string[];
+	/** Folders it reads the files of. A bind walks nothing, so here this is a `reads`. */
+	files?: string[];
 	writes?: string[];
 	network?: boolean;
+	/** Windows registry keys it reads (`HKLM\…`, `HKCU\…`). Nothing to bind here on Linux. */
+	registry?: string[];
 }
 
 /** An id names the plugin's state dir and socket: one lowercase path component. */
@@ -69,6 +73,8 @@ export interface SandboxPaths {
 	bun: string;
 	runner: string;
 	home: string;
+	/** The host's config dir (`PUNKTFUNK_CONFIG_DIR`), which no plugin may bind. */
+	configDir: string;
 	/** A plugin without network: the runner's dir its UI socket goes in, and the forwarded port. */
 	ui?: { dir: string; port: number };
 	/** The host's `/home` when it is a link ({@link homeLink}), mirrored inside. */
@@ -202,27 +208,27 @@ export const bwrapArgv = (
 	}
 	// What it said it needs. `-try` so an uninstalled launcher's dir is simply absent rather
 	// than a sandbox that refuses to start.
-	for (const p of manifest.reads ?? []) {
+	for (const p of [...(manifest.reads ?? []), ...(manifest.files ?? [])]) {
 		const abs = expandHome(p, paths.home);
-		if (bindable(abs, paths.home)) argv.push("--ro-bind-try", abs, at(abs));
+		if (bindable(abs, paths)) argv.push("--ro-bind-try", abs, at(abs));
 	}
 	for (const p of manifest.writes ?? []) {
 		const abs = expandHome(p, paths.home);
-		if (bindable(abs, paths.home)) argv.push("--bind-try", abs, at(abs));
+		if (bindable(abs, paths)) argv.push("--bind-try", abs, at(abs));
 	}
 	// Operator grants are read-only unless one opts into write.
 	for (const grant of grants) {
 		const abs = expandHome(grant.path, paths.home);
-		if (bindable(abs, paths.home))
+		if (bindable(abs, paths))
 			argv.push(grant.write ? "--bind-try" : "--ro-bind-try", abs, at(abs));
 	}
 	// bwrap fails on a link it can't place, so none lands on, in or above anything placed.
 	const placed = destinations(argv);
 	for (const grant of grants) {
-		if (!bindable(expandHome(grant.path, paths.home), paths.home)) continue;
+		if (!bindable(expandHome(grant.path, paths.home), paths)) continue;
 		for (const link of grant.links ?? []) {
 			const dest = at(link.path);
-			if (link.path !== path.resolve(link.path) || !bindable(link.path, paths.home)) continue;
+			if (link.path !== path.resolve(link.path) || !bindable(link.path, paths)) continue;
 			if (placed.some((p) => under(p, dest) || under(dest, p))) continue;
 			argv.push("--symlink", link.target, dest);
 			placed.push(dest);
@@ -258,18 +264,21 @@ const destinations = (argv: readonly string[]): string[] => {
 
 /**
  * A root no manifest or grant may bind: the host's processes, devices, the session bus and
- * runtime sockets, the home or anything above it, keys, and punktfunk's own config or anything
- * above it, which holds every plugin's token. Checked on the path and on what it resolves to in
- * the runner's view.
+ * runtime sockets, the home or anything above it, keys, and the host's config dir (`configDir`,
+ * and `~/.config/punktfunk*` wherever the config lives) or anything above it, which holds every
+ * plugin's token. Checked on the path and on what it resolves to in the runner's view. The
+ * host's `refusal_rule` is the other half; path-refusal-vectors.json pins the two.
  */
-export const refusedRoot = (abs: string, home: string): boolean => {
-	const refused = (p: string, h: string) => {
+export const refusedRoot = (abs: string, home: string, configDir: string): boolean => {
+	const refused = (p: string, h: string, c: string) => {
 		const under = (base: string) => p === base || p.startsWith(`${base}/`);
 		const above = (base: string) => `${base}/`.startsWith(`${p}/`);
 		return (
 			p === "/" ||
 			above(h) ||
+			above(c) ||
 			above(path.join(h, ".config", "punktfunk")) ||
+			under(c) ||
 			["/proc", "/sys", "/dev"].some(under) ||
 			(under("/run") && !p.startsWith("/run/media/")) ||
 			[".ssh", ".gnupg"].some((d) => under(path.join(h, d))) ||
@@ -283,15 +292,16 @@ export const refusedRoot = (abs: string, home: string): boolean => {
 			return p;
 		}
 	};
-	// Both spellings of both sides: on Fedora Atomic `/home` is a link to `/var/home`.
+	// Every spelling of every side: on Fedora Atomic `/home` is a link to `/var/home`.
 	const p = path.resolve(abs);
 	const paths = [p, real(p)];
 	const homes = [home, real(home)];
-	return paths.some((x) => homes.some((h) => refused(x, h)));
+	const configs = [configDir, real(configDir)];
+	return paths.some((x) => homes.some((h) => configs.some((c) => refused(x, h, c))));
 };
 
-const bindable = (abs: string, home: string): boolean =>
-	path.isAbsolute(abs) && !refusedRoot(abs, home);
+const bindable = (abs: string, paths: SandboxPaths): boolean =>
+	path.isAbsolute(abs) && !refusedRoot(abs, paths.home, paths.configDir);
 
 /**
  * A seccomp program refusing netlink sockets, as the bytes bwrap reads from `--add-seccomp-fd`.
@@ -410,6 +420,17 @@ const PROBE_BINDS: readonly string[] = [
 
 /** Host `true` as an absolute path. `/bin/true` is an FHS path NixOS does not have.
  *  Do not realpath: Nix `true` is a symlink onto the coreutils multicall binary. */
+/**
+ * The host binary beside the runner bundle: `<install>\scripting\runner-cli.js` and
+ * `<install>\punktfunk-host.exe`, which `plugins spawn` runs a plugin's AppContainer through.
+ */
+export const hostExe = (): string =>
+	path.resolve(
+		path.dirname(process.env.PUNKTFUNK_RUNNER_ENTRY ?? process.argv[1] ?? ""),
+		"..",
+		"punktfunk-host.exe",
+	);
+
 const whichTrue = (): string => {
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
 		if (!dir) continue;
@@ -444,6 +465,12 @@ export const sandboxProbe = (
 	},
 	platform: string = process.platform,
 ): { ok: true } | { ok: false; reason: string } => {
+	if (platform === "win32") {
+		// The host binary beside the runner is the AppContainer's door; the installer puts both.
+		return fs.existsSync(hostExe())
+			? { ok: true }
+			: { ok: false, reason: `${hostExe()} is missing — reinstall punktfunk, or set PUNKTFUNK_PLUGIN_SANDBOX=off` };
+	}
 	if (platform !== "linux") {
 		return { ok: false, reason: "sandboxing is Linux-only here" };
 	}

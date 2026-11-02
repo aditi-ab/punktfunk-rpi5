@@ -8,6 +8,7 @@
 import { afterAll, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { SANDBOX_REFUSED_EXIT } from "../src/runner.js";
 
 const SDK = path.join(import.meta.dir, "..");
 const ROOT = path.join(SDK, `.runner-cli-fixtures-${process.pid}`);
@@ -53,4 +54,57 @@ test(
 		expect(cpuMs).toBeLessThan(MAX_CPU_MS);
 	},
 	WINDOW_MS + 15_000,
+);
+
+// The refusal's exit status is the contract with every supervisor (`RestartPreventExitStatus=78`
+// in the unit), so it is read off the real process. Linux only: that is where the default is a
+// sandbox and the probe is a program on PATH.
+test.skipIf(process.platform !== "linux")(
+	"a plugin on a box with no bwrap ends the runner with the refusal status",
+	async () => {
+		const root = path.join(ROOT, "refused");
+		const pkg = path.join(root, "plugins", "node_modules", "punktfunk-plugin-demo");
+		for (const dir of [pkg, path.join(root, "scripts"), path.join(root, "no-bwrap")])
+			fs.mkdirSync(dir, { recursive: true });
+		const files = {
+			"package.json": JSON.stringify({
+				name: "punktfunk-plugin-demo",
+				main: "index.js",
+				punktfunk: { schema: 1, id: "demo" },
+			}),
+			"index.js": "export default {};",
+		};
+		for (const [name, text] of Object.entries(files)) {
+			fs.writeFileSync(path.join(pkg, name), text);
+			fs.chmodSync(path.join(pkg, name), 0o644);
+		}
+		const proc = Bun.spawn(
+			[
+				process.execPath,
+				"src/runner-cli.ts",
+				"--scripts",
+				path.join(root, "scripts"),
+				"--plugins",
+				path.join(root, "plugins"),
+			],
+			{
+				cwd: SDK,
+				// An empty PATH dir: the probe can't pass, whatever this machine has installed.
+				env: {
+					...process.env,
+					PATH: path.join(root, "no-bwrap"),
+					PUNKTFUNK_CONFIG_DIR: root,
+					PUNKTFUNK_PLUGIN_SANDBOX: "on",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		expect(await proc.exited).toBe(SANDBOX_REFUSED_EXIT);
+		expect(await new Response(proc.stderr).text()).toContain(
+			"stopping instead of running punktfunk-plugin-demo",
+		);
+		expect(fs.existsSync(path.join(root, "plugin-state", "runner.refused"))).toBe(true);
+	},
+	20_000,
 );

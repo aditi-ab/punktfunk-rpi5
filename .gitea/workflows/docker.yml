@@ -2,7 +2,7 @@
 #
 # Two very different image families now:
 #
-#   BUILDER images (punktfunk-rust-ci{,-noble,-arm64cross}, punktfunk-fedora{,44}-rpm)
+#   BUILDER images (punktfunk-rust-ci{,-noble,-arm64cross}, punktfunk-fedora{,44,45}-rpm)
 #     live on the LAN registry (home-ci-core — unom/infra runners/ci-core/) and are
 #     CONTENT-KEYED: the tag is a hash of what they are built from (the ci/ tree, +
 #     rust-toolchain.toml for the cross image), and a build only happens when that key
@@ -119,6 +119,11 @@ jobs:
             dockerfile: ci/fedora-rpm.Dockerfile
             buildargs: --build-arg FEDORA_VERSION=44
             keysuffix: -f44
+          # Fedora 45 builder (Bazzite 45, Fedora 45): same Dockerfile, newer base.
+          - image: punktfunk-fedora45-rpm
+            dockerfile: ci/fedora-rpm.Dockerfile
+            buildargs: --build-arg FEDORA_VERSION=45
+            keysuffix: -f45
           # Android builder (JDK + SDK/NDK + cargo-ndk + sccache) — android.yml and
           # android-screenshots.yml run in it; ~3 GB of per-run Google downloads became
           # image layers.

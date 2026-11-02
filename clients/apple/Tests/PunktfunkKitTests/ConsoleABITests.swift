@@ -3,6 +3,7 @@ import XCTest
 #if canImport(Metal)
 import Metal
 import PunktfunkCore
+@testable import PunktfunkKit
 
 /// The console's C ABI end to end, the way the Swift host drives it: built over this process's
 /// Metal device and queue, drawing into a texture Swift owns.
@@ -81,9 +82,21 @@ final class ConsoleABITests: XCTestCase {
         XCTAssertTrue(punktfunk_console_at_root(console), "Back walks back to the root")
     }
 
-    private func offscreen(width: Int, height: Int) throws -> MTLTexture {
+    /// The format this platform's console layer holds, which is what the glass hands over.
+    func testDrawsIntoTheLayerFormat() throws {
+        let texture = try offscreen(width: 320, height: 180, format: consoleDrawable)
+        XCTAssertTrue(
+            punktfunk_console_frame(
+                console, Unmanaged.passUnretained(texture).toOpaque(), UInt32(texture.width),
+                UInt32(texture.height), PunktfunkInsets(), 0),
+            "Skia wraps a \(consoleDrawable.rawValue) drawable")
+    }
+
+    private func offscreen(
+        width: Int, height: Int, format: MTLPixelFormat = .bgra8Unorm
+    ) throws -> MTLTexture {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+            pixelFormat: format, width: width, height: height, mipmapped: false)
         desc.usage = [.renderTarget, .shaderRead]
         desc.storageMode = .private
         return try XCTUnwrap(device.makeTexture(descriptor: desc))

@@ -4,7 +4,7 @@
      assets/launcher-icons masters). See each directory's README for provenance/licensing.
      Registered under the hicolor-style layout IconTheme::add_resource_path expects. -->
 <gresources>
-  <gresource prefix="/io/unom/Punktfunk">
+  <gresource prefix="/io/unom/punktfunk">
     <file>style.css</file>
     <file>icons/scalable/actions/pf-launcher-steam-symbolic.svg</file>
     <file>icons/scalable/actions/pf-launcher-lutris-symbolic.svg</file>

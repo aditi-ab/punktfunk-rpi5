@@ -1,0 +1,7 @@
+# The directories punktfunk-seats and the seat units use. /var/lib/punktfunk belongs to the door's
+# uid; the supervisor's own state lives in /var/lib/punktfunk-seats, root's alone, so nothing the
+# door can rename sits under what root works on. It is 0711: a seat user reaches its own entry and
+# can't list the others. The supervisor makes seats, trust and games below it.
+d /run/punktfunk        0755 root root -
+d /run/punktfunk/seats  0755 root root -
+d /var/lib/punktfunk-seats 0711 root root -

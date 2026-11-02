@@ -1,7 +1,7 @@
 // Hosts grid ⇄ trust prompt ⇄ live stream. ContentView owns the session model, host store and
 // LAN discovery, and switches between the home grid (HomeView) and the live session. The connect,
 // trust and wake flow (ConnectFlow), the grid + cards (HomeView/HostCards), the trust prompt
-// (TrustCardView) and the HUD with its badges (StreamHUDView) live in their own files.
+// (TrustCardView) and the live stream with its overlays (StreamScene) live in their own files.
 
 #if os(macOS)
 import AppKit
@@ -19,17 +19,16 @@ struct ContentView: View {
     // The dev auto-connect hook (DEBUG-only — see `autoConnectIfAsked`) writes these three, so
     // they stay observed here; every OTHER stream setting reaches a session through
     // `EffectiveSettings`, resolved once per connect.
-    @AppStorage(DefaultsKey.streamWidth) private var width = 0
-    @AppStorage(DefaultsKey.streamHeight) private var height = 0
-    @AppStorage(DefaultsKey.streamHz) private var hz = 0
-    @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
-    @AppStorage(DefaultsKey.fullscreenAlways) private var fullscreenAlways = false
+    @AppStorage(DefaultsKey.streamWidth) private var width = SettingDefault.streamWidth
+    @AppStorage(DefaultsKey.streamHeight) private var height = SettingDefault.streamHeight
+    @AppStorage(DefaultsKey.streamHz) private var hz = SettingDefault.streamHz
+    @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming =
+        SettingDefault.fullscreenWhileStreaming
+    @AppStorage(DefaultsKey.fullscreenAlways) private var fullscreenAlways = SettingDefault.fullscreenAlways
     // The raw string is what @AppStorage observes (so cycles from any surface re-render this
     // view); the absent-key default runs the legacy-hudEnabled migration once per init.
     @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
         = StatsVerbosity.current.rawValue
-    @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
-    @AppStorage(DefaultsKey.statsScalePct) private var statsScalePct = 100
     /// The tier the overlay actually shows: the live session's (its preset's, then whatever the
     /// ⌃⌥⇧S/three-finger cycle moved it to) while streaming, the persisted global otherwise.
     private var statsVerbosity: StatsVerbosity {
@@ -61,6 +60,8 @@ struct ContentView: View {
         let preset: PresetSelection
         /// A `browse` link: open the host's library instead of dialing it.
         let browse: Bool
+        /// The link's `as=`: the host profile to play as, this connect only.
+        var asProfile: String?
 
         var actionTitle: String { browse ? "Open Library" : "Connect" }
         var message: String {
@@ -82,12 +83,19 @@ struct ContentView: View {
     @State private var liveActivity = SessionActivityController()
     #endif
     @State private var pairingTarget: StoredHost?
+    /// A link's connect, waiting on the PIN pairing it detoured through (`pairingBinding`
+    /// drops it when the pair screen closes).
+    @State private var pairThen: (@MainActor (StoredHost) -> Void)?
     /// A fresh `pair=required`/unknown host the user tapped: drives the choice between no-PIN
     /// delegated approval ("Request Access") and the SPAKE2 PIN ceremony (rule 3b).
     @State private var approvalChoice: ApprovalRequest?
     /// A delegated-approval connect is in flight (host parks it until the operator approves):
     /// drives the cancelable "Waiting for approval" prompt and the pin-as-paired on success.
     @State private var awaitingApproval: ApprovalRequest?
+    /// The profile picker a connect waits on.
+    @State private var profileAsk: ProfileAsk?
+    /// The wait for a profile's seat to come up, before the dial.
+    @State private var seatWait: SeatWait?
     @State private var speedTestTarget: StoredHost?
     @State private var libraryTarget: LibraryTarget?
     #if os(iOS) || os(visionOS) || os(tvOS)
@@ -115,29 +123,15 @@ struct ContentView: View {
     /// The fullscreen edge and ownership, outliving the controller views SwiftUI rebuilds.
     @State private var fullscreenEdge = FullscreenController.Edge()
     #endif
-    #if os(iOS) || os(visionOS)
-    /// The stats-OFF tier's touch-exit disc window (see the overlay in `stream(captureEnabled:)`
-    /// — the disc must LEAVE the hierarchy so nothing composites over the metal layer).
+    /// The stats-OFF tier's touch-exit disc window (`StreamScene`), opened at each session start.
+    /// Read on iOS and visionOS only.
     @State private var showTouchExit = false
-    #endif
     /// The quick-action ring (design/touch-client-overlay.md §2), one per session. iOS opens it
     /// with the two-finger twist or the exit disc, tvOS with a short Back on the remote, macOS
     /// with ⌃⌥⇧O or the Stream menu, an iPad keyboard with ⌃⌥⇧O; a pad opens it with `Select+A`
     /// on all three (§2.5, §2.6).
     @StateObject private var ring = RingState()
 
-    /// The ring this platform draws. macOS takes the DESKTOP default (no soft keyboard, no
-    /// on-screen pad), tvOS the TV one (no touch, keyboard or microphone slot), iOS the touch
-    /// one; a configured blob overrides each.
-    private var ringConfig: OverlayConfig {
-        #if os(macOS)
-        OverlayConfig.parse(model.settings.overlayActions, platform: .desktop)
-        #elseif os(tvOS)
-        OverlayConfig.parse(model.settings.overlayActions, platform: .tv)
-        #else
-        OverlayConfig.parse(model.settings.overlayActions)
-        #endif
-    }
     #if !os(macOS)
     @State private var showSettings = false
     #endif
@@ -146,7 +140,7 @@ struct ContentView: View {
     // On tvOS the same screens are focus-engine-driven, so the Siri Remote keeps working;
     // with no (extended) controller attached tvOS falls back to HomeView as before.
     @ObservedObject private var gamepadManager = GamepadManager.shared
-    @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
+    @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = SettingDefault.gamepadUIEnabled
     /// When the switch above takes over — "connected" (default) or "always". See
     /// `GamepadUIEnvironment`.
     @AppStorage(DefaultsKey.gamepadUIMode) private var gamepadUIMode =
@@ -154,11 +148,11 @@ struct ContentView: View {
     /// Auto-wake on connect (Settings → General). On (default): a dial to an offline saved host
     /// fires Wake-on-LAN up front and falls into the "Waking…" wait if the dial fails. Off: connects
     /// go straight through with no wake. The explicit "Wake Host" action is unaffected either way.
-    @AppStorage(DefaultsKey.autoWake) private var autoWakeEnabled = true
+    @AutoWake private var autoWakeEnabled
     /// Where a bare launch opens (Settings → Library). Library (the default) opens the default
     /// host's shelf; Stream also dials its desktop. Resolved once per process by
     /// `applyStartScreen`, never on foregrounding — see `startApplied`.
-    @AppStorage(DefaultsKey.startIn) private var startInRaw = StartIn.hosts.stored
+    @AppStorage(DefaultsKey.startIn) private var startInRaw = SettingDefault.startIn
     /// Which host that is, when several are paired. Empty until somebody picks one; with exactly
     /// one paired host the default is derived and this stays empty.
     @AppStorage(DefaultsKey.defaultHost) private var defaultHostID = ""
@@ -169,27 +163,25 @@ struct ContentView: View {
     /// Background keep-alive (Settings → General, iOS-only). Default OFF (today's freeze-on-background
     /// is the default). When on, backgrounding a live session keeps audio + the connection alive and
     /// drops video, auto-disconnecting after `backgroundTimeoutMinutes`.
-    @AppStorage(DefaultsKey.backgroundKeepAlive) private var backgroundKeepAlive = false
-    @AppStorage(DefaultsKey.backgroundTimeoutMinutes) private var backgroundTimeoutMinutes = 10
+    @AppStorage(DefaultsKey.backgroundKeepAlive) private var backgroundKeepAlive = SettingDefault.backgroundKeepAlive
+    @AppStorage(DefaultsKey.backgroundTimeoutMinutes) private var backgroundTimeoutMinutes =
+        SettingDefault.backgroundTimeoutMinutes
     /// scenePhase drives the keep-alive: use THIS, not the willResignActive observers — resign-active
     /// also fires for Control Center / app-switcher peeks, where the disconnect timer must not start.
     @Environment(\.scenePhase) private var scenePhase
 
-    /// While the console fronts the app and no stream is up, the console draws every screen:
-    /// connect, wake, pairing, the approval wait, a failed dial, its launch hold. The app's own
-    /// alerts and sheets would be a second interface over it — and on a TV, a focus trap the pad
-    /// cannot reach. Once the stream shows, the app owns the screen again, trust card included.
-    private var consoleOwnsScreen: Bool {
-        gamepadUIActive
-            && (model.phase == .idle || model.phase == .connecting || consoleHoldsStream)
-    }
-
-    /// The console's launch hold covers the stream it dialled. A trust card is the stream
-    /// view's, so the hold gives way to it.
-    private var consoleHoldsStream: Bool {
-        guard model.consoleHold else { return false }
-        if case .awaitingTrust = model.phase { return false }
-        return true
+    /// Who draws the window, this app or the console, and what each hand-off shows.
+    private var owner: ScreenOwner {
+        #if os(macOS)
+        let fullscreen = isFullscreen
+        #else
+        let fullscreen = false
+        #endif
+        return ScreenOwner.resolve(
+            console: gamepadUIActive, phase: model.phase, live: model.connection != nil,
+            consoleHold: model.consoleHold, error: model.errorMessage != nil,
+            fullscreen: fullscreen, appDrivenFullscreen: appDrivenFullscreen,
+            fullscreenAlways: fullscreenAlways)
     }
 
     /// A console that could not be built hands the screen back to this app's own UI.
@@ -219,7 +211,10 @@ struct ContentView: View {
                     DispatchQueue.main.async { flow.requestAccess(req) }
                 }
                 Button("Pair with PIN…") {
-                    DispatchQueue.main.async { pairingTarget = req.host }
+                    DispatchQueue.main.async {
+                        pairThen = req.thenConnect
+                        pairingTarget = req.host
+                    }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: { req in
@@ -234,21 +229,23 @@ struct ContentView: View {
             } message: {
                 Text(model.errorMessage ?? "")
             }
-            // The delegated-approval wait: the host holds the connection open until the operator
-            // approves it. Cancel returns the UI at once; the in-flight connect is left to time out
-            // and its late result is discarded by SessionModel's connect guard (disconnect resets
-            // the phase/host it checks).
+            // The delegated-approval wait: the host holds the request until the operator approves
+            // it. Cancel returns the UI at once; `ConnectFlow.requestAccess` drops the late answer.
             .alert(
                 "Waiting for approval",
                 isPresented: awaitingApprovalPresented,
                 presenting: awaitingApproval
             ) { _ in
-                Button("Cancel", role: .cancel) { model.disconnect() }
+                Button("Cancel", role: .cancel) {}
             } message: { req in
                 Text("Approve \u{201C}\(DeviceName.current)\u{201D} in \(req.host.displayName)'s "
-                    + "web console (port 47992 → Pairing). This device connects automatically once "
-                    + "you approve it — no need to reconnect.")
+                    + "web console (port 47992 → Pairing). This device is paired once you "
+                    + "approve it.")
             }
+            // Who is playing: shown by a connect when its host lists several profiles.
+            .sheet(item: $profileAsk) { ProfilePickerView(ask: $0) }
+            // The seat of the picked profile is starting; the dial follows once it is up.
+            .sheet(item: $seatWait) { SeatWaitView(wait: $0) }
             // Informational deep-link outcome (unknown host, a refused preset, already
             // streaming). Not an error.
             .alert("Can't open", isPresented: deepLinkNoticePresented) {
@@ -268,6 +265,20 @@ struct ContentView: View {
             } message: { confirm in
                 Text(confirm.message)
             }
+            #if os(iOS)
+            // A phone holds landscape under both; `home` shows the console.
+            .onChange(of: owner.showsConsole, initial: true) { _, shown in
+                LandscapeLock.console = shown
+            }
+            .onChange(of: model.connection != nil, initial: true) { _, up in
+                LandscapeLock.streaming = up
+            }
+            #endif
+            #if os(visionOS)
+            // The Home sits on the system glass; a stream is a square-cornered rectangle, like
+            // the monitor it shows.
+            .glassBackgroundEffect(displayMode: model.phase == .streaming ? .never : .always)
+            #endif
     }
 
     /// The confirmed link's action: exactly what a `.known` (id-referenced) link would have done,
@@ -277,7 +288,9 @@ struct ContentView: View {
         if confirm.browse {
             libraryTarget = LibraryTarget(host: confirm.host, preset: confirm.preset)
         } else {
-            flow.connect(confirm.host, launchID: confirm.launch, preset: confirm.preset)
+            flow.connect(
+                confirm.host, launchID: confirm.launch, preset: confirm.preset,
+                profile: .ask(link: confirm.asProfile), fromLink: true)
         }
     }
 
@@ -292,7 +305,7 @@ struct ContentView: View {
                 sessionView
             }
             // The console stays mounted over the stream while its launch hold is up.
-            if model.connection == nil || consoleHoldsStream {
+            if owner.showsHome {
                 home
             }
         }
@@ -308,6 +321,7 @@ struct ContentView: View {
                     download: model.launchDownload,
                     sourceRect: hold.sourceRect,
                     onShow: { model.revealStream() })
+                    .overFlatPicture()
                     // Its own view per launch — a reused one keeps the last flight's state.
                     .id(hold.seq)
                     .transition(.asymmetric(insertion: .identity, removal: .opacity))
@@ -315,6 +329,13 @@ struct ContentView: View {
         }
         .animation(.easeInOut(duration: 0.3), value: model.launchHold)
         .onAppear {
+            // A plain connect the host parked for its operator gets the request-access wait.
+            let approval = $awaitingApproval
+            model.onAwaitingApproval = { host in
+                if approval.wrappedValue == nil {
+                    approval.wrappedValue = ApprovalRequest(host: host, advertisedFingerprint: nil)
+                }
+            }
             DemoMode.resume(in: store)
             autoConnectIfAsked()
             // An intent that ran before this window subscribed. Ahead of the start screen,
@@ -459,12 +480,6 @@ struct ContentView: View {
                 // A session actually started — remember it on the card ("Connected … ago"
                 // plus the accent ring on the most recent host).
                 guard let host = model.activeHost else { break }
-                // Delegated approval just succeeded: the operator let this device in, so pin the
-                // host's observed fingerprint and remember it as paired — future connects are then
-                // silent (rule 1), exactly like after a PIN/TOFU success. Dismisses the wait prompt.
-                let approvedFingerprint = awaitingApproval?.host.id == host.id
-                    ? model.connection?.hostFingerprint : nil
-                if awaitingApproval?.host.id == host.id { awaitingApproval = nil }
                 // The session's Welcome names the library's port without an mDNS advert, so a
                 // host reached by address over a VPN has one too. 0 is not advertised.
                 let liveMgmtPort = model.connection?.hostMgmtPort
@@ -472,13 +487,8 @@ struct ContentView: View {
                 // On the next run-loop turn: a store write inside `.onChange` publishes from
                 // within a view update.
                 DispatchQueue.main.async {
-                    store.markConnected(
-                        host.id, mgmtPort: liveMgmtPort, fingerprint: approvedFingerprint)
+                    store.markConnected(host.id, mgmtPort: liveMgmtPort)
                 }
-            case .idle:
-                // The delegated-approval connect failed, timed out, or was cancelled — drop the
-                // wait prompt (SessionModel surfaces any error via `errorMessage`).
-                if awaitingApproval != nil { awaitingApproval = nil }
             default:
                 break
             }
@@ -512,6 +522,11 @@ struct ContentView: View {
             guard note.object as AnyObject === model.connection else { return }
             model.toggleMicMute()
         }
+        // ⌃⌥⇧C, captured: the same rule.
+        .onReceive(NotificationCenter.default.publisher(for: .punktfunkToggleClipboard)) { note in
+            guard note.object as AnyObject === model.connection else { return }
+            model.toggleClipboardSync()
+        }
         #endif
         #if os(macOS)
         // Fullscreen from launch under Always, else only while a session is up (incl. the trust
@@ -521,6 +536,7 @@ struct ContentView: View {
             active: fullscreenAlways || (fullscreenForSession && model.connection != nil),
             stream: model.connection.map { CGSize(width: Int($0.width), height: Int($0.height)) },
             captured: model.mouseCaptured,
+            spansDisplays: model.connection?.showsScreens == true,
             isFullscreen: $isFullscreen, appDriven: $appDrivenFullscreen, edge: fullscreenEdge))
         #endif
         // A game launched from the library just exited, so the session ended on purpose: put the
@@ -570,14 +586,14 @@ struct ContentView: View {
 
     private var deepLinkNoticePresented: Binding<Bool> {
         Binding(
-            get: { deepLinkNotice != nil && !consoleOwnsScreen },
+            get: { deepLinkNotice != nil && !owner.consoleOwnsScreen },
             set: { if !$0 { deepLinkNotice = nil } })
     }
 
     /// Down while the console is up: it asks the same question in a way a pad can answer.
     private var deepLinkConfirmPresented: Binding<Bool> {
         Binding(
-            get: { deepLinkConfirm != nil && !consoleOwnsScreen },
+            get: { deepLinkConfirm != nil && !owner.consoleOwnsScreen },
             set: { if !$0 { deepLinkConfirm = nil } })
     }
 
@@ -640,44 +656,42 @@ struct ContentView: View {
     /// macOS has no shell, so the sheet stays and switches its CONTENT by mode instead.
     private var touchPairingTarget: Binding<StoredHost?> {
         #if os(macOS)
-        Binding(get: { consoleOwnsScreen ? nil : pairingTarget }, set: { pairingTarget = $0 })
+        Binding(
+            get: { owner.consoleOwnsScreen ? nil : pairingTarget },
+            set: { pairingBinding.wrappedValue = $0 })
         #else
         Binding(
             get: { gamepadUIActive ? nil : pairingTarget },
-            set: { pairingTarget = $0 })
+            set: { pairingBinding.wrappedValue = $0 })
         #endif
+    }
+
+    /// `pairingTarget` for every pair screen: closing one drops a link's waiting connect, so a
+    /// cancelled link never streams after a later pairing of the same host.
+    private var pairingBinding: Binding<StoredHost?> {
+        Binding(
+            get: { pairingTarget },
+            set: {
+                pairingTarget = $0
+                if $0 == nil { pairThen = nil }
+            })
     }
 
     private var approvalChoicePresented: Binding<Bool> {
         Binding(
-            get: { approvalChoice != nil && !consoleOwnsScreen },
+            get: { approvalChoice != nil && !owner.consoleOwnsScreen },
             set: { if !$0 { approvalChoice = nil } })
     }
 
     private var awaitingApprovalPresented: Binding<Bool> {
         Binding(
-            get: { awaitingApproval != nil && !consoleOwnsScreen },
+            get: { awaitingApproval != nil && !owner.consoleOwnsScreen },
             set: { if !$0 { awaitingApproval = nil } })
-    }
-
-    /// Whether the "Connection failed" alert is ready to be shown at all (see the macOS
-    /// deferral below).
-    private var connectionErrorReady: Bool {
-        guard model.errorMessage != nil else { return false }
-        #if os(macOS)
-        // Defer the alert while a forced-fullscreen exit is still pending: a sheet attached to a
-        // fullscreen window makes AppKit drop `-toggleFullScreen:`, so presenting it now strands
-        // the window fullscreen on the home screen after a session error. Gated on a fullscreen
-        // WE drove, never on the setting: a window the user fullscreened themselves is never
-        // going to flip back, so the same gate would swallow the failure forever.
-        if appDrivenFullscreen && isFullscreen { return false }
-        #endif
-        return true
     }
 
     private var connectionErrorPresented: Binding<Bool> {
         Binding(
-            get: { connectionErrorReady && !consoleOwnsScreen },
+            get: { owner.showsError },
             set: { if !$0 { model.errorMessage = nil } })
     }
 
@@ -771,9 +785,12 @@ struct ContentView: View {
             break // deep-linked to the host we're already on — nothing to do
         case .confirm(let host, let selection):
             deepLinkConfirm = DeepLinkConfirm(
-                host: host, launch: link.launch, preset: selection, browse: false)
+                host: host, launch: link.launch, preset: selection, browse: false,
+                asProfile: link.asProfile)
         case .proceed(let host, let selection):
-            flow.connect(host, launchID: link.launch, preset: selection)
+            flow.connect(
+                host, launchID: link.launch, preset: selection,
+                profile: .ask(link: link.asProfile), fromLink: true)
         }
     }
 
@@ -818,13 +835,13 @@ struct ContentView: View {
             // Never while the console owns the screen: disabling its view would stop the very
             // input it draws the connect card for.
             .disabled(
-                !consoleOwnsScreen
+                !owner.consoleOwnsScreen
                     && (connectingOverlayName != nil || waker.waking != nil
                         || model.launchHold != nil))
             #endif
             .overlay {
                 // The console draws its own dial, wake wait and launch hold.
-                if !consoleOwnsScreen {
+                if !owner.consoleOwnsScreen {
                     ConnectOverlay(
                         connectingHostName: connectingOverlayName,
                         waker: waker,
@@ -837,6 +854,8 @@ struct ContentView: View {
     /// during the delegated-approval wait (that has its own "Waiting for approval" prompt, so the
     /// takeover must not stack over it) and, of course, when idle or streaming.
     private var connectingOverlayName: String? {
+        // A lost session waiting out its redial keeps the takeover between its dials.
+        if model.phase == .idle, let redial = model.redial { return redial.host.displayName }
         // A launch dial has the launch hold instead — that says which GAME is coming, and stacking
         // "Connecting to <host>" on top of it would be two takeovers for one act.
         guard awaitingApproval == nil, model.launchHold == nil,
@@ -855,14 +874,15 @@ struct ContentView: View {
                     store: store, selection: $macDestination,
                     hosts: HomeView(
                         store: store, model: model, discovery: discovery,
-                        showAddHost: $showAddHost, pairingTarget: $pairingTarget,
+                        showAddHost: $showAddHost, pairingTarget: pairingBinding,
                         speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
                         connect: { flow.connect($0, preset: $1) },
                         connectDiscovered: flow.connectDiscovered,
                         onPaired: handlePaired, onLaunchTitle: launchTitle,
                         onConnectShelf: connectFromShelf, wake: { flow.wakeOnly($0) }),
                     onLaunch: launchTitle, onConnectShelf: connectFromShelf,
-                    onConnectHost: { flow.connect($0, preset: .inherit, fromLibrary: true) })
+                    onConnectHost: { flow.connect($0, preset: .inherit, fromLibrary: true) },
+                    wake: { flow.wakeOnly($0, onOnline: $1) })
                 // On appear too: `returnToLibrary` writes the shelf while the stream is still up.
                 .onAppear(perform: showShelfInSidebar)
                 .onChange(of: libraryTarget) { _, _ in showShelfInSidebar() }
@@ -890,14 +910,15 @@ struct ContentView: View {
     private var console: some View {
         ConsoleHomeView(
             store: store, model: model, discovery: discovery, waker: waker,
-            entry: $libraryTarget, notice: $deepLinkNotice, pairing: $pairingTarget,
+            entry: $libraryTarget, notice: $deepLinkNotice, pairing: pairingBinding,
             linkConfirm: $deepLinkConfirm, runLink: runDeepLinkConfirm,
             onFailed: { consoleFailed = true }, onPaired: handlePaired,
-            connect: { flow.connect($0, preset: $1) }, connectDiscovered: flow.connectDiscovered,
+            connect: { flow.connect($0, preset: $1, profile: .send($2)) },
+            connectDiscovered: flow.connectDiscovered,
             requestAccess: flow.consoleRequestAccess,
             requestAccessDiscovered: flow.requestAccessDiscovered,
-            launchTitle: launchTitle, connectShelf: connectFromShelf,
-            wakeOnly: { flow.wakeOnly($0) })
+            launchTitle: { launch($0, $1, profile: .send($2)) }, connectShelf: connectFromShelf,
+            wakeOnly: { flow.wakeOnly($0) }, awaitingApproval: awaitingApproval != nil)
     }
 
     #if !os(macOS)
@@ -905,7 +926,7 @@ struct ContentView: View {
     private var touchHome: some View {
         HomeView(
             store: store, model: model, discovery: discovery,
-            showAddHost: $showAddHost, pairingTarget: $pairingTarget,
+            showAddHost: $showAddHost, pairingTarget: pairingBinding,
             speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
             showSettings: $showSettings,
             connect: { flow.connect($0, preset: $1) }, connectDiscovered: flow.connectDiscovered,
@@ -961,7 +982,7 @@ struct ContentView: View {
         LibraryTabView(
             store: store, onLaunch: launchTitle, onConnectShelf: connectFromShelf,
             onConnectHost: { flow.connect($0, preset: .inherit, fromLibrary: true) },
-            showHosts: { touchTab = .hosts })
+            showHosts: { touchTab = .hosts }, wake: { flow.wakeOnly($0, onOnline: $1) })
     }
     #endif
 
@@ -973,7 +994,10 @@ struct ContentView: View {
             return nil
         }()
         return ZStack {
-            stream(captureEnabled: pendingFingerprint == nil && !consoleHoldsStream)
+            StreamScene(
+                model: model, ring: ring,
+                captureEnabled: owner.streamTakesInput,
+                statsVerbosity: statsVerbosity, showTouchExit: $showTouchExit)
                 // Blur the live stream during the trust prompt (heavy) and during a resize (lighter
                 // — the deliberate "hold on" while the host rebuilds its pipeline and the decoder
                 // re-inits on the new-mode IDR). Only the resize blur animates; the trust blur snaps
@@ -982,7 +1006,7 @@ struct ContentView: View {
                 .animation(.easeInOut(duration: 0.22), value: model.resizing)
                 .overlay {
                     if pendingFingerprint != nil {
-                        Color.black.opacity(0.45)
+                        Color.black.opacity(0.45).overFlatPicture()
                     }
                 }
                 // The resize spinner rides over the (blurred) stream; suppressed under the trust
@@ -996,6 +1020,7 @@ struct ContentView: View {
                 .overlay {
                     if pendingFingerprint == nil, model.resizing {
                         ResizeIndicatorView(active: true)
+                            .overFlatPicture()
                             .transition(.opacity.combined(with: .scale(scale: 0.92)))
                     }
                 }
@@ -1015,6 +1040,7 @@ struct ContentView: View {
                         model.rejectTrust()
                         pairingTarget = host
                     })
+                    .overFlatPicture()
             }
         }
         #if os(macOS)
@@ -1044,246 +1070,6 @@ struct ContentView: View {
         #endif
     }
 
-    private func stream(captureEnabled: Bool) -> some View {
-        let placement = HUDPlacement(rawValue: hudPlacement) ?? .topTrailing
-        return Group {
-            if let conn = model.connection {
-                StreamView(
-                    connection: conn,
-                    captureEnabled: captureEnabled,
-                    onCaptureChange: { [weak model] captured in
-                        model?.mouseCaptured = captured
-                        #if os(visionOS)
-                        // The window that takes the keyboard takes the controllers too.
-                        if captured { model?.claimControllers() }
-                        #endif
-                    },
-                    onDisconnectRequest: { [weak model] in
-                        model?.disconnect() // the captured-state ⌃⌥⇧D combo
-                    },
-                    onDial: dialSink,
-                    onFrame: { [meter = model.meter, queue = model.clientQueue] au in
-                        meter.note(byteCount: au.data.count)
-                        // Receipt and the host split are the core's; the client-queue wait
-                        // (receipt → pull, both client-local) is Apple's own overlay line.
-                        queue.record(
-                            ptsNs: UInt64(bitPattern: au.receivedNs), atNs: au.pulledNs,
-                            offsetNs: 0)
-                    },
-                    onSessionEnd: { [weak model] in
-                        Task { @MainActor in model?.sessionEnded() }
-                    },
-                    // Resize overlay START — the follower is main-actor, so this drives the blur
-                    // + spinner synchronously the instant the window differs from the live mode.
-                    onResizeTarget: { [weak model] w, h in
-                        model?.resizeTargeted(width: w, height: h)
-                    },
-                    // Resize overlay END — the coded dims of each new-mode IDR, reported from the
-                    // decode pump thread; hop to the main actor to clear the overlay.
-                    onDecodedSize: { [weak model] w, h in
-                        Task { @MainActor in model?.resizeDecoded(width: w, height: h) }
-                    },
-                    endToEndMeter: model.endToEnd
-                )
-                #if os(visionOS)
-                .theater(TheaterStage.shared.renderers(for: conn))
-                .overlay {
-                    if TheaterStage.shared.renderers(for: conn) != nil { InTheaterPlaceholder() }
-                }
-                .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
-                    StreamOrnament(connection: conn, quickActions: { ring.toggleCentred() })
-                }
-                #endif
-                .overlay(alignment: placement.alignment) {
-                    // The stats overlay MORPHS between tiers and SCALES UP on enter. With no `.id`, a
-                    // verbosity change keeps the same StreamHUDView identity, so its one shared glass
-                    // card animates its frame/shape to the new tier (a morph) instead of cross-fading a
-                    // fresh card in. The `.transition` therefore fires only on the off↔on boundary — a
-                    // scale-up (0.8→1) from the HUD's own corner. The ZStack is the stable host the
-                    // `.animation` watches as the child enters/leaves and morphs.
-                    ZStack {
-                        if captureEnabled && statsVerbosity != .off {
-                            StreamHUDView(
-                                model: model, connection: conn, placement: placement,
-                                verbosity: statsVerbosity,
-                                scale: Double(min(max(statsScalePct, 75), 200)) / 100)
-                                .transition(
-                                    .scale(scale: 0.8, anchor: placement.unitPoint)
-                                        .combined(with: .opacity))
-                        }
-                    }
-                    .animation(.smooth(duration: 0.28), value: statsVerbosity)
-                }
-                .overlay(alignment: .bottom) {
-                    StreamBadgeStack(
-                        model: model, captureEnabled: captureEnabled, statsVerbosity: statsVerbosity)
-                }
-                #if os(iOS) || os(visionOS)
-                // Touch has no menu or ⌘D: while the HUD shows no Disconnect (compact, off) a
-                // corner disc opens the ring. Off drops it after 8 s, since any overlay above the
-                // stream costs ~a refresh of latency; compact composites a pill anyway. The
-                // virtual controller carries its own ring button, so the discs leave while it is up.
-                .overlay(alignment: .topLeading) {
-                    if captureEnabled, !model.virtualPadShown,
-                       statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
-                        HStack(spacing: 10) {
-                            // Opens the quick-action ring (End stream is a slot inside, behind
-                            // a two-press arm), keeping the disc's fade rules.
-                            Button {
-                                ring.pressTick &+= 1
-                                ring.openAt(CGPoint(x: 30, y: 30))
-                            } label: { touchDisc("ellipsis.circle") }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Quick actions")
-                            // The mic toggle rides the same discs, for the same reason: in these
-                            // tiers the HUD carries no buttons (compact is a stat pill, off is
-                            // nothing), so this is a touch-only user's ONLY way to mute. Absent —
-                            // not greyed — when the session sends no microphone at all.
-                            if model.micAvailable {
-                                Button { model.toggleMicMute() } label: {
-                                    touchDisc(model.micMuted ? "mic.slash.fill" : "mic.fill")
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel(
-                                    model.micMuted ? "Unmute microphone" : "Mute microphone")
-                            }
-                        }
-                        .padding(12)
-                        .transition(.opacity)
-                        .task {
-                            guard statsVerbosity == .off else { return }
-                            try? await Task.sleep(for: .seconds(8))
-                            withAnimation(.easeOut(duration: 0.6)) { showTouchExit = false }
-                        }
-                    }
-                }
-                // The virtual controller: above the stream's touch surface, so its controls take
-                // their fingers first and every other finger falls through; below the ring, whose
-                // scrim owns every finger while it is up. Mounted only while shown (tenet 1).
-                .overlay {
-                    if captureEnabled, model.virtualPadShown, let pad = model.virtualPad {
-                        VirtualPadLayer(config: OverlayConfig.parse(model.settings.overlayActions).pad,
-                                        wire: pad, openRing: { [ring] at in ring.openAt(at) })
-                    }
-                }
-                #endif
-                // The quick-action ring, over the virtual controller: opened by the iOS twist or
-                // disc, the pad's ring button, the remote's Back, the Mac's chord or the Vision
-                // Pro's ornament. Mounted only while open — a closed overlay costs nothing.
-                .overlay {
-                    if captureEnabled, ring.visible {
-                        RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn))
-                    }
-                }
-                .onChange(of: ring.committed) { _, open in
-                    model.setRingOpen(open)
-                    #if os(macOS)
-                    // The Mac's pointer is grabbed while streaming, so the stream layer hands it
-                    // back for as long as the ring is up (nothing else can click a button above
-                    // the video) and takes it again on close.
-                    NotificationCenter.default.post(
-                        name: .punktfunkRingOpen, object: NSNumber(value: open))
-                    #endif
-                }
-                #if !os(tvOS)
-                // ⌃⌥⇧O from InputCapture: the Mac's while captured, the iPad's in both states. It
-                // names its session; the Stream menu's item goes through `sessionFocus` instead.
-                .onReceive(NotificationCenter.default.publisher(
-                    for: .punktfunkToggleQuickActions
-                )) { note in
-                    guard captureEnabled, model.phase == .streaming,
-                          note.object as AnyObject === conn else { return }
-                    ring.toggleCentred()
-                }
-                #endif
-            }
-        }
-    }
-
-    #if os(iOS) || os(visionOS)
-    /// The two-finger twist → the ring. Nil on the platforms without a twist.
-    private var dialSink: ((DialEvent) -> Void)? { { [ring] event in ring.handle(event) } }
-    #endif
-
-    #if os(iOS) || os(visionOS) || os(tvOS) || os(macOS)
-    /// The session's live state and commands behind each ring slot.
-    private func ringActions(_ conn: PunktfunkConnection) -> RingActions {
-        RingActions(
-            endStream: { [weak model] in model?.disconnect() },
-            disconnectLinger: { [weak model] in model?.disconnect(deliberate: false) },
-            touchMode: { TouchInputMode.current(conn.settings) },
-            cycleTouchMode: {
-                // Passthrough is skipped toward a host that drops contacts (§5.4).
-                let order = TouchInputMode.allCases.filter { $0 != .touch || conn.hostSupportsTouch }
-                let i = order.firstIndex(of: TouchInputMode.current(conn.settings)) ?? 0
-                TouchInputMode.sessionOverride = order[(i + 1) % order.count]
-            },
-            keyboard: { NotificationCenter.default.post(name: .punktfunkToggleSoftKeyboard, object: conn) },
-            stats: { [model] in model.statsVerbosity },
-            cycleStats: { [model] in model.cycleStats() },
-            micAvailable: { [model] in model.micAvailable },
-            micMuted: { [model] in model.micMuted },
-            toggleMic: { [model] in model.toggleMicMute() },
-            hostActions: { [model] in model.activeHost.map { HostPowerStore.shared.actions(for: $0) } ?? [] },
-            invokeHost: { [model] action in
-                guard let host = model.activeHost else { return }
-                Task { _ = await HostPowerStore.shared.invoke(action, on: host) }
-            },
-            sendShortcut: { keys in
-                let vks = keys.compactMap(keyVk)
-                guard vks.count == keys.count, !vks.isEmpty else { return }
-                for vk in vks { conn.send(.key(vk, down: true)) }
-                for vk in vks.reversed() { conn.send(.key(vk, down: false)) }
-            },
-            padAvailable: { [model] in model.virtualPadAvailable },
-            padShown: { [model] in model.virtualPadShown },
-            togglePad: { [model] in model.toggleVirtualPad() },
-            tapPadButton: { [model] bit in model.tapPadButton(bit) },
-            pointerGranted: { conn.canSendPointer },
-            padMouseTarget: { [ring] in Self.padMouseTarget(ring, conn) },
-            padMouseMode: { [ring] in conn.padMouseMode(Self.padMouseTarget(ring, conn)) },
-            cyclePadMouse: { [ring] in conn.cyclePadMouse(Self.padMouseTarget(ring, conn)) },
-            currentMode: {
-                let m = conn.currentMode()
-                return (m.width, m.height, m.refreshHz)
-            },
-            requestMode: { w, h, hz in conn.requestMode(width: w, height: h, refreshHz: hz) },
-            scrollInverted: { [model] in model.settings.invertScroll },
-            toggleScrollInversion: { [model] in model.setInvertScroll(!model.settings.invertScroll) },
-            streamedGame: { [model] in model.streamedGame },
-            endGame: { [weak model] in model?.endStreamedGame() })
-    }
-    #endif
-    #if os(iOS) || os(visionOS) || os(tvOS) || os(macOS)
-    /// The wire pads the controller-mouse toggle acts on: the ring's opener, else every live pad.
-    private static func padMouseTarget(_ ring: RingState, _ conn: PunktfunkConnection) -> UInt16 {
-        guard let pad = ring.opener else { return conn.livePads }
-        return pad < 16 ? 1 << pad : 0
-    }
-    #endif
-    #if !os(iOS) && !os(visionOS)
-    private var dialSink: ((DialEvent) -> Void)? { nil }
-    #endif
-
-    #if os(iOS) || os(visionOS)
-    /// One touch-control disc: an SF Symbol on a floating glass disc over the frame (26+,
-    /// material fallback), sized as a comfortable tap target. `interactive`: the disc IS the tap
-    /// target, so the glass reacts to press, and the hit region is matched to the visible disc so
-    /// every tap triggers that press highlight.
-    private func touchDisc(_ symbol: String) -> some View {
-        Image(systemName: symbol)
-            .font(.headline.weight(.semibold))
-            .frame(width: 36, height: 36)
-            .glassBackground(Circle(), interactive: true)
-            .contentShape(Circle())
-    }
-    #endif
-
-    // The two `shortcutHintText` strings that used to live here — one per platform, told once per
-    // session by the banner above — are now `ShortcutsCatalog.groups`, which both About pages
-    // render. The mic line is still conditional there for the same reason it was here: teaching a
-    // shortcut for a microphone that isn't on would be a lie.
-
     // MARK: - Connect
 
     /// The connect, trust and wake flow over this window's model, stores and prompts.
@@ -1291,7 +1077,7 @@ struct ContentView: View {
         ConnectFlow(
             model: model, store: store, presets: presets, discovery: discovery, waker: waker,
             autoWake: $autoWakeEnabled, approvalChoice: $approvalChoice,
-            awaitingApproval: $awaitingApproval)
+            awaitingApproval: $awaitingApproval, profileAsk: $profileAsk, seatWait: $seatWait)
     }
 
     /// A title picked on a library shelf: dial its host, booting straight into that title — with
@@ -1299,8 +1085,12 @@ struct ContentView: View {
     /// launch made there streams with the preset the card promises; the host's own shelf carries
     /// `.inherit` and the binding decides, exactly as a plain card tap does.
     private func launchTitle(_ shelf: LibraryTarget, _ id: String) {
+        launch(shelf, id, profile: .ask())
+    }
+
+    private func launch(_ shelf: LibraryTarget, _ id: String, profile: ConnectFlow.ProfileChoice) {
         libraryTarget = nil
-        flow.connect(shelf.host, launchID: id, preset: shelf.preset)
+        flow.connect(shelf.host, launchID: id, preset: shelf.preset, profile: profile)
     }
 
     /// A shelf's own Connect / Resume: dial its host launching NOTHING. The host is already
@@ -1314,14 +1104,17 @@ struct ContentView: View {
         flow.connect(shelf.host, preset: shelf.preset, fromLibrary: true)
     }
 
-    /// Pairing ceremony succeeded — pin the host and connect. The guard backstops a stale
-    /// ceremony surfacing after dismissal (PairSheet also self-discards those).
+    /// Pairing ceremony succeeded — pin the host. Only a link's pairing goes on to stream;
+    /// otherwise the next tap does. The guard backstops a stale ceremony surfacing after
+    /// dismissal (PairSheet also self-discards those).
     private func handlePaired(_ host: StoredHost, fingerprint: Data) {
         guard pairingTarget?.id == host.id else { return }
         store.pin(host.id, fingerprint: fingerprint)
+        guard let then = pairThen else { return }
+        pairThen = nil
         var pinned = host
         pinned.pinnedSHA256 = fingerprint
-        flow.connect(pinned)
+        then(pinned)
     }
 
     // MARK: - First-run + dev hooks
@@ -1395,6 +1188,11 @@ struct ContentView: View {
         if let kbps = ProcessInfo.processInfo.environment["PUNKTFUNK_BITRATE_KBPS"],
            let v = Int(kbps) {
             effective.bitrateKbps = v
+        }
+        // PUNKTFUNK_HDR=1|0: the global HDR switch is the only one a record-less connect
+        // sees, so an unattended HDR run needs this.
+        if let hdr = ProcessInfo.processInfo.environment["PUNKTFUNK_HDR"] {
+            effective.hdrEnabled = hdr == "1"
         }
         model.connect(to: host, effective: effective, gamepad: pad, autoTrust: true)
         #endif

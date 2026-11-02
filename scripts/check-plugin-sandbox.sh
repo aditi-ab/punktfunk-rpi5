@@ -134,7 +134,7 @@ want "netlink is refused"                netlink     refused
 want "kernel tunables are read-only"     tunables    EROFS
 
 echo "== the capability probe agrees with reality"
-if grep -q 'cannot be sandboxed' "$LOG"; then
+if grep -q "can't be sandboxed" "$LOG"; then
   echo "  FAIL the probe called this box incapable while the sandbox worked"; fail=$((fail+1))
 else echo "  ok   the probe called this box capable"; pass=$((pass+1)); fi
 

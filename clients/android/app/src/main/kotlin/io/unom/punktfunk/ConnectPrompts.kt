@@ -24,6 +24,8 @@ import io.unom.punktfunk.models.PendingTrust
 internal fun ConnectPrompts(
     /** The client identity — the PIN ceremony needs it to run SPAKE2; null while it is still minting. */
     identity: ClientIdentity?,
+    /** Runs the PIN ceremony. */
+    services: HostServices,
     presets: List<StreamPreset>,
     isOnline: (KnownHost) -> Boolean,
     // ---- trust / pairing --------------------------------------------------------------------
@@ -52,8 +54,6 @@ internal fun ConnectPrompts(
     /** true = write the measured bitrate to the preset, false = to the global default. */
     onApplySpeedTest: (Boolean) -> Unit,
     onDismissSpeedTest: () -> Unit,
-    /** The delivery profile a finding offered, to remember on the tested host's record. */
-    onUsePacedDelivery: (Int) -> Unit,
     // ---- edit host ---------------------------------------------------------------------------
     editTarget: KnownHost?,
     /** A MAC from the live advert, for a host whose own is not learned yet. */
@@ -89,7 +89,7 @@ internal fun ConnectPrompts(
             )
             PendingTrust.Kind.PAIR -> {
                 val onSavePaired = { fp: String -> onPaired(pt, fp) }
-                PairPinDialog(pt, identity, onSavePaired) { onPendingTrustChange(null) }
+                PairPinDialog(pt, services, identity, onSavePaired) { onPendingTrustChange(null) }
             }
         }
     }
@@ -110,7 +110,6 @@ internal fun ConnectPrompts(
         SpeedTestPrompt(
             speedTest.host.name, speedTestTarget, speedTestPhase,
             onApplySpeedTest, onDismissSpeedTest,
-            onUsePacedDelivery = onUsePacedDelivery,
         )
     }
 

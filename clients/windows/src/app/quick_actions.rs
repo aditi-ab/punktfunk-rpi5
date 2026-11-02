@@ -13,12 +13,15 @@
 use super::lucide;
 use super::settings::{active_preset, commit};
 use super::style::*;
-use super::AppCtx;
+use super::{AppCtx, AsyncSetState};
 use pf_client_core::overlay_actions::{
     catalogue, chord_chip, key_legend, slot_icon, Chord, OverlayConfig, RingPlatform, Shortcut,
     SlotId, CHORD_MODIFIERS, KEY_GRID, RING_SLOTS,
 };
 use pf_client_core::ring::{slot_offset, CENTRE_DIAMETER, RING_RADIUS, SLOT_DIAMETER};
+use pf_fluent::Palette;
+use punktfunk_core::input::key_vk;
+use std::rc::Rc;
 use std::sync::Arc;
 use windows_reactor::*;
 
@@ -42,19 +45,25 @@ const CLOCK: [&str; RING_SLOTS] = [
     "10 o'clock",
 ];
 
-/// What the settings page hands the editor: the app, the scope being edited, and the revision
-/// counter every commit bumps (the page repaints on it).
+/// What the settings page hands the editor: the app, its palette, the scope being edited, the
+/// revision counter every commit bumps (the page repaints on it) and the status line a failed
+/// save lands on.
 #[derive(Clone)]
 pub(super) struct Props {
     pub ctx: Arc<AppCtx>,
+    pub pal: Palette,
     pub scope: String,
     pub rev: u64,
     pub set_rev: AsyncSetState<u64>,
+    pub set_status: AsyncSetState<String>,
 }
 
 impl PartialEq for Props {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.ctx, &other.ctx) && self.scope == other.scope && self.rev == other.rev
+        Arc::ptr_eq(&self.ctx, &other.ctx)
+            && self.pal == other.pal
+            && self.scope == other.scope
+            && self.rev == other.rev
     }
 }
 
@@ -96,7 +105,7 @@ impl Draft {
 /// carry in progress, a shortcut being edited, whether the next chord on the keyboard is being
 /// captured, and whether the reset has been armed by a first press.
 #[derive(Clone, PartialEq, Default)]
-struct Ui {
+pub(super) struct Ui {
     selected: Option<usize>,
     hover: Option<usize>,
     drag: Option<Drag>,
@@ -121,7 +130,9 @@ fn write(props: &Props, cfg: &OverlayConfig) {
     commit(
         &props.ctx,
         &props.scope,
+        "overlay_actions",
         (props.rev, &props.set_rev),
+        &props.set_status,
         move |s| {
             s.overlay_actions = blob;
         },
@@ -143,6 +154,7 @@ fn short_label(cfg: &OverlayConfig, slot: &SlotId) -> String {
         SlotId::Guide => "Guide".into(),
         SlotId::Qam => "QAM".into(),
         SlotId::PadMouse => "Mouse".into(),
+        SlotId::PadType => "Pad type".into(),
         SlotId::StreamMute => "Mute".into(),
         SlotId::SwapScreens => "Swap".into(),
         SlotId::Host(_) => "Power".into(),
@@ -181,106 +193,84 @@ fn disc_at(x: f64, y: f64) -> Option<usize> {
 
 // ---- keys ----
 
-/// The virtual key a chord name stands for, for the capture accelerators.
-fn virtual_key(name: &str) -> Option<VirtualKey> {
-    Some(match name {
-        "escape" => VirtualKey::Escape,
-        "tab" => VirtualKey::Tab,
-        "space" => VirtualKey::Space,
-        "enter" => VirtualKey::Enter,
-        "backspace" => VirtualKey::Back,
-        "delete" => VirtualKey::Delete,
-        "insert" => VirtualKey::Insert,
-        "home" => VirtualKey::Home,
-        "end" => VirtualKey::End,
-        "pageup" => VirtualKey::PageUp,
-        "pagedown" => VirtualKey::PageDown,
-        "up" => VirtualKey::Up,
-        "down" => VirtualKey::Down,
-        "left" => VirtualKey::Left,
-        "right" => VirtualKey::Right,
-        "printscreen" => VirtualKey::Snapshot,
-        "pause" => VirtualKey::Pause,
-        "capslock" => VirtualKey::CapitalLock,
-        n => {
-            let b = n.as_bytes();
-            return match b {
-                [c @ b'a'..=b'z'] => Some(VirtualKey((VirtualKey::A.0) + (c - b'a') as i32)),
-                [c @ b'0'..=b'9'] => Some(VirtualKey((VirtualKey::Number0.0) + (c - b'0') as i32)),
-                [b'f', rest @ ..] if !rest.is_empty() => n[1..]
-                    .parse::<i32>()
-                    .ok()
-                    .filter(|f| (1..=12).contains(f))
-                    .map(|f| VirtualKey(VirtualKey::F1.0 + f - 1)),
-                _ => None,
-            };
-        }
-    })
-}
-
-/// The modifier combinations the capture listens for — Ctrl, Alt and Shift in every mix. The
-/// Windows key is the toggle's: the shell never sees a chord that Windows itself owns.
-fn modifier_masks() -> [u32; 8] {
-    let (c, m, s) = (
-        VirtualKeyModifiers::Control.0,
-        VirtualKeyModifiers::Menu.0,
-        VirtualKeyModifiers::Shift.0,
-    );
-    [0, c, m, s, c | m, c | s, m | s, c | m | s]
-}
-
-fn mods_of(mask: u32) -> [bool; 4] {
+/// A key event's Ctrl, Alt and Shift as a chord's modifier row. The Windows key is the
+/// toggle's: the shell never sees a chord that Windows itself owns.
+fn mods_of(m: InputModifiers) -> [bool; 4] {
     [
-        mask & VirtualKeyModifiers::Control.0 != 0,
-        mask & VirtualKeyModifiers::Menu.0 != 0,
-        mask & VirtualKeyModifiers::Shift.0 != 0,
+        m.contains(InputModifiers::CONTROL),
+        m.contains(InputModifiers::ALT),
+        m.contains(InputModifiers::SHIFT),
         false,
     ]
 }
 
+/// The grid key a pressed virtual key is, by the VK the session injects for each name.
+fn grid_key(vk: u32) -> Option<&'static str> {
+    KEY_GRID
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .find(|name| key_vk(name).map(u32::from) == Some(vk))
+}
+
 // ---- the section ----
 
-/// The Quick actions section: the ring, its picker, the shortcuts and their editor.
-pub(super) fn quick_actions_section(props: &Props, cx: &mut RenderCx) -> Element {
-    let (ui, set_ui) = cx.use_state(Ui::default());
-    let cfg = current(props);
-    let mut parts: Vec<Element> = vec![
-        text_block(
-            "Click a button to change it, or drag one onto another to swap the two. \
-             Ctrl+Alt+Shift+O, a two-finger twist or Select+A opens this dial in a stream.",
-        )
-        .font_size(12.0)
-        .foreground(ThemeRef::SecondaryText)
-        .wrap()
-        .max_width(560.0)
-        .horizontal_alignment(HorizontalAlignment::Left)
-        .into(),
-        ring(props, &cfg, &ui, &set_ui),
-        ring_label(&cfg, &ui),
-        legend_row(props, &cfg, &ui, &set_ui),
-    ];
-    if let Some(k) = ui.selected {
-        parts.push(picker(props, &cfg, k, &ui, &set_ui));
+/// Where the editor sends its next state.
+type SetUi = Callback<Ui>;
+
+/// The Quick actions section: the ring, its picker, the shortcuts and their editor. Its
+/// message is the editor's whole next state.
+pub(super) struct QuickActions {
+    ui: Ui,
+}
+
+impl Component for QuickActions {
+    type Input = Props;
+    type Message = Ui;
+
+    fn create(_props: &Props, _cx: &ComponentContext<Self>) -> Self {
+        QuickActions { ui: Ui::default() }
     }
-    parts.push(match &ui.draft {
-        Some(d) => shortcut_editor(props, &cfg, d, &ui, &set_ui),
-        None => shortcuts(props, &cfg, &ui, &set_ui),
-    });
-    vstack(parts).spacing(14.0).into()
+
+    fn update(&mut self, ui: Ui, _cx: &ComponentContext<Self>) {
+        self.ui = ui;
+    }
+
+    fn view(&self, props: &Props, cx: &mut ViewContext<'_, Self>) -> View {
+        let (ui, set_ui) = (&self.ui, &cx.forward());
+        let cfg = current(props);
+        let mut parts: Vec<View> = vec![
+            muted(
+                &props.pal,
+                "Click a button to change it, or drag one onto another to swap the two. \
+                 Ctrl+Alt+Shift+O, a two-finger twist or Select+A opens this dial in a stream.",
+            )
+            .font_size(12.0)
+            .text_wrapping(TextWrapping::Wrap)
+            .max_width(560.0)
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .into(),
+            ring(props, &cfg, ui, set_ui),
+            ring_label(&cfg, ui),
+            legend_row(&cfg, ui, set_ui),
+        ];
+        if let Some(k) = ui.selected {
+            parts.push(picker(props, &cfg, k, ui, set_ui));
+        }
+        parts.push(match &ui.draft {
+            Some(d) => shortcut_editor(props, &cfg, d, ui, set_ui),
+            None => shortcuts(props, &cfg, ui, set_ui),
+        });
+        vstack(parts).spacing(14.0).into()
+    }
 }
 
 /// A disc's Lucide mark, as a glyph of the icon font at exactly `size`. Not [`lucide::icon`]:
 /// that hands the mark to a control to size and tint, and a disc is neither — it is our own
 /// dark surface on both themes, so the ink is white whatever the theme says, and the size is
 /// the ring's geometry rather than a button's. `dim` is the unavailable slot, faded not hidden.
-fn mark(name: &str, size: f64, dim: bool) -> Element {
-    let ink = Color {
-        a: if dim { 100 } else { 242 },
-        r: 255,
-        g: 255,
-        b: 255,
-    };
-    text_block(lucide::glyph(name))
+fn mark(name: &str, size: f64, dim: bool) -> View {
+    let ink = Color::argb(if dim { 100 } else { 242 }, 255, 255, 255);
+    text(lucide::glyph(name))
         .font_family(lucide::FAMILY)
         .font_size(size)
         .foreground(ink)
@@ -293,22 +283,8 @@ fn mark(name: &str, size: f64, dim: bool) -> Element {
 /// from the SHARED slot table, so a disc here carries exactly what the in-stream ring draws for
 /// the same slot. Only an id the table cannot know — an unknown host action, a future slot —
 /// falls back to its short word, which is what the console does too.
-fn disc_face(cfg: &OverlayConfig, slot: Option<&SlotId>, dim: bool) -> Element {
-    let ink = if dim {
-        Color {
-            a: 100,
-            r: 255,
-            g: 255,
-            b: 255,
-        }
-    } else {
-        Color {
-            a: 242,
-            r: 255,
-            g: 255,
-            b: 255,
-        }
-    };
+fn disc_face(cfg: &OverlayConfig, slot: Option<&SlotId>, dim: bool) -> View {
+    let ink = Color::argb(if dim { 100 } else { 242 }, 255, 255, 255);
     let Some(slot) = slot else {
         return mark("plus", ICON_DIP * 0.8, true);
     };
@@ -319,9 +295,9 @@ fn disc_face(cfg: &OverlayConfig, slot: Option<&SlotId>, dim: bool) -> Element {
     if let Some(name) = slot_icon(&slot.id(), "") {
         return mark(name, ICON_DIP, dim);
     }
-    text_block(short_label(cfg, slot))
+    text(short_label(cfg, slot))
         .font_size(12.0)
-        .semibold()
+        .font_weight(FontWeight::SEMI_BOLD)
         .foreground(ink)
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Center)
@@ -329,7 +305,7 @@ fn disc_face(cfg: &OverlayConfig, slot: Option<&SlotId>, dim: bool) -> Element {
 }
 
 /// A chord as a stacked keycap: the modifiers small on top, the key large under them.
-fn keycap(keys: &[String], ink: Color, small: f64, big: f64) -> Element {
+fn keycap(keys: &[String], ink: Color, small: f64, big: f64) -> View {
     let (mods, key) = match keys.split_last() {
         Some((key, mods)) => (
             mods.iter()
@@ -340,10 +316,10 @@ fn keycap(keys: &[String], ink: Color, small: f64, big: f64) -> Element {
         ),
         None => (String::new(), String::new()),
     };
-    let mut lines: Vec<Element> = Vec::new();
+    let mut lines: Vec<View> = Vec::new();
     if !mods.is_empty() {
         lines.push(
-            text_block(mods)
+            text(mods)
                 .font_size(small)
                 .foreground(ink)
                 .horizontal_alignment(HorizontalAlignment::Center)
@@ -351,9 +327,9 @@ fn keycap(keys: &[String], ink: Color, small: f64, big: f64) -> Element {
         );
     }
     lines.push(
-        text_block(key)
+        text(key)
             .font_size(big)
-            .bold()
+            .font_weight(FontWeight::BOLD)
             .foreground(ink)
             .horizontal_alignment(HorizontalAlignment::Center)
             .into(),
@@ -366,66 +342,39 @@ fn keycap(keys: &[String], ink: Color, small: f64, big: f64) -> Element {
 }
 
 /// A round disc of the in-stream ring's surface: dark, translucent, a white hairline.
-fn disc(face: Element, diameter: f64, raised: bool, selected: bool) -> Border {
-    border(face)
+fn disc(face: View, diameter: f64, raised: bool, selected: bool) -> Border {
+    Border::new()
+        .content(face)
         .width(diameter)
         .height(diameter)
         .corner_radius(diameter / 2.0)
-        .background(Color {
-            a: if raised { 190 } else { 140 },
-            r: 0,
-            g: 0,
-            b: 0,
-        })
-        .border_brush(if selected {
-            Color {
-                a: 230,
-                r: 255,
-                g: 255,
-                b: 255,
-            }
-        } else {
-            Color {
-                a: 46,
-                r: 255,
-                g: 255,
-                b: 255,
-            }
-        })
+        .background(Color::argb(if raised { 190 } else { 140 }, 0, 0, 0))
+        .border_brush(Color::argb(if selected { 230 } else { 46 }, 255, 255, 255))
         .border_thickness(uniform(if selected { 2.0 } else { 1.0 }))
 }
 
 /// The ring on its stage: the discs at the ring's geometry, the inert centre, and the stage's
 /// pointer handlers — a carry lives on the stage, not the disc, because a pointer that leaves
-/// a disc stops reporting to it.
-fn ring(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> Element {
-    let mut children: Vec<Element> = Vec::new();
-    // The stage is a flat card face, like every other card on this shell. It used to be a
-    // gradient, baked to a BMP because reactor's brushes are flat — decoration that read as
-    // a different app, and the same reason the console's editor dropped its own.
-    children.push(
-        border(vstack(Vec::<Element>::new()))
-            .background(ThemeRef::CardBackground)
-            .border_brush(ThemeRef::CardStroke)
-            .border_thickness(uniform(1.0))
-            .corner_radius(22.0)
-            .width(STAGE_W)
-            .height(STAGE_H)
-            .canvas_left(0.0)
-            .canvas_top(0.0)
-            .into(),
-    );
+/// a disc stops reporting to it. The carried disc is drawn last, so it rides over the others.
+fn ring(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetUi) -> View {
+    // The stage is a flat card face, like every other card on this shell.
+    let mut children: Vec<View> = vec![blank(STAGE_W, STAGE_H)
+        .background(ThemeBrush::CardBackground)
+        .border_brush(ThemeBrush::CardStroke)
+        .border_thickness(uniform(1.0))
+        .corner_radius(22.0)
+        .into()];
     // The centre: what the sheet opens from in-stream — not editable here, dimmed and inert.
     // It wears the ring's own `more` mark, so the editor's centre is the centre people press.
     let cd = CENTRE_DIAMETER as f64;
     children.push(
         disc(mark("ellipsis", ICON_DIP, true), cd, false, false)
-            .tooltip("More \u{2014} the rest of the actions, in the stream")
             .canvas_left(STAGE_W / 2.0 - cd / 2.0)
             .canvas_top(STAGE_H / 2.0 - cd / 2.0)
-            .into(),
+            .tooltip("More \u{2014} the rest of the actions, in the stream"),
     );
     let d = SLOT_DIAMETER as f64;
+    let mut carried_disc = None;
     for k in 0..RING_SLOTS {
         let (mut x, mut y) = disc_centre(k);
         let carried = ui.drag.filter(|dr| dr.slot == k && dr.moved());
@@ -438,20 +387,21 @@ fn ring(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> E
             .map(|s| describe(cfg, s))
             .unwrap_or(("Empty".into(), String::new()));
         let face = disc_face(cfg, slot, !note.is_empty());
-        let mut el: Element = disc(face, d, carried.is_some(), ui.selected == Some(k))
+        let el = disc(face, d, carried.is_some(), ui.selected == Some(k))
+            .canvas_left(x - d / 2.0)
+            .canvas_top(y - d / 2.0)
             .tooltip(if note.is_empty() {
                 label.clone()
             } else {
                 format!("{label} — {note}")
-            })
-            .canvas_left(x - d / 2.0)
-            .canvas_top(y - d / 2.0)
-            .into();
+            });
         if carried.is_some() {
-            el = el.canvas_z_index(5);
+            carried_disc = Some(el);
+        } else {
+            children.push(el);
         }
-        children.push(el);
     }
+    children.extend(carried_disc);
 
     let press = {
         let (ui, set_ui) = (ui.clone(), set_ui.clone());
@@ -516,7 +466,7 @@ fn ring(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> E
     };
     let leave = {
         let (ui, set_ui) = (ui.clone(), set_ui.clone());
-        move || {
+        move |_: PointerEventInfo| {
             if ui.drag.is_some() || ui.hover.is_some() {
                 let mut u = ui.clone();
                 u.drag = None;
@@ -525,7 +475,13 @@ fn ring(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> E
             }
         }
     };
-    Canvas::new(children)
+    Border::new()
+        .content(
+            Canvas::new()
+                .children(children)
+                .width(STAGE_W)
+                .height(STAGE_H),
+        )
         .width(STAGE_W)
         .height(STAGE_H)
         .background(hit_test_backstop())
@@ -541,8 +497,8 @@ fn ring(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> E
 /// picker is open over. The in-stream ring carries the same band under its own discs, and it is
 /// where the name went when the discs became marks. It keeps its height whatever it says, so
 /// the ring does not hop as the pointer crosses a disc.
-fn ring_label(cfg: &OverlayConfig, ui: &Ui) -> Element {
-    let text = ui
+fn ring_label(cfg: &OverlayConfig, ui: &Ui) -> View {
+    let line = ui
         .hover
         .or(ui.selected)
         .and_then(|k| cfg.ring[k].as_ref())
@@ -555,9 +511,9 @@ fn ring_label(cfg: &OverlayConfig, ui: &Ui) -> Element {
             }
         })
         .unwrap_or_default();
-    text_block(text)
+    text(line)
         .font_size(13.0)
-        .semibold()
+        .font_weight(FontWeight::SEMI_BOLD)
         .height(20.0)
         .horizontal_alignment(HorizontalAlignment::Center)
         .into()
@@ -565,17 +521,15 @@ fn ring_label(cfg: &OverlayConfig, ui: &Ui) -> Element {
 
 /// Six buttons under the ring, one per disc, so a keyboard and a screen reader reach every
 /// slot the pointer reaches.
-fn legend_row(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> Element {
-    let _ = props;
-    let buttons: Vec<Element> = (0..RING_SLOTS)
+fn legend_row(cfg: &OverlayConfig, ui: &Ui, set_ui: &SetUi) -> View {
+    let buttons: Vec<View> = (0..RING_SLOTS)
         .map(|k| {
             let slot = cfg.ring[k].as_ref();
             let (label, _) = slot
                 .map(|s| describe(cfg, s))
                 .unwrap_or(("Empty".into(), String::new()));
             let short = slot.map_or("Empty".to_string(), |s| short_label(cfg, s));
-            let mut b = button(short)
-                .tooltip(label.clone())
+            let b = button(short)
                 .automation_name(format!("{}: {label}", CLOCK[k]))
                 .on_click({
                     let (ui, set_ui) = (ui.clone(), set_ui.clone());
@@ -589,12 +543,12 @@ fn legend_row(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>
                         set_ui.call(u);
                     }
                 });
-            if ui.selected == Some(k) {
-                b = b.accent();
+            b.style(if ui.selected == Some(k) {
+                ButtonStyle::Accent
             } else {
-                b = b.subtle();
-            }
-            b.into()
+                ButtonStyle::Subtle
+            })
+            .tooltip(label)
         })
         .collect();
     hstack(buttons)
@@ -605,25 +559,25 @@ fn legend_row(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>
 
 /// The picker for one disc: the catalogue by group, the current pick marked, a note where a
 /// slot cannot work on this shell, and the swap targets for a keyboard.
-fn picker(props: &Props, cfg: &OverlayConfig, k: usize, ui: &Ui, set_ui: &SetState<Ui>) -> Element {
+fn picker(props: &Props, cfg: &OverlayConfig, k: usize, ui: &Ui, set_ui: &SetUi) -> View {
     let current = cfg.ring[k].as_ref().map(SlotId::id).unwrap_or_default();
     // No title and no Done: the band above already names the slot being edited, the disc is
     // ringed white while its picker is open, and a pick closes the card — the GTK popover's
     // behaviour, which needed neither either.
-    let mut parts: Vec<Element> = Vec::new();
+    let mut parts: Vec<View> = Vec::new();
     for group in catalogue(cfg, RingPlatform::Desktop) {
-        parts.push(section(group.title));
-        let mut row: Vec<Element> = Vec::new();
+        parts.push(section(&props.pal, group.title));
+        let mut row: Vec<View> = Vec::new();
         for entry in group.entries {
             let is_current = entry.id == current;
             let unavailable =
                 !entry.note.is_empty() && !entry.id.starts_with("host:") && !is_current;
-            let text = if entry.note.is_empty() {
+            let line = if entry.note.is_empty() {
                 entry.label.clone()
             } else {
                 format!("{} — {}", entry.label, entry.note)
             };
-            let mut b = button(text).on_click({
+            let mut b = button(line).on_click({
                 let (props, cfg, id) = (props.clone(), cfg.clone(), entry.id.clone());
                 let (ui, set_ui) = (ui.clone(), set_ui.clone());
                 move || {
@@ -636,9 +590,9 @@ fn picker(props: &Props, cfg: &OverlayConfig, k: usize, ui: &Ui, set_ui: &SetSta
                 }
             });
             b = if is_current {
-                b.accent()
+                b.style(ButtonStyle::Accent)
             } else {
-                b.subtle().enabled(!unavailable)
+                b.style(ButtonStyle::Subtle).is_enabled(!unavailable)
             };
             row.push(b.into());
         }
@@ -648,8 +602,8 @@ fn picker(props: &Props, cfg: &OverlayConfig, k: usize, ui: &Ui, set_ui: &SetSta
 }
 
 /// Buttons that wrap into rows of at most five, so a group never runs off the card.
-fn wrap_row(buttons: Vec<Element>) -> Element {
-    let rows: Vec<Element> = buttons
+fn wrap_row(buttons: Vec<View>) -> View {
+    let rows: Vec<View> = buttons
         .chunks(5)
         .map(|chunk| hstack(chunk.to_vec()).spacing(6.0).into())
         .collect();
@@ -657,40 +611,30 @@ fn wrap_row(buttons: Vec<Element>) -> Element {
 }
 
 /// The shortcuts under the ring: a row each with its keycap, name and legend; Add; Reset.
-fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> Element {
-    let mut rows: Vec<Element> = Vec::new();
+fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetUi) -> View {
+    let mut rows: Vec<View> = Vec::new();
     for sc in &cfg.shortcuts {
         let chip = chord_chip(&sc.keys);
-        let ink = Color {
-            a: 242,
-            r: 255,
-            g: 255,
-            b: 255,
-        };
+        let ink = Color::argb(242, 255, 255, 255);
         let face = disc(keycap(&sc.keys, ink, 8.0, 12.0), 40.0, false, false);
         let title = if sc.label.is_empty() {
             chip.clone()
         } else {
             sc.label.clone()
         };
-        let mut text: Vec<Element> = vec![text_block(title)
+        let mut lines: Vec<View> = vec![text(title)
             .vertical_alignment(VerticalAlignment::Center)
             .into()];
         if !sc.label.is_empty() {
-            text.push(
-                text_block(chip)
-                    .font_size(12.0)
-                    .foreground(ThemeRef::SecondaryText)
-                    .into(),
-            );
+            lines.push(muted(&props.pal, chip).font_size(12.0).into());
         }
         rows.push(
             hstack((
                 face,
-                vstack(text)
+                vstack(lines)
                     .spacing(2.0)
                     .vertical_alignment(VerticalAlignment::Center),
-                button("Edit").subtle().on_click({
+                button("Edit").style(ButtonStyle::Subtle).on_click({
                     let (ui, set_ui, sc) = (ui.clone(), set_ui.clone(), sc.clone());
                     move || {
                         let mut u = ui.clone();
@@ -706,30 +650,41 @@ fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>)
     }
     // The reset is two presses, and it says so on the button — the console's own armed row,
     // and the same wording every other client's reset carries.
-    let reset = button(if ui.reset_armed {
-        "Press again to reset"
+    // One mark either way: the accent fill is what says it is armed.
+    let reset = icon_button(
+        "rotate-cw",
+        if ui.reset_armed {
+            "Press again to reset"
+        } else {
+            "Reset to default"
+        },
+    )
+    .style(if ui.reset_armed {
+        ButtonStyle::Accent
     } else {
-        "Reset to default"
+        ButtonStyle::Default
     })
-    // One mark either way: the accent fill below is what says it is armed, and the glyph takes
-    // the on-accent brush by itself.
-    .icon(lucide::icon("rotate-cw"))
-    .tooltip("Restores the platform dial and removes the shortcuts")
     .on_click({
         let (props, ui, set_ui) = (props.clone(), ui.clone(), set_ui.clone());
         move || {
             if ui.reset_armed {
-                commit(&props.ctx, &props.scope, (props.rev, &props.set_rev), |s| {
-                    s.overlay_actions.clear();
-                });
+                commit(
+                    &props.ctx,
+                    &props.scope,
+                    "overlay_actions",
+                    (props.rev, &props.set_rev),
+                    &props.set_status,
+                    |s| s.overlay_actions.clear(),
+                );
             }
             let mut u = ui.clone();
             u.reset_armed = !ui.reset_armed;
             set_ui.call(u);
         }
-    });
+    })
+    .tooltip("Restores the platform dial and removes the shortcuts");
     let actions = hstack((
-        button("Add shortcut").icon(lucide::icon("plus")).on_click({
+        icon_button("plus", "Add shortcut").on_click({
             let (ui, set_ui) = (ui.clone(), set_ui.clone());
             move || {
                 let mut u = ui.clone();
@@ -739,22 +694,20 @@ fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>)
                 set_ui.call(u);
             }
         }),
-        if ui.reset_armed {
-            reset.accent()
-        } else {
-            reset
-        },
+        reset,
     ))
     .spacing(8.0)
     .into();
-    let mut parts: Vec<Element> = vec![section("Shortcuts")];
+    let mut parts: Vec<View> = vec![section(&props.pal, "Shortcuts")];
     if rows.is_empty() {
         parts.push(
-            text_block("A new shortcut takes the first empty dial slot.")
-                .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText)
-                .wrap()
-                .into(),
+            muted(
+                &props.pal,
+                "A new shortcut takes the first empty dial slot.",
+            )
+            .font_size(12.0)
+            .text_wrapping(TextWrapping::Wrap)
+            .into(),
         );
     }
     parts.extend(rows);
@@ -770,16 +723,12 @@ fn shortcut_editor(
     cfg: &OverlayConfig,
     draft: &Draft,
     ui: &Ui,
-    set_ui: &SetState<Ui>,
-) -> Element {
+    set_ui: &SetUi,
+) -> View {
+    let pal = &props.pal;
     let keys = draft.chord.keys();
     let chip = chord_chip(&keys);
-    let ink = Color {
-        a: 242,
-        r: 255,
-        g: 255,
-        b: 255,
-    };
+    let ink = Color::argb(242, 255, 255, 255);
     let preview = hstack((
         disc(
             keycap(&keys, ink, 9.0, 14.0),
@@ -788,23 +737,21 @@ fn shortcut_editor(
             false,
         ),
         vstack((
-            text_block(if chip.is_empty() {
+            text(if chip.is_empty() {
                 "Pick a key".to_string()
             } else {
                 chip.clone()
             })
             .font_size(20.0)
-            .semibold(),
-            text_block("How the dial will draw it")
-                .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText),
+            .font_weight(FontWeight::SEMI_BOLD),
+            muted(pal, "How the dial will draw it").font_size(12.0),
         ))
         .spacing(2.0)
         .vertical_alignment(VerticalAlignment::Center),
     ))
     .spacing(16.0);
 
-    let set_draft = |ui: &Ui, set_ui: &SetState<Ui>, f: &dyn Fn(&mut Draft)| {
+    let set_draft = |ui: &Ui, set_ui: &SetUi, f: &dyn Fn(&mut Draft)| {
         let mut u = ui.clone();
         if let Some(d) = u.draft.as_mut() {
             f(d);
@@ -812,63 +759,55 @@ fn shortcut_editor(
         set_ui.call(u);
     };
 
-    let name = text_box(draft.label.clone())
+    let name = TextBox::new()
+        .text(&draft.label)
         .header("Name")
         .placeholder_text("Optional — e.g. Task Manager")
         .on_text_changed({
             let (ui, set_ui) = (ui.clone(), set_ui.clone());
-            move |text: String| set_draft(&ui, &set_ui, &|d| d.label = text.clone())
+            move |line: Rc<str>| set_draft(&ui, &set_ui, &|d| d.label = line.to_string())
         })
         .max_width(320.0)
         .horizontal_alignment(HorizontalAlignment::Left);
 
-    let mut mods: Vec<Element> = CHORD_MODIFIERS
+    let mut mods: Vec<View> = CHORD_MODIFIERS
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            toggle_button(key_legend(m), draft.chord.mods[i])
-                .on_checked({
-                    let (ui, set_ui) = (ui.clone(), set_ui.clone());
-                    move |on: bool| set_draft(&ui, &set_ui, &|d| d.chord.mods[i] = on)
-                })
-                .into()
+            let (ui, set_ui) = (ui.clone(), set_ui.clone());
+            toggle(key_legend(m), draft.chord.mods[i], move |on| {
+                set_draft(&ui, &set_ui, &|d| d.chord.mods[i] = on)
+            })
+            .into()
         })
         .collect();
     mods.push(
-        toggle_button("Press the chord…", ui.capture)
-            .on_checked({
-                let (ui, set_ui) = (ui.clone(), set_ui.clone());
-                move |on: bool| {
-                    let mut u = ui.clone();
-                    u.capture = on;
-                    set_ui.call(u);
-                }
+        {
+            let (ui, set_ui) = (ui.clone(), set_ui.clone());
+            toggle("Press the chord…", ui.capture, move |on| {
+                let mut u = ui.clone();
+                u.capture = on;
+                set_ui.call(u);
             })
-            .tooltip(
-                "Then press the keys on your keyboard (Ctrl, Alt and Shift; Win stays a toggle)",
-            )
-            .margin(edges(12.0, 0.0, 0.0, 0.0))
-            .into(),
+        }
+        .margin(edges(12.0, 0.0, 0.0, 0.0))
+        .tooltip("Then press the keys on your keyboard (Ctrl, Alt and Shift; Win stays a toggle)"),
     );
 
-    let grid: Vec<Element> = KEY_GRID
+    let grid: Vec<View> = KEY_GRID
         .iter()
         .map(|row| {
-            let keys: Vec<Element> = row
+            let keys: Vec<View> = row
                 .iter()
                 .map(|name| {
-                    toggle_button(key_legend(name), draft.chord.key.as_deref() == Some(*name))
-                        .on_checked({
-                            let (ui, set_ui) = (ui.clone(), set_ui.clone());
-                            move |on: bool| {
-                                if on {
-                                    set_draft(&ui, &set_ui, &|d| {
-                                        d.chord.key = Some(name.to_string())
-                                    });
-                                }
-                            }
-                        })
-                        .into()
+                    let (ui, set_ui) = (ui.clone(), set_ui.clone());
+                    let on = draft.chord.key.as_deref() == Some(*name);
+                    toggle(key_legend(name), on, move |on| {
+                        if on {
+                            set_draft(&ui, &set_ui, &|d| d.chord.key = Some(name.to_string()));
+                        }
+                    })
+                    .into()
                 })
                 .collect();
             hstack(keys)
@@ -878,13 +817,13 @@ fn shortcut_editor(
         })
         .collect();
 
-    let mut actions: Vec<Element> = vec![button(if draft.id.is_some() {
+    let mut actions: Vec<View> = vec![button(if draft.id.is_some() {
         "Save"
     } else {
         "Add shortcut"
     })
-    .accent()
-    .enabled(draft.chord.key.is_some())
+    .style(ButtonStyle::Accent)
+    .is_enabled(draft.chord.key.is_some())
     .on_click({
         let (props, cfg, ui, set_ui, d) = (
             props.clone(),
@@ -930,7 +869,7 @@ fn shortcut_editor(
     }
     actions.push(
         button("Cancel")
-            .subtle()
+            .style(ButtonStyle::Subtle)
             .on_click({
                 let (ui, set_ui) = (ui.clone(), set_ui.clone());
                 move || {
@@ -943,57 +882,57 @@ fn shortcut_editor(
             .into(),
     );
 
-    let mut el: Element = card(
+    let editor = card(
         vstack((
-            section(if draft.id.is_some() {
-                "Shortcut"
-            } else {
-                "New shortcut"
-            }),
+            section(
+                pal,
+                if draft.id.is_some() {
+                    "Shortcut"
+                } else {
+                    "New shortcut"
+                },
+            ),
             preview,
             name,
-            text_block("Hold the modifiers marked on, then the key.")
-                .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText),
+            muted(pal, "Hold the modifiers marked on, then the key.").font_size(12.0),
             hstack(mods).spacing(6.0),
             vstack(grid).spacing(4.0),
             hstack(actions).spacing(8.0),
         ))
         .spacing(12.0),
-    )
-    .into();
-
-    // Pressing the chord on the real keyboard fills the modifiers and the key in one go: while
-    // the capture is on, an accelerator per key and modifier mix on this card takes it.
-    if ui.capture {
-        for row in KEY_GRID {
-            for name in row {
-                let Some(vk) = virtual_key(name) else {
-                    continue;
-                };
-                for mask in modifier_masks() {
-                    let (ui, set_ui) = (ui.clone(), set_ui.clone());
-                    el = el.keyboard_accelerator(KeyboardAccelerator::new(
-                        vk,
-                        VirtualKeyModifiers(mask),
-                        move || {
-                            let mut u = ui.clone();
-                            if let Some(d) = u.draft.as_mut() {
-                                // Win is never captured from the keyboard: its toggle stands.
-                                let win = d.chord.mods[3];
-                                d.chord.mods = mods_of(mask);
-                                d.chord.mods[3] = win;
-                                d.chord.key = Some(name.to_string());
-                            }
-                            u.capture = false;
-                            set_ui.call(u);
-                        },
-                    ));
-                }
-            }
-        }
+    );
+    if !ui.capture {
+        return editor.into();
     }
-    el
+    // Pressing the chord on the real keyboard fills the modifiers and the key in one go: while
+    // the capture is on, the card takes the first press of a key on the grid.
+    let (ui, set_ui) = (ui.clone(), set_ui.clone());
+    editor
+        .on_preview_key_down(RoutedCallback::new(move |k: KeyEventInfo| {
+            let Some(name) = grid_key(k.key.0) else {
+                return false;
+            };
+            let mut u = ui.clone();
+            if let Some(d) = u.draft.as_mut() {
+                // Win is never captured from the keyboard: its toggle stands.
+                let win = d.chord.mods[3];
+                d.chord.mods = mods_of(k.modifiers);
+                d.chord.mods[3] = win;
+                d.chord.key = Some(name.to_string());
+            }
+            u.capture = false;
+            set_ui.call(u);
+            true
+        }))
+        .into()
+}
+
+/// A toggle button that hands its handler the new state.
+fn toggle(label: impl Into<View>, on: bool, changed: impl Fn(bool) + 'static) -> ToggleButton {
+    ToggleButton::new()
+        .content(label)
+        .is_checked(on)
+        .on_is_checked_changed(move |v: Option<bool>| changed(v == Some(true)))
 }
 
 #[cfg(test)]
@@ -1048,19 +987,22 @@ mod tests {
         assert!(d.moved());
     }
 
-    /// Every key on the grid has a virtual key for the capture, and a draft reads a shortcut
-    /// back the way the editor wrote it.
+    /// A pressed key finds its grid name, and a draft reads a shortcut back the way the editor
+    /// wrote it.
     #[test]
-    fn the_grid_maps_to_virtual_keys_and_the_draft_round_trips() {
+    fn a_press_finds_its_grid_key_and_the_draft_round_trips() {
         for row in KEY_GRID {
             for name in row {
-                assert!(virtual_key(name).is_some(), "{name}");
+                let vk = key_vk(name).map(u32::from);
+                assert_eq!(vk.and_then(grid_key), Some(*name), "{name}");
             }
         }
-        assert_eq!(virtual_key("a"), Some(VirtualKey::A));
-        assert_eq!(virtual_key("0"), Some(VirtualKey::Number0));
-        assert_eq!(virtual_key("f12"), Some(VirtualKey::F12));
-        assert_eq!(virtual_key("win"), None);
+        assert_eq!(grid_key(VirtualKey::A.0), Some("a"));
+        assert_eq!(
+            grid_key(VirtualKey::CONTROL.0),
+            None,
+            "a modifier alone is no key"
+        );
         let sc = Shortcut {
             id: "s1".into(),
             label: "Tasks".into(),
@@ -1069,9 +1011,8 @@ mod tests {
         let d = Draft::of(&sc);
         assert_eq!(d.chord.mods, [true, false, true, false]);
         assert_eq!(d.chord.keys(), sc.keys);
-        assert_eq!(
-            mods_of(VirtualKeyModifiers::Control.0 | VirtualKeyModifiers::Shift.0),
-            [true, false, true, false]
-        );
+        let mut m = InputModifiers::CONTROL;
+        m |= InputModifiers::SHIFT;
+        assert_eq!(mods_of(m), [true, false, true, false]);
     }
 }

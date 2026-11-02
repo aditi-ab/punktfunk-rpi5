@@ -81,10 +81,14 @@ final class AudioDeviceWatcherTests: XCTestCase {
     /// happens when AirPods come out of an ear — and require that the session hears about it. This
     /// is the trigger the recovery leans on for the voice-processing engine, whose own notification
     /// behaviour cannot be verified here (no Mac in this project's fleet can initialize VPIO).
+    /// Skips while anything plays on the default output: the move would hop that audio.
     func testTheDefaultOutputDeviceMovingReachesTheOwner() throws {
         guard let original = AudioDevices.defaultOutputDevice() else {
             throw XCTSkip("no default output device")
         }
+        try XCTSkipIf(
+            AudioDevices.isRunningSomewhere(original),
+            "something is playing on the default output — moving it would hop that audio")
         let others = AudioDevices.outputs()
             .compactMap { AudioDevices.deviceID(forUID: $0.uid) }
             .filter { $0 != original }
@@ -119,3 +123,20 @@ final class AudioDeviceWatcherTests: XCTestCase {
     }
     #endif
 }
+
+#if os(macOS)
+extension AudioDevices {
+    /// Does any process run IO on `id`? A test that moves the default output skips on true:
+    /// the person listening hears the hop. Unreadable counts as running.
+    static func isRunningSomewhere(_ id: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var running = UInt32(1)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        _ = AudioObjectGetPropertyData(id, &address, 0, nil, &size, &running)
+        return running != 0
+    }
+}
+#endif

@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<!-- Game Mode on iOS/iPadOS 18.6+ and macOS 26: without this key it may not turn on.
+	     GCSupportsGameMode (build settings) covers the older releases. -->
+	<key>LSSupportsGameMode</key>
+	<true/>
+	<!-- visionOS only: Config/Info.plist plus the SpatialGamepad profile, which App Store export
+	     refuses on iOS, macOS and tvOS. Change both files together; apple.yml checks they match. -->
+	<key>GCSupportedGameControllers</key>
+	<array>
+		<dict>
+			<key>ProfileName</key>
+			<string>ExtendedGamepad</string>
+		</dict>
+		<dict>
+			<key>ProfileName</key>
+			<string>MicroGamepad</string>
+		</dict>
+		<!-- visionOS hands PlayStation VR2 Sense controllers only to an app that names this. -->
+		<dict>
+			<key>ProfileName</key>
+			<string>SpatialGamepad</string>
+		</dict>
+	</array>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_punktfunk._udp</string>
+	</array>
+	<!-- CoreBluetooth: the Steam Controller 2 as-is passthrough (Sc2BleLink) reads an OS-paired
+	     SC2's custom Valve GATT service, on all three app targets. Both keys so older iOS
+	     releases (which read the Peripheral key) get a string too. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Bluetooth lets Punktfunk read your Steam Controller and pass it through to the streaming PC.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Bluetooth lets Punktfunk read your Steam Controller and pass it through to the streaming PC.</string>
+	<!-- NOTE: there is deliberately NO NSAppTransportSecurity dict here. ATS stays fully ON.
+	     The host is self-signed at a user-supplied address, which default ATS can never accept
+	     (it exempts only .local, unqualified names, and RFC1918/link-local literals — notably NOT
+	     Tailscale's 100.64/10 CGNAT range), so the management API talks over MgmtTransport
+	     (Network.framework), which is outside the URL loading system and pins the host by
+	     SHA-256 fingerprint instead. That leaves cover-art CDN fetches as the app's only
+	     URLSession traffic, and they keep the full ATS policy — which is the whole reason not to
+	     reach for NSAllowsArbitraryLoads here. See MgmtTransport.swift. -->
+	<!-- Background keep-alive (opt-in, iOS/iPadOS): the ONLY sanctioned way to keep the long-lived
+	     QUIC socket + pump-thread set alive while backgrounded is the audio background mode, backed
+	     by the session's real, audible remote audio (AVAudioEngine keeps rendering). Video decode is
+	     dropped; a bounded timer auto-disconnects. Never silence-as-keepalive (App Review 2.5.4).
+	     tvOS ignores/tolerates the key; macOS is not gated by it. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+	<!-- Live Activities (iOS/iPadOS): the Lock-Screen / Dynamic-Island session surface. Updated
+	     locally (pushType nil) from the alive app process — no aps-environment. tvOS/macOS ignore it. -->
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<!-- Notched Macs: claim the WHOLE panel. Without this key the system shrinks the display's
+	     active area for us the moment a window sits behind the camera housing, so the panel
+	     fullscreen stops below the notch and NSScreen.safeAreaInsets reads zero — the settings'
+	     below-the-notch mode would never appear either. We route around the housing ourselves
+	     (SafeDisplay.coversHousing), which is the audit this key asserts. -->
+	<key>NSPrefersDisplaySafeAreaCompatibilityMode</key>
+	<false/>
+	<!-- Deep links: punktfunk://connect/<host-uuid>[?launch=<GameEntry.id>]. Emitted by the
+	     launcher widget and Siri/Shortcuts; routed by ContentView.onOpenURL into the existing
+	     connect path. Shared across all three targets (tvOS/macOS accept it harmlessly). -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>io.unom.punktfunk.deeplink</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>punktfunk</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

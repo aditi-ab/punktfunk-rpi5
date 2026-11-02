@@ -1,0 +1,38 @@
+# The audio endpoint enumerator a seat's Remote Desktop listener loads (`AudioEnumeratorDll`):
+# Remote Audio plus one DualSense render endpoint per pad the seat's host serves. Shipped as
+# `pf_seat_audio.dll` for x64 and x86, since every process of a seat session that uses MMDevAPI
+# loads it at its own bitness.
+[package]
+name = "pf-seat-audio"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "pf_seat_audio"
+crate-type = ["cdylib"]
+
+[target.'cfg(windows)'.dependencies]
+pf-driver-proto = { path = "../pf-driver-proto" }
+# `#[implement]` expands to `windows_core` paths.
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Apo",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+[lints]
+workspace = true

@@ -14,6 +14,10 @@
 #   iphone-6.9 1320×2868   (portrait)  /  2868×1320 (the landscape hero)
 #   ipad-13    2064×2752   (portrait)
 #   appletv    1920×1080
+#   visionpro  3840×2160   (the app's window in the Simulator's evening living room)
+#
+# visionOS has no device frame to render: Apple asks for the app in its surroundings, and takes a
+# Simulator capture at this size. Its store set is VISION_SCENES.
 #
 # The iPad set is landscape throughout, and simctl cannot rotate a device. The iPad simulator runs
 # in Full Screen Apps mode and the capture build is marked full-screen-only (UIRequiresFullScreen,
@@ -28,6 +32,7 @@
 #   tools/screenshots.sh all            # every platform this machine can build
 #   tools/screenshots.sh macos          # just macOS
 #   tools/screenshots.sh ios ipad tvos  # specific platforms
+#   tools/screenshots.sh visionos       # needs BUILD_VISIONOS=1 xcframework slices; not in `all`
 #   OUT=~/Desktop/shots tools/screenshots.sh all
 #   PUNKTFUNK_SHOT_HERO=~/frame.png tools/screenshots.sh ios   # real captured frame for the hero
 #   PUNKTFUNK_SHOT_FPS=120 tools/screenshots.sh ios ipad       # HUD refresh; Simulators report 60
@@ -45,7 +50,10 @@ BUNDLE_ID="io.unom.punktfunk"
 # The App Store set, in listing order — the first three are what most people ever see, so they are
 # the stream itself, the machines it found, and their games. Everything else in
 # ShotScenes.all is a dev scene; capture those with `SCENES="15-library-touch 16-host-page" ...`.
+SCENES_GIVEN="${SCENES:-}"
 SCENES=(${SCENES:-01-stream 02-hosts 15-library-touch 15f-library-filter 06-console 12-controllers 09e-waking-modal 05-settings 03-pair})
+# The Apple Vision Pro listing, in order.
+VISION_SCENES=(01-stream 02-hosts 15f-library-filter 06-console 05-settings)
 SETTLE="${SETTLE:-4}" # seconds to let a scene lay out before capturing
 
 mkdir -p "$OUT"
@@ -130,8 +138,11 @@ shoot_sim() {
   # simulator and none was ever reused (they piled up on the runner). And the name is user-visible:
   # `UIDevice.current.name` is what the pairing sheet prefills as this device's name, so
   # "pf-shot-iphone-6.9" was rendered into an App Store screenshot.
-  local udid
-  udid="$(xcrun simctl list devices available | grep -E "$match" | grep -oE '[0-9A-F-]{36}' | head -1 || true)"
+  # PF_SHOT_UDID (optional): capture on this device. The first match may be the simulator
+  # someone is working in, and the capture installs its build there.
+  local udid="${PF_SHOT_UDID:-}"
+  [ -n "$udid" ] \
+    || udid="$(xcrun simctl list devices available | grep -E "$match" | grep -oE '[0-9A-F-]{36}' | head -1 || true)"
   if [ -z "$udid" ]; then
     local devtype rt
     devtype="$(xcrun simctl list devicetypes | grep -E "$match" \
@@ -153,6 +164,15 @@ shoot_sim() {
     local sbprefs="$HOME/Library/Developer/CoreSimulator/Devices/$udid/data/Library/Preferences/com.apple.springboard.plist"
     [ -f "$sbprefs" ] || plutil -create xml1 "$sbprefs"
     plutil -replace SBEnhancedWindowingModeEnabled -bool NO "$sbprefs"
+  fi
+  if [ "$prefix" = visionpro ]; then
+    # The room behind the window, read at boot. The evening one: the window's glass goes dark
+    # in it, which the app's light-on-dark UI is drawn for.
+    xcrun simctl shutdown "$udid" 2>/dev/null || true
+    local envprefs="$HOME/Library/Developer/CoreSimulator/Devices/$udid/data/Library/Preferences/com.apple.RealityEnvironment.plist"
+    mkdir -p "$(dirname "$envprefs")"
+    [ -f "$envprefs" ] || plutil -create xml1 "$envprefs"
+    plutil -replace activeSyntheticEnvironment -string LivingRoomNight "$envprefs"
   fi
   xcrun simctl boot "$udid" 2>/dev/null || true
   xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true
@@ -215,6 +235,11 @@ shoot_sim() {
         warn "$prefix/$scene: the app reported no window size — left uncropped"
       fi
     fi
+    if [ "$prefix" = visionpro ]; then
+      # visionOS restores a window's last size across launches.
+      grep -q '^PF_SHOT_WINDOW_PX 2560 1440$' "$applog" \
+        || warn "$prefix/$scene: the window is not 1280×720 pt — capture it again"
+    fi
     rm -f "$applog"
     log "$prefix/$scene → $dest ($(pixels "$dest"))"
   done
@@ -235,6 +260,11 @@ for target in "$@"; do
     ios)   shoot_sim 'iPhone 16 Pro Max'   Punktfunk-iOS  iphonesimulator  iphone-6.9 iOS 'iPhone 16 Pro Max' ;;
     ipad)  shoot_sim 'iPad Pro 13|iPad Pro .*M4|iPad Pro \(13' Punktfunk-iOS iphonesimulator ipad-13 iOS 'iPad Pro 13-inch (M4)' ;;
     tvos)  shoot_sim 'Apple TV'            Punktfunk-tvOS appletvsimulator appletv    tvOS 'Apple TV 4K' ;;
+    visionos)
+      # A device of the 4K type captures 3840×2160. The other type's 2732×2048 the store refuses.
+      [ -n "$SCENES_GIVEN" ] || SCENES=("${VISION_SCENES[@]}")
+      shoot_sim 'Apple Vision Pro \(' Punktfunk-iOS xrsimulator visionpro visionOS 'Apple Vision Pro'
+      ;;
     all)
       shoot_macos
       if xcrun --find simctl >/dev/null 2>&1; then
@@ -245,7 +275,7 @@ for target in "$@"; do
         warn "Skipping iOS/iPadOS/tvOS — full Xcode not found (Command Line Tools only)."
       fi
       ;;
-    *) die "unknown target '$target' (use: all macos ios ipad tvos)" ;;
+    *) die "unknown target '$target' (use: all macos ios ipad tvos visionos)" ;;
   esac
 done
 

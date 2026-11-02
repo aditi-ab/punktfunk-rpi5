@@ -152,6 +152,12 @@ fn set_encode(owner: u32, request: Request) {
     use pf_driver_proto::encode::{
         SET_ENCODE_REQUEST_LEGACY_SIZE, SetEncodeReply, SetEncodeRequest,
     };
+    // Sized before the handles are adopted: on an IOCTL error the host reaps its duplicates,
+    // and the driver must not have taken them as well.
+    if request.output_buffer_len() < size_of::<SetEncodeReply>() {
+        request.complete(STATUS_BUFFER_TOO_SMALL);
+        return;
+    }
     let Some(req) = read_input_prefix::<SetEncodeRequest>(&request, SET_ENCODE_REQUEST_LEGACY_SIZE)
     else {
         request.complete(STATUS_INVALID_PARAMETER);
@@ -194,9 +200,15 @@ fn set_render_adapter(owner: u32, request: Request) {
     request.complete(st);
 }
 
-/// `IOCTL_ADD`: create `owner`'s virtual monitor at the requested mode → reply with the OS
-/// target id + LUID.
+/// `IOCTL_ADD`: create `owner`'s virtual monitor at the requested mode and reply with its OS
+/// target id and LUID, or complete with the status class `create_monitor` returns.
 fn add(owner: u32, request: Request) {
+    // Sized before the monitor exists: a short buffer fails with nothing created, or the host
+    // reads the error as "nothing to remove" and the monitor holds its slot until the owner goes.
+    if request.output_buffer_len() < control::ADD_REPLY_LEGACY_SIZE {
+        request.complete(STATUS_BUFFER_TOO_SMALL);
+        return;
+    }
     let Some(req) = read_add_request(&request) else {
         request.complete(STATUS_INVALID_PARAMETER);
         return;
@@ -210,12 +222,14 @@ fn add(owner: u32, request: Request) {
     if crate::adapter::adapter().is_none() {
         crate::adapter::retry_init();
     }
-    let Some((monitor_id, target_id, luid_low, luid_high)) =
-        crate::monitor::create_monitor(owner, &req)
-    else {
-        request.complete(STATUS_NOT_FOUND);
-        return;
-    };
+    let (monitor_id, target_id, luid_low, luid_high) =
+        match crate::monitor::create_monitor(owner, &req) {
+            Ok(made) => made,
+            Err(st) => {
+                request.complete(st);
+                return;
+            }
+        };
     let reply = control::AddReply {
         adapter_luid_low: luid_low,
         adapter_luid_high: luid_high,
@@ -241,11 +255,11 @@ fn set_cursor_channel(owner: u32, request: Request) {
         request.complete(STATUS_INVALID_PARAMETER);
         return;
     };
-    let Some(ch) = crate::cursor_worker::CursorChannel::from_request(&req) else {
+    let Some(ch) = crate::cursor::CursorChannel::from_request(&req) else {
         request.complete(STATUS_INVALID_PARAMETER);
         return;
     };
-    match crate::monitor::set_cursor_channel(owner, req.target_id, ch) {
+    match crate::cursor::set_cursor_channel(owner, req.target_id, ch) {
         Ok(()) => request.complete(STATUS_SUCCESS),
         Err(ch) => {
             dbglog!(
@@ -266,7 +280,7 @@ fn set_cursor_forward(owner: u32, request: Request) {
         request.complete(STATUS_INVALID_PARAMETER);
         return;
     };
-    if crate::monitor::set_cursor_forward(owner, req.target_id, req.enable != 0) {
+    if crate::cursor::set_cursor_forward(owner, req.target_id, req.enable != 0) {
         request.complete(STATUS_SUCCESS);
     } else {
         dbglog!(

@@ -103,6 +103,10 @@ fun HostCard(
      * no presets never pays for the slot.
      */
     reservePresetSlot: Boolean = false,
+    /** The profile this device plays as on the host; drawn as a small face. */
+    profileName: String? = null,
+    profilePicture: String? = null,
+    profileArt: io.unom.punktfunk.ProfileArt? = null,
 ) {
     // D-pad / controller focus highlight: a clickable card is focusable, but the default state
     // layer is too subtle on a TV across a room — draw a clear primary-colour border when focused.
@@ -129,7 +133,16 @@ fun HostCard(
                     .padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                HostAvatar(name, online, os)
+                Box {
+                    HostAvatar(name, online, os)
+                    if (profileName != null) {
+                        Box(Modifier.align(Alignment.BottomEnd)) {
+                            io.unom.punktfunk.ProfileFace(
+                                profileName, 24, picture = profilePicture, art = profileArt,
+                            )
+                        }
+                    }
+                }
                 Spacer(Modifier.height(10.dp))
                 Text(
                     name,

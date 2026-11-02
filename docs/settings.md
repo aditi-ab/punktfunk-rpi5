@@ -39,9 +39,10 @@ label and its options and knows what to pick. If it needs a paragraph, it is not
 ## Advanced settings
 
 Every client hides its advanced rows until **Show advanced** is on (the last row of General). A
-row is advanced when most players never change it and its default is right for them: codec,
-decoder, V-Sync, audio quality, controller forwarding, stats position and size. The tier is not
-an escape from the questions above; an advanced setting is still a setting.
+row is advanced when most players never change it and its default is right for them: decoder,
+V-Sync, audio quality, controller forwarding, stats position and size. The video codec is not:
+players pick PyroWave there. The tier is not an escape from the questions above; an advanced
+setting is still a setting.
 
 - **The catalogue is the list.** `clients/shared/settings-catalog.json` holds each shared
   setting's key, label, category and tier. Change it first; the console, Android and Apple

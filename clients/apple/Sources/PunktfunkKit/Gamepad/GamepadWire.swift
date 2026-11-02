@@ -31,6 +31,13 @@ public enum GamepadWire {
     /// host routes it to the DualSense mute / Steam quick-access menu; a plain virtual xpad has no
     /// such button.
     public static let misc1 = UInt32(PUNKTFUNK_BTN_MISC1)
+    /// What a synthetic Quick Access tap presses, in order. A pad with the button takes
+    /// `misc1`. Every other pad takes the chord Steam reads there: Guide held, then A.
+    /// Mirrors punktfunk-core's `quick_access_presses`.
+    public static func quickAccessPresses(hasButton: Bool) -> [UInt32] {
+        hasButton ? [misc1] : [guide, a]
+    }
+
     /// Back-grip paddles (Xbox Elite P1–P4 / DualSense Edge / Steam-Deck L4-L5-R4-R5, as
     /// R4/L4/R5/L5). `GamepadCapture.buttonMask` does not read them yet — the GameController
     /// `paddleButton1..4` ↔ BTN_PADDLE physical correspondence needs confirming on a real Elite

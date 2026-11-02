@@ -7,10 +7,11 @@ The web console tells you when a newer host is out, and on most installs updates
 
 ## The Updates card
 
-**Host → Updates** in the [web console](/docs/web-console) shows the version you run, the channel
-you follow, how the host was installed and, once a newer release exists, either an **Update now**
-button or the command that updates this install. The host checks a signed feed on `git.unom.io`
-while the console is open; **Check now** checks right away. The host also fires `update.available`
+The top of **Host** in the [web console](/docs/web-console) shows the version you run and whether
+it is current; **Check for update** checks right away. Once a newer release exists, the Updates
+card unfolds below it with the channel you follow, how the host was installed, and either an
+**Update now** button or the command that updates this install. The host checks a signed feed on
+`git.unom.io` while the console is open. The host also fires `update.available`
 and `update.applied` on the [event stream](/docs/automation).
 
 The channel comes from the repository you installed from (on a Steam Deck, the branch
@@ -21,9 +22,9 @@ The channel comes from the repository you installed from (on a Steam Deck, the b
 | Install | Button |
 |---|---|
 | Windows installer | Always. |
-| apt, dnf, Bazzite sysext, rpm-ostree layer | After a one-time opt-in: `sudo usermod -aG punktfunk-update $USER`. The button appears within a minute, no new login needed. rpm-ostree stages the update: reboot to finish. |
+| apt, dnf, Bazzite sysext, rpm-ostree layer | After a one-time opt-in: `sudo usermod -aG punktfunk-update $USER`, then restart the computer. The host keeps the groups it started with, so logging out is not enough. rpm-ostree stages the update: reboot to finish. |
 | Arch (pacman) | The same opt-in, plus `PACMAN_FULL_SYSUPGRADE=1` in `/etc/punktfunk/update.conf`: the button runs a full `pacman -Syu`. |
-| Steam Deck on-device build | Always. It rebuilds on the Deck, which takes a while; the log is `~/.config/punktfunk/logs/update-steamos.log`. |
+| Steam Deck on-device build | Always, except while Reachable without logging in is on: then run `update.sh --pull` in Konsole. It rebuilds on the Deck, which takes a while; the log is `~/.config/punktfunk/logs/update-steamos.log`. |
 | Omarchy, NixOS, source builds | Command only. |
 
 The button asks for the console password and warns you if a stream is live, because updating drops
@@ -83,8 +84,14 @@ A host left running on a replaced binary fails every new KDE desktop session wit
   sudo punktfunk-sysext install --from-file ~/punktfunk-known-good.raw   # to go back
   ```
 
-- After a Bazzite major rebase the old image refuses to load. Run `sudo punktfunk-sysext update`
-  once to fetch the image for the new base.
+- After a Bazzite major rebase the old image refuses to load, and `punktfunk-sysext` goes with it.
+  Download the script again and update once to fetch the image for the new base:
+
+  ```sh
+  curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh
+  sudo bash punktfunk-sysext.sh update
+  ```
+
 - `refusing to downgrade`: the feed's newest image is older than yours. Roll back on purpose with
   `sudo PUNKTFUNK_SYSEXT_ALLOW_DOWNGRADE=1 punktfunk-sysext update`, or the file you kept.
 - The script checks the feed's signature with `gpg`. If it reports a bad signature, a foreign feed
@@ -92,7 +99,7 @@ A host left running on a replaced binary fails every new KDE desktop session wit
 
 ## Turn the check off
 
-Turn off **Check for updates** under **Host → Settings → System** (`PUNKTFUNK_UPDATE_CHECK=0` in
+Turn off **Check for updates** under **Host → System** (`PUNKTFUNK_UPDATE_CHECK=0` in
 `host.env`). To keep the check but drop the button, turn off **Console updates** under
 **Show advanced** (`PUNKTFUNK_UPDATE_APPLY=0`). The check contacts `git.unom.io` and nothing else.
 

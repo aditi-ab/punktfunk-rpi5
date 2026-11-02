@@ -23,8 +23,6 @@
 //!        `display-disturb modeset [--interval-ms 2000]`
 //!        `display-disturb adl-emul [--lock|--unlock] [--connector N]`
 
-// Unsafe-proof program: every `unsafe {}` in this tool carries a `// SAFETY:` proof.
-
 #[cfg(not(target_os = "windows"))]
 fn main() {
     eprintln!("display-disturb is Windows-only (it exercises the WDDM display stack).");

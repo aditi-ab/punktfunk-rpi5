@@ -129,6 +129,10 @@ public final class VideoDecoder: @unchecked Sendable {
     /// under BT.709. Read inside `createSessionLocked` under `lock`.
     private var bitDepth: UInt8 = 8
 
+    /// Where the core assembles the AUs, for samples over the AU itself. PUMP THREAD, which is
+    /// the one thread that calls `decode`.
+    var accessUnitMemory: AccessUnitSlotPool?
+
     public init(
         onDecoded: @escaping @Sendable (ReadyFrame) -> Void,
         onDecodeError: @escaping @Sendable (OSStatus) -> Void = { _ in }
@@ -193,7 +197,7 @@ public final class VideoDecoder: @unchecked Sendable {
         // invalidate the session between here and DecodeFrame. The VT output callback takes the
         // ring lock, not this one, so there's no re-entrancy. DecodeFrame is async — non-blocking.
         guard let session,
-              let sample = codec.sampleBuffer(au: au, format: newFormat)
+              let sample = codec.sampleBuffer(au: au, format: newFormat, in: accessUnitMemory)
         else { lock.unlock(); return false }
         var infoOut = VTDecodeInfoFlags()
         // The AU's receipt instant + wire flags ride through as a retained context; the output

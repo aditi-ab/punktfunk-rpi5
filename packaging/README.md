@@ -25,6 +25,12 @@ traps in each ecosystem.
 The Windows *client* packages from [`clients/windows/packaging/`](../clients/windows/packaging/),
 not here.
 
+The package workflows build on main and tags only. A pull request that touches `packaging/` or
+`scripts/` runs `packaging-lint.yml` instead: `bash -n` and shellcheck over the shell, `rpmspec
+--parse` on each spec, `makepkg --printsrcinfo` on each PKGBUILD, and each channel's file
+capabilities and groups against [`linux/capabilities.txt`](linux/capabilities.txt) and
+[`linux/punktfunk.sysusers`](linux/punktfunk.sysusers). It builds nothing.
+
 ## Why the host is not a Flatpak
 
 The host needs the zero-copy encode path, `/dev/uinput`, the PipeWire graph and the compositor's

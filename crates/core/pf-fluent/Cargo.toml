@@ -1,0 +1,18 @@
+[package]
+name = "pf-fluent"
+description = "The WinUI theme colours windows-reactor's ThemeBrush does not name, for the Windows client and installer"
+version.workspace = true
+edition.workspace = true
+# The workspace pin's windows-reactor declares 1.95; same note as clients/windows.
+rust-version = "1.96"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-reactor = { workspace = true }
+windows = { workspace = true, features = ["UI_ViewManagement"] }
+
+[lints]
+workspace = true

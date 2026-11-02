@@ -59,9 +59,9 @@ struct ScreenshotHostView: View {
             .environment(\.colorScheme, scene.colorScheme)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             // The scene keeps its safe area, so the HUD clears the Dynamic Island; the streamed
-            // frame ignores it itself. Black matches the dark iOS window. tvOS and macOS keep the
-            // system backdrop and window background the real app sits on.
-            #if os(iOS) || os(visionOS)
+            // frame ignores it itself. Black matches the dark iOS window. tvOS, macOS and visionOS
+            // keep the system backdrop the real app sits on: on visionOS, the window's glass.
+            #if os(iOS)
             .background(Color.black.ignoresSafeArea())
             #endif
             #if os(macOS)

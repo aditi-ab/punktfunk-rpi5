@@ -1,0 +1,103 @@
+# Lints the packaging sources on every pull request that touches them. deb, rpm, arch and flatpak
+# build only on push to main and tags, so a broken spec, PKGBUILD or shell script otherwise
+# surfaces on the canary. Nothing is built here: syntax, shellcheck, rpmspec, makepkg
+# --printsrcinfo, the payload checker's self-test, each channel's policy against its matrix and
+# the Steam Deck rebuild check on a stub box. scripts/ci/check-workflow-paths.py fails CI when
+# the paths below stop covering what the lane lints, and holds every workflow's path lists to
+# the files its package recipes name.
+name: packaging-lint
+
+on:
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - 'scripts/**'
+      - 'flake.nix'
+      - '.gitea/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  shell:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install shellcheck and python3 if the runner lacks them
+        run: |
+          set -eu
+          command -v shellcheck >/dev/null && command -v python3 >/dev/null && exit 0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends shellcheck python3
+
+      # `bash -n` on every shell file, then shellcheck at error severity.
+      - name: Shell syntax and shellcheck (error)
+        run: sh scripts/ci/lint-shell.sh
+
+      # Advisory: the warning backlog is listed, never blocking.
+      - name: shellcheck (warning, advisory)
+        continue-on-error: true
+        run: sh scripts/ci/lint-shell.sh --warn
+
+      # Pure bash: the checker still fails on a path every format must ship.
+      - name: Payload checker self-test
+        run: bash scripts/ci/assert-payload-parity.sh --self-test
+
+      # Each channel's file capabilities and groups against capabilities.txt and punktfunk.sysusers.
+      - name: Packaging policy matrices
+        run: |
+          python3 scripts/ci/check-packaging-policy.py --self-test
+          python3 scripts/ci/check-packaging-policy.py
+
+      # The Steam Deck scripts are linted above with the rest. This sources the real lib.sh and takes
+      # each branch of rebuild-check.sh with update.sh stubbed, which neither bash -n nor shellcheck
+      # can do.
+      - name: Steam Deck rebuild check
+        run: bash scripts/ci/check-steamdeck-rebuild.sh
+
+      - name: Workflow path lists
+        run: python3 scripts/ci/check-workflow-paths.py --lanes
+
+  rpmspec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: 192.168.1.58:5010/punktfunk-fedora-rpm:latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `--parse` fails on an unclosed %if, an unknown tag, a bad Requires and a %files for a
+      # subpackage that does not exist. The macros rpm.yml passes are defined so none stay open.
+      - name: rpmspec --parse
+        run: |
+          set -eu
+          specs=$(find packaging -name '*.spec')
+          [ -n "$specs" ]
+          for spec in $specs; do
+            echo "== $spec"
+            rpmspec --parse --define 'pf_version 0.0.0' --define 'pf_release 1' "$spec" > /dev/null
+          done
+
+  makepkg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: 192.168.1.58:5010/punktfunk-arch-ci:latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # makepkg refuses root. Once as the AUR user builds it, once with the opt-in packages CI
+      # builds (web, scripting, bun).
+      - name: makepkg --printsrcinfo
+        run: |
+          set -eu
+          id builder >/dev/null 2>&1 || useradd -m builder
+          chown -R builder: "$PWD"
+          dirs=$(find packaging -name PKGBUILD -printf '%h\n')
+          [ -n "$dirs" ]
+          for dir in $dirs; do
+            for flags in "" "PF_WITH_WEB=1 PF_WITH_SCRIPTING=1"; do
+              echo "== $dir $flags"
+              (cd "$dir" && sudo -u builder env $flags makepkg --printsrcinfo > /dev/null)
+            done
+          done

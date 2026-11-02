@@ -27,24 +27,26 @@ Linux and `%ProgramData%\punktfunk` on Windows.
 
 | | Linux | Windows |
 |---|---|---|
-| Isolation | One bubblewrap sandbox per plugin, with its own PID namespace | All plugins share the runner's `NT AUTHORITY\LocalService` account |
-| Files | `/usr`, its own code, its state dir, the manifest's paths and the operator's grants | The config dir is read-only except `plugin-state`; the user's profile is closed |
-| Network | None unless the manifest sets `network` | Unrestricted |
-| Host API | A socket the runner forwards; `connect()` finds it | Loopback HTTPS |
+| Isolation | One bubblewrap sandbox per plugin, with its own PID namespace | One AppContainer per plugin, `punktfunk.plugin.<id>`, under the runner's `NT AUTHORITY\LocalService` account |
+| Files | `/usr`, its own code, its state dir, the manifest's paths and the operator's grants | Program Files, its own code, its state dir, the manifest's paths and the operator's grants; user profiles are closed |
+| Network | None unless the manifest sets `network` | None unless the manifest sets `network`; never loopback |
+| Host API | A socket the runner forwards; `connect()` finds it | A named pipe per plugin; `connect()` finds it |
 
 ## The manifest
 
 Declare what the plugin needs in a `punktfunk` block in its `package.json`; the
 [minimal plugin](#a-minimal-library-plugin) below has one. It ships inside the reviewed tarball, so
-nothing the plugin does at runtime widens it. Without it, a plugin does not start on Linux.
+nothing the plugin does at runtime widens it. Without it, a plugin does not start.
 
 | Field | Meaning |
 |---|---|
 | `schema` | `1`. Any other value is refused. |
 | `id` | The plugin id: `[a-z][a-z0-9-]*`, at most 64 characters. Use the same string as the plugin's `name`; it keys the plugin's token, state dir and library provider. |
 | `reads` | Paths the plugin reads. Absolute or `~/`-rooted. A missing path is skipped. |
+| `files` | Folders the plugin reads the files of, nothing below them. Use it for a folder that holds a game tree: on Windows a `reads` entry rewrites every file below it, and a `files` entry lands at once. One `*` component names each folder under it: `%ProgramFiles%/EA Games/*/__Installer` is every game's `__Installer`, new ones within a minute. Needs host 0.46; an older host drops the entry, so also ask for it from `wants`. |
 | `writes` | Paths it also writes. |
 | `network` | `true` to reach the network. |
+| `registry` | Windows registry keys it reads, as `HKLM\…` or `HKCU\…`. A key under `HKCU`, like a path under `~/`, marks a source that belongs to one account; the host grants it in every signed-in account's hive. |
 | `exec` | Named argv templates the host may run for this plugin's titles. |
 
 The sandbox never binds `/`, the home directory or its parents, `/proc`, `/sys`, `/dev`, `/run`
@@ -66,6 +68,12 @@ declares its kind:
 No other value may start with `-`. The host drops a title whose values don't fit when the plugin
 publishes it.
 
+A ROM needs no template. `launch: { kind: "emulator", value: "pcsx2", args: [...] }` names a
+catalog emulator, and the arguments `platform`, `file`, and optionally `core` and `extra`. The host
+starts `file` in its best copy of that emulator, after first-run setup and the platform's firmware.
+`GET /api/v1/emulators/catalog` lists the platforms and emulators. A plugin that moves saves asks
+once with `saves: true` on `POST /api/v1/plugin-access/requests`.
+
 ## A minimal library plugin
 
 `@punktfunk/plugin-kit/library` supplies everything except the scan: the sync loop, file watching,
@@ -84,9 +92,9 @@ the console settings form and the CLI. Four files:
     "test": "bun test"
   },
   "dependencies": {
-    "@punktfunk/host": "^0.3.0",
-    "@punktfunk/plugin-kit": "^0.9.0",
-    "effect": "4.0.0-beta.99"
+    "@punktfunk/host": "^0.4.0",
+    "@punktfunk/plugin-kit": "^0.13.0",
+    "effect": "4.0.1"
   },
   "punktfunk": {
     "schema": 1,
@@ -234,7 +242,7 @@ export default plugin.def;
   image `fetch` found. `lookup <id>` on the plugin's CLI prints what it finds for one game.
 
 Add `"network": true` to the manifest. Register in the store's `metadata` category so the console
-offers it under **Library** → **Art & Metadata**.
+offers it under **Library** → **Sources** → **Art & Metadata**.
 
 ## Hold a launch
 
@@ -306,7 +314,11 @@ yield* serveUi({
 
 A package can't know where someone keeps their ROMs or a second Steam library. Return those
 folders from `wants: (cfg) => [...]`. Before each scan the kit asks the host for every one the
-plugin can't reach, then scans what it can reach now.
+plugin can't reach, then scans what it can reach now. Return `{ path, files: true }` for a folder
+that holds a game tree when its own files are all you read. For a library folder whose game
+folders each hold the one file you read, return the pattern `{ path: "D:\\Games\\*", files: true }`
+beside the game folders themselves: one yes covers them all, and a host before 0.46 refuses the
+pattern and prompts per folder.
 
 A plugin that doesn't use `defineLibraryPlugin` yields `requestAccess(paths, reason)` from
 `@punktfunk/plugin-kit`. A request only creates a pending row: the operator allows it on the

@@ -1,0 +1,1578 @@
+//! Rate and recovery control between frames: the FEC-driven encoder-rate re-derivation, the
+//! client's bitrate requests (in place, or an encoder rebuild), and the keyframe/RFI coalescing
+//! with its recovery-cadence diagnosis.
+
+use super::rebuild::Rebuilt;
+use super::rebuild_plan::RebuildAsk;
+use super::state::{announce_pipeline_gap, StreamState};
+use super::*;
+
+impl StreamState {
+    /// Apply adaptive FEC behind the encoder rate it implies.
+    ///
+    /// A move that leaves the encoder rate where it is publishes at once (on
+    /// PyroWave most do: its parity is the head's). A synchronous encoder publishes when it
+    /// accepts, at the first screen's share in force; an asynchronous one is asked, and the
+    /// parity waits in `fec.pending` until the encoder has settled no higher than the rate the
+    /// parity leaves room for. A newer proposal or a moved budget asks again. A refusal keeps
+    /// the previous FEC and is logged once per proposal.
+    pub(super) fn on_fec_moved(&mut self) {
+        let requested = self.fec.requested.load(Ordering::Acquire);
+        let discarded = self.fec.pending.take();
+        if let Some((fec, want)) = discarded {
+            if fec == requested && want == self.enc_derive(fec).enc_kbps(self.live.bitrate_kbps) {
+                if !self.live.enc.retarget_settled() {
+                    self.fec.pending = Some((fec, want));
+                    return;
+                }
+                let want_bps = u64::from(want) * 1000;
+                let applied = self.live.enc.applied_bitrate_bps().unwrap_or(want_bps);
+                let moved = settle_fec(
+                    applied,
+                    want_bps,
+                    &self.fec.target,
+                    &self.fec.requested,
+                    &mut self.fec.last,
+                    requested,
+                );
+                self.note_fec_move(requested, want, moved);
+                return;
+            }
+        }
+        if requested == self.fec.last {
+            if let Some((_, asked)) = discarded {
+                self.ask_back_fec(asked);
+            }
+            return;
+        }
+        let prev = self
+            .enc_derive(self.fec.last)
+            .enc_kbps(self.live.bitrate_kbps);
+        let to = self.enc_derive(requested);
+        let want = to.enc_kbps(self.live.bitrate_kbps);
+        if want == prev {
+            publish_fec(&self.fec.target, &mut self.fec.last, requested);
+            return;
+        }
+        match fec_retarget(
+            self.live.enc.bitrate_retarget_is_synchronous(),
+            |bps| self.live.enc.reconfigure_bitrate(bps),
+            u64::from(want) * 1000,
+            &self.fec.target,
+            &self.fec.requested,
+            &mut self.fec.last,
+            requested,
+        ) {
+            FecMove::Published => {
+                self.live.applied_share = to.share_permille;
+                self.note_fec_move(requested, want, true);
+            }
+            FecMove::Pending => self.fec.pending = Some((requested, want)),
+            FecMove::Held => self.note_fec_move(requested, want, false),
+        }
+    }
+
+    /// The proposal came back to the applied FEC before the encoder settled the rate `asked`
+    /// for another one: ask it back to the applied FEC's rate, or it stays on the other.
+    fn ask_back_fec(&mut self, asked: u32) {
+        let applied = self.fec.last;
+        let back = self.enc_derive(applied).enc_kbps(self.live.bitrate_kbps);
+        if asked == back {
+            return;
+        }
+        let moved = fec_retarget(
+            self.live.enc.bitrate_retarget_is_synchronous(),
+            |bps| self.live.enc.reconfigure_bitrate(bps),
+            u64::from(back) * 1000,
+            &self.fec.target,
+            &self.fec.requested,
+            &mut self.fec.last,
+            applied,
+        );
+        if matches!(moved, FecMove::Pending) {
+            self.fec.pending = Some((applied, back));
+        }
+    }
+
+    /// Say what a proposal came to. A hold the control task re-proposes every
+    /// window is logged at warn once, then at debug.
+    fn note_fec_move(&mut self, requested: u8, encoder_kbps: u32, moved: bool) {
+        if moved {
+            self.fec.hold_logged = 0;
+            tracing::debug!(
+                fec_pct = requested,
+                encoder_kbps,
+                budget_kbps = self.live.bitrate_kbps,
+                "adaptive FEC moved — encoder rate re-derived within the wire budget"
+            );
+        } else if std::mem::replace(&mut self.fec.hold_logged, requested) != requested {
+            tracing::warn!(
+                requested_fec_pct = requested,
+                applied_fec_pct = self.fec.last,
+                "adaptive FEC held — encoder did not take the matching bitrate"
+            );
+        } else {
+            tracing::debug!(requested_fec_pct = requested, "adaptive FEC still held");
+        }
+    }
+
+    /// The client's latest bitrate ask: reconfigure in place when the encoder can, else rebuild
+    /// it at the new rate ([`RebuildAsk::Bitrate`]), and tell the ceiling what the encoder made
+    /// of it.
+    ///
+    /// The ask arrives already resolved against the ceiling — the control task spends it there so
+    /// the ack and the encoder never disagree. Clamping again here would make an ack the client
+    /// already holds a promise the encoder was never given.
+    pub(super) fn on_bitrate_request(&mut self) {
+        self.settle_applied_rate();
+        let mut want_kbps = None;
+        while let Ok(k) = self.ends.bitrate_rx.try_recv() {
+            want_kbps = Some(k);
+        }
+        self.live
+            .enc
+            .set_send_spread_us(self.shared.send_spread_us.load(Ordering::Relaxed));
+        let Some(new_kbps) = want_kbps.filter(|&k| k != self.live.bitrate_kbps) else {
+            return;
+        };
+        if self.retarget_in_place(new_kbps) {
+            return;
+        }
+        let from_kbps = self.live.bitrate_kbps;
+        match self.rebuild(RebuildAsk::Bitrate(new_kbps)) {
+            Ok(Rebuilt::Built) => tracing::info!(
+                from_kbps,
+                to_kbps = self.live.bitrate_kbps,
+                requested_kbps = new_kbps,
+                "encoder rebuilt at new bitrate (adaptive bitrate)"
+            ),
+            Ok(Rebuilt::Kept(e)) | Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
+                    "bitrate-change encoder rebuild failed — keeping the current rate")
+            }
+            Ok(Rebuilt::Unchanged) => {}
+        }
+    }
+
+    /// `new_kbps` on the live encoder at the first screen's share in force, no IDR. `false` = it
+    /// cannot take a rate in place.
+    fn retarget_in_place(&mut self, new_kbps: u32) -> bool {
+        let ed = self.enc_now();
+        if !self
+            .live
+            .enc
+            .reconfigure_bitrate(ed.enc_kbps(new_kbps) as u64 * 1000)
+        {
+            return false;
+        }
+        self.live.applied_share = ed.share_permille;
+        let applied_kbps = self.applied_kbps(new_kbps);
+        tracing::info!(
+            from_kbps = self.live.bitrate_kbps,
+            to_kbps = applied_kbps,
+            requested_kbps = new_kbps,
+            "encoder bitrate reconfigured in place (adaptive bitrate — no IDR)"
+        );
+        self.note_applied_rate(new_kbps, applied_kbps);
+        if applied_kbps < self.live.bitrate_kbps {
+            self.pipelining.behind_score = 0;
+        }
+        self.facts.counters.note_bitrate(applied_kbps);
+        self.live.bitrate_kbps = applied_kbps;
+        self.shared
+            .live_bitrate
+            .store(applied_kbps, Ordering::Relaxed);
+        true
+    }
+
+    /// What the live encoder applied of `asked`, as a wire budget; `asked` when it does not say.
+    fn applied_kbps(&self, asked: u32) -> u32 {
+        let ed = self.enc_now();
+        self.live
+            .enc
+            .applied_bitrate_bps()
+            .map(|b| (b / 1000) as u32)
+            .filter(|&k| k > 0)
+            .map(|k| ed.applied_budget_kbps(asked, k))
+            .unwrap_or(asked)
+    }
+
+    /// A rate rebuild committed: the session runs what its new encoder applied of `asked`, and
+    /// the escalation evidence, which was the old encoder's, starts over.
+    pub(super) fn adopt_rebuilt_rate(&mut self, asked: u32) {
+        let applied = self.applied_kbps(asked);
+        self.note_applied_rate(asked, applied);
+        self.facts.counters.note_bitrate(applied);
+        self.live.bitrate_kbps = applied;
+        self.shared.live_bitrate.store(applied, Ordering::Relaxed);
+        self.pipelining.behind_score = 0;
+        self.pipelining.depth_frames = 0;
+        self.pipelining.ahead_run = 0;
+    }
+
+    /// A rate rebuild failed: a refused climb still teaches the ceiling, though it cost no
+    /// encoder. Down there is no ceiling to learn; the client was acked a rate the session is
+    /// not running and is told the one it is.
+    pub(super) fn keep_rate(&mut self, asked: u32) {
+        if asked > self.live.bitrate_kbps {
+            self.note_applied_rate(asked, self.live.bitrate_kbps);
+        } else {
+            let _ = self
+                .ends
+                .retarget_tx
+                .send((self.live.bitrate_kbps, AckReason::EncoderLimit));
+        }
+    }
+
+    /// The rate the encoder settled on, read back after the fact.
+    ///
+    /// An encoder that applies a retarget on its own thread — the Windows IDD
+    /// driver, whose bitrate control is a queued message with no reply —
+    /// answers a frame later, so the read taken beside the request cannot see a
+    /// decline. Only a retarget is read back this way, and only a rate below
+    /// the session's own is acted on: an encoder that answers in place cannot
+    /// trip it, because the session rate came from this same read-back.
+    fn settle_applied_rate(&mut self) {
+        // A pending FEC ask is the encoder's answer to parity, not to the
+        // budget: read against the applied FEC it would look like a clamp.
+        if !self.live.retargeted || self.fec.pending.is_some() {
+            return;
+        }
+        let ed = self.enc_now();
+        let Some(applied) = self
+            .live
+            .enc
+            .applied_bitrate_bps()
+            .map(|b| (b / 1000) as u32)
+            .filter(|&k| k > 0)
+            .map(|k| ed.applied_budget_kbps(self.live.bitrate_kbps, k))
+            .filter(|&k| k < self.live.bitrate_kbps)
+        else {
+            return;
+        };
+        tracing::info!(
+            from_kbps = self.live.bitrate_kbps,
+            to_kbps = applied,
+            "the encoder settled below the rate it was given — the session follows it"
+        );
+        self.note_applied_rate(self.live.bitrate_kbps, applied);
+        self.facts.counters.note_bitrate(applied);
+        self.live.bitrate_kbps = applied;
+        self.shared.live_bitrate.store(applied, Ordering::Relaxed);
+    }
+
+    /// What the encoder made of `want`: the ceiling learns it, and a client that
+    /// was promised `want` is corrected.
+    ///
+    /// A failed rebuild reports the rate it kept, so a refusal that costs no
+    /// encoder at all still teaches the ceiling.
+    fn note_applied_rate(&mut self, want: u32, applied: u32) {
+        self.live.retargeted = true;
+        self.shared
+            .encoder_ceiling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_applied(want, applied);
+        if applied < want {
+            let _ = self
+                .ends
+                .retarget_tx
+                .send((applied, AckReason::EncoderLimit));
+        }
+    }
+
+    /// Publish capture health, then serve the host's own repairs (a recovered source stall at
+    /// once, a torn reference or a `/status` force-IDR once the base cooldown allows), then fold
+    /// the client's asks (keyframe requests, RFI ranges) into at most one encoder action: an
+    /// RFI when the encoder can anchor, else one IDR per cooldown. A client keyframe ask that
+    /// lands in the same tick as an RFI the encoder anchored is the same loss: the anchor
+    /// repairs it, and a re-ask past the anchor's flight forces the IDR.
+    pub(super) fn on_recovery_requests(&mut self) {
+        let mut want_kf = false;
+        // Staged recovery closed on real source frames (WP14): the client held the last image
+        // through the hole, so the next AU is an IDR, owed in-flight records are invalid, and
+        // the measured local outage is announced so the straddling window is not scored as
+        // congestion.
+        if self.health_published_at.elapsed() >= std::time::Duration::from_millis(500) {
+            self.health_published_at = std::time::Instant::now();
+            *self
+                .shared
+                .capture_health
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
+                self.live.capturer.supervised().map(|s| s.health());
+            // A client that roamed shares a path with whoever is at its new address now.
+            crate::session_status::refresh_peer(
+                self.live_session.id,
+                self.facts.conn.remote_address().ip(),
+            );
+        }
+        self.live.asks.drain(&mut *self.live.capturer);
+        if let Some(outage) = self.live.asks.outage.take() {
+            let outage_ms = outage.as_millis().min(u32::MAX as u128) as u32;
+            tracing::info!(
+                outage_ms,
+                "capture recovered from a source stall — forcing an IDR, announcing the gap"
+            );
+            // The host's own repair, not a client ask: straight to the encoder, then stamped so
+            // the cooldown swallows the client's echo of the same freeze. Through the gate, the
+            // stamp would coalesce this IDR itself.
+            self.live.enc.request_keyframe();
+            self.facts.counters.link.note_idr();
+            self.clock.inflight.clear();
+            self.clock.last_forced_idr = Some(std::time::Instant::now());
+            announce_pipeline_gap(&self.ends.gap_tx, outage_ms);
+        }
+        if std::mem::take(&mut self.live.asks.idr) {
+            tracing::info!(
+                "capture re-held a re-sent buffer — owing an IDR over the reference it may \
+                 have torn"
+            );
+            self.owed_idr = true;
+        }
+        if self.shared.force_idr.swap(false, Ordering::Relaxed) {
+            self.owed_idr = true;
+        }
+        self.serve_owed_idr();
+        // Kept apart from the host's own reasons: a client ask never pre-empts the RFI.
+        let mut client_kf = false;
+        while self.ends.keyframe.try_recv().is_ok() {
+            client_kf = true;
+        }
+        let mut rfi_range: Option<(u32, u32)> = None;
+        while let Ok((first, last)) = self.ends.rfi.try_recv() {
+            rfi_range = Some(match rfi_range {
+                Some((pf, pl)) => (pf.min(first), pl.max(last)),
+                None => (first, last),
+            });
+        }
+        if self.plan.codec == crate::encode::Codec::PyroWave
+            && (want_kf || client_kf || rfi_range.is_some())
+        {
+            tracing::debug!(
+                want_kf,
+                client_kf,
+                ?rfi_range,
+                "PyroWave session: recovery request ignored (all-intra — next frame is the recovery)"
+            );
+            want_kf = false;
+            client_kf = false;
+            rfi_range = None;
+        }
+        // An RFI the encoder declined is proof that recovery needs an IDR — the anchor
+        // itself was lost, or every surviving reference is tainted. Not an echo.
+        let mut rfi_declined = false;
+        let mut anchored = false;
+        if !want_kf {
+            if let Some((first, last)) = rfi_range {
+                let width = last.wrapping_sub(first);
+                if width > punktfunk_core::packet::RFI_MAX_RANGE {
+                    tracing::debug!(first, last, width, "RFI range too wide — keyframe instead");
+                    want_kf = true;
+                } else if self.live.enc.caps().supports_rfi
+                    && self
+                        .live
+                        .enc
+                        .invalidate_ref_frames(first as i64, last as i64)
+                {
+                    self.last_rfi = Some(std::time::Instant::now());
+                    anchored = true;
+                } else {
+                    want_kf = true;
+                    rfi_declined = true;
+                    self.facts.counters.link.note_rfi_declined();
+                }
+            }
+        }
+        if client_kf && anchored {
+            tracing::debug!("keyframe request coalesced — rides on the RFI just anchored");
+        } else if want_kf || client_kf {
+            self.force_keyframe(rfi_declined);
+        }
+    }
+
+    /// The host's own repair IDR. It is not an echo of anything the client saw, so the echo
+    /// gate neither swallows it nor counts it: it waits out the base cooldown after the last
+    /// IDR (that one was encoded before the tear, or is the torn frame), then goes straight to
+    /// the encoder and starts the cooldown for the client's echo. PyroWave is all intra.
+    fn serve_owed_idr(&mut self) {
+        if !self.owed_idr {
+            return;
+        }
+        if self.plan.codec == crate::encode::Codec::PyroWave {
+            self.owed_idr = false;
+            return;
+        }
+        let base = if self.live.enc.caps().intra_refresh_recovery {
+            IDR_COOLDOWN_INTRA
+        } else {
+            IDR_COOLDOWN_FULL
+        };
+        let now = std::time::Instant::now();
+        if self
+            .clock
+            .last_forced_idr
+            .is_some_and(|t| now.saturating_duration_since(t) < base)
+        {
+            return;
+        }
+        self.owed_idr = false;
+        tracing::info!("forcing the host's repair IDR");
+        self.live.enc.request_keyframe();
+        self.facts.counters.link.note_idr();
+        self.clock.last_forced_idr = Some(now);
+    }
+
+    /// One forced IDR per cooldown. A stream whose recovery marks the client can lift on heals
+    /// over ~0.5 s (2 s window); every other stream's only repair is the IDR, so the window is
+    /// short — swallow the round-trip echo, re-issue a lost IDR promptly. An IDR the client
+    /// re-asks after is one it lost or could not use; each such IDR doubles the cooldown
+    /// ([`idr_cooldown`]), and a run of them is the gate's storm ([`IDR_STORM`]).
+    fn force_keyframe(&mut self, rfi_declined: bool) {
+        let base = if self.live.enc.caps().intra_refresh_recovery {
+            IDR_COOLDOWN_INTRA
+        } else {
+            IDR_COOLDOWN_FULL
+        };
+        let now = std::time::Instant::now();
+        match self.kf_gate.decide(
+            now,
+            base,
+            self.clock.last_forced_idr,
+            self.last_rfi,
+            rfi_declined,
+        ) {
+            KeyframeVerdict::Coalesced { cooldown, unhealed } => {
+                // In-flight IDR has not repaired the client yet — do not RFI-anchor over that damage.
+                self.live.enc.distrust_references();
+                tracing::debug!(
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    unhealed,
+                    "keyframe request coalesced — within the IDR cooldown; RFI anchor trust \
+                     withdrawn until the IDR repairs the client"
+                );
+            }
+            KeyframeVerdict::RfiEcho { swallowed } => {
+                // Do not distrust: the recovery frame is still in flight.
+                tracing::debug!(
+                    swallowed,
+                    "keyframe request coalesced — echo of an RFI-recovered loss"
+                );
+            }
+            KeyframeVerdict::Force {
+                cooldown,
+                unhealed,
+                rfi_unhealed,
+            } => {
+                tracing::debug!(
+                    rfi_unhealed,
+                    unhealed,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    "forcing keyframe (client decode recovery)"
+                );
+                if rfi_unhealed {
+                    self.live.enc.distrust_references();
+                }
+                self.live.enc.request_keyframe();
+                self.facts.counters.link.note_idr();
+                self.clock.last_forced_idr = Some(now);
+                // A re-issue is the host's own cooldown, not a disturbance with a period.
+                if unhealed == 0 {
+                    if let Some(period) = self.recovery_cadence.note(now) {
+                        self.diagnose_recovery_cadence(period);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Forced keyframes have become periodic: say which side is at fault, from the client's
+    /// delivery count and the wire re-key history — never a guess at the display.
+    fn diagnose_recovery_cadence(&self, period: std::time::Duration) {
+        let client_rx = self.shared.client_packets_received.load(Ordering::Relaxed);
+        let sent = self.sent;
+        if client_rx == 0 {
+            tracing::error!(
+                period_s = format!("{:.1}", period.as_secs_f64()),
+                frames_sent = sent,
+                "THE VIDEO DATA PLANE IS NOT REACHING THE CLIENT — it reports 0 \
+                 packets received all session while this host has sent the frames \
+                 counted here, so the picture is black and every keyframe we force is \
+                 wasted. The control plane is healthy (this report arrived on it), so \
+                 the session looks alive: audio, input and the library keep working. \
+                 Video leaves the same UDP socket toward the same address as control, \
+                 so a hop is treating the two differently: one that drops full-size \
+                 datagrams (the 'wire MTU' lines say what the path carries), or one \
+                 that drops the video DSCP mark (PUNKTFUNK_DSCP=0 turns it off to \
+                 test). The client may also have received the datagrams and could not \
+                 open them: this counter is incremented AFTER decrypt and replay \
+                 checks, so a session whose every datagram failed to open reports \
+                 exactly this same zero"
+            );
+        } else if let Some(ppm) = self
+            .facts
+            .counters
+            .share
+            .wire_loss_ppm()
+            .filter(|&p| p >= 900_000)
+        {
+            tracing::warn!(
+                period_s = format!("{:.1}", period.as_secs_f64()),
+                wire_loss_ppm = ppm,
+                "client keyframe recoveries come while the path has STOPPED CARRYING VIDEO — \
+                 the client's last report window counted under a tenth of the packets this \
+                 host sent, though video did arrive earlier in the session. A client that \
+                 moved onto a path that drops full-size datagrams, or a hop that started \
+                 blocking them, does this; the 'wire MTU' lines say whether the host saw it move"
+            );
+        } else if matches_client_recovery_cooldown(period) {
+            if client_rx == u32::MAX {
+                tracing::warn!(
+                    period_s = format!("{:.1}", period.as_secs_f64()),
+                    frames_sent = sent,
+                    "client keyframe recoveries land on a client software cooldown, \
+                     but this client is too old to report whether any video reached \
+                     it — so this is EITHER a client that cannot sustain the stream \
+                     and is shedding a standing receive queue, OR a client that has \
+                     received nothing at all and is re-asking on its no-video timer. \
+                     They are opposite faults; the host cannot tell them apart from \
+                     the period. Its log does: 'receive backlog stopped draining' \
+                     (with queue_depth) means the first, 'no video received … into \
+                     the session' means the second. Upgrading the client makes this \
+                     line decide on its own"
+                );
+            } else {
+                tracing::warn!(
+                    period_s = format!("{:.1}", period.as_secs_f64()),
+                    client_packets_received = client_rx,
+                    "client keyframe recoveries match the client's jump-to-live \
+                     cooldown, and it confirms video IS arriving — the CLIENT cannot \
+                     sustain the stream and is shedding a standing receive queue \
+                     (check its log for 'receive backlog stopped draining' with \
+                     queue_depth, and for a decode rung that demoted); a slower \
+                     decode path or a link below the bitrate does this, and it is NOT \
+                     a host display disturbance"
+                );
+            }
+        } else if self.shared.wire_rekeys.load(Ordering::Relaxed) > 0 {
+            tracing::warn!(
+                period_s = format!("{:.1}", period.as_secs_f64()),
+                wire_rekeys = self.shared.wire_rekeys.load(Ordering::Relaxed),
+                "client keyframe recoveries are METRONOMIC on a session whose wire \
+                 MTU had to be re-keyed mid-stream — a constrained path (VPN/overlay \
+                 adapter, lowered NIC MTU) black-holing full-size video is the prime \
+                 suspect, NOT a host/display disturbance; see the 'wire MTU' lines \
+                 above, and pin PUNKTFUNK_WIRE_MTU to skip the lossy discovery window \
+                 on this path"
+            );
+        } else if cfg!(windows) {
+            tracing::warn!(
+                period_s = format!("{:.1}", period.as_secs_f64()),
+                "client keyframe recoveries are METRONOMIC — a periodic host/display \
+                 disturbance (display-topology churn, display-poller software, \
+                 virtual-display timing) is the likely cause, not random network \
+                 loss; correlate with 'slow display-descriptor poll' / 'display \
+                 descriptor changed' / 'IDD-push capture stall' lines"
+            );
+        } else {
+            tracing::warn!(
+                period_s = format!("{:.1}", period.as_secs_f64()),
+                "client keyframe recoveries are METRONOMIC — a timer, not random loss. \
+                 'audio egress' with late=0 in the same window clears this process; then \
+                 read the 'wire egress' line for that window (outq_max_kb, tx_dropped, \
+                 carrier_changes = this box's kernel or NIC) and any 'network changed' \
+                 line at the same instant (DHCP renewal, route or link flap). Both clean \
+                 = the path or the client: the client's per-second stats decide"
+            );
+        }
+    }
+}
+
+/// Publish one FEC target to the packetizer and the stream's applied record.
+fn publish_fec(fec_target: &AtomicU8, last_fec: &mut u8, requested: u8) {
+    *last_fec = requested;
+    fec_target.store(requested, Ordering::Release);
+}
+
+/// What a FEC proposal came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FecMove {
+    /// Parity moved with the encoder.
+    Published,
+    /// An asynchronous encoder queued the rate; parity waits for it to settle.
+    Pending,
+    /// The encoder refused the rate; parity stays where it was.
+    Held,
+}
+
+/// Apply a control-proposed FEC target behind the encoder's answer. A
+/// synchronous accepted retarget moves applied FEC at once and an asynchronous
+/// one waits for [`settle_fec`]. A refusal returns the slot to the applied
+/// value unless a newer proposal landed.
+pub(super) fn fec_retarget(
+    synchronous: bool,
+    retarget: impl FnOnce(u64) -> bool,
+    bps: u64,
+    fec_target: &AtomicU8,
+    fec_requested: &AtomicU8,
+    last_fec: &mut u8,
+    requested: u8,
+) -> FecMove {
+    if !retarget(bps) {
+        hold_fec(fec_requested, *last_fec, requested);
+        return FecMove::Held;
+    }
+    if synchronous {
+        publish_fec(fec_target, last_fec, requested);
+        FecMove::Published
+    } else {
+        FecMove::Pending
+    }
+}
+
+/// An asynchronous retarget the encoder has settled. Parity follows only when
+/// the encoder is no higher than the rate the new parity leaves room for:
+/// above it, the wire would carry more than the budget.
+pub(super) fn settle_fec(
+    applied_bps: u64,
+    want_bps: u64,
+    fec_target: &AtomicU8,
+    fec_requested: &AtomicU8,
+    last_fec: &mut u8,
+    requested: u8,
+) -> bool {
+    if applied_bps <= want_bps {
+        publish_fec(fec_target, last_fec, requested);
+        true
+    } else {
+        hold_fec(fec_requested, *last_fec, requested);
+        false
+    }
+}
+
+/// Return the proposal slot to the applied value, unless the control task has
+/// written a newer proposal since.
+fn hold_fec(fec_requested: &AtomicU8, applied: u8, requested: u8) {
+    let _ = fec_requested.compare_exchange(requested, applied, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// A recovery frame's flight: encode, wire, decode. A request inside it echoes the loss the
+/// frame repairs; one past it says the frame landed and did not.
+const RECOVERY_FLIGHT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Longest wait between forced IDRs, whatever the backoff. 3 s of a broken picture is the
+/// ceiling a user tolerates over a storm of repairs that never take.
+const IDR_COOLDOWN_MAX: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Base cooldown where the encoder's recovery marks let the picture heal over ~0.5 s.
+pub(super) const IDR_COOLDOWN_INTRA: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Base cooldown where the IDR is the only repair, so the wait is short. `synth_abr` takes
+/// this one: an arithmetic encoder has no recovery marks.
+pub(super) const IDR_COOLDOWN_FULL: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Consecutive unhealed IDRs that name the state in the log and refute an unmeasured link.
+const IDR_STORM: u32 = 3;
+
+/// A request this long after the previous one opens a new episode: the run of unhealed IDRs,
+/// the swallowed RFI echoes and the previous request all belong to the old one.
+const KF_EPISODE_RESET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Requests the [`RECOVERY_FLIGHT`] echo hedge swallows before the next one forces an IDR.
+const RFI_ECHO_MAX_SWALLOWED: u32 = 2;
+
+/// `base` doubled per unhealed IDR, capped at [`IDR_COOLDOWN_MAX`].
+fn idr_cooldown(base: std::time::Duration, unhealed: u32) -> std::time::Duration {
+    base.saturating_mul(1u32 << unhealed.min(2))
+        .min(IDR_COOLDOWN_MAX)
+}
+
+/// What one keyframe request gets ([`KeyframeGate::decide`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum KeyframeVerdict {
+    /// Inside the IDR cooldown: nothing sent, RFI anchor trust withdrawn.
+    Coalesced {
+        cooldown: std::time::Duration,
+        unhealed: u32,
+    },
+    /// Echo of a loss an in-flight RFI repairs: nothing sent.
+    RfiEcho { swallowed: u32 },
+    /// Send the IDR. `unhealed` = consecutive IDRs the client re-asked after, this one
+    /// included; `rfi_unhealed` = an RFI echo was swallowed and the client still asks.
+    Force {
+        cooldown: std::time::Duration,
+        unhealed: u32,
+        rfi_unhealed: bool,
+    },
+}
+
+/// How long the encoder stays on confirmed references past the last window that showed loss.
+const LOSS_MODE_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// While the link loses packets the encoder references only frames the client confirmed
+/// ([`crate::encode::Encoder::set_reference_floor`]), so a lost frame is skipped, not
+/// repaired. On with a lossy report window, off [`LOSS_MODE_HOLD`] past the last. Each
+/// switch is logged, with the mean reference distance on the way off.
+#[derive(Default)]
+pub(super) struct LossMode {
+    /// `PUNKTFUNK_ACKED_REFS`: `Some` holds the mode all session, `None` follows the link.
+    forced: Option<bool>,
+    seen: Option<std::time::Instant>,
+    on: bool,
+    frames: u64,
+    distance: u64,
+}
+
+impl LossMode {
+    pub(super) fn new(forced: Option<bool>) -> LossMode {
+        LossMode {
+            forced,
+            ..LossMode::default()
+        }
+    }
+
+    pub(super) fn is_on(&self) -> bool {
+        self.on
+    }
+
+    /// The confirmed frames frame `wire` may reference, given whether a lossy window arrived
+    /// since the last frame and what the client confirmed (`last << 16 | mask`). A forced
+    /// mode ignores the link.
+    pub(super) fn floor(
+        &mut self,
+        lossy: bool,
+        acked: u64,
+        wire: u32,
+        now: std::time::Instant,
+    ) -> Option<crate::encode::Acked> {
+        if lossy {
+            self.seen = Some(now);
+        }
+        let on = self.forced.unwrap_or_else(|| {
+            self.seen
+                .is_some_and(|t| now.duration_since(t) < LOSS_MODE_HOLD)
+        });
+        if on != self.on {
+            self.on = on;
+            if on {
+                tracing::info!("acked references engaged: the link shows loss");
+            } else {
+                tracing::info!(
+                    frames = self.frames,
+                    mean_distance = self.distance.checked_div(self.frames),
+                    "acked references released"
+                );
+                (self.frames, self.distance) = (0, 0);
+            }
+        }
+        if !on || acked == crate::native::wiring::NONE_ACKED {
+            return None;
+        }
+        let last = (acked >> 16) as u32;
+        self.frames += 1;
+        self.distance += u64::from(wire.wrapping_sub(last));
+        Some(crate::encode::Acked {
+            last: i64::from(last),
+            mask: acked as u16,
+        })
+    }
+}
+
+/// Frames whose plaintext a NACK can still reach.
+const RESEND_FRAMES: usize = 3;
+/// Bytes the ring holds at most; the oldest frames go first, never the one in progress.
+const RESEND_BYTES: usize = 4 << 20;
+
+/// The plaintext of the last few frames' packets, as the session staged them
+/// ([`punktfunk_core::session::Session::tap_plaintext`]), for a client that names the shards
+/// one of them lacks. Buffers are reused frame to frame.
+#[derive(Default)]
+pub(super) struct ResendRing {
+    frames: std::collections::VecDeque<RingFrame>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct RingFrame {
+    index: u32,
+    sent: Option<std::time::Instant>,
+    wires: Vec<Vec<u8>>,
+    used: usize,
+}
+
+impl RingFrame {
+    fn bytes(&self) -> usize {
+        self.wires[..self.used].iter().map(Vec::len).sum()
+    }
+}
+
+/// A plaintext packet's place in its block, from its `punktfunk/2` header.
+#[derive(Clone, Copy)]
+struct Place {
+    base: u32,
+    shard: u16,
+    k: u16,
+    m: u16,
+}
+
+/// Where a plaintext packet of video frame `index` sits; `None` for any other packet.
+fn place(p: &[u8], index: u32) -> Option<Place> {
+    let u16_at = |o: usize| Some(u16::from_le_bytes(p.get(o..o + 2)?.try_into().ok()?));
+    let u32_at = |o: usize| Some(u32::from_le_bytes(p.get(o..o + 4)?.try_into().ok()?));
+    let video = *p.first()? == punktfunk_core::packet::V2_STREAM_VIDEO;
+    (video && u32_at(8)? == index).then_some(())?;
+    Some(Place {
+        base: u32_at(18)?,
+        shard: u16_at(22)?,
+        k: u16_at(24)?,
+        m: u16_at(26)?,
+    })
+}
+
+impl ResendRing {
+    /// Frame `index` starts; its packets follow through [`Self::note`].
+    pub(super) fn begin(&mut self, index: u32) {
+        let mut f = if self.frames.len() >= RESEND_FRAMES {
+            self.frames.pop_front().unwrap_or_default()
+        } else {
+            RingFrame::default()
+        };
+        self.bytes -= f.bytes();
+        (f.index, f.sent, f.used) = (index, Some(std::time::Instant::now()), 0);
+        self.frames.push_back(f);
+    }
+
+    /// A copy of one packet the current frame staged.
+    pub(super) fn note(&mut self, plaintext: &[u8]) {
+        while self.bytes > RESEND_BYTES && self.frames.len() > 1 {
+            let old = self.frames.pop_front().expect("more than one");
+            self.bytes -= old.bytes();
+        }
+        let Some(f) = self.frames.back_mut() else {
+            return;
+        };
+        if f.used == f.wires.len() {
+            f.wires.push(Vec::new());
+        }
+        let slot = &mut f.wires[f.used];
+        slot.clear();
+        slot.extend_from_slice(plaintext);
+        f.used += 1;
+        self.bytes += plaintext.len();
+    }
+
+    /// Frame `index`'s packets the client named, and how long ago the frame went out;
+    /// `None` when the ring no longer holds it. A name is a data shard's index in the AU,
+    /// or a parity shard's numbered after all the data in block order, as the client's
+    /// reassembler counts them.
+    pub(super) fn pick(&self, index: u32, shards: &[u16]) -> Option<(Vec<&[u8]>, u64)> {
+        let f = self.frames.iter().find(|f| f.index == index)?;
+        let video: Vec<(&[u8], Place)> = f.wires[..f.used]
+            .iter()
+            .filter_map(|w| Some((w.as_slice(), place(w, index)?)))
+            .collect();
+        let total_data = video.iter().map(|(_, p)| p.base + u32::from(p.k)).max()?;
+        let mut blocks: Vec<(u32, u16)> = video.iter().map(|(_, p)| (p.base, p.m)).collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        let parity_at = |base: u32| {
+            total_data
+                + blocks
+                    .iter()
+                    .take_while(|(b, _)| *b < base)
+                    .map(|(_, m)| u32::from(*m))
+                    .sum::<u32>()
+        };
+        let name = |p: &Place| {
+            if p.shard < p.k {
+                p.base + u32::from(p.shard)
+            } else {
+                parity_at(p.base) + u32::from(p.shard - p.k)
+            }
+        };
+        let picked = video
+            .iter()
+            .filter(|(_, p)| shards.contains(&(name(p) as u16)))
+            .map(|(w, _)| *w)
+            .collect();
+        let age = f.sent.map_or(0, |t| t.elapsed().as_millis() as u64);
+        Some((picked, age))
+    }
+}
+
+/// Episode state behind [`StreamState::force_keyframe`]: which requests coalesce, and how far
+/// the IDR cooldown has backed off. A request past the last IDR's [`RECOVERY_FLIGHT`] means
+/// that IDR landed and did not heal; each such IDR doubles the cooldown ([`idr_cooldown`]);
+/// a cooldown no such request lands in resets the run, as does a [`KF_EPISODE_RESET`] gap.
+#[derive(Default)]
+pub(super) struct KeyframeGate {
+    last_request: Option<std::time::Instant>,
+    rfi_echo_swallowed: u32,
+    unhealed: u32,
+    refuted: Arc<crate::send_pacing::Refutation>,
+}
+
+impl KeyframeGate {
+    /// A gate whose [`IDR_STORM`] raises `refuted` ([`crate::send_pacing::Refutation`]).
+    pub(super) fn new(refuted: Arc<crate::send_pacing::Refutation>) -> Self {
+        KeyframeGate {
+            refuted,
+            ..KeyframeGate::default()
+        }
+    }
+
+    /// What one keyframe request at `now` gets. The [`IDR_STORM`]th unhealed IDR in a row is
+    /// logged and refutes an unmeasured link.
+    pub(super) fn decide(
+        &mut self,
+        now: std::time::Instant,
+        base: std::time::Duration,
+        last_idr: Option<std::time::Instant>,
+        last_rfi: Option<std::time::Instant>,
+        rfi_declined: bool,
+    ) -> KeyframeVerdict {
+        let new_episode = self
+            .last_request
+            .is_none_or(|t| now.duration_since(t) > KF_EPISODE_RESET);
+        if new_episode {
+            self.rfi_echo_swallowed = 0;
+            self.unhealed = 0;
+        }
+        let prev_request = self.last_request.replace(now).filter(|_| !new_episode);
+        let cooldown = idr_cooldown(base, self.unhealed);
+        let since_idr = |t: Option<std::time::Instant>| t.map(|t| now.saturating_duration_since(t));
+        if since_idr(last_idr).is_some_and(|d| d < cooldown) {
+            return KeyframeVerdict::Coalesced {
+                cooldown,
+                unhealed: self.unhealed,
+            };
+        }
+        if !rfi_declined
+            && since_idr(last_rfi).is_some_and(|d| d < RECOVERY_FLIGHT)
+            && self.rfi_echo_swallowed < RFI_ECHO_MAX_SWALLOWED
+        {
+            self.rfi_echo_swallowed += 1;
+            return KeyframeVerdict::RfiEcho {
+                swallowed: self.rfi_echo_swallowed,
+            };
+        }
+        let missed = last_idr
+            .zip(prev_request)
+            .is_some_and(|(idr, req)| req.saturating_duration_since(idr) >= RECOVERY_FLIGHT);
+        self.unhealed = if missed { self.unhealed + 1 } else { 0 };
+        let rfi_unhealed = std::mem::take(&mut self.rfi_echo_swallowed) > 0;
+        let cooldown = idr_cooldown(base, self.unhealed);
+        if self.unhealed == IDR_STORM {
+            self.refuted.raise(crate::send_pacing::Evidence::IdrStorm);
+            tracing::warn!(
+                unhealed = self.unhealed,
+                cooldown_ms = cooldown.as_millis() as u64,
+                "forced IDRs are not healing the client — it loses the repair itself (decoder, \
+                 receive buffer or link), not a host display disturbance. IDR cooldown backed \
+                 off; the client log's 'receive backlog stopped draining' decides which"
+            );
+        }
+        KeyframeVerdict::Force {
+            cooldown,
+            unhealed: self.unhealed,
+            rfi_unhealed,
+        }
+    }
+}
+
+/// ±10 % of [`FLUSH_COOLDOWN`]: a software cooldown is the most periodic thing in the system.
+fn matches_client_flush_cadence(period: std::time::Duration) -> bool {
+    let flush = punktfunk_core::reanchor::FLUSH_COOLDOWN;
+    period.abs_diff(flush) < flush / 10
+}
+
+/// ±10 % of [`NO_VIDEO_RETRY`]. Opposite fault from flush cadence; only the delivery count tells which.
+fn matches_client_no_video_cadence(period: std::time::Duration) -> bool {
+    let no_video = punktfunk_core::reanchor::NO_VIDEO_RETRY;
+    period.abs_diff(no_video) < no_video / 10
+}
+
+fn matches_client_recovery_cooldown(period: std::time::Duration) -> bool {
+    matches_client_flush_cadence(period) || matches_client_no_video_cadence(period)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::swap::tests::CountsKeyframes;
+
+    /// An asynchronous encoder that records the rates it is asked for.
+    struct Retargets(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
+
+    impl crate::encode::Encoder for Retargets {
+        fn submit(&mut self, _frame: &crate::capture::CapturedFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<crate::encode::EncodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
+            self.0.lock().unwrap().push(bps);
+            true
+        }
+        fn bitrate_retarget_is_synchronous(&self) -> bool {
+            false
+        }
+    }
+
+    /// A rate taken in place is derived at the first screen's share in force, so the screens'
+    /// next turn owes the encoder no second retarget.
+    #[test]
+    fn an_in_place_rate_takes_the_first_screens_share() {
+        let mut f = super::super::swap::tests::fake();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        f.st.live.enc = Box::new(Retargets(asked.clone()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        f.st.ends.bitrate_rx = rx;
+        f.st.shared
+            .screen_wire
+            .primary_share
+            .store(500, Ordering::Relaxed);
+        tx.send(f.st.live.bitrate_kbps / 2)
+            .expect("the loop's end is open");
+        f.st.on_bitrate_request();
+        f.st.on_screens();
+        assert_eq!(asked.lock().unwrap().len(), 1, "retargeted twice");
+    }
+
+    /// A FEC proposal that comes back to the applied one before the encoder settled the ask
+    /// puts the encoder back on the applied FEC's rate.
+    #[test]
+    fn a_reverted_fec_proposal_asks_the_encoder_back() {
+        let mut f = super::super::swap::tests::fake();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        f.st.live.enc = Box::new(Retargets(asked.clone()));
+        let applied = f.st.fec.last;
+        f.st.fec.requested.store(applied, Ordering::Release);
+        f.st.on_fec_moved();
+        let back = f.st.enc_derive(applied).enc_kbps(f.st.live.bitrate_kbps);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [u64::from(back) * 1000],
+            "left on the abandoned rate"
+        );
+        assert_eq!(f.st.fec.pending, Some((applied, back)));
+    }
+
+    /// A downward rate the encoder could not be rebuilt at leaves the session on its old rate,
+    /// and the client is told so; the frame on the wire stays open for the encoder it belongs to.
+    #[test]
+    fn a_failed_rate_rebuild_tells_the_client_the_rate_kept() {
+        let mut f = super::super::swap::tests::fake();
+        let (tx, rx) = std::sync::mpsc::channel();
+        f.st.ends.bitrate_rx = rx;
+        let (retarget_tx, mut retarget_rx) = tokio::sync::mpsc::unbounded_channel();
+        f.st.ends.retarget_tx = retarget_tx;
+        f.st.clock.wire_frame_open = true;
+        let (kept, au_seq) = (f.st.live.bitrate_kbps, f.st.clock.au_seq);
+        tx.send(kept / 2).expect("the loop's end is open");
+        f.st.on_bitrate_request();
+        assert_eq!(
+            f.st.live.bitrate_kbps, kept,
+            "the test encoder opened; this check needs a refusal"
+        );
+        assert_eq!(
+            retarget_rx.try_recv().ok(),
+            Some((kept, AckReason::EncoderLimit)),
+            "the client still believes the lower rate"
+        );
+        assert_eq!(
+            f.st.clock.au_seq, au_seq,
+            "a failed open closed the old encoder's frame"
+        );
+        assert!(f.st.clock.wire_frame_open);
+    }
+
+    /// A torn reference raised inside the cooldown of the IDR before it is repaired once that
+    /// cooldown ends, never dropped as an echo.
+    #[test]
+    fn a_host_repair_inside_the_cooldown_waits_then_lands() {
+        let mut f = super::super::swap::tests::fake();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        f.st.live.enc = Box::new(CountsKeyframes(asked.clone()));
+        f.st.clock.last_forced_idr = Some(std::time::Instant::now());
+        f.st.live.asks.idr = true;
+        f.st.on_recovery_requests();
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "inside the cooldown"
+        );
+        f.st.clock.last_forced_idr =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        f.st.on_recovery_requests();
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the repair was dropped"
+        );
+    }
+
+    use super::*;
+    use crate::encode::Encoder;
+    use std::time::{Duration, Instant};
+
+    /// Drives [`KeyframeGate`] like the encode loop: a request every `step` from `t`, each
+    /// answered by the verdict, a forced IDR stamping `last_idr`. Returns the forced IDRs'
+    /// `(offset_ms, unhealed, cooldown)`.
+    fn storm(
+        gate: &mut KeyframeGate,
+        base: Duration,
+        t0: Instant,
+        last_idr: &mut Option<Instant>,
+        from_ms: u64,
+        to_ms: u64,
+        step_ms: u64,
+    ) -> Vec<(u64, u32, Duration)> {
+        let mut forced = Vec::new();
+        let mut ms = from_ms;
+        while ms < to_ms {
+            let now = t0 + Duration::from_millis(ms);
+            if let KeyframeVerdict::Force {
+                cooldown, unhealed, ..
+            } = gate.decide(now, base, *last_idr, None, false)
+            {
+                *last_idr = Some(now);
+                forced.push((ms, unhealed, cooldown));
+            }
+            ms += step_ms;
+        }
+        forced
+    }
+
+    /// A client that asks again after every IDR has landed is not healed by IDRs: the
+    /// cooldown doubles to the cap and holds there; a cooldown it stays quiet through, or an
+    /// episode gap, puts the next loss back on the base cooldown.
+    #[test]
+    fn an_idr_the_client_reasks_after_backs_the_cooldown_off_to_the_cap() {
+        let base = Duration::from_millis(750);
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut gate = KeyframeGate::default();
+        let mut last_idr = None;
+        // Requests every 230 ms for 10 s: the first forces, the rest land past the flight.
+        let forced = storm(&mut gate, base, t0, &mut last_idr, 0, 10_000, 230);
+        let shape: Vec<_> = forced.iter().map(|&(_, u, c)| (u, c)).collect();
+        assert_eq!(
+            &shape[..4],
+            &[(0, base), (1, ms(1500)), (2, ms(3000)), (3, ms(3000))],
+            "double, then hold at the cap"
+        );
+        assert!(shape[4..]
+            .iter()
+            .all(|&(u, c)| u >= IDR_STORM && c == ms(3000)));
+        assert!(
+            forced.len() < 10_000 / 750 / 2,
+            "{} IDRs in 10 s is the storm, not the backoff",
+            forced.len()
+        );
+        // Quiet through a whole cooldown after the last IDR: the next loss starts over.
+        let (last_ms, ..) = *forced.last().unwrap();
+        let quiet = t0 + ms(last_ms + 3_500);
+        assert!(matches!(
+            gate.decide(quiet, base, last_idr, None, false),
+            KeyframeVerdict::Force { unhealed: 0, cooldown, .. } if cooldown == base
+        ));
+        last_idr = Some(quiet);
+        // One late re-ask inside the cooldown, then a long healthy silence: the old episode's
+        // request must not turn the next unrelated loss into an unhealed IDR.
+        assert!(matches!(
+            gate.decide(quiet + ms(500), base, last_idr, None, false),
+            KeyframeVerdict::Coalesced { unhealed: 0, .. }
+        ));
+        assert!(matches!(
+            gate.decide(quiet + Duration::from_secs(600), base, last_idr, None, false),
+            KeyframeVerdict::Force { unhealed: 0, cooldown, .. } if cooldown == base
+        ));
+        // The intra-refresh window is capped too, never 8 s.
+        assert_eq!(idr_cooldown(Duration::from_secs(2), 3), IDR_COOLDOWN_MAX);
+    }
+
+    /// The storm refutes the link the send thread's pacer reads at the [`IDR_STORM`]th
+    /// unhealed IDR, not before, and a healed episode after it leaves it refuted.
+    #[test]
+    fn an_idr_storm_raises_the_pacers_flag() {
+        use crate::send_pacing::{Evidence, Refutation};
+        let base = Duration::from_millis(750);
+        let t0 = Instant::now();
+        let refuted = Arc::new(Refutation::default());
+        let mut gate = KeyframeGate::new(refuted.clone());
+        let mut last_idr = None;
+        let early = storm(&mut gate, base, t0, &mut last_idr, 0, 5_060, 230);
+        assert!(early.iter().all(|&(_, u, _)| u < IDR_STORM), "{early:?}");
+        assert_eq!(refuted.evidence(), None, "raised before the storm");
+        let late = storm(&mut gate, base, t0, &mut last_idr, 5_060, 10_000, 230);
+        assert_eq!(late[0].1, IDR_STORM);
+        assert_eq!(refuted.evidence(), Some(Evidence::IdrStorm));
+        let healed = t0 + Duration::from_secs(600);
+        assert!(matches!(
+            gate.decide(healed, base, last_idr, None, false),
+            KeyframeVerdict::Force { unhealed: 0, .. }
+        ));
+        assert_eq!(refuted.evidence(), Some(Evidence::IdrStorm));
+    }
+
+    /// An echo inside an RFI's flight is swallowed twice and then forces with the anchor
+    /// distrusted; an echo inside an IDR's flight is the same loss, not an unhealed IDR.
+    #[test]
+    fn echoes_inside_a_recovery_flight_are_the_same_loss() {
+        let base = Duration::from_millis(750);
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut gate = KeyframeGate::default();
+        let rfi = Some(t0);
+        assert_eq!(
+            gate.decide(t0 + ms(100), base, None, rfi, false),
+            KeyframeVerdict::RfiEcho { swallowed: 1 }
+        );
+        assert_eq!(
+            gate.decide(t0 + ms(200), base, None, rfi, false),
+            KeyframeVerdict::RfiEcho { swallowed: 2 }
+        );
+        assert!(matches!(
+            gate.decide(t0 + ms(250), base, None, rfi, false),
+            KeyframeVerdict::Force {
+                rfi_unhealed: true,
+                unhealed: 0,
+                ..
+            }
+        ));
+        // A declined RFI is proof, never an echo.
+        let mut gate = KeyframeGate::default();
+        assert!(matches!(
+            gate.decide(t0 + ms(100), base, None, rfi, true),
+            KeyframeVerdict::Force {
+                rfi_unhealed: false,
+                ..
+            }
+        ));
+        // IDR at t0, echo at +200 ms (inside the flight), next loss after the cooldown.
+        let idr = Some(t0);
+        assert!(matches!(
+            gate.decide(t0 + ms(200), base, idr, None, false),
+            KeyframeVerdict::Coalesced { .. }
+        ));
+        assert!(matches!(
+            gate.decide(t0 + ms(800), base, idr, None, false),
+            KeyframeVerdict::Force { unhealed: 0, .. }
+        ));
+    }
+
+    /// The 2026-08-13 field log's exact reading — `period_s=2.0` — must be attributed to the
+    /// client's backlog shedding, not to a host display disturbance. The whole point of routing
+    /// on the shared constant is that this stays true if the cooldown is ever retuned, so the
+    /// test derives its cases from `FLUSH_COOLDOWN` instead of hardcoding two seconds.
+    #[test]
+    fn a_recovery_cadence_on_the_clients_cooldown_is_not_blamed_on_the_display() {
+        let flush = punktfunk_core::reanchor::FLUSH_COOLDOWN;
+        assert!(matches_client_flush_cadence(flush), "the field reading");
+        assert!(matches_client_flush_cadence(flush + flush / 20));
+        assert!(matches_client_flush_cadence(flush - flush / 20));
+
+        assert!(!matches_client_flush_cadence(flush / 2));
+        assert!(!matches_client_flush_cadence(flush * 2));
+        assert!(!matches_client_flush_cadence(flush + flush / 5));
+        assert!(!matches_client_flush_cadence(std::time::Duration::ZERO));
+    }
+
+    /// Encoder whose in-place retarget answer is scripted; every other trait
+    /// method keeps its default. `asks` records the rates it was offered.
+    struct RetargetEnc {
+        accepts: bool,
+        asks: Vec<u64>,
+    }
+
+    impl crate::encode::Encoder for RetargetEnc {
+        fn submit(&mut self, _frame: &crate::capture::CapturedFrame) -> Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> Result<Option<crate::encode::EncodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
+            self.asks.push(bps);
+            self.accepts
+        }
+    }
+
+    /// A budget-identity codec changes parity without changing its encoder
+    /// rate, so its proposal publishes directly to the packetizer.
+    #[test]
+    fn on_fec_moved_applies_identity_budget_fec_without_a_retarget() {
+        let applied = AtomicU8::new(10);
+        let mut last_fec = 10;
+        publish_fec(&applied, &mut last_fec, 30);
+        assert_eq!(last_fec, 30);
+        assert_eq!(applied.load(Ordering::Relaxed), 30);
+    }
+
+    /// An asynchronous encoder has only queued the rate when it returns true:
+    /// it is asked, and parity stays where it was with the proposal standing.
+    #[test]
+    fn on_fec_moved_asks_an_asynchronous_encoder_and_waits() {
+        let applied = AtomicU8::new(10);
+        let requested = AtomicU8::new(30);
+        let mut last_fec = 10;
+        let mut enc = RetargetEnc {
+            accepts: true,
+            asks: Vec::new(),
+        };
+        assert_eq!(
+            fec_retarget(
+                false,
+                |bps| enc.reconfigure_bitrate(bps),
+                12_000_000,
+                &applied,
+                &requested,
+                &mut last_fec,
+                30,
+            ),
+            FecMove::Pending
+        );
+        assert_eq!(enc.asks, [12_000_000], "the encoder was asked");
+        assert_eq!(last_fec, 10);
+        assert_eq!(applied.load(Ordering::Relaxed), 10);
+        assert_eq!(requested.load(Ordering::Relaxed), 30, "the proposal stands");
+    }
+
+    /// Settled: parity follows an encoder that made room for it, and is held
+    /// behind one that stayed above the rate the new parity leaves — that
+    /// wire would carry more than the budget.
+    #[test]
+    fn a_settled_retarget_moves_parity_only_inside_the_budget() {
+        for (applied_bps, moved) in [(12_000_000, true), (11_500_000, true), (13_000_000, false)] {
+            let target = AtomicU8::new(10);
+            let requested = AtomicU8::new(30);
+            let mut last_fec = 10;
+            assert_eq!(
+                settle_fec(
+                    applied_bps,
+                    12_000_000,
+                    &target,
+                    &requested,
+                    &mut last_fec,
+                    30
+                ),
+                moved,
+                "{applied_bps}"
+            );
+            let (fec, slot) = if moved { (30, 30) } else { (10, 10) };
+            assert_eq!(last_fec, fec, "{applied_bps}");
+            assert_eq!(target.load(Ordering::Relaxed), fec, "{applied_bps}");
+            assert_eq!(requested.load(Ordering::Relaxed), slot, "{applied_bps}");
+        }
+    }
+
+    /// The `want == prev` leg aside, [`StreamState::on_fec_moved`] is this helper:
+    /// an accepted retarget publishes the requested FEC to `fec_target` and
+    /// `last_fec` together.
+    #[test]
+    fn on_fec_moved_applies_the_proposal_once_the_encoder_accepts() {
+        let applied = AtomicU8::new(10);
+        let requested = AtomicU8::new(30);
+        let mut last_fec = 10;
+        let mut enc = RetargetEnc {
+            accepts: true,
+            asks: Vec::new(),
+        };
+        assert_eq!(
+            fec_retarget(
+                true,
+                |bps| enc.reconfigure_bitrate(bps),
+                12_000_000,
+                &applied,
+                &requested,
+                &mut last_fec,
+                30,
+            ),
+            FecMove::Published
+        );
+        assert_eq!(enc.asks, [12_000_000]);
+        assert_eq!(last_fec, 30);
+        assert_eq!(applied.load(Ordering::Relaxed), 30);
+        assert_eq!(requested.load(Ordering::Relaxed), 30);
+    }
+
+    /// A refused retarget leaves applied FEC and `last_fec` untouched and hands
+    /// the request slot back to the applied value.
+    #[test]
+    fn on_fec_moved_refusal_keeps_the_previous_fec() {
+        let applied = AtomicU8::new(10);
+        let requested = AtomicU8::new(30);
+        let mut last_fec = 10;
+        let mut enc = RetargetEnc {
+            accepts: false,
+            asks: Vec::new(),
+        };
+        assert_eq!(
+            fec_retarget(
+                true,
+                |bps| enc.reconfigure_bitrate(bps),
+                12_000_000,
+                &applied,
+                &requested,
+                &mut last_fec,
+                30,
+            ),
+            FecMove::Held
+        );
+        assert_eq!(last_fec, 10);
+        assert_eq!(applied.load(Ordering::Relaxed), 10);
+        assert_eq!(requested.load(Ordering::Relaxed), 10);
+    }
+
+    /// The refusal's compare-exchange must not clobber a proposal the control
+    /// task wrote after the refused one: the reset applies only to the slot
+    /// still holding the value this call was asked to move.
+    #[test]
+    fn on_fec_moved_refusal_does_not_clobber_a_newer_proposal() {
+        let applied = AtomicU8::new(10);
+        // Control raced ahead: the slot holds a newer proposal than the refused 30.
+        let requested = AtomicU8::new(50);
+        let mut last_fec = 10;
+        let mut enc = RetargetEnc {
+            accepts: false,
+            asks: Vec::new(),
+        };
+        assert_eq!(
+            fec_retarget(
+                true,
+                |bps| enc.reconfigure_bitrate(bps),
+                12_000_000,
+                &applied,
+                &requested,
+                &mut last_fec,
+                30,
+            ),
+            FecMove::Held
+        );
+        assert_eq!(last_fec, 10);
+        assert_eq!(applied.load(Ordering::Relaxed), 10);
+        assert_eq!(requested.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn the_two_client_cooldowns_are_distinguishable_and_both_excluded_from_display_blame() {
+        let flush = punktfunk_core::reanchor::FLUSH_COOLDOWN;
+        let no_video = punktfunk_core::reanchor::NO_VIDEO_RETRY;
+        assert_ne!(
+            flush, no_video,
+            "identical cooldowns make the host's verdict a coin flip"
+        );
+        // Neither may fall inside the other's ±10% band, or the period stops discriminating.
+        assert!(!matches_client_flush_cadence(no_video));
+        assert!(!matches_client_no_video_cadence(flush));
+        // Both are client software cooldowns: never the metronomic display-disturbance branch.
+        assert!(matches_client_recovery_cooldown(flush));
+        assert!(matches_client_recovery_cooldown(no_video));
+        // A real periodic disturbance still reaches that branch.
+        assert!(!matches_client_recovery_cooldown(flush * 3));
+        assert!(!matches_client_recovery_cooldown(std::time::Duration::ZERO));
+    }
+}
+
+#[cfg(test)]
+mod loss_mode_tests {
+    use super::*;
+
+    /// A lossy window turns confirmed references on, with the newest confirmed frame as the
+    /// floor once there is one, and they hold ten seconds past the last such window.
+    #[test]
+    fn loss_mode_holds_ten_seconds_past_the_last_lossy_window() {
+        let t0 = std::time::Instant::now();
+        let s = std::time::Duration::from_secs;
+        let acked = 40u64 << 16 | 0b11;
+        let mut m = LossMode::default();
+        assert_eq!(
+            m.floor(false, acked, 42, t0),
+            None,
+            "a clean link keeps the chain"
+        );
+        let none = crate::native::wiring::NONE_ACKED;
+        assert_eq!(m.floor(true, none, 42, t0), None, "nothing confirmed yet");
+        assert!(m.is_on());
+        let want = crate::encode::Acked {
+            last: 40,
+            mask: 0b11,
+        };
+        assert_eq!(m.floor(false, acked, 43, t0 + s(9)), Some(want));
+        assert_eq!(m.floor(false, acked, 44, t0 + s(10)), None);
+        assert!(!m.is_on());
+    }
+}
+
+#[cfg(test)]
+mod resend_ring_tests {
+    use super::ResendRing;
+
+    /// A plaintext packet whose header says where it sits; the rest is filler.
+    fn packet(frame: u32, base: u32, shard: u16, k: u16, m: u16, len: usize) -> Vec<u8> {
+        let mut p = vec![0u8; len.max(30)];
+        p[8..12].copy_from_slice(&frame.to_le_bytes());
+        p[18..22].copy_from_slice(&base.to_le_bytes());
+        p[22..24].copy_from_slice(&shard.to_le_bytes());
+        p[24..26].copy_from_slice(&k.to_le_bytes());
+        p[26..28].copy_from_slice(&m.to_le_bytes());
+        p
+    }
+
+    fn frame(r: &mut ResendRing, index: u32, packets: usize, len: usize) {
+        r.begin(index);
+        for s in 0..packets as u16 {
+            r.note(&packet(index, 0, s, packets as u16, 0, len));
+        }
+    }
+
+    /// The ring keeps the last three frames and gives up the oldest first when the bytes
+    /// run over, never the frame in progress.
+    #[test]
+    fn the_ring_holds_the_last_frames_and_sheds_the_oldest() {
+        let mut r = ResendRing::default();
+        for f in 0..5u32 {
+            frame(&mut r, f, 2, 1000);
+        }
+        assert!(r.pick(1, &[0]).is_none());
+        assert_eq!(r.pick(4, &[0, 1]).unwrap().0.len(), 2);
+        frame(&mut r, 9, 80, 64 * 1024);
+        r.note(&packet(9, 0, 80, 81, 0, 10));
+        assert!(
+            r.pick(3, &[0]).is_none() && r.pick(4, &[0]).is_none(),
+            "over the cap"
+        );
+        assert_eq!(
+            r.pick(9, &[80]).unwrap().0.len(),
+            1,
+            "never the frame in progress"
+        );
+    }
+
+    /// A name picks the packet the client's reassembler means: data by its index in the AU,
+    /// parity numbered after all the data in block order. Another frame's packets never.
+    #[test]
+    fn a_name_picks_the_shard_the_client_means() {
+        let mut r = ResendRing::default();
+        r.begin(7);
+        // Block 0: 4 data + 2 parity; block 1 at base 4: 3 data + 2 parity. 7 data in all.
+        for s in 0..6 {
+            r.note(&packet(7, 0, s, 4, 2, 40));
+        }
+        for s in 0..5 {
+            r.note(&packet(7, 4, s, 3, 2, 40));
+        }
+        r.note(&packet(8, 0, 2, 4, 2, 40));
+        let (picked, _) = r.pick(7, &[2, 8, 9]).unwrap();
+        let at = |p: &[u8]| (p[18], p[22]);
+        let got: Vec<(u8, u8)> = picked.iter().map(|p| at(p)).collect();
+        assert_eq!(got, [(0, 2), (0, 5), (4, 3)]);
+    }
+}

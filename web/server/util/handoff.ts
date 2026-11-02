@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 // Verifies the console handoff ticket `punktfunk-host ctl console-url` mints, keyed by the
 // management token both sides already hold. The ticket never enters browser argv, where
 // /proc/<pid>/cmdline would expose it to other local users: the host writes it into a 0600 page
@@ -56,7 +58,7 @@ export function safeEqualHex(a: string, b: string): boolean {
  */
 export async function verifyHandoff(
 	ticket: string,
-	key: string,
+	keys: string | readonly string[],
 	seen: Map<string, number>,
 	now: number = Date.now(),
 ): Promise<HandoffVerdict> {
@@ -90,9 +92,28 @@ export async function verifyHandoff(
 	// different map key than the real ticket.
 	if (seen.has(ticket)) return { ok: false, reason: "replayed" };
 	seen.set(ticket, now);
-	if (!safeEqualHex(mac, await macFor(key, ts, nonce))) {
-		seen.delete(ticket);
-		return { ok: false, reason: "bad-signature" };
+	for (const key of typeof keys === "string" ? [keys] : keys) {
+		if (key && safeEqualHex(mac, await macFor(key, ts, nonce)))
+			return { ok: true };
 	}
-	return { ok: true };
+	seen.delete(ticket);
+	return { ok: false, reason: "bad-signature" };
+}
+
+/**
+ * The owner's host's key, on a door: the door keeps it in `owner-handoff-key` beside its own
+ * token, so the owner's `ctl console-url`, which signs with their own host's token, opens the
+ * door's console. Never a seat's. Empty off a door. Read per call: the owner's row mints a new
+ * token each time it starts.
+ */
+export function ownerHandoffKeys(
+	dir: string = process.env.PUNKTFUNK_CONFIG_DIR ?? "",
+): string[] {
+	if (!dir) return [];
+	try {
+		const key = readFileSync(join(dir, "owner-handoff-key"), "utf8").trim();
+		return key ? [key] : [];
+	} catch {
+		return [];
+	}
 }

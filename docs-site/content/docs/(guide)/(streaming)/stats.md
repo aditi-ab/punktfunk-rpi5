@@ -87,6 +87,9 @@ delay and rendering time. It stays approximate: those are averages, the Advanced
   `HDR`, or `HDR→SDR` when an HDR stream is tone-mapped for a screen that can't show it, and
   `4:4:4`, or `4:4:4→4:2:0` when you asked for full chroma and the host declined. At every level it
   ends with the name of the stream's [preset](/docs/presets-and-links).
+- **`native-d3d11va-bind`** and **`native-d3d11va-copy`** name D3D11VA on a Windows client that
+  draws through Direct3D 11: `bind` shows the decoder's own pictures, `copy` copies each one once
+  first.
 - **`audio lossless 96 kHz / 24-bit`** (Normal and up) names the format of a lossless audio
   session, with `5.1` or `7.1` when it is surround.
 - **`lost N`** counts frames instead of a percentage when the last second held under 30 frames.
@@ -174,7 +177,7 @@ screen, and `stats-json:` carries every figure as JSON. Parse the JSON; the text
 
 ## Recording a capture for a bug report
 
-The overlay only shows the last second. To record a whole run, use the **Performance** page in the
+The overlay only shows the last second. To record a whole run, use **Diagnostics** → **Performance** in the
 [web console](/docs/web-console):
 
 1. Press **Start capture**. Arming it costs the stream nothing.

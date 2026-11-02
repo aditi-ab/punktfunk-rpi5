@@ -11,6 +11,7 @@
 mod access;
 mod clipboard;
 mod connect;
+mod cursor;
 mod input;
 mod planes;
 mod probe;

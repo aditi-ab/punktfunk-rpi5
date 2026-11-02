@@ -13,7 +13,7 @@ extension InputCapture {
     /// bookkeeping stays on the physical VK, so modifier direction tracking and the client-local
     /// ⌘-based shortcuts are untouched. The swap is its own inverse: a key that went down remapped
     /// goes up remapped, so the host never sees a stuck modifier.
-    static func applyModifierLayout(_ vk: UInt32, _ layout: ModifierLayout) -> UInt32 {
+    nonisolated static func applyModifierLayout(_ vk: UInt32, _ layout: ModifierLayout) -> UInt32 {
         guard layout == .windows else { return vk }
         switch vk {
         case 0x5B: return 0xA4 // L Command → L Alt (VK_LWIN → VK_LMENU)
@@ -25,7 +25,7 @@ extension InputCapture {
     }
     /// HID usage (GCKeyCode raw) → Windows VK (the host maps VK → evdev; every VK emitted
     /// here exists in punktfunk-host/src/inject.rs::vk_to_evdev — extend the two together).
-    static let hidToVK: [Int: UInt32] = {
+    nonisolated static let hidToVK: [Int: UInt32] = {
         var m: [Int: UInt32] = [:]
         // a–z: HID 0x04..0x1D → VK 'A'..'Z'.
         for i in 0..<26 { m[0x04 + i] = UInt32(0x41 + i) }
@@ -77,7 +77,7 @@ extension InputCapture {
     /// the host's vk_to_evdev (inject.rs) accepts both with zero change. Modifier keys come
     /// via flagsChanged (handleFlagsChanged), not keyDown, so they're absent here. Keys with
     /// no host evdev arm (F13–F20, KeypadEquals, the Fn key) are omitted → nil → swallowed.
-    static let keyCodeToVK: [UInt16: UInt32] = {
+    nonisolated static let keyCodeToVK: [UInt16: UInt32] = {
         var m: [UInt16: UInt32] = [:]
         // Letters — kVK_ANSI_A..Z (scattered keycodes) → VK 'A'..'Z'.
         m[0x00] = 0x41; m[0x01] = 0x53; m[0x02] = 0x44; m[0x03] = 0x46 // A S D F
@@ -133,7 +133,7 @@ extension InputCapture {
     /// `deviceBit`/`siblingBit` the device-dependent bits (LOW 16 bits, NX_DEVICE*KEYMASK
     /// in IOLLEvent.h) for this key and its opposite-side twin. Consumed by
     /// `resolveModifier`, which explains why both kinds of bit are needed.
-    static let modifierBits:
+    nonisolated static let modifierBits:
         [UInt16: (vk: UInt32, classMask: UInt, deviceBit: UInt, siblingBit: UInt)] = [
             56: (0xA0, 0x2_0000, 0x2, 0x4), // left shift → VK_LSHIFT
             60: (0xA1, 0x2_0000, 0x4, 0x2), // right shift → VK_RSHIFT

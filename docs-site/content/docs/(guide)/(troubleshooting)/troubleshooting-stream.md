@@ -23,7 +23,7 @@ The host can't capture this session. Check:
 A locked GNOME session blocks capture. Turn the lock off:
 [GNOME → Do not lock the session](/docs/gnome#do-not-lock-the-session).
 
-### Games from my library open on a physical monitor, not on the stream (Hyprland / sway)
+### Games from my library open on a physical monitor, not on the stream (Hyprland / sway / niri)
 
 A new window opens on the focused monitor, and something took focus from the stream: a click on a
 physical monitor, or a launcher (Steam Big Picture, Heroic) that opens the game window later.
@@ -36,8 +36,9 @@ physical monitor, or a launcher (Steam Big Picture, Heroic) that opens the game 
 
 ### Game Mode: black screen on connect, or the stream is stuck at the box's resolution
 
-**Attach mode** is on, so the host mirrors the box's own screen instead of taking the session
-over. The checks and the fix:
+A screen is pinned under **Displays** → **Stream this monitor**, or `host.env` sets
+`PUNKTFUNK_GAMESCOPE_ATTACH`, so the host mirrors the box's own screen instead of taking the
+session over. The checks and the fix:
 [gamescope → Troubleshooting](/docs/gamescope#the-stream-is-black-on-connect-or-stuck-at-the-boxs-resolution).
 
 ## Windows
@@ -58,14 +59,14 @@ frames wait behind its frames. Any streamer stutters the same way. The console's
 page shows it under **Video encoder sharing**.
 
 - By default the host pauses Instant Replay once a stream falls behind while another app encodes,
-  and turns it back on when the last stream ends. **Host → Settings → Pause Instant Replay**: `on`
+  and turns it back on when the last stream ends. **Host → Pause Instant Replay**: `on`
   pauses it for every stream, `off` leaves it alone.
 - Or press Alt+Shift+F10 before you connect, or turn it off in the NVIDIA App overlay.
 
 ### The picture freezes for a moment, over and over (Windows)
 
 A freeze on a steady rhythm is a display or driver disturbance, not bandwidth. While it happens,
-**Home** → **Live status** → **Capture health** reads `stalled`.
+the session's row on **Home** → **Details** → **Capture health** reads `stalled`.
 
 Search the log on the console's **Troubleshooting** page for `METRONOMIC`. The line names the cause
 and its cures:

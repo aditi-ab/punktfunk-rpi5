@@ -47,40 +47,36 @@ on:
     # web-only push should not light up the whole fleet. Applies to branch pushes;
     # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
     paths:
-      - 'crates/pf-bitstream/**'
-      - 'crates/pf-capture/**'
-      - 'crates/pf-client-core/**'
-      - 'crates/pf-clipboard/**'
-      - 'crates/pf-console-ui/**'
-      - 'crates/pf-dmabuf/**'
-      - 'crates/pf-driver-proto/**'
-      - 'crates/pf-encode/**'
-      - 'crates/pf-encode-core/**'
-      - 'crates/pf-frame/**'
-      - 'crates/pf-gpu/**'
-      - 'crates/pf-host-config/**'
-      - 'crates/pf-inject/**'
-      - 'crates/pf-audio/**'
-      - 'crates/pf-libva/**'
-      - 'crates/pf-paths/**'
-      - 'crates/pf-paths-win/**'
-      - 'crates/pf-portal/**'
-      - 'crates/pf-presenter/**'
-      - 'crates/pf-update/**'
-      - 'crates/pf-update-check/**'
-      - 'crates/pf-vaapi/**'
-      - 'crates/pf-v4l2dec/**'
-      - 'crates/pf-v4l2/**'
-      - 'crates/pf-vdisplay/**'
-      - 'crates/pf-vkdecode/**'
-      - 'crates/pf-win-display/**'
-      - 'crates/pf-zerocopy/**'
-      - 'crates/punktfunk-core/**'
-      - 'crates/punktfunk-ffi/**'
-      - 'crates/punktfunk-encode-worker/**'
-      - 'crates/punktfunk-host/**'
-      - 'crates/punktfunk-tray/**'
-      - 'crates/pyrowave-sys/**'
+      - 'crates/client/**'
+      - 'crates/codec/pf-bitstream/**'
+      - 'crates/codec/pf-libva/**'
+      - 'crates/codec/pf-v4l2/**'
+      - 'crates/codec/pf-v4l2dec/**'
+      - 'crates/codec/pf-vaapi/**'
+      - 'crates/codec/pf-vkdecode/**'
+      - 'crates/codec/pyrowave-sys/**'
+      - 'crates/core/**'
+      - 'crates/host/pf-audio/**'
+      - 'crates/host/pf-capture/**'
+      - 'crates/host/pf-clipboard/**'
+      - 'crates/host/pf-driver-proto/**'
+      - 'crates/host/pf-encode/**'
+      - 'crates/host/pf-encode-core/**'
+      - 'crates/host/pf-frame/**'
+      - 'crates/host/pf-gpu/**'
+      - 'crates/host/pf-host-config/**'
+      - 'crates/host/pf-inject/**'
+      - 'crates/host/pf-paths/**'
+      - 'crates/host/pf-paths-win/**'
+      - 'crates/host/pf-portal/**'
+      - 'crates/host/pf-seats/**'
+      - 'crates/host/pf-vdisplay/**'
+      - 'crates/host/pf-win-display/**'
+      - 'crates/host/pf-zerocopy/**'
+      - 'crates/host/punktfunk-encode-worker/**'
+      - 'crates/host/punktfunk-host/**'
+      - 'crates/install/pf-update/**'
+      - 'crates/install/punktfunk-tray/**'
       - 'clients/linux/**'
       - 'clients/session/**'
       - 'clients/shared/**'
@@ -97,6 +93,11 @@ on:
       - 'packaging/linux/*.rules'
       - 'packaging/linux/*.service'
       - 'packaging/linux/*.sh'
+      - 'packaging/linux/*.tmpfiles'
+      - 'packaging/linux/*.sysusers'
+      - 'packaging/linux/payload.txt'
+      - 'packaging/linux/seat-*'
+      - 'packaging/linux/door-*'
       - 'packaging/linux/*.ufw'
       - 'packaging/linux/*.xml'
       - 'packaging/linux/icons/**'
@@ -128,6 +129,7 @@ on:
       - 'scripts/web-init.sh'
       - 'scripts/alsa-ucm2/**'
       - 'scripts/ci/assert-cap-matrix.sh'
+      - 'scripts/ci/assert-payload-parity.sh'
       - 'scripts/ci/deb-install-smoke.sh'
       - 'scripts/ci/drop-partial-target.sh'
       - 'scripts/ci/ensure-sccache.sh'
@@ -344,6 +346,12 @@ jobs:
           # The plugin/script runner (bun-bundled Effect SDK).
           VERSION="$VERSION" bash packaging/debian/build-scripting-deb.sh
 
+      # Every path packaging/linux/payload.txt names for the client, read out of the built .deb.
+      - name: Assert the shared payload (client .deb)
+        run: |
+          bash scripts/ci/assert-payload-parity.sh --self-test
+          bash scripts/ci/assert-payload-parity.sh dist/punktfunk-client_*.deb
+
       # Visibility only. With the target cache now actually saving release artifacts (see the
       # cache key note above), this is how a regression in that arrangement becomes visible:
       # a run that suddenly reports thousands of misses is a cache that stopped restoring.
@@ -486,12 +494,17 @@ jobs:
           # if the artifact is missing — building it here keeps it on the same sccache pass as the
           # host. Unlike the tray it shares the host's dependency graph by design (v1 accepts that
           # the worker shares the host dependency graph), so feature unification here is harmless.
+          #
+          # punktfunk-seats is the seat supervisor's binary. punktfunk-host already links its
+          # library and pf-inject, so this adds no feature unification, only the one executable.
           cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-            -p punktfunk-host -p punktfunk-encode-worker
+            -p punktfunk-host -p punktfunk-encode-worker -p punktfunk-seats
 
       - name: Build host .deb
         run: |
           VERSION="$VERSION" bash packaging/debian/build-deb.sh
+          # The seat supervisor, a separate .deb the host depends on.
+          VERSION="$VERSION" bash packaging/debian/build-seats-deb.sh
 
       # Visibility only — placed here, right after the last compile, rather than at the end of the
       # job: the gamescope gate below must stay the final step (see its own note).
@@ -509,6 +522,12 @@ jobs:
         run: |
           bash scripts/ci/assert-cap-matrix.sh --self-test
           bash scripts/ci/assert-cap-matrix.sh dist/punktfunk-host_*.deb
+
+      # Every path packaging/linux/payload.txt names for the host and seats, read out of the built .debs.
+      - name: Assert the shared payload (host and seats .debs)
+        run: |
+          bash scripts/ci/assert-payload-parity.sh --self-test
+          bash scripts/ci/assert-payload-parity.sh dist/punktfunk-host_*.deb dist/punktfunk-seats_*.deb
 
       - name: Publish to the Gitea apt registry
         env:

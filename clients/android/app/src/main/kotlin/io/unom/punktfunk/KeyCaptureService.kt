@@ -1,6 +1,7 @@
 package io.unom.punktfunk
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.view.KeyEvent
@@ -17,17 +18,28 @@ import androidx.compose.ui.platform.LocalContext
  * runs in the input dispatcher before that policy. The user turns it on under Accessibility.
  *
  * It hands every key to the focused stream ([stream], set by [MainActivity]) and consumes what the
- * stream owns. With no focused stream it touches nothing: other apps' keys pass straight through,
- * and it never reads window content — the config requests key filtering only.
+ * stream owns. It asks for keys only while a stream holds the window: every filtered key, in any
+ * app, waits up to 500 ms for this process to answer, and a late one lands as a long press. It
+ * never reads window content.
  */
 class KeyCaptureService : AccessibilityService() {
     override fun onServiceConnected() {
+        instance = this
         running = true
+        filterKeys(stream != null)
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
+        instance = null
         running = false
         return super.onUnbind(intent)
+    }
+
+    private fun filterKeys(on: Boolean) {
+        val info = serviceInfo ?: return
+        val flag = AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
+        info.flags = if (on) info.flags or flag else info.flags and flag.inv()
+        serviceInfo = info
     }
 
     /** A key consumed here never reaches the dispatcher, so it never repeats there either;
@@ -39,9 +51,18 @@ class KeyCaptureService : AccessibilityService() {
     override fun onInterrupt() {}
 
     companion object {
-        /** The focused stream's key handler; null whenever no stream holds the window. */
+        /** Main thread only; cleared on unbind. */
+        private var instance: KeyCaptureService? = null
+
+        /** The focused stream's key handler; null whenever no stream holds the window. Setting it
+         *  turns the service's key filter on or off; main thread only. */
         @Volatile
         var stream: ((KeyEvent) -> Boolean)? = null
+            set(value) {
+                val changed = (field == null) != (value == null)
+                field = value
+                if (changed) instance?.filterKeys(value != null)
+            }
 
         /** The user has the service on, so Alt+Tab needs no stand-in and the banner says nothing. */
         var running by mutableStateOf(false)

@@ -42,6 +42,20 @@ public enum AudioDevices {
         return channelCount(id, scope: kAudioObjectPropertyScopeInput)
     }
 
+    /// 0-based input channels the mic device names as loopback (Focusrite 4th Gen: "Loopback 1",
+    /// "Loopback 2"). They carry what the Mac plays, so a mic mix that took them would send the
+    /// stream back to the host. Resolves the device like `inputChannelCount(forUID:)`.
+    static func loopbackInputChannels(forUID uid: String) -> [Int] {
+        let id = uid.isEmpty ? defaultInputDevice() : deviceID(forUID: uid)
+        guard let id else { return [] }
+        return (0..<channelCount(id, scope: kAudioObjectPropertyScopeInput)).filter { c in
+            let name = stringProperty(
+                id, kAudioObjectPropertyElementName,
+                scope: kAudioObjectPropertyScopeInput, element: UInt32(c + 1))
+            return name?.lowercased().filter(\.isLetter).contains("loopback") == true
+        }
+    }
+
     /// The device the system is currently capturing from — the key `SessionAudio`'s
     /// voice-processing gate latches a start failure against (the failure is a property of the
     /// input device, so a new device earns a fresh attempt).
@@ -130,12 +144,14 @@ public enum AudioDevices {
     }
 
     private static func stringProperty(
-        _ id: AudioDeviceID, _ selector: AudioObjectPropertySelector
+        _ id: AudioDeviceID, _ selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
+        element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain
     ) -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
+            mScope: scope,
+            mElement: element)
         var ref: CFString?
         var size = UInt32(MemoryLayout<CFString?>.size)
         let status = withUnsafeMutablePointer(to: &ref) { p in

@@ -7,13 +7,13 @@ import java.nio.charset.StandardCharsets
 
 /**
  * The `punktfunk://` URL grammar (design/client-deep-links.md §2). A **port**, not a new design:
- * the Rust `crates/pf-client-core/src/deeplink.rs` is the reference, Swift keeps a third copy, and
+ * the Rust `crates/client/pf-client-core/src/deeplink.rs` is the reference, Swift keeps a third copy, and
  * all three are held together by `clients/shared/deeplink-vectors.json`, which each language's test
  * suite runs verbatim — so the three parsers cannot drift into three different security postures.
  *
  * ```text
  * punktfunk://connect/<host-ref>[?fp=<64-hex>][&host=<addr[:port]>][&launch=<id>]
- *                               [&preset=<ref>][&name=<label>]
+ *                               [&preset=<ref>][&as=<profile>][&name=<label>]
  * ```
  *
  * The invariant the grammar exists to keep: **a URL may only ever do what a click on an existing
@@ -33,6 +33,7 @@ object DeepLinks {
     const val MAX_LAUNCH_LEN = 128
     const val MAX_PRESET_LEN = 64
     const val MAX_NAME_LEN = 64
+    const val MAX_AS_LEN = 64
 
     /** The default native port, as everywhere else in the clients. */
     const val DEFAULT_PORT = 9777
@@ -100,6 +101,7 @@ object DeepLinks {
         var launch: String? = null
         var preset: String? = null
         var legacyPreset: String? = null
+        var asProfile: String? = null
         var name: String? = null
         for (pair in query.split('&')) {
             if (pair.isEmpty()) continue
@@ -149,6 +151,12 @@ object DeepLinks {
                     }
                     legacyPreset = value
                 }
+                key == "as" && asProfile == null -> {
+                    if (scalarCount(value) > MAX_AS_LEN) {
+                        return DeepLinkResult.Refused(LinkError.PARAM_TOO_LONG, "as")
+                    }
+                    asProfile = value
+                }
                 key == "name" && name == null -> {
                     if (scalarCount(value) > MAX_NAME_LEN) {
                         return DeepLinkResult.Refused(LinkError.PARAM_TOO_LONG, "name")
@@ -157,7 +165,7 @@ object DeepLinks {
                 }
             }
         }
-        return DeepLinkResult.Parsed(DeepLink(route, hostRef, fp, host, launch, preset ?: legacyPreset, name))
+        return DeepLinkResult.Parsed(DeepLink(route, hostRef, fp, host, launch, preset ?: legacyPreset, name, asProfile))
     }
 
     /**
@@ -203,14 +211,14 @@ object DeepLinks {
     /**
      * The self-emitted form for a saved host: id first (address-independent), with the address and
      * pin alongside so the link degrades to a confirmation sheet instead of a dead click when the
-     * record is gone.
+     * record is gone. The desktop tile is no title: its link is the host's.
      */
     fun forHost(host: KnownHost, launch: String? = null, preset: String? = null) = DeepLink(
         route = LinkRoute.CONNECT,
         hostRef = host.id,
         fp = host.fpHex.ifEmpty { null },
         host = host.address to host.port,
-        launch = launch,
+        launch = launch?.takeUnless { it == io.unom.punktfunk.kit.library.GameEntry.DESKTOP_ID },
         preset = preset,
     )
 
@@ -390,6 +398,8 @@ data class DeepLink(
     val preset: String? = null,
     /** Display label for the unknown-host confirmation sheet (external emitters). */
     val name: String? = null,
+    /** The profile on the host to play as: an id or a name. Wins for this connect, never saved. */
+    val asProfile: String? = null,
 ) {
     /** The canonical URL for this link — always `punktfunk://`, never the `pf://` alias. */
     fun toUrl(): String {
@@ -416,6 +426,7 @@ data class DeepLink(
             push("preset", it)
             push("profile", it)
         }
+        asProfile?.let { push("as", it) }
         name?.let { push("name", it) }
         return sb.toString()
     }

@@ -1,0 +1,3 @@
+• PyroWave decodes the next frame while showing the last, and fills the screen at full resolution.
+• Android TVs list only real controllers. A TV remote no longer counts as a controller or turns into a second pad on the host.
+• A controller joins the stream on its first press, so Steam no longer announces pads that come and go.

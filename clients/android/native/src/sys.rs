@@ -21,6 +21,14 @@ pub(crate) fn sysprop(name: &CStr) -> Option<String> {
     }
 }
 
+/// `ro.build.version.sdk`; 0 when unreadable.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn sdk_int() -> u32 {
+    sysprop(c"ro.build.version.sdk")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// A raw property value as [`sysprop`] returns it.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn prop_value(raw: &[u8]) -> Option<String> {

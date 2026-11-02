@@ -77,8 +77,8 @@ target/release/punktfunk-host serve              # native clients only
 target/release/punktfunk-host serve --gamestream # plus Moonlight (trusted LAN only)
 ```
 
-The host finds `punktfunk-encode-worker` beside itself and runs PyroWave there at raised GPU
-priority. Grant it the capability the packages grant:
+The host finds `punktfunk-encode-worker` beside itself and runs PyroWave and the NVIDIA frame
+convert there at raised GPU priority. Grant it the capability the packages grant:
 `sudo setcap cap_sys_nice=ep target/release/punktfunk-encode-worker`.
 
 To run the host as a user service from a clone at `~/punktfunk`, copy
@@ -116,11 +116,10 @@ itself, so build both. More:
 
 ## Windows host and client
 
-Install the MSVC toolchain, CMake and LLVM (libclang). In PowerShell, keep the target path short
-and let CMake 4 build the vendored libraries:
+Install the MSVC toolchain, CMake and LLVM (libclang). In PowerShell, keep the target path short:
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'C:\t'; $env:CMAKE_POLICY_VERSION_MINIMUM = '3.5'
+$env:CARGO_TARGET_DIR = 'C:\t'
 cargo build --release -p punktfunk-host --features nvenc,qsv
 cargo build --release -p punktfunk-tray
 cargo build --release -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli
@@ -153,7 +152,7 @@ elevated shell after stopping the host (`punktfunk-host service stop`). Signing 
 On a Mac with Xcode 26.5:
 
 ```sh
-rustup target add aarch64-apple-darwin
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
 bash scripts/build-xcframework.sh     # BUILD_IOS=1 / BUILD_TVOS=1 add those slices
 cd clients/apple && open Punktfunk.xcodeproj
 ```

@@ -1,5 +1,6 @@
-// The rules both VideoToolbox pumps follow per access unit. Neither pump had a test before this,
-// which is how a straggler reached the decoder and how a recovery anchor never ended a wait.
+// The rules both VideoToolbox pumps follow per access unit: the wait for parameter sets and which
+// post-loss AUs reach the decoder. Which AU is a straggler is the core's rule
+// (`PunktfunkConnection.recoveryOnFrame`).
 
 import CoreMedia
 import XCTest
@@ -22,7 +23,6 @@ final class AUPumpStateTests: XCTestCase {
         var state = AUPumpState()
         let step = state.note(frameIndex: 1, idrFormat: try format(1920, 1080))
         XCTAssertEqual(step.newSize, .init(width: 1920, height: 1080))
-        XCTAssertFalse(step.straggler)
         XCTAssertFalse(state.awaitingIDR)
         XCTAssertNotNil(state.format)
     }
@@ -49,30 +49,6 @@ final class AUPumpStateTests: XCTestCase {
         _ = state.note(frameIndex: 1, idrFormat: try format(1920, 1080))
         let resized = state.note(frameIndex: 2, idrFormat: try format(2560, 1440))
         XCTAssertEqual(resized.newSize, .init(width: 2560, height: 1440))
-    }
-
-    func testStragglerIsSkippedAndLeavesTheStateAlone() throws {
-        var state = AUPumpState()
-        _ = state.note(frameIndex: 10, idrFormat: try format(1920, 1080))
-        let late = state.note(frameIndex: 9, idrFormat: nil)
-        XCTAssertTrue(late.straggler)
-        // A newer frame still goes through, so one straggler does not stall the stream.
-        XCTAssertFalse(state.note(frameIndex: 11, idrFormat: nil).straggler)
-    }
-
-    func testDuplicateIndexIsAStraggler() throws {
-        var state = AUPumpState()
-        _ = state.note(frameIndex: 5, idrFormat: try format(1280, 720))
-        XCTAssertTrue(state.note(frameIndex: 5, idrFormat: nil).straggler)
-    }
-
-    func testStragglerFilterSurvivesIndexWraparound() throws {
-        var state = AUPumpState()
-        _ = state.note(frameIndex: .max - 1, idrFormat: try format(1280, 720))
-        // Wrapping FORWARD past UInt32.max is a normal advance, not a rewind.
-        XCTAssertFalse(state.note(frameIndex: 2, idrFormat: nil).straggler)
-        // And a frame from before the wrap is still late.
-        XCTAssertTrue(state.note(frameIndex: .max, idrFormat: nil).straggler)
     }
 
     func testRequireIDRDropsTheFormatUntilParameterSetsReturn() throws {
@@ -141,15 +117,6 @@ final class AUPumpStateTests: XCTestCase {
         XCTAssertTrue(step.askKeyframe)
         // The concealer resumes at the IDR and says so per AU; the pump follows it.
         XCTAssertFalse(state.note(frameIndex: 4, idrFormat: try format(1920, 1080), concealed: .decodable).withhold)
-    }
-
-    func testIsStragglerMirrorsNote() throws {
-        var state = AUPumpState()
-        XCTAssertFalse(state.isStraggler(frameIndex: 5), "nothing submitted yet")
-        _ = state.note(frameIndex: 5, idrFormat: try format(1920, 1080))
-        XCTAssertTrue(state.isStraggler(frameIndex: 4))
-        XCTAssertTrue(state.isStraggler(frameIndex: 5))
-        XCTAssertFalse(state.isStraggler(frameIndex: 6))
     }
 
     func testARecoveryMarkWhileWithholdingAsksForAKeyframe() throws {

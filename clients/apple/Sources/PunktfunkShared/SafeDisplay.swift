@@ -43,26 +43,21 @@ public enum SafeDisplay {
     /// not necessarily the inset the caller can read right now.
     ///
     /// The stream is always landscape, but the settings screen the resolution row is rendered in may
-    /// be portrait, and `safeAreaInsets` only ever describes the CURRENT orientation. In portrait a
-    /// notched iPhone reports its housing on `top` and reports `left`/`right` as zero, so reading
-    /// the horizontal insets there would compute "no inset needed" for exactly the devices that
-    /// need one.
+    /// be portrait, and `safeAreaInsets` only ever describes the CURRENT orientation.
     ///
-    /// - In landscape, `max(left, right)` is the answer directly. (iOS symmetrizes the two so
-    ///   content stays centred, so they normally agree; `max` is simply the safe reduction.)
+    /// - In landscape a housing insets BOTH sides (iOS symmetrizes them so content stays centred),
+    ///   and the larger is the safe reduction. An inset on one side only is a side bar, as on a
+    ///   foldable's cover screen, and hides nothing of a full-screen stream.
     /// - In portrait, the housing's portrait TOP inset equals its landscape SIDE inset on every
-    ///   notched/Dynamic Island iPhone — the same physical intrusion, measured on the axis that
-    ///   happens to be vertical at the time — so `top` is the correct stand-in. It is accepted only
-    ///   on phones and only past [`housingTopInsetThreshold`], so an iPad's status bar (or an older
+    ///   notched/Dynamic Island iPhone, so `top` is the stand-in. It is accepted only on phones
+    ///   and only past [`housingTopInsetThreshold`], so an iPad's status bar (or an older
     ///   iPhone's) never fabricates an inset for a device with nothing to avoid.
     ///
-    /// Returns 0 when there is no housing to route around, which makes the safe mode identical to
-    /// the native one — and the caller's dedup then drops the duplicate row on its own.
+    /// Returns 0 when there is no housing to route around; the caller then offers no safe mode.
     public static func sideInsetPoints(
         left: Double, right: Double, top: Double, isPhone: Bool
     ) -> Double {
-        let horizontal = max(left, right)
-        if horizontal > 0 { return horizontal }
+        if min(left, right) > 0 { return max(left, right) }
         if isPhone, top >= housingTopInsetThreshold { return top }
         return 0
     }
@@ -104,6 +99,13 @@ public enum SafeDisplay {
             evenFloor(Double(nativeWidth), minWidth),
             evenFloor(Double(nativeHeight) - insetPixels, minHeight)
         )
+    }
+
+    /// The points native fullscreen keeps clear on a Mac with a housing: the menu bar's band,
+    /// which runs deeper than the housing (37 pt over 32 on a 14" MacBook Pro at 2×). `menuBar`
+    /// reads 0 while the bar is hidden, so the housing is the floor. Without a housing, none.
+    public static func fullscreenTopInset(housing: Double, menuBar: Double) -> Double {
+        housing > 0 ? max(housing, menuBar) : 0
     }
 
     /// Host-valid rounding: the encoder rejects odd dimensions, and an inset subtraction lands odd

@@ -30,6 +30,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -53,11 +54,11 @@ import io.unom.punktfunk.kit.link.host
 import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
-import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.console.SkiaConsole
 import io.unom.punktfunk.console.SkiaConsoleShell
 import io.unom.punktfunk.models.LibraryReturn
 import io.unom.punktfunk.models.Tab
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -67,9 +68,10 @@ fun App(forceGamepadUi: Boolean = false) {
     val activity = context as? MainActivity
     val settingsStore = remember { SettingsStore(context) }
     var settings by remember { mutableStateOf(settingsStore.load()) }
-    // The active session (null = not streaming). It carries the settings the connect resolved,
-    // so the stream screen never re-reads the store behind its own connect's back.
-    var session by remember { mutableStateOf<ActiveSession?>(null) }
+    // The active session (null = not streaming), held for the process: a recreated activity shows
+    // the same stream. It carries the settings the connect resolved.
+    val session = SessionGate.owner.session
+    val owner = SessionGate.owner
     var tab by remember { mutableStateOf(Tab.Connect) }
     // Set when a session ends because its game exited and it began as a library launch: the host
     // whose library the console shell should come back to. Held HERE because the shell's own
@@ -191,18 +193,14 @@ fun App(forceGamepadUi: Boolean = false) {
         }
         onDispose {}
     }
+    // Orientation has the same one owner, for the same reason. A hinge across the stream lets
+    // go, so a clamshell half-folded on a table stands upright and takes the tabletop split.
+    val hinge = rememberFoldHinge()
+    HoldLandscape("shell", if (session != null) hinge == null else gamepadUi)
 
-    // Publish the live session process-wide: a `punktfunk://` link that arrives as a SECOND
-    // activity instance (the normal case under `launchMode = standard`) refuses it before that
-    // instance is resumed (MainActivity.onCreate), and every shell's dial refuses to open a second
-    // session behind it. Cleared on dispose, so an activity destroyed mid-stream leaves no ghost.
-    DisposableEffect(session) {
-        SessionGate.live = session?.let { SessionGate.Live(it.hostId) }
-        onDispose { SessionGate.live = null }
-    }
-
-    // The same rule for the rare in-instance case (a caller that set FLAG_ACTIVITY_SINGLE_TOP, so
-    // the link reached `onNewIntent` on the streaming activity itself). Pointing at the host
+    // A link may not preempt a live session. MainActivity.onCreate refuses one that arrives as a
+    // second instance; this is the rare in-instance case (a caller that set FLAG_ACTIVITY_SINGLE_TOP,
+    // so the link reached `onNewIntent` on the streaming activity itself). Pointing at the host
     // already being streamed is the one exception, and its right answer is to do nothing — the
     // intent has already brought the app forward, which is exactly what "focus it" means here.
     val pendingLink = activity?.pendingDeepLink
@@ -253,6 +251,70 @@ fun App(forceGamepadUi: Boolean = false) {
         reopenLibrary = null
     }
 
+    // A lost session dials the same host again on the schedule every client shares; the host
+    // resumes the session it still holds. The connect modal stays up between dials and Cancel
+    // stops them. A refusal or a spent schedule ends it with a toast.
+    val redialScope = rememberCoroutineScope()
+    var redialing by remember { mutableStateOf<Pair<String, Job>?>(null) }
+    val redialServices = remember { HostServices(KnownHostStore(context), JniHostNative(context)) }
+    fun redial(spec: DialSpec, name: String) {
+        val job = redialScope.launch {
+            var attempt = 0
+            while (true) {
+                val wait = SessionEndReason.LOST.redialDelayMs(attempt++)
+                if (wait == null) {
+                    Toast.makeText(
+                        context,
+                        "Lost the connection to $name — the host may be asleep. Wake it to reconnect.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    break
+                }
+                delay(wait)
+                val record = redialServices.store.resolve(spec.pinHex, spec.host, spec.port)
+                when (val dialed = redialServices.dial(spec, record, name)) {
+                    is HostServices.Connected -> {
+                        owner.open(dialed.session)
+                        break
+                    }
+                    is HostServices.Failed -> if (!dialed.unreachable) {
+                        Toast.makeText(
+                            context,
+                            dialed.said.ifEmpty { ConnectErrors.connectMessage(dialed.token, requestAccess = false) },
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        break
+                    }
+                    HostServices.Cancelled -> break
+                }
+            }
+            redialing = null
+        }
+        redialing = name to job
+    }
+    // A woken host that answered before it could stream: one dial after [waitMs], which keeps
+    // dialing while the host refuses inside its window. Past it, the host's refusal shows.
+    fun redialWaking(spec: DialSpec, name: String, waitMs: Long) {
+        val job = redialScope.launch {
+            delay(waitMs)
+            val record = redialServices.store.resolve(spec.pinHex, spec.host, spec.port)
+            when (val dialed = redialServices.dial(spec, record, name)) {
+                is HostServices.Connected -> owner.open(dialed.session)
+                is HostServices.Failed -> Toast.makeText(
+                    context,
+                    dialed.said.ifEmpty { ConnectErrors.connectMessage(dialed.token, requestAccess = false) },
+                    Toast.LENGTH_LONG,
+                ).show()
+                HostServices.Cancelled -> {}
+            }
+            redialing = null
+        }
+        redialing = name to job
+    }
+    redialing?.let { (name, job) ->
+        ConnectModal(ConnectPhase.Connecting(name), onCancel = { job.cancel(); redialing = null }, onRetry = {})
+    }
+
     AnimatedContent(
         targetState = session,
         transitionSpec = {
@@ -263,7 +325,20 @@ fun App(forceGamepadUi: Boolean = false) {
         // Read once: `touchLibrary` is a `var`, so it does not smart-cast through the branch.
         val library = touchLibrary
         when {
-            active != null -> StreamScreen(active) { reason ->
+            active != null -> StreamScreen(
+                active,
+                hinge,
+                wakeRedial = {
+                    val waking = redialServices.wakeRedial(active)
+                    if (waking != null) {
+                        if (skiaConsole) SkiaConsole.sessionEnded(null)
+                        owner.end(active.handle)
+                        val name = active.hostId?.let { redialServices.store.byId(it)?.name } ?: waking.first.host
+                        redialWaking(waking.first, name, waking.second)
+                    }
+                    waking != null
+                },
+            ) { reason ->
                 // A game launched from a library exiting is a normal finish, and the player is
                 // almost certainly after the next title — so send them back to that library rather
                 // than all the way out to host selection. The console shell's own screen state does
@@ -275,11 +350,18 @@ fun App(forceGamepadUi: Boolean = false) {
                     } else {
                         null
                     }
+                val redialSpec = active.redial.takeIf { reason == SessionEndReason.LOST }
                 // The console keeps its stack across the stream and wants to know how the session
                 // ended — a clean end is no toast, an abnormal one says why (the desktop shell's
-                // exact contract).
-                if (skiaConsole) SkiaConsole.sessionEnded(abnormalEndMessage(reason))
-                session = null
+                // exact contract). A redial says it itself.
+                if (skiaConsole) {
+                    SkiaConsole.sessionEnded(abnormalEndMessage(reason).takeIf { redialSpec == null })
+                }
+                owner.end(active.handle)
+                if (redialSpec != null) {
+                    val name = active.hostId?.let { redialServices.store.byId(it)?.name } ?: redialSpec.host
+                    redial(redialSpec, name)
+                }
             }
             // The console: the same Skia shell the Linux/Windows session binary shows, drawn by
             // native onto a SurfaceView (design/android-skia-console-port.md). `gamepadUi` already
@@ -287,7 +369,7 @@ fun App(forceGamepadUi: Boolean = false) {
             gamepadUi -> SkiaConsoleShell(
                 settings = settings,
                 onSettingsChange = { settings = it; settingsStore.save(it) },
-                onConnected = { padHeldByStream = true; session = it },
+                onConnected = { padHeldByStream = true; owner.open(it) },
                 deepLink = pendingLink,
                 onDeepLinkHandled = { activity?.pendingDeepLink = null },
                 reopenLibrary = reopenLibrary,
@@ -299,7 +381,7 @@ fun App(forceGamepadUi: Boolean = false) {
             library != null -> LibraryScreen(
                 host = library.first,
                 settings = settings,
-                onLaunched = { touchAutoStream = false; session = it },
+                onLaunched = { touchAutoStream = false; owner.open(it) },
                 onBack = {
                     touchLibrary = null
                     touchAutoStream = false
@@ -311,7 +393,7 @@ fun App(forceGamepadUi: Boolean = false) {
                 when (targetTab) {
                     Tab.Connect -> ConnectScreen(
                         settings = settings,
-                        onConnected = { session = it },
+                        onConnected = { owner.open(it) },
                         onSettingsChange = { settings = it; settingsStore.save(it) },
                         deepLink = pendingLink,
                         onDeepLinkHandled = { activity?.pendingDeepLink = null },

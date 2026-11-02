@@ -1,0 +1,2521 @@
+//! GameStream video data plane.
+//!
+//! On RTSP PLAY the client pings [`VIDEO_PORT`]; we learn that UDP endpoint and run
+//! capture → encode → [`VideoPacketizer`] → UDP. Source is portal PipeWire
+//! (`PUNKTFUNK_VIDEO_SOURCE=portal`), a compositor virtual output (`virtual`), or
+//! a synthetic test pattern (default).
+//!
+//! Runs on its own native thread. Encode, FEC packetize, and paced send are
+//! separate threads joined by depth-2 queues. Game lifetime:
+//! `design/session-game-lifetime.md`.
+
+use super::video::{FrameType, VideoPacketizer};
+use super::VIDEO_PORT;
+use crate::capture::{self, Capturer, FastSyntheticCapturer};
+use crate::encode::{self, Codec};
+use crate::encode_recovery::{
+    grab_frame, on_submit_error, reset_stalled_encoder, run_parked_stage, EncoderWatchdog,
+    RebuildBudget, SourceAsks, MAX_ENCODER_RESETS,
+};
+use crate::native::pipeline::{
+    count_capture_loss, encoder_bps_for_budget, follow_source_mode, open_session_encoder,
+    rebuild_after_capture_loss, session_client_label, CaptureLossRebuild, SourceFollow,
+    WireFraming,
+};
+use anyhow::{Context, Result};
+use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Negotiated video parameters from the RTSP ANNOUNCE.
+#[derive(Clone)]
+pub struct StreamConfig {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub packet_size: usize,
+    pub bitrate_kbps: u32,
+    pub codec: Codec,
+    /// 4:4:4 only for a PyroWave client that asked (`chromaSamplingType=1`); else 4:2:0.
+    pub chroma: encode::ChromaFormat,
+    /// Client's `x-nv-vqos[0].fec.minRequiredFecPackets` — parity floor per FEC block.
+    pub min_fec: u8,
+    /// Client asked for HDR (`dynamicRangeMode != 0`) and the host can deliver it.
+    /// Encoder picks Main10 from the captured (P010) format. Always `false` on SDR hosts.
+    pub hdr: bool,
+    /// Client's `x-nv-video[0].videoEncoderSlicesPerFrame`, the session's slice count. Hardware
+    /// TV decoders wedge on multi-slice AUs they did not request. Absent ⇒ 1.
+    pub slices: u32,
+    /// Client echoed `SS_ENC_VIDEO`; shards are AES-128-GCM-sealed under the `/launch` rikey.
+    /// Only true when the host advertised the bit (`gs_video_encryption_offered`).
+    pub encrypt_video: bool,
+    /// The range the client's `encoderCscMode` asked for, one bit for SDR and HDR alike.
+    pub studio_asked: crate::session_plan::StudioAsk,
+    /// The encode resolution ANNOUNCE negotiated against. Every capture and encoder open of the
+    /// session uses it, so an Encoder-row change applies at the next session.
+    pub encoder: Arc<encode::Resolved>,
+}
+
+/// The negotiated values without the resolution's probe cells, for the log lines.
+impl std::fmt::Debug for StreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamConfig")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("fps", &self.fps)
+            .field("packet_size", &self.packet_size)
+            .field("bitrate_kbps", &self.bitrate_kbps)
+            .field("codec", &self.codec)
+            .field("chroma", &self.chroma)
+            .field("min_fec", &self.min_fec)
+            .field("hdr", &self.hdr)
+            .field("slices", &self.slices)
+            .field("encrypt_video", &self.encrypt_video)
+            .field("studio_asked", &self.studio_asked)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Pooled capturer plus the three reuse keys: HDR-ness, metadata-cursor mode (both fixed at
+/// PipeWire negotiation), and the `capture_monitor` pin (`None` = portal's pick). A mismatch
+/// needs a fresh screencast session. The pin is live — without it a reconnect keeps the
+/// previous screen (`design/per-monitor-portal-capture.md`).
+pub type PooledCapturer = (Box<dyn Capturer>, bool, bool, bool, Option<String>);
+
+/// Slot for the persistent screen capturer, shared with the control plane and reused across
+/// streams so a reconnect doesn't open a second (conflicting) screencast session.
+pub type CapturerSlot = Arc<std::sync::Mutex<Option<PooledCapturer>>>;
+
+/// A pending client reference-frame-invalidation range (lost `firstFrame..=lastFrame`), set by the
+/// control plane and drained by the video thread (see [`AppState::rfi_range`](crate::host::AppState::rfi_range)).
+pub type RfiSlot = Arc<std::sync::Mutex<Option<(i64, i64)>>>;
+
+/// Game-lifetime wiring spent by the stream thread (`design/session-game-lifetime.md`).
+/// The control plane builds these from live `AppState` at RTSP PLAY; they only exist together.
+pub struct GameLifetime {
+    /// [`crate::host::AppState::quit`]: a decision may end the game; a drop gets a reconnect window.
+    pub quit: Arc<AtomicBool>,
+    /// [`super::GsState::preempted`]: the stop flag admission raises on a steal.
+    pub preempted: Arc<AtomicBool>,
+    /// Paired client's cert fingerprint; only it can reclaim the launch. `None` if unread.
+    pub fingerprint: Option<String>,
+    /// Launching peer's source IP ([`super::LaunchSession::peer_ip`]). Bound when the video
+    /// thread learns its UDP endpoint so an off-path LAN peer cannot win the race. `None` = open.
+    pub owner_ip: Option<std::net::IpAddr>,
+    /// Session A/V ping payload — the half of the endpoint guard a shared-address peer cannot forge.
+    pub av_ping: [u8; super::AV_PING_LEN],
+    pub on_game_exit: super::OnSessionLost,
+}
+
+/// The registry handles this session's loop keeps current: what `GET /status` and the
+/// console's cards read while it streams. Snapshotting them at launch would freeze the
+/// bitrate at the client's ask and leave the capture card empty.
+struct LiveTelemetry {
+    bitrate_kbps: Arc<std::sync::atomic::AtomicU32>,
+    capture_health: Arc<std::sync::Mutex<Option<pf_capture::CaptureHealth>>>,
+}
+
+/// Spawn the video stream thread (idempotent via `running`). Stops when `running` clears.
+/// `force_idr` is set by the control stream on a client recovery request; `video_cap` holds
+/// the persistent capturer the thread borrows for the stream's duration. The thread is
+/// tracked on `media`, for `/resume` and the next PLAY to wait on.
+#[allow(clippy::too_many_arguments)]
+pub fn start(
+    cfg: StreamConfig,
+    app: Option<super::apps::AppEntry>,
+    running: Arc<AtomicBool>,
+    force_idr: Arc<AtomicBool>,
+    rfi_range: RfiSlot,
+    loss: Arc<super::GsLossStats>,
+    video_hdr: super::VideoHdr,
+    // Session rikey, only when `cfg.encrypt_video`. Not a `StreamConfig` field: that
+    // struct is `Debug`-logged at stream start.
+    gcm_key: Option<[u8; 16]>,
+    video_cap: CapturerSlot,
+    stats: Arc<crate::stats_recorder::StatsRecorder>,
+    on_lost: super::OnSessionLost,
+    media: &crate::host::MediaThreads,
+    // Input tallies the control loop bumps; this thread clears them and hands them to the
+    // registry, which is what `session.ended` reports.
+    counters: Arc<crate::session_status::SessionCounters>,
+    life: GameLifetime,
+) {
+    match std::thread::Builder::new()
+        .name("punktfunk-video".into())
+        .spawn(move || {
+            pf_frame::thread_qos::boost_thread_priority(true);
+            // Hold even for video-only viewers — plane parity with native `LiveSessionGuard`.
+            let _sleep = crate::sleep_inhibit::hold();
+            tracing::info!(?cfg, "video stream starting");
+            // Before `run`: `run` launches the app, and the title's wrapper keys on this marker.
+            // RTSP carries no device name, so the console's label for the paired certificate
+            // is the only name there is; empty for a device nobody has named.
+            let client_label = life
+                .fingerprint
+                .as_deref()
+                .and_then(|fp| crate::gamestream::load_client_labels().get(fp).cloned())
+                .unwrap_or_default();
+            let stream_marker = crate::stream_marker::announce(crate::stream_marker::StreamInfo {
+                width: cfg.width,
+                height: cfg.height,
+                refresh_hz: cfg.fps,
+                hdr: cfg.hdr,
+                client: client_label.clone(),
+                fingerprint: life.fingerprint.clone(),
+                launch: app.as_ref().map(|a| a.title.clone()),
+                plane: crate::events::Plane::Gamestream,
+                preset: None,
+                profile: None,
+            });
+            let event_client = crate::events::ClientRef {
+                name: client_label.clone(),
+                fingerprint: life.fingerprint.clone(),
+                plane: crate::events::Plane::Gamestream,
+                preset: None,
+                profile: None,
+            };
+            crate::events::emit(crate::events::EventKind::ClientConnected {
+                client: event_client.clone(),
+            });
+            // This plane's session in the registry the management API acts on: it is what
+            // gives the console a session id, and with it a per-session stop and keyframe
+            // instead of only the host-wide one. `stop` is read by the loop below.
+            let lifecycle = crate::lifecycle::Lifecycle::with_quit(life.quit.clone());
+            lifecycle.enter(crate::lifecycle::Phase::Streaming);
+            let stop = lifecycle.stop_flag().clone();
+            let live = LiveTelemetry {
+                bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(cfg.bitrate_kbps)),
+                capture_health: Arc::new(std::sync::Mutex::new(None)),
+            };
+            // The control loop bumps these without a session handle, so they are cleared
+            // here rather than made fresh: the summary must not carry the last session's input.
+            counters.reset();
+            let live_session =
+                crate::session_status::register(crate::session_status::Registration {
+                    mode: Arc::new(std::sync::atomic::AtomicU64::new(
+                        crate::session_status::pack_mode(cfg.width, cfg.height, cfg.fps),
+                    )),
+                    bitrate_kbps: live.bitrate_kbps.clone(),
+                    codec: cfg.codec,
+                    // Shares this plane's "the end was deliberate" flag, so an operator stop
+                    // reads here exactly as `/cancel` does.
+                    life: lifecycle.clone(),
+                    force_idr: force_idr.clone(),
+                    client: session_client_label(life.fingerprint.as_deref(), life.owner_ip),
+                    client_name: (!client_label.is_empty()).then(|| client_label.clone()),
+                    plane: crate::events::Plane::Gamestream,
+                    hdr: cfg.hdr,
+                    ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    // The compat plane publishes its launched game separately
+                    // (`session_status::publish_gamestream_game`).
+                    game: None,
+                    capture_health: live.capture_health.clone(),
+                    join: false,
+                    controls: crate::session_status::SessionControls {
+                        fingerprint: life.fingerprint.clone(),
+                        ..crate::session_status::SessionControls::open()
+                    },
+                    bit_depth: if cfg.hdr { 10 } else { 8 },
+                    chroma: cfg.chroma,
+                    counters: counters.clone(),
+                    // The launch owner's address: what the console pairs with a native
+                    // session sharing the same client.
+                    peer: life.owner_ip,
+                });
+            // Released when the closure exits so idle clocks are not pinned between sessions.
+            #[cfg(target_os = "linux")]
+            let _clock_pin = crate::gpuclocks::session_pin();
+            let result = run(
+                cfg,
+                app.as_ref(),
+                &running,
+                &stop,
+                &force_idr,
+                &rfi_range,
+                &loss,
+                &video_hdr,
+                gcm_key,
+                &video_cap,
+                &stats,
+                &on_lost,
+                &live,
+                &life,
+                &lifecycle,
+            );
+            // Clean return is a stop; error is `error`. Compat has no typed close code.
+            let reason = match &result {
+                Ok(()) => crate::events::DisconnectReason::Quit,
+                Err(_) => crate::events::DisconnectReason::Error,
+            };
+            // Why `session.ended` says it ended. The first reason wins, so an operator stop
+            // keeps its own.
+            lifecycle.end(match &result {
+                Ok(()) => crate::events::SessionEndReason::HostEnded,
+                Err(_) => crate::events::SessionEndReason::HostError,
+            });
+            if let Err(e) = result {
+                tracing::error!(error = %format!("{e:#}"), "video stream failed");
+            }
+            // `session.ended`, then the stream marker, then `client.disconnected`. Native emits
+            // its disconnect from the connection task, so there it can come first.
+            drop(live_session);
+            running.store(false, Ordering::SeqCst);
+            *video_hdr.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            drop(stream_marker);
+            crate::events::emit(crate::events::EventKind::ClientDisconnected {
+                client: event_client,
+                reason,
+            });
+            tracing::info!("video stream stopped");
+        }) {
+        Ok(thread) => media.track(thread),
+        Err(e) => tracing::warn!(error = %e, "video thread did not start"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run(
+    cfg: StreamConfig,
+    app: Option<&super::apps::AppEntry>,
+    running: &Arc<AtomicBool>,
+    // Set by `DELETE /session/{id}`: this one session, not the whole host.
+    stop: &AtomicBool,
+    force_idr: &AtomicBool,
+    rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
+    loss: &super::GsLossStats,
+    video_hdr: &std::sync::Mutex<Option<pf_frame::HdrMeta>>,
+    gcm_key: Option<[u8; 16]>,
+    video_cap: &std::sync::Mutex<Option<PooledCapturer>>,
+    stats: &Arc<crate::stats_recorder::StatsRecorder>,
+    on_lost: &super::OnSessionLost,
+    live: &LiveTelemetry,
+    life: &GameLifetime,
+    lifecycle: &crate::lifecycle::Lifecycle,
+) -> Result<()> {
+    pf_frame::session_tuning::on_hot_thread();
+    // Every source below resolves the compositor, which cancels a pending Game Mode hand-back.
+    let _gamescope_hold = crate::compositor_route::GamescopeHold::new(lifecycle.clone());
+    // Reject an out-of-range mode before allocating capture/encode buffers.
+    encode::validate_dimensions(cfg.codec, cfg.width, cfg.height)
+        .context("client-requested video mode")?;
+    let sock = UdpSocket::bind(("0.0.0.0", VIDEO_PORT)).context("bind video UDP")?;
+    // QoS is after `connect` — Windows qWAVE derives the flow from the connected 5-tuple.
+    punktfunk_core::transport::grow_socket_buffers(&sock);
+    // Client re-pings until video flows, so a missed early ping is fine.
+    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
+    tracing::info!(
+        port = VIDEO_PORT,
+        "video: awaiting client ping to learn endpoint"
+    );
+    // Owner IP and this session's ping payload — both media planes share `learn_client_endpoint`.
+    let client = super::learn_client_endpoint(&sock, "video", life.owner_ip, &life.av_ping)?;
+    sock.connect(client)
+        .context("connect client video endpoint")?;
+    // Guard keeps the Windows qWAVE flow alive for this function's scope (the stream).
+    let _qos_flow = punktfunk_core::transport::set_media_qos(
+        &sock,
+        punktfunk_core::transport::MediaClass::Video,
+    );
+    tracing::info!(%client, "video: client endpoint learned");
+    let client_label = client.ip().to_string();
+
+    // Not pooled: a reconnect at a different resolution needs a freshly-sized output.
+    if pf_host_config::config().video_source.as_deref() == Some("virtual") {
+        let target = resolve_gs_app(app);
+        // RTSP carries no device name; the peer IP is the stats-capture label too.
+        let owner = crate::session_launch::LaunchOwner {
+            client: client_label.clone(),
+            fingerprint: life.fingerprint.clone(),
+            plane: crate::events::Plane::Gamestream,
+            preset: None,
+            profile: None,
+            pad: punktfunk_core::config::GamepadPref::Xbox360,
+            pad_slots: None,
+        };
+        // The entry's own `apps.json` prep, then its library entry's. `PF_APP_TITLE` and the
+        // `PF_STREAM_*` names the native plane's prep env and the marker file use.
+        let mut prep_cmds = app.map(|a| a.prep.clone()).unwrap_or_default();
+        if let Some(lib_id) = app.and_then(|a| a.library_id.as_deref()) {
+            prep_cmds.extend(crate::library::prep_for(lib_id));
+        }
+        let mut prep_env = vec![(
+            "PF_APP_TITLE".to_string(),
+            app.map(|a| a.title.clone()).unwrap_or_default(),
+        )];
+        prep_env.extend(crate::hooks::prep_mode_env(
+            cfg.width, cfg.height, cfg.fps, cfg.hdr,
+        ));
+        // Moonlight has no resume, so a relaunch is what reprieves the leftover game.
+        let crate::session_launch::Prepared {
+            claim: launch_claim,
+            stamp: launch_stamp,
+            prep: _prep,
+            declined,
+            waiting: _waiting,
+        } = crate::session_launch::prepare(target.as_ref(), &owner, &prep_cmds, &prep_env, &|| {
+            life.quit.load(Ordering::Relaxed)
+        });
+        // The title's files never arrived: Moonlight has no notice channel, so stream without it.
+        let target = match declined {
+            Some(sentence) => {
+                tracing::warn!(reason = %sentence, "streaming without the launched title");
+                None
+            }
+            None => target,
+        };
+        // Re-runnable: the encode loop calls it again on a mid-stream capture loss.
+        let GsSource {
+            mut capturer,
+            compositor,
+            route: gamescope_route,
+            nested_launch_started,
+            #[cfg(target_os = "linux")]
+            seat,
+            #[cfg(target_os = "linux")]
+            lease,
+        } = open_gs_virtual_source(&cfg, app, target.as_ref(), &life.quit, true)?;
+        // Only Linux `launch_is_nested` reads them; gamescope does not exist on Windows.
+        #[cfg(not(target_os = "linux"))]
+        let _ = (&gamescope_route, nested_launch_started);
+        // GameStream holds a real display; without this, Windows `admit` budgets cannot see it.
+        // `None` identity is the anonymous slot. Dropped at the end of `run`.
+        let _admission_guard = crate::vdisplay::admission::register(
+            None,
+            (cfg.width, cfg.height, cfg.fps),
+            life.preempted.clone(),
+            "gamestream".to_string(),
+            crate::vdisplay::admission::LiveDisplay {
+                compositor: Some(compositor),
+                route: gamescope_route.clone(),
+                isolation: None,
+                audio_sink: Default::default(),
+            },
+            None,
+        );
+        tracing::info!(
+            ?compositor,
+            app = ?app.map(|a| &a.title),
+            w = cfg.width,
+            h = cfg.height,
+            "video source: virtual display (native client resolution)"
+        );
+        // Launch now that capture is live, for backends that do not nest via `set_launch_command`.
+        let spawned = crate::session_launch::spawn(
+            target.as_ref(),
+            &owner,
+            launch_claim.as_ref(),
+            #[cfg(target_os = "linux")]
+            crate::session_launch::SpawnAt {
+                compositor,
+                nested_spawn: crate::vdisplay::launch_is_nested(
+                    compositor,
+                    gamescope_route.as_ref(),
+                ) && nested_launch_started,
+                seat: seat.as_deref(),
+            },
+        );
+
+        // Exit ends the session; session end can end the game only if asked, and a drop waits
+        // the reconnect window (`design/session-game-lifetime.md`).
+        let _game_life = target.as_ref().map(|t| {
+            let on_game_exit = life.on_game_exit.clone();
+            let lifecycle = lifecycle.clone();
+            let on_exit = crate::session_launch::end_on_game_exit(move || {
+                tracing::info!("the launched game exited — ending the session");
+                lifecycle.end(crate::events::SessionEndReason::GameExited);
+                // Skip keep-alive linger so the next `/launch` starts clean.
+                on_game_exit();
+            });
+            let lease = crate::session_launch::lease(
+                t,
+                &owner,
+                launch_stamp,
+                launch_claim.as_ref(),
+                spawned,
+                // No per-session head to watch, no pool generation, no control channel of
+                // ours: a Moonlight launch keeps the `running` stage, never isolates, and its
+                // launch findings stay in the log.
+                crate::session_launch::LeaseExtras {
+                    #[cfg(target_os = "linux")]
+                    nested: crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()),
+                    ..Default::default()
+                },
+                Box::new(on_exit),
+            );
+            // Drops first so the console does not briefly show live and `grace` rows together.
+            let published = crate::session_status::publish_gamestream_game(lease.shared());
+            (
+                published,
+                crate::gamelease::SessionGuard::new(
+                    lease,
+                    life.quit.clone(),
+                    life.fingerprint.clone(),
+                    // Drop opens the reconnect window the next `/launch` of this title matches.
+                    launch_claim,
+                ),
+            )
+        });
+        // The output the stream captures now, for a re-attach after a loss that leaves it up.
+        #[cfg(target_os = "linux")]
+        let attached = std::cell::RefCell::new((compositor, gamescope_route.clone(), lease));
+        // A handed-back keepalive re-attaches to its output: on KWin every create is a new
+        // virtual output, and a burst of them wedges the compositor. `None` re-detects the live
+        // compositor so a Desktop↔Game switch is followed. WxH is locked at ANNOUNCE.
+        let rebuild = |keepalive: Option<Box<dyn Send>>| {
+            if let Some(keepalive) = keepalive {
+                #[cfg(target_os = "linux")]
+                {
+                    let (c, route, lease) = attached.borrow().clone();
+                    let lease = lease.context("no output to re-attach to")?;
+                    return match gs_capture_output(
+                        lease.into_output(keepalive),
+                        &cfg,
+                        c,
+                        route.as_ref(),
+                    ) {
+                        Ok(capturer) => {
+                            tracing::info!(
+                                "gamestream: capture loss — re-attached to the live output, no \
+                                 new display"
+                            );
+                            Ok((capturer, gs_cursor_blend(c, route.as_ref(), &cfg)))
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"),
+                                "gamestream: re-attach to the live output failed — creating another");
+                            Err(e)
+                        }
+                    };
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    drop(keepalive);
+                    anyhow::bail!("no output to re-attach to");
+                }
+            }
+            let s = open_gs_virtual_source(&cfg, app, target.as_ref(), &life.quit, false)?;
+            let blend = gs_cursor_blend(s.compositor, s.route.as_ref(), &cfg);
+            #[cfg(target_os = "linux")]
+            {
+                *attached.borrow_mut() = (s.compositor, s.route, s.lease);
+            }
+            Ok((s.capturer, blend))
+        };
+        return stream_body(
+            &mut capturer,
+            Some(&rebuild),
+            gs_cursor_blend(compositor, gamescope_route.as_ref(), &cfg),
+            &sock,
+            cfg.clone(),
+            running,
+            stop,
+            force_idr,
+            rfi_range,
+            loss,
+            video_hdr,
+            gcm_key,
+            stats,
+            &client_label,
+            on_lost,
+            live,
+        );
+    }
+
+    // Reuse gated on HDR + cursor mode + pin. Depth is a PipeWire-negotiation property;
+    // mismatch needs a fresh session. The pointer follows the compositor that is up now.
+    #[cfg(target_os = "linux")]
+    let metadata_cursor =
+        match crate::vdisplay::compositor_for_kind(crate::vdisplay::detect_active_session().kind) {
+            Some(c) => host_composites_metadata_cursor(c, &cfg),
+            None => blend_capable_metadata_cursor(&cfg),
+        };
+    #[cfg(not(target_os = "linux"))]
+    let metadata_cursor = blend_capable_metadata_cursor(&cfg);
+    // Host-wide pin: without this, Moonlight gets whichever head the portal hands back.
+    #[cfg(target_os = "linux")]
+    let pinned = crate::vdisplay::capture_monitor();
+    #[cfg(not(target_os = "linux"))]
+    let pinned: Option<String> = None;
+    // The range the encoder signals, which a mirror's YUV converts must write.
+    let full_range = {
+        let plan = gs_session_plan(&cfg, metadata_cursor);
+        plan.full_range(plan.hdr, plan.bit_depth)
+    };
+    let pooled = match video_cap.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some((c, was_hdr, was_meta, was_full, ref was_pin))
+            if was_hdr == cfg.hdr
+                && was_meta == metadata_cursor
+                && was_full == full_range
+                && *was_pin == pinned =>
+        {
+            Some(c)
+        }
+        Some((c, was_hdr, was_meta, was_full, was_pin)) => {
+            tracing::info!(
+                was_hdr,
+                want_hdr = cfg.hdr,
+                was_metadata_cursor = was_meta,
+                want_metadata_cursor = metadata_cursor,
+                was_full_range = was_full,
+                want_full_range = full_range,
+                was_monitor = was_pin.as_deref().unwrap_or("<portal's pick>"),
+                want_monitor = pinned.as_deref().unwrap_or("<portal's pick>"),
+                "video source: pooled capturer depth/cursor-mode/monitor mismatch — opening a \
+                 fresh screencast session"
+            );
+            drop(c);
+            None
+        }
+        None => None,
+    };
+    let mut capturer: Box<dyn Capturer> = match pooled {
+        Some(c) => {
+            tracing::info!("video source: reusing capturer");
+            c
+        }
+        #[cfg(target_os = "linux")]
+        None if pf_host_config::config().video_source.as_deref() == Some("portal")
+            && pinned.is_some() =>
+        {
+            let connector = pinned.as_deref().expect("guarded by the match arm");
+            tracing::info!(
+                hdr = cfg.hdr,
+                metadata_cursor,
+                monitor = connector,
+                "video source: mirroring the pinned monitor (portal source, host pin)"
+            );
+            open_gs_mirror_source(connector, &cfg, metadata_cursor)
+                .with_context(|| format!("mirror the pinned monitor {connector:?}"))?
+        }
+        None if pf_host_config::config().video_source.as_deref() == Some("portal") => {
+            tracing::info!(
+                hdr = cfg.hdr,
+                metadata_cursor,
+                "video source: portal desktop capture"
+            );
+            capture::open_portal_monitor(cfg.hdr, metadata_cursor, full_range, &cfg.encoder)
+                .context("open portal capturer")?
+        }
+        None => {
+            tracing::info!("video source: synthetic test pattern");
+            Box::new(FastSyntheticCapturer::new(cfg.width, cfg.height))
+        }
+    };
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(true);
+    }
+    // Portal/synthetic: no virtual output to re-detect.
+    let result = stream_body(
+        &mut capturer,
+        None,
+        metadata_cursor,
+        &sock,
+        cfg.clone(),
+        running,
+        stop,
+        force_idr,
+        rfi_range,
+        loss,
+        video_hdr,
+        gcm_key,
+        stats,
+        &client_label,
+        on_lost,
+        live,
+    );
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(false);
+    }
+    // Portal terminal states are sticky and this path has no rebuild. Re-pooling a dead
+    // capturer wedges the next connect; drop it and pay one fresh screencast session.
+    if result.is_ok() && capturer.is_alive() {
+        *video_cap.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((capturer, cfg.hdr, metadata_cursor, full_range, pinned));
+    } else {
+        tracing::info!(
+            stream_failed = result.is_err(),
+            capturer_alive = capturer.is_alive(),
+            "video source: retiring the pooled capturer — the next stream opens a fresh screencast \
+             session"
+        );
+    }
+    result
+}
+
+/// Capturer on the pinned physical monitor for the portal source
+/// (`design/per-monitor-portal-capture.md`). Not [`open_gs_virtual_source`]: a mirror launches
+/// nothing and creates no virtual output. A missing monitor fails the stream rather than
+/// falling back to another screen.
+#[cfg(target_os = "linux")]
+fn open_gs_mirror_source(
+    connector: &str,
+    cfg: &StreamConfig,
+    metadata_cursor: bool,
+) -> Result<Box<dyn Capturer>> {
+    // Enumerate against the compositor that is up now — Desktop↔Game may have switched.
+    // Mirror streams an existing head: no gamescope sub-mode, and no session to stand up.
+    let (compositor, _) = crate::compositor_route::resolve_compositor(
+        punktfunk_core::config::CompositorPref::Auto,
+        false,
+        false,
+        false,
+    )?;
+    let mut vd = crate::vdisplay::open_mirror(compositor, connector)?;
+    vd.set_hw_cursor(metadata_cursor);
+    // Panel runs at the owner's mode; the client scales. Pass the client's anyway.
+    let vout = vd
+        .create(punktfunk_core::Mode {
+            width: cfg.width,
+            height: cfg.height,
+            refresh_hz: cfg.fps,
+        })
+        .context("start mirroring the pinned monitor")?;
+    let plan = gs_session_plan(cfg, metadata_cursor);
+    crate::capture::capture_virtual_output(
+        vout,
+        crate::capture::VirtualCaptureRequest {
+            output: plan.output_format(&cfg.encoder),
+            codec: Some(plan.codec),
+            encoder: cfg.encoder.clone(),
+            capture: crate::session_plan::CaptureBackend::resolve(),
+            kwin: compositor == crate::vdisplay::Compositor::Kwin,
+            gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
+            stream_hz: cfg.fps,
+            screen: 0,
+            gamescope_cursor: false,
+        },
+    )
+    .context("attach a capturer to the mirrored monitor")
+}
+
+/// Resolve a `/launch` catalog entry against the host's own library. The client sends only
+/// an appid. `None` = nothing to launch (Desktop, or an unresolvable entry).
+fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<crate::library::LaunchTarget> {
+    let app = app?;
+    if let Some(id) = app.library_id.as_deref() {
+        match crate::library::resolve_launch(id) {
+            Some(t) => return Some(t),
+            None => tracing::warn!(
+                launch_id = id,
+                "requested launch id not in this host's library (or no launch recipe) — ignoring"
+            ),
+        }
+    }
+    let cmd = app
+        .cmd
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())?;
+    Some(crate::library::LaunchTarget {
+        launcher: false,
+        game: crate::gamelease::GameRef {
+            id: None,
+            store: None,
+            title: if app.title.trim().is_empty() {
+                cmd.to_string()
+            } else {
+                app.title.clone()
+            },
+        },
+        detect: crate::library::spec_from_command(cmd),
+        command: Some(cmd.to_string()),
+        // A bare `apps.json` command names no entry, so the host default decides.
+        own_workspace: crate::library::OnWindow::default().own_workspace(),
+        on_window: crate::library::OnWindow::default(),
+    })
+}
+
+/// Cursor-as-metadata where the encoder draws the pointer and the compositor is not gamescope,
+/// which carries no metadata cursor either way. Shared by `set_hw_cursor` and the pooled
+/// mirror.
+fn host_composites_metadata_cursor(
+    compositor: crate::vdisplay::Compositor,
+    cfg: &StreamConfig,
+) -> bool {
+    compositor != crate::vdisplay::Compositor::Gamescope && gs_cursor_blend(compositor, None, cfg)
+}
+
+/// [`cursor_blend_for`](crate::session_plan::cursor_blend_for) at this plane's shape: no
+/// cursor channel, depth 10 only with HDR.
+fn gs_cursor_blend(
+    compositor: crate::vdisplay::Compositor,
+    route: Option<&crate::vdisplay::GamescopeRoute>,
+    cfg: &StreamConfig,
+) -> bool {
+    crate::session_plan::cursor_blend_for(
+        false,
+        compositor,
+        cfg.codec,
+        if cfg.hdr { 10 } else { 8 },
+        cfg.hdr,
+        route,
+        &cfg.encoder,
+    )
+}
+
+/// Cursor-as-metadata where this session's encode backend composites `frame.cursor`: the
+/// answer when no compositor is known.
+fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
+    crate::session_plan::encoder_blends_cursor(
+        cfg.codec,
+        if cfg.hdr { 10 } else { 8 },
+        cfg.hdr,
+        &cfg.encoder,
+    )
+}
+
+/// An opened virtual source.
+struct GsSource {
+    capturer: Box<dyn Capturer>,
+    compositor: crate::vdisplay::Compositor,
+    route: Option<crate::vdisplay::GamescopeRoute>,
+    /// This acquire spawned gamescope with the launch as its primary child. A keep-alive reuse
+    /// spawned nothing.
+    nested_launch_started: bool,
+    /// The gamescope seat a launch that did not nest goes to. `None` off a gamescope spawn.
+    #[cfg(target_os = "linux")]
+    seat: Option<String>,
+    /// The output, for a re-attach after a capture loss that leaves it up. `None` for a portal fd.
+    #[cfg(target_os = "linux")]
+    lease: Option<crate::capture::OutputLease>,
+}
+
+/// Virtual-display source at the client's mode. The app's own `compositor` wins; otherwise the
+/// native plane's [`crate::compositor_route::resolve_compositor`] picks, pin included. Only a
+/// connect (`revive`) may revive a session. Re-run on mid-stream capture loss to follow a
+/// Desktop↔Game switch. Does not launch the app — a rebuild must not re-spawn it. The capturer
+/// owns the output keepalive; the factory is dropped here.
+fn open_gs_virtual_source(
+    cfg: &StreamConfig,
+    app: Option<&super::apps::AppEntry>,
+    // Resolved once by the caller so a rebuild cannot re-resolve to something different.
+    launch: Option<&crate::library::LaunchTarget>,
+    quit: &Arc<AtomicBool>,
+    revive: bool,
+) -> Result<GsSource> {
+    let (compositor, gamescope_route) = if let Some(c) = app.and_then(|a| a.compositor) {
+        // Still resolve a route, or `create` falls through to a bare spawn on a managed box.
+        let r = crate::vdisplay::resolve_gamescope_route(c, false);
+        (c, r)
+    } else {
+        // Gate on a resolved command so an unresolvable entry falls back to auto routing.
+        // Host policy only: a Moonlight cert is not a console device, same as admission.
+        let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
+        // No per-session injector on this plane: input always takes the shared backend.
+        crate::compositor_route::resolve_compositor(
+            punktfunk_core::config::CompositorPref::Auto,
+            crate::vdisplay::wants_dedicated_game_session(has_launch, None, false),
+            false,
+            revive,
+        )?
+    };
+    let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
+    vd.set_hw_cursor(host_composites_metadata_cursor(compositor, cfg));
+    // gamescope takes its HDR flags and display-reuse key from this. An HDR plan captures PQ
+    // only, so without it an SDR gamescope streams SDR inside a PQ container.
+    vd.set_hdr(cfg.hdr);
+    // Per-session, not a process-global env: concurrent sessions must not stomp launch targets.
+    vd.set_launch_command(launch.and_then(|t| t.command.clone()));
+    // Same reason: a process env let either plane retarget the other's `create`.
+    vd.set_gamescope_route(gamescope_route.clone());
+    // Register an unread stop flag so a later session can preempt (3 s grace, then force).
+    // Anonymous slot 0 — only another slot-0 connect preempts it.
+    let _idd_setup_guard = crate::windows::idd::setup_guard(
+        crate::session_plan::CaptureBackend::resolve(),
+        None,
+        (cfg.width, cfg.height),
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    let vout = crate::vdisplay::registry::acquire(
+        &mut vd,
+        punktfunk_core::Mode {
+            width: cfg.width,
+            height: cfg.height,
+            refresh_hz: cfg.fps,
+        },
+        // Quit App / management stop / game exit skip linger; only a real drop lingers.
+        quit.clone(),
+        None,
+    )
+    .context("create virtual output at client resolution")?;
+    let nested_launch_started = vd.nested_launch_started();
+    #[cfg(target_os = "linux")]
+    let seat = vout.seat.clone();
+    #[cfg(target_os = "linux")]
+    let lease = crate::capture::OutputLease::of(&vout);
+    let capturer = gs_capture_output(vout, cfg, compositor, gamescope_route.as_ref())?;
+    Ok(GsSource {
+        capturer,
+        compositor,
+        route: gamescope_route,
+        nested_launch_started,
+        #[cfg(target_os = "linux")]
+        seat,
+        #[cfg(target_os = "linux")]
+        lease,
+    })
+}
+
+/// An active capturer on `vout` at this session's plan. On gamescope it also blends the XFixes
+/// pointer when the node carries none.
+fn gs_capture_output(
+    vout: crate::vdisplay::VirtualOutput,
+    cfg: &StreamConfig,
+    compositor: crate::vdisplay::Compositor,
+    route: Option<&crate::vdisplay::GamescopeRoute>,
+) -> Result<Box<dyn Capturer>> {
+    let plan = gs_session_plan(cfg, gs_cursor_blend(compositor, route, cfg));
+    let gamescope = compositor == crate::vdisplay::Compositor::Gamescope;
+    let mut capturer = capture::capture_virtual_output(
+        vout,
+        capture::VirtualCaptureRequest {
+            output: plan.output_format(&cfg.encoder),
+            codec: Some(plan.codec),
+            encoder: cfg.encoder.clone(),
+            capture: crate::session_plan::CaptureBackend::resolve(),
+            kwin: compositor == crate::vdisplay::Compositor::Kwin,
+            gamescope,
+            stream_hz: cfg.fps,
+            screen: 0,
+            gamescope_cursor: crate::session_plan::gamescope_cursor_for(gamescope, route),
+        },
+    )
+    .context("capture virtual output")?;
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(true);
+    }
+    Ok(capturer)
+}
+
+/// Shared [`SessionPlan`](crate::session_plan::SessionPlan) at this plane's shape: 4:2:0 unless
+/// PyroWave negotiated 4:4:4 (stock Moonlight cannot decode it), depth 10 only with HDR, no
+/// cursor-forward (GameStream has no client cursor channel), and exactly the slices the client
+/// asked for: a TV decoder wedges on more.
+fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_plan::SessionPlan {
+    let mut plan = crate::session_plan::SessionPlan::resolve(
+        &cfg.encoder,
+        if cfg.hdr { 10 } else { 8 },
+        cfg.hdr,
+        cfg.chroma,
+        cfg.codec,
+        cursor_blend,
+        false,
+        cfg.slices,
+    );
+    plan.studio_asked = cfg.studio_asked;
+    plan
+}
+
+/// [`open_session_encoder`] for `frame` at the client's negotiated size, rate and depth, on the
+/// session's resolution. An IDD-push source gets the driver's encoder, which then owes access
+/// units through `ready_aus`; its wire domain continues at `wire_seq_base` (the loop's `au_seq`).
+fn gs_open_encoder(
+    plan: &crate::session_plan::SessionPlan,
+    capturer: &dyn Capturer,
+    frame: &crate::capture::CapturedFrame,
+    cfg: &StreamConfig,
+    enc_bps: u64,
+    wire_seq_base: u32,
+) -> Result<Box<dyn encode::Encoder>> {
+    let (enc, _) = open_session_encoder(
+        &cfg.encoder,
+        plan,
+        capturer,
+        frame,
+        (cfg.width, cfg.height),
+        cfg.fps,
+        |_, _| enc_bps,
+        gs_bit_depth(frame.format),
+        None,
+        wire_seq_base,
+    )?;
+    Ok(enc)
+}
+
+/// Encoder `bit_depth` from the captured format. Backends key the real profile off `format`;
+/// this keeps the argument honest (a hard-coded `8` mislabels a P010 stream).
+fn gs_bit_depth(format: crate::capture::PixelFormat) -> u8 {
+    use crate::capture::PixelFormat;
+    match format {
+        PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::X2Rgb10 | PixelFormat::X2Bgr10 => {
+            10
+        }
+        _ => 8,
+    }
+}
+
+type PacketBatch = Vec<Vec<u8>>;
+
+/// One tick's access units: bitstream, frame type, wire frameIndex and the instant its
+/// host-processing clock starts ([`GsLoop::poll_aus`]).
+type AuBatch = Vec<(Vec<u8>, FrameType, u32, Instant)>;
+
+/// Send `pkts` with as few syscalls as possible (`sendmmsg`, up to 64 per call). The socket is
+/// connected, so no per-message address. Returns an error on the first send failure.
+#[cfg(target_os = "linux")]
+fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    const CHUNK: usize = 64;
+    let fd = sock.as_raw_fd();
+    for chunk in pkts.chunks(CHUNK) {
+        let mut iovs: Vec<libc::iovec> = chunk
+            .iter()
+            .map(|p| libc::iovec {
+                iov_base: p.as_ptr() as *mut libc::c_void,
+                iov_len: p.len(),
+            })
+            .collect();
+        let mut hdrs: Vec<libc::mmsghdr> = iovs
+            .iter_mut()
+            .map(|iov| {
+                // SAFETY: `libc::mmsghdr` is a plain `#[repr(C)]` struct of integers and raw
+                // pointers, for which an all-zero bit pattern is valid (null pointers / zero
+                // lengths); the fields we rely on (`msg_iov`, `msg_iovlen`) are overwritten on the
+                // next two lines before the struct is handed to the kernel.
+                let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                h.msg_hdr.msg_iov = iov;
+                h.msg_hdr.msg_iovlen = 1;
+                h
+            })
+            .collect();
+        let mut off = 0usize;
+        while off < hdrs.len() {
+            // SAFETY: `fd` is `sock`'s live raw fd (`sock` outlives the call). `hdrs[off..]
+            // .as_mut_ptr()` is a live slice of `(hdrs.len() - off)` `mmsghdr`s — exactly the count
+            // passed — into which the kernel writes each `msg_len`. Each header's `msg_iov` points
+            // into `iovs` (a local that outlives this call, with `msg_iovlen == 1` matching its one
+            // entry) and each `iovec.iov_base` points into the `chunk` packet buffers (the caller's
+            // `pkts`, alive for the call); the kernel only reads those payloads. Flags 0; the return
+            // is error-/progress-checked before advancing `off`.
+            let n = unsafe {
+                libc::sendmmsg(fd, hdrs[off..].as_mut_ptr(), (hdrs.len() - off) as u32, 0)
+            };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            off += n as usize;
+        }
+    }
+    Ok(())
+}
+
+/// Windows USO: equal-size packets of a paced burst go in one `WSASendMsg`. Remainder
+/// (USO off, mixed sizes, the frame's short last packet, or what a full buffer cut off) is a
+/// per-packet `send`. A packet the full buffer refuses is lost, and the session goes on.
+#[cfg(target_os = "windows")]
+fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
+    let refs: Vec<&[u8]> = pkts.iter().map(|p| p.as_slice()).collect();
+    let n = super::uso::send_uso_all(sock, &refs)?;
+    for p in &pkts[n..] {
+        if let Err(e) = sock.send(p)
+            && !super::uso::is_buffer_full(&e)
+        {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// One syscall per packet (non-Linux, non-Windows; GameStream hosting does not ship there).
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
+    for p in pkts {
+        sock.send(p)?;
+    }
+    Ok(())
+}
+
+/// One encoded frame handed to the packetizer: AUs plus the 90 kHz RTP timestamp.
+/// FEC runs on that thread so it never serializes behind encode.
+struct RawFrame {
+    /// The stream loop owns numbering (`au_seq`) so RFI stays 1:1 with Moonlight across
+    /// mid-stream encoder rebuilds.
+    aus: AuBatch,
+    ts: u32,
+}
+
+/// Packetize AUs into data + Reed–Solomon shards, then hand the batch to the paced sender.
+/// The send hand-off blocks so backpressure fills the encode queue and the encode loop drops
+/// the newest frame rather than stalling. Exits when either neighbor's channel closes.
+fn spawn_packetizer(
+    rx: std::sync::mpsc::Receiver<RawFrame>,
+    tx: std::sync::mpsc::SyncSender<PacketBatch>,
+    // Recycled batches. `try_recv` only — an empty return channel means allocate fresh.
+    pool_rx: std::sync::mpsc::Receiver<PacketBatch>,
+    mut pk: VideoPacketizer,
+    // Applied between frames, never mid-AU (block geometry + wire percent stay in step).
+    fec_pct_live: Arc<std::sync::atomic::AtomicU8>,
+    goodput: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<()> {
+    std::thread::Builder::new()
+        .name("punktfunk-pkt".into())
+        .spawn(move || {
+            pf_frame::thread_qos::boost_thread_priority(false);
+            let mut shells: Vec<PacketBatch> = Vec::new();
+            let mut cur_pct = fec_pct_live.load(std::sync::atomic::Ordering::Relaxed);
+            while let Ok(frame) = rx.recv() {
+                let pct = fec_pct_live.load(std::sync::atomic::Ordering::Relaxed);
+                if pct != cur_pct {
+                    pk.set_fec_percent(pct);
+                    cur_pct = pct;
+                }
+                while let Ok(mut spent) = pool_rx.try_recv() {
+                    pk.recycle(&mut spent);
+                    shells.push(spent);
+                }
+                let mut batch = shells.pop().unwrap_or_default();
+                for (au, ft, idx, from) in frame.aus {
+                    // Moonlight's "Host processing latency": 1/10 ms, saturating.
+                    let processing_100us =
+                        u16::try_from(from.elapsed().as_micros() / 100).unwrap_or(u16::MAX);
+                    pk.packetize_into(&mut batch, &au, ft, frame.ts, Some(idx), processing_100us);
+                }
+                if batch.is_empty() {
+                    continue;
+                }
+                let bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
+                if tx.send(batch).is_err() {
+                    break;
+                }
+                goodput.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .context("spawn packetizer thread")?;
+    Ok(())
+}
+
+/// Paced send thread: every frame on one [`Pacer`](crate::send_pacing::Pacer) at the link
+/// rate, bounded to ~2 frame intervals. Moonlight says nothing about its link, so `L` is
+/// this host's port under the 800 Mbit/s floor, and `PUNKTFUNK_DELIVERY` the only other
+/// way to shape it. Send failure ends the whole session via `on_lost` — audio would
+/// otherwise keep streaming at the dead endpoint.
+#[allow(clippy::too_many_arguments)]
+fn spawn_sender(
+    sock: UdpSocket,
+    rx: std::sync::mpsc::Receiver<PacketBatch>,
+    frame_interval: Duration,
+    // The derived encoder rate, live.
+    stream_bps: Arc<std::sync::atomic::AtomicU64>,
+    pool_tx: std::sync::mpsc::SyncSender<PacketBatch>,
+    spread_us: Arc<std::sync::Mutex<Vec<u32>>>,
+    running: Arc<AtomicBool>,
+    on_lost: super::OnSessionLost,
+) -> Result<()> {
+    std::thread::Builder::new()
+        .name("punktfunk-send".into())
+        .spawn(move || {
+            pf_frame::thread_qos::boost_thread_priority(false);
+            let mut sent: u64 = 0;
+            let mut dropped: u64 = 0;
+            use crate::send_pacing as sp;
+            let host = crate::telemetry::net_health::host_link(
+                sock.local_addr().ok().map(|a| a.ip()),
+                Some(&sock),
+            );
+            let ports = sp::Ports::of((host.iface_kind, host.link_mbps), (0, 0));
+            let mut pacer = sp::Pacer::new(ports, sp::forced());
+            let link = pacer.link();
+            tracing::info!(link_kbps = link.kbps, source = ?link.source, "video: pacing at the link rate");
+            while let Ok(mut batch) = rx.recv() {
+                dropped += sp::inject_video_drop(&mut batch);
+                if batch.is_empty() {
+                    continue;
+                }
+                let wire_bytes: usize = batch.iter().map(|p| p.len()).sum();
+                let stream_kbps = (stream_bps.load(Ordering::Relaxed) / 1_000) as u32;
+                pacer.update(stream_kbps, 0, None, sp::Shape::Auto, frame_interval * 2);
+                pacer.begin(wire_bytes);
+                let r = pacer.send(&batch, |chunk| {
+                    sendmmsg_all(&sock, chunk)?;
+                    sent += chunk.len() as u64;
+                    Ok::<(), std::io::Error>(())
+                });
+                let (stat, _) = pacer.finish();
+                match r {
+                    Ok(()) => {
+                        // A stalled reader must not grow this unbounded.
+                        let mut v = spread_us.lock().unwrap_or_else(|p| p.into_inner());
+                        if v.len() < 1024 {
+                            v.push(stat.spread_us);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::info!(error = %e, sent, "video: client unreachable — ending session");
+                        running.store(false, Ordering::SeqCst);
+                        on_lost();
+                        return;
+                    }
+                }
+                let _ = pool_tx.try_send(batch);
+            }
+            tracing::debug!(sent, dropped, "video sender exiting");
+        })
+        .context("spawn send thread")?;
+    Ok(())
+}
+
+/// The instant an epoch-nanosecond stamp names. `None` for no stamp, a stamp ahead of now,
+/// or one before `Instant`'s range.
+fn instant_of(pts_ns: u64) -> Option<Instant> {
+    if pts_ns == 0 {
+        return None;
+    }
+    let age = punktfunk_core::quic::wall_clock_ns().checked_sub(pts_ns)?;
+    Instant::now().checked_sub(Duration::from_nanos(age))
+}
+
+/// At most one IDR per this window. Floor is 100 ms: `frame_interval * 2` is 16.7 ms at
+/// 120 fps, while a client under loss re-asks every ~30 ms — every request would pass and the
+/// IDR storm would feed the loss that prompts the next request.
+fn keyframe_coalesce_window(frame_interval: Duration) -> Duration {
+    (frame_interval * 2).max(Duration::from_millis(100))
+}
+
+/// Keyframe requests, one IDR per [`keyframe_coalesce_window`]. A request inside the window
+/// stays owed and fires once it passes: Moonlight re-asks only after its next loss, so a
+/// dropped re-ask for a lost IDR freezes the picture until the client's 120-frame drop limit.
+struct KeyframeGate {
+    window: Duration,
+    last: Option<Instant>,
+    owed: bool,
+}
+
+impl KeyframeGate {
+    fn new(window: Duration) -> Self {
+        KeyframeGate {
+            window,
+            last: None,
+            owed: false,
+        }
+    }
+
+    /// An IDR is needed but not asked for this tick (a dropped frame).
+    fn owe(&mut self) {
+        self.owed = true;
+    }
+
+    /// Notes `asked`; true when an IDR is due now.
+    fn due(&mut self, asked: bool, now: Instant) -> bool {
+        self.owed |= asked;
+        if !self.owed
+            || self
+                .last
+                .is_some_and(|t| now.duration_since(t) < self.window)
+        {
+            return false;
+        }
+        self.emitted(now);
+        true
+    }
+
+    /// An IDR went out, here or from a rebuild; it settles every request so far.
+    fn emitted(&mut self, now: Instant) {
+        self.last = Some(now);
+        self.owed = false;
+    }
+}
+
+/// The access units' side of the Moonlight wire: frame numbering, units in flight and the IDR
+/// gate. Apart from the encoder, so a reset hook can borrow it while the encoder is borrowed.
+struct GsWire {
+    /// Wire frameIndex of the next batch. The loop owns it, so RFI stays 1:1 with Moonlight
+    /// across encoder rebuilds.
+    au_seq: u32,
+    /// Submitted, not yet polled; the next submit is numbered `au_seq + inflight`.
+    inflight: u32,
+    /// Without RFI each request is a full IDR. One IDR resolves pending loss; NVENC
+    /// invalidate is never rate-limited.
+    keyframes: KeyframeGate,
+}
+
+impl GsWire {
+    /// The encoder restarted: what it had in flight is gone, and its IDR settles the gate.
+    fn after_reset(&mut self) {
+        self.inflight = 0;
+        self.keyframes.emitted(Instant::now());
+    }
+}
+
+/// The session's encoder and the loop state that follows it across reopens.
+struct GsEncoder {
+    enc: Box<dyn encode::Encoder>,
+    /// Format and size it runs at. The source can change under the loop with nothing
+    /// negotiating it.
+    src: (capture::PixelFormat, u32, u32),
+    /// Fixed per encoder; one without NVENC RFI skips the always-false invalidate.
+    supports_rfi: bool,
+    wire: GsWire,
+    /// Submit/poll failure, a stall or a ladder rung rebuilds in place.
+    watchdog: EncoderWatchdog,
+}
+
+impl GsEncoder {
+    /// [`gs_open_encoder`] for `frame`. Numbering starts at 1: Moonlight rejects frame 0, so
+    /// an opening IDR numbered 0 never decodes.
+    fn open(
+        plan: &crate::session_plan::SessionPlan,
+        capturer: &dyn Capturer,
+        frame: &capture::CapturedFrame,
+        cfg: &StreamConfig,
+        enc_bps: u64,
+        keyframes: KeyframeGate,
+    ) -> Result<Self> {
+        let au_seq = 1;
+        let enc = gs_open_encoder(plan, capturer, frame, cfg, enc_bps, au_seq)?;
+        Ok(GsEncoder {
+            src: (frame.format, frame.width, frame.height),
+            supports_rfi: enc.caps().supports_rfi,
+            enc,
+            wire: GsWire {
+                au_seq,
+                inflight: 0,
+                keyframes,
+            },
+            watchdog: EncoderWatchdog::new(),
+        })
+    }
+
+    /// Replace the encoder at `frame`'s mode, numbered on from `au_seq`. The new one opens on
+    /// an IDR; the old one's access units in flight died with it.
+    fn reopen(
+        &mut self,
+        plan: &crate::session_plan::SessionPlan,
+        capturer: &dyn Capturer,
+        frame: &capture::CapturedFrame,
+        cfg: &StreamConfig,
+        enc_bps: u64,
+    ) -> Result<()> {
+        self.enc = gs_open_encoder(plan, capturer, frame, cfg, enc_bps, self.wire.au_seq)?;
+        self.src = (frame.format, frame.width, frame.height);
+        self.supports_rfi = self.enc.caps().supports_rfi;
+        self.enc.request_keyframe();
+        self.wire.after_reset();
+        self.watchdog.on_au();
+        Ok(())
+    }
+}
+
+/// Re-opens the virtual source on capture loss: the new capturer and its `cursor_blend`. With
+/// the old capturer's keepalive it only re-attaches to the output the loss left up.
+type GsRebuild<'a> = &'a dyn Fn(Option<Box<dyn Send>>) -> Result<(Box<dyn Capturer>, bool)>;
+
+/// GameStream's side of [`rebuild_after_capture_loss`]: the loop's re-open closure, judged on
+/// the compositor live at the loss.
+struct GsLossRebuild<'a> {
+    rebuild: GsRebuild<'a>,
+    running: &'a AtomicBool,
+    live: Option<crate::vdisplay::Compositor>,
+}
+
+impl CaptureLossRebuild for GsLossRebuild<'_> {
+    type Built = (Box<dyn Capturer>, bool);
+
+    fn plane(&self) -> crate::events::Plane {
+        crate::events::Plane::Gamestream
+    }
+
+    fn reattach(&mut self, keepalive: Box<dyn Send>) -> Option<Self::Built> {
+        (self.rebuild)(Some(keepalive)).ok()
+    }
+
+    fn build(&mut self, _first: bool) -> Result<Self::Built> {
+        (self.rebuild)(None)
+    }
+
+    fn ending(&self) -> bool {
+        !self.running.load(Ordering::SeqCst)
+    }
+
+    fn budget_compositor(&self) -> Option<crate::vdisplay::Compositor> {
+        self.live
+    }
+}
+
+/// Encode loop over a borrowed capturer. Send is a dedicated thread so a send spike cannot
+/// stall capture/encode.
+#[allow(clippy::too_many_arguments)]
+fn stream_body(
+    // `&mut Box` so a capture-loss rebuild can swap the capturer in place.
+    capturer: &mut Box<dyn Capturer>,
+    // Virtual-display: re-open on capture loss. `None` for portal/synthetic — propagate.
+    rebuild: Option<GsRebuild<'_>>,
+    // Encoder composites cursor bitmaps. `false` = pointer is embedded (or absent).
+    cursor_blend: bool,
+    sock: &UdpSocket,
+    cfg: StreamConfig,
+    running: &Arc<AtomicBool>,
+    // Set by `DELETE /session/{id}`: this one session, not the whole host.
+    stop: &AtomicBool,
+    force_idr: &AtomicBool,
+    rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
+    // Client 0x0201 loss counters — 1 Hz adaptation reads deltas.
+    loss: &super::GsLossStats,
+    // What this loop encodes, for the control thread's HDR-mode cue.
+    video_hdr: &std::sync::Mutex<Option<pf_frame::HdrMeta>>,
+    gcm_key: Option<[u8; 16]>,
+    stats: &Arc<crate::stats_recorder::StatsRecorder>,
+    client_label: &str,
+    on_lost: &super::OnSessionLost,
+    live: &LiveTelemetry,
+) -> Result<()> {
+    let frame = capturer
+        .next_frame(pf_capture::FirstFrame::Default)
+        .context("capture first frame")?;
+    // A mirror is sized by `open_encoder_fitted`. A virtual display was created at the
+    // negotiated size, so a mismatch is a backend fault — not fatal, the encoder opens at the
+    // captured size.
+    if !crate::session_plan::mirrored() && (frame.width != cfg.width || frame.height != cfg.height)
+    {
+        tracing::warn!(
+            captured = ?(frame.width, frame.height),
+            negotiated = ?(cfg.width, cfg.height),
+            "captured size != negotiated size — the client decodes a stream that disagrees with \
+             what it negotiated (a virtual-display backend fault — see the vdisplay lines above)"
+        );
+    }
+    // Sunshine default 20. `PUNKTFUNK_FEC_PCT=0` is data-only. Read before the encoder opens:
+    // encoder rate is derived under this parity.
+    let fec_pct: u8 = std::env::var("PUNKTFUNK_FEC_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let enc_bps = gs_encoder_bps(&cfg, cfg.bitrate_kbps, fec_pct);
+    // Compositors emit on damage; re-encode the last frame or a static desktop starves the client.
+    let target_fps = cfg.fps.clamp(1, 240);
+    let frame_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
+    let plan = gs_session_plan(&cfg, cursor_blend);
+    let video = GsEncoder::open(
+        &plan,
+        &**capturer,
+        &frame,
+        &cfg,
+        enc_bps,
+        KeyframeGate::new(keyframe_coalesce_window(frame_interval)),
+    )
+    .context("open video encoder for stream")?;
+    let mut pk = VideoPacketizer::new(cfg.packet_size, fec_pct, cfg.min_fec);
+    if cfg.encrypt_video {
+        match gcm_key {
+            Some(key) => pk.set_encryption_key(key),
+            // Streaming plaintext to a client expecting ciphertext is a black screen.
+            None => anyhow::bail!("SS_ENC_VIDEO negotiated but the session key is gone"),
+        }
+    }
+    let stream_start = Instant::now();
+
+    // Depth-2 queues: a slow stage buffers one frame; beyond that the newest drops (FEC/RFI).
+    let goodput = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<PacketBatch>(2);
+    // Depth 4 > the two depth-2 queues combined, so a batch always has a return slot.
+    let (pool_tx, pool_rx) = std::sync::mpsc::sync_channel::<PacketBatch>(4);
+    let spread_us = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let stream_bps = Arc::new(std::sync::atomic::AtomicU64::new(enc_bps));
+    let fec_pct_live = Arc::new(std::sync::atomic::AtomicU8::new(fec_pct));
+    spawn_sender(
+        sock.try_clone().context("clone video socket")?,
+        batch_rx,
+        frame_interval,
+        stream_bps.clone(),
+        pool_tx,
+        spread_us.clone(),
+        running.clone(),
+        on_lost.clone(),
+    )?;
+    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawFrame>(2);
+    spawn_packetizer(
+        raw_rx,
+        batch_tx,
+        pool_rx,
+        pk,
+        fec_pct_live.clone(),
+        goodput.clone(),
+    )?;
+
+    let now = Instant::now();
+    let adapt = GsAdapt::new(fec_pct, cfg.bitrate_kbps);
+    GsLoop {
+        capturer,
+        rebuild,
+        cfg,
+        running,
+        stop,
+        force_idr,
+        rfi_range,
+        loss,
+        video_hdr,
+        stats,
+        client_label,
+        on_lost,
+        live,
+        frame,
+        plan,
+        video,
+        frame_interval,
+        next_frame: now,
+        cap_credit: crate::send_pacing::CaptureCredit::new(now),
+        rebuilds: 0,
+        published_hdr: None,
+        asks: SourceAsks::default(),
+        health_published_at: now,
+        stream_start,
+        raw_tx,
+        sent_batches: 0,
+        dropped_batches: 0,
+        fec_pct,
+        enc_bps,
+        adapt,
+        adapt_lost_seen: 0,
+        adapt_supported: true,
+        fec_pct_live,
+        stream_bps,
+        goodput,
+        spread_us,
+        perf: pf_host_config::config().perf,
+        fps_t: stream_start,
+        win: GsWindow::default(),
+        sid: None,
+        driver: Default::default(),
+        last_driver_dropped: 0,
+        last_dropped_batches: 0,
+    }
+    .run()
+}
+
+/// One tick's capture, for the phases after it.
+struct GsTick {
+    /// The driver's AU wait and every stage timing count from here.
+    start: Instant,
+    /// A new frame arrived; `false` re-encodes the last one.
+    fresh: bool,
+    t_cap: Duration,
+    measure: bool,
+}
+
+/// After the encode phase: `Next` runs the rest of the tick, `Retry` skips it after a backoff,
+/// `End` stops the stream.
+enum GsFlow {
+    Next,
+    Retry,
+    End,
+}
+
+/// One session's encode loop: what [`stream_body`] lends it, the encoder, and the tallies of
+/// the once-a-second window.
+struct GsLoop<'a> {
+    capturer: &'a mut Box<dyn Capturer>,
+    rebuild: Option<GsRebuild<'a>>,
+    cfg: StreamConfig,
+    running: &'a Arc<AtomicBool>,
+    stop: &'a AtomicBool,
+    force_idr: &'a AtomicBool,
+    rfi_range: &'a std::sync::Mutex<Option<(i64, i64)>>,
+    loss: &'a super::GsLossStats,
+    video_hdr: &'a std::sync::Mutex<Option<pf_frame::HdrMeta>>,
+    stats: &'a Arc<crate::stats_recorder::StatsRecorder>,
+    client_label: &'a str,
+    on_lost: &'a super::OnSessionLost,
+    live: &'a LiveTelemetry,
+
+    frame: capture::CapturedFrame,
+    /// Rebuilt with the live cursor blend whenever the source is.
+    plan: crate::session_plan::SessionPlan,
+    video: GsEncoder,
+    frame_interval: Duration,
+    next_frame: Instant,
+    /// Loop-local so a mid-stream rebuild cannot reopen the overshoot.
+    cap_credit: crate::send_pacing::CaptureCredit,
+    /// A delivered frame clears this; a permanently dead source ends the stream after the cap.
+    rebuilds: u32,
+    published_hdr: Option<pf_frame::HdrMeta>,
+    /// What the source raised: the parked rung after the grab, the torn reference at the
+    /// keyframe fold.
+    asks: SourceAsks,
+    /// Same 500 ms cadence the native loop publishes on.
+    health_published_at: Instant,
+    /// The 90 kHz RTP clock counts from here.
+    stream_start: Instant,
+    raw_tx: std::sync::mpsc::SyncSender<RawFrame>,
+    sent_batches: u64,
+    dropped_batches: u64,
+
+    /// The configured parity; a refused retarget resets adaptation to it.
+    fec_pct: u8,
+    /// Client bitrate is a wire budget: parity + framing fit inside it. Adaptation re-derives
+    /// it; mid-stream rebuilds reopen at the live rate.
+    enc_bps: u64,
+    adapt: GsAdapt,
+    adapt_lost_seen: u64,
+    /// Software paths refuse in-place retarget; raising FEC then overshoots the budget.
+    adapt_supported: bool,
+    fec_pct_live: Arc<std::sync::atomic::AtomicU8>,
+    stream_bps: Arc<std::sync::atomic::AtomicU64>,
+
+    goodput: Arc<std::sync::atomic::AtomicU64>,
+    spread_us: Arc<std::sync::Mutex<Vec<u32>>>,
+    perf: bool,
+    fps_t: Instant,
+    win: GsWindow,
+    sid: Option<(u64, u32)>,
+    /// Windows driver: its own stages per tick, and the pool's drops.
+    driver: crate::stats_recorder::DriverStages,
+    last_driver_dropped: u64,
+    last_dropped_batches: u64,
+}
+
+/// One stats window's tallies: ticks, fresh frames among them, and each stage's µs as a
+/// maximum for the perf line and samples for the recorder.
+#[derive(Default)]
+struct GsWindow {
+    fps_count: u32,
+    uniq: u32,
+    mx_cap: u128,
+    mx_enc: u128,
+    mx_pkt: u128,
+    mx_send: u128,
+    v_cap: Vec<u32>,
+    v_enc: Vec<u32>,
+    v_pkt: Vec<u32>,
+    v_send: Vec<u32>,
+}
+
+impl GsWindow {
+    /// One tick's stage boundaries, each measured from the tick's start.
+    fn note(&mut self, t_cap: Duration, t_enc: Duration, t_pkt: Duration, t_send: Duration) {
+        let cap_us = t_cap.as_micros();
+        let enc_us = (t_enc - t_cap).as_micros();
+        // Both should be small; if not, a full queue is stalling encode.
+        let poll_us = (t_pkt - t_enc).as_micros();
+        let enqueue_us = (t_send - t_pkt).as_micros();
+        self.mx_cap = self.mx_cap.max(cap_us);
+        self.mx_enc = self.mx_enc.max(enc_us);
+        self.mx_pkt = self.mx_pkt.max(poll_us);
+        self.mx_send = self.mx_send.max(enqueue_us);
+        self.v_cap.push(cap_us as u32);
+        self.v_enc.push(enc_us as u32);
+        self.v_pkt.push(poll_us as u32);
+        self.v_send.push(enqueue_us as u32);
+    }
+
+    /// The recorder's stages. On the driver, `capture` is host bookkeeping and `encode` the
+    /// wait for the driver's next AU: its own stages (`driver`) replace both.
+    fn stages(
+        &mut self,
+        driver: Option<Vec<crate::stats_recorder::StageTiming>>,
+        spread: &mut [u32],
+    ) -> Vec<crate::stats_recorder::StageTiming> {
+        use crate::stats_recorder::stage;
+        match driver {
+            Some(mut s) => {
+                s.extend([
+                    stage("copy", &mut self.v_pkt),
+                    stage("send", &mut self.v_send),
+                    stage("send_spread", spread),
+                ]);
+                s
+            }
+            None => vec![
+                stage("capture", &mut self.v_cap),
+                stage("encode", &mut self.v_enc),
+                stage("packetize", &mut self.v_pkt),
+                stage("send", &mut self.v_send),
+                stage("send_spread", spread),
+            ],
+        }
+    }
+}
+
+impl GsLoop<'_> {
+    /// The tick loop. Every phase is a method; the order is the contract.
+    fn run(mut self) -> Result<()> {
+        while self.running.load(Ordering::SeqCst) {
+            self.publish_health();
+            // An operator stop ends the session the way a lost client does — `on_lost` clears
+            // the launch and the audio plane too, so nothing is left claiming the host is busy.
+            if self.stop.load(Ordering::SeqCst) {
+                tracing::info!("gamestream: stopping this session — the operator asked");
+                (self.on_lost)();
+                break;
+            }
+            let Some(tick) = self.capture_tick()? else {
+                continue;
+            };
+            if !self.follow_source_mode()? {
+                continue;
+            }
+            match self.encode_and_send(&tick)? {
+                GsFlow::Next => {}
+                GsFlow::Retry => continue,
+                GsFlow::End => break,
+            }
+            self.win.fps_count += 1;
+            if self.fps_t.elapsed() >= Duration::from_secs(1) {
+                self.stats_window();
+            }
+            // One interval past the last wake: the grid's next tick and the keep-alive's anchor.
+            self.next_frame += self.frame_interval;
+            crate::send_pacing::wait_next_tick(
+                &mut **self.capturer,
+                &mut *self.video.enc,
+                &self.frame,
+                &mut self.cap_credit,
+                &mut self.next_frame,
+                tick.fresh.then_some(tick.start),
+                self.frame_interval,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// The capturer's health for the console's card, every 500 ms.
+    fn publish_health(&mut self) {
+        if self.health_published_at.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.health_published_at = Instant::now();
+        *self
+            .live
+            .capture_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = self.capturer.supervised().map(|s| s.health());
+    }
+
+    /// Grab the newest frame ([`grab_frame`]) and run the rung the capturer's ladder parked. A
+    /// lost capture rebuilds the source ([`Self::rebuild_source`]); `None` then skips the rest
+    /// of the tick.
+    fn capture_tick(&mut self) -> Result<Option<GsTick>> {
+        let start = Instant::now();
+        let measure = self.perf || self.stats.is_armed();
+        let cap_result = grab_frame(
+            &mut **self.capturer,
+            &mut self.asks,
+            self.video.enc.telemetry(),
+        );
+        run_parked_stage(
+            &mut **self.capturer,
+            &mut self.asks,
+            &mut *self.video.enc,
+            &mut self.video.watchdog,
+            || self.video.wire.after_reset(),
+        );
+        let fresh = match cap_result {
+            Ok(Some(f)) => {
+                self.frame = f;
+                self.win.uniq += 1;
+                self.rebuilds = 0;
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                self.rebuild_source(e)?;
+                return Ok(None);
+            }
+        };
+        let t_cap = start.elapsed();
+        // Blend the live pointer, not the one this frame was captured with: a still desktop
+        // repeats its frame while pointer-only buffers (Mutter) or XFixes move it.
+        #[cfg(target_os = "linux")]
+        if self.plan.cursor_blend {
+            self.frame.cursor = self.capturer.cursor().and_then(|c| {
+                c.set_forward(false);
+                c.overlay()
+            });
+        }
+        if self.frame.cursor.as_ref().is_some_and(|c| !c.visible) {
+            self.frame.cursor = None;
+        }
+        Ok(Some(GsTick {
+            start,
+            fresh,
+            t_cap,
+            measure,
+        }))
+    }
+
+    /// Rebuild a lost source in place ([`rebuild_after_capture_loss`]) — send, packetizer,
+    /// socket and RTP survive — and reopen the encoder on its first frame. `Err` with no
+    /// rebuild to run, once [`count_capture_loss`] has spent the rebuilds, or when no source
+    /// comes up within the budget.
+    fn rebuild_source(&mut self, e: anyhow::Error) -> Result<()> {
+        let Some(rebuild) = self.rebuild else {
+            return Err(e).context("capture frame");
+        };
+        let keepalive = count_capture_loss(
+            crate::events::Plane::Gamestream,
+            &mut self.rebuilds,
+            e,
+            &mut **self.capturer,
+        )?;
+        // The budget follows the session live at the loss; `detect_active_session`
+        // answers `none` off Linux, where gamescope does not exist.
+        let budget = RebuildBudget::start();
+        let mut loss = GsLossRebuild {
+            rebuild,
+            running: self.running,
+            live: crate::vdisplay::compositor_for_kind(
+                crate::vdisplay::detect_active_session().kind,
+            ),
+        };
+        let (new_cap, blend) = rebuild_after_capture_loss(&mut loss, keepalive, &budget)?;
+        self.plan = gs_session_plan(&self.cfg, blend);
+        *self.capturer = new_cap;
+        self.asks = SourceAsks::default();
+        if let Some(feed) = self.capturer.feed() {
+            feed.set_active(true);
+        }
+        self.frame = self
+            .capturer
+            .next_frame(pf_capture::FirstFrame::Default)
+            .context("first frame after rebuild")?;
+        self.reopen_encoder()
+            .context("reopen encoder after rebuild")?;
+        self.next_frame = Instant::now();
+        tracing::info!("gamestream: source rebuilt — stream continues");
+        Ok(())
+    }
+
+    /// [`GsEncoder::reopen`] at the current frame, plan and rate.
+    fn reopen_encoder(&mut self) -> Result<()> {
+        self.video.reopen(
+            &self.plan,
+            &**self.capturer,
+            &self.frame,
+            &self.cfg,
+            self.enc_bps,
+        )
+    }
+
+    /// [`follow_source_mode`]: the encoder cannot follow a resolution change in place, so it
+    /// reopens at the delivered size. GameStream has no mid-stream mode message, so the client
+    /// is not told. `false` when a failed reopen spent this tick backing off.
+    fn follow_source_mode(&mut self) -> Result<bool> {
+        let from = self.video.src;
+        let to = (self.frame.format, self.frame.width, self.frame.height);
+        let followed = follow_source_mode(
+            self,
+            from,
+            to,
+            self.frame_interval,
+            Self::reopen_encoder,
+            |lp| (&mut lp.video.watchdog, &mut lp.next_frame),
+        )?;
+        match followed {
+            SourceFollow::Unchanged => Ok(true),
+            SourceFollow::BackedOff => Ok(false),
+            SourceFollow::Reopened(()) => {
+                tracing::info!(
+                    from = %format!("{}x{} {:?}", from.1, from.2, from.0),
+                    to = %format!("{}x{} {:?}", to.1, to.2, to.0),
+                    negotiated = ?(self.cfg.width, self.cfg.height),
+                    "gamestream: the capture source changed mode mid-stream — reopened the \
+                     encoder at the delivered size (the client is not told; a strict decoder \
+                     may not follow — see the note at this guard)"
+                );
+                Ok(true)
+            }
+        }
+    }
+
+    /// Hold the next tick `backoff` out and sleep through it.
+    fn back_off(&mut self, backoff: Duration) {
+        self.next_frame = Instant::now() + backoff;
+        std::thread::sleep(backoff);
+    }
+
+    /// Submit this tick's frame, hand the ready access units to the packetizer and rebuild a
+    /// stalled encoder in place.
+    fn encode_and_send(&mut self, tick: &GsTick) -> Result<GsFlow> {
+        self.request_keyframes();
+        self.apply_hdr_meta();
+        // A pixel-less frame's encoder (the Windows driver) already holds the access units it
+        // owes — waited for after a fresh frame, never on a repeat; every other backend takes
+        // this tick's frame.
+        let au_wait = if tick.fresh {
+            tick.start + self.frame_interval
+        } else {
+            tick.start
+        };
+        let owed = crate::send_pacing::owed_aus(&self.frame, &mut *self.video.enc, au_wait);
+        let submitted = match owed {
+            Some(_) => Ok(()),
+            None => {
+                let index = self
+                    .video
+                    .wire
+                    .au_seq
+                    .wrapping_add(self.video.wire.inflight);
+                self.video.enc.submit_indexed(&self.frame, index)
+            }
+        };
+        if let Err(e) = submitted {
+            // Owed AUs died with the discarded state. IDR bypasses coalesce: the client must resync.
+            let backoff =
+                on_submit_error(&mut self.video.watchdog, e, self.frame_interval, || {
+                    reset_stalled_encoder(&mut *self.video.enc, || self.video.wire.after_reset())
+                })?;
+            self.back_off(backoff);
+            return Ok(GsFlow::Retry);
+        }
+        self.video.wire.inflight = self
+            .video
+            .wire
+            .inflight
+            .wrapping_add(owed.map_or(1, |n| n as u32));
+        let t_enc = tick.start.elapsed();
+
+        // 90 kHz RTP from wall-clock so a variable capture rate stays correct.
+        let ts = (self.stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
+        let (aus, poll_err) = self.poll_aus(tick.start, owed.is_some());
+        let t_pkt = tick.start.elapsed();
+        if !self.enqueue(aus, ts) {
+            return Ok(GsFlow::End);
+        }
+        if self.recover_stall(poll_err)? {
+            return Ok(GsFlow::Retry);
+        }
+        if tick.measure {
+            self.note_stages(tick, t_enc, t_pkt, owed.is_some());
+        }
+        Ok(GsFlow::Next)
+    }
+
+    /// One tick's stage timings into the window, and the driver's own stages when it encodes.
+    fn note_stages(&mut self, tick: &GsTick, t_enc: Duration, t_pkt: Duration, driver: bool) {
+        self.win
+            .note(tick.t_cap, t_enc, t_pkt, tick.start.elapsed());
+        if driver {
+            self.driver
+                .note(crate::stats_recorder::DriverSample::from_telemetry(
+                    self.video.enc.telemetry().as_ref(),
+                ));
+        }
+    }
+
+    /// Fold this tick's keyframe asks — a client RFI range, a forced IDR, a torn reference —
+    /// through the gate.
+    fn request_keyframes(&mut self) {
+        let mut want_keyframe = false;
+        if let Some((first, last)) = self
+            .rfi_range
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            // Wider than RFI_MAX_RANGE is a phantom range — keyframe, never a force-reference.
+            let width = (last as u32).wrapping_sub(first as u32);
+            if width > punktfunk_core::packet::RFI_MAX_RANGE
+                || !(self.video.supports_rfi && self.video.enc.invalidate_ref_frames(first, last))
+            {
+                want_keyframe = true;
+            }
+        }
+        if self.force_idr.swap(false, Ordering::SeqCst) {
+            want_keyframe = true;
+        }
+        // A re-held PipeWire buffer may have torn the reference the encoder last read.
+        if std::mem::take(&mut self.asks.idr) {
+            want_keyframe = true;
+        }
+        if self.video.wire.keyframes.due(want_keyframe, Instant::now()) {
+            self.video.enc.request_keyframe();
+        } else if want_keyframe {
+            tracing::debug!("video: keyframe request held (IDR still in flight)");
+        }
+    }
+
+    /// Stock Moonlight tone-maps from in-band mastering/CLL SEI on keyframes. `None` is a
+    /// no-op. A change goes to the control thread's HDR-mode cue.
+    fn apply_hdr_meta(&mut self) {
+        let hdr_meta = self
+            .capturer
+            .colour()
+            .hdr_meta
+            .filter(|_| gs_bit_depth(self.frame.format) == 10);
+        self.video.enc.set_hdr_meta(hdr_meta);
+        if hdr_meta != self.published_hdr {
+            self.published_hdr = hdr_meta;
+            *self.video_hdr.lock().unwrap_or_else(|e| e.into_inner()) = hdr_meta;
+        }
+    }
+
+    /// Drain every access unit the encoder has ready, numbered on from `au_seq`. A poll error
+    /// comes back beside the units drained before it, for the stall recovery. A unit's
+    /// processing clock starts at `tick_start`, or at its OS present when the `driver`
+    /// encoded it, since that encode ran before the tick began.
+    fn poll_aus(&mut self, tick_start: Instant, driver: bool) -> (AuBatch, Option<anyhow::Error>) {
+        let mut aus = Vec::new();
+        loop {
+            let au = match self.video.enc.poll() {
+                Ok(Some(au)) => au,
+                Ok(None) => return (aus, None),
+                Err(e) => return (aus, Some(e)),
+            };
+            let ft = if au.keyframe {
+                FrameType::Idr
+            } else {
+                FrameType::P
+            };
+            let idx = self.video.wire.au_seq.wrapping_add(aus.len() as u32);
+            let from = match driver.then(|| instant_of(au.pts_ns)).flatten() {
+                Some(present) => present.min(tick_start),
+                None => tick_start,
+            };
+            aus.push((au.data, ft, idx, from));
+            self.video.wire.inflight = self.video.wire.inflight.saturating_sub(1);
+            self.video.watchdog.on_au();
+        }
+    }
+
+    /// Hand one tick's access units to the packetizer. Never blocks: a full queue drops the
+    /// batch and owes an IDR, so encode is never capped. `false` once the packetizer is gone.
+    fn enqueue(&mut self, aus: AuBatch, ts: u32) -> bool {
+        if aus.is_empty() {
+            return true;
+        }
+        let batch_len = aus.len() as u32;
+        match self.raw_tx.try_send(RawFrame { aus, ts }) {
+            Ok(()) => {
+                self.sent_batches += 1;
+                self.video.wire.au_seq = self.video.wire.au_seq.wrapping_add(batch_len);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.dropped_batches += 1;
+                self.video.wire.keyframes.owe();
+                // Spend the indexes: the encoder numbered these frames, and the gap is how
+                // Moonlight learns they are lost instead of decoding past a missing reference.
+                self.video.wire.au_seq = self.video.wire.au_seq.wrapping_add(batch_len);
+                if self.dropped_batches.is_power_of_two() {
+                    tracing::warn!(
+                        dropped_batches = self.dropped_batches,
+                        "video: pipeline queue full — frame dropped"
+                    );
+                }
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+        }
+        true
+    }
+
+    /// A poll error, or the shared stall rule, rebuilds the encoder in place and backs off:
+    /// `true` then skips the rest of the tick.
+    fn recover_stall(&mut self, poll_err: Option<anyhow::Error>) -> Result<bool> {
+        let stalled =
+            self.video
+                .watchdog
+                .stalled(self.video.wire.inflight as usize, 1, self.frame_interval);
+        if poll_err.is_none() && stalled.is_none() {
+            return Ok(false);
+        }
+        let why = match &poll_err {
+            Some(e) => format!("poll failed: {e:#}"),
+            None => stalled.unwrap_or_default(),
+        };
+        let Some(backoff) = self.video.watchdog.recover(self.frame_interval, || {
+            reset_stalled_encoder(&mut *self.video.enc, || self.video.wire.after_reset())
+        }) else {
+            return Err(poll_err.unwrap_or_else(|| anyhow::anyhow!("{why}")))
+                .context("encoder stalled — in-place rebuild unavailable or exhausted");
+        };
+        tracing::warn!(reset = self.video.watchdog.resets(), max = MAX_ENCODER_RESETS, %why,
+            "encode stall detected — encoder rebuilt in place, forcing an IDR");
+        self.back_off(backoff);
+        Ok(true)
+    }
+
+    /// The once-a-second window: the streaming line, the recorder's sample, loss adaptation,
+    /// then a fresh window.
+    fn stats_window(&mut self) {
+        let secs = self.fps_t.elapsed().as_secs_f64();
+        let win_bytes = self.goodput.swap(0, Ordering::Relaxed);
+        // Drain every window so the sender's bounded push buffer stays fresh.
+        let mut v_spread =
+            std::mem::take(&mut *self.spread_us.lock().unwrap_or_else(|p| p.into_inner()));
+        let w = &self.win;
+        if self.perf {
+            tracing::info!(
+                fps = w.fps_count,
+                uniq = w.uniq,
+                enc_us = w.mx_enc,
+                pkt_us = w.mx_pkt,
+                send_us = w.mx_send,
+                cap_us = w.mx_cap,
+                "video: streaming (perf)"
+            );
+        } else {
+            tracing::debug!(
+                fps = w.fps_count,
+                sent_batches = self.sent_batches,
+                dropped_batches = self.dropped_batches,
+                "video: streaming"
+            );
+        }
+        let driver_dropped = self
+            .video
+            .enc
+            .telemetry()
+            .map_or(self.last_driver_dropped, |t| t.dropped_total);
+        if self.stats.is_armed() {
+            self.push_sample(secs, win_bytes, &mut v_spread, driver_dropped);
+        }
+        self.last_driver_dropped = driver_dropped;
+        self.driver.reset();
+        self.adapt_to_loss();
+        self.win = GsWindow::default();
+        self.last_dropped_batches = self.dropped_batches;
+        self.fps_t = Instant::now();
+    }
+
+    /// The window's sample for the stats recorder. The host sees no receiver loss, FEC
+    /// recovery or EAGAIN here: those stay absent.
+    fn push_sample(
+        &mut self,
+        secs: f64,
+        win_bytes: u64,
+        v_spread: &mut [u32],
+        driver_dropped: u64,
+    ) {
+        let session_id = self.stats.session_id(&mut self.sid, || {
+            self.stats.register_session(
+                "gamestream",
+                self.cfg.width,
+                self.cfg.height,
+                self.cfg.fps,
+                self.cfg.codec.label(),
+                self.client_label,
+            )
+        });
+        let stages = self.win.stages(self.driver.stages(), v_spread);
+        let queue_drops = self
+            .dropped_batches
+            .saturating_sub(self.last_dropped_batches);
+        let pool_drops = driver_dropped.saturating_sub(self.last_driver_dropped);
+        self.live
+            .bitrate_kbps
+            .store(self.adapt.budget_kbps, Ordering::Relaxed);
+        let sample = crate::stats_recorder::StatsSample {
+            t_ms: 0,
+            session_id,
+            stages,
+            fps: (self.win.uniq as f64 / secs) as f32,
+            repeat_fps: (self.win.fps_count.saturating_sub(self.win.uniq) as f64 / secs) as f32,
+            mbps: (win_bytes as f64 * 8.0 / secs / 1_000_000.0) as f32,
+            // Live wire budget, not the client's ask.
+            bitrate_kbps: self.adapt.budget_kbps,
+            frames_dropped: Some((queue_drops + pool_drops) as u32),
+            packets_dropped: None,
+            send_dropped: None,
+            fec_recovered: None,
+            host_p50_us: None,
+            host_p99_us: None,
+            rtt_us: None,
+            fec_us: None,
+            seal_us: None,
+            sock_us: None,
+        };
+        self.stats.push_sample(session_id, sample);
+    }
+
+    /// Step [`GsAdapt`] on the window's client-reported loss. The wire never exceeds the live
+    /// budget, so a refused in-place retarget turns adaptation off for the session: raising
+    /// FEC with a frozen encoder rate would overshoot.
+    fn adapt_to_loss(&mut self) {
+        if !(self.adapt_supported && gs_adapt_enabled()) {
+            return;
+        }
+        let lost_total = self.loss.lost.load(Ordering::Relaxed);
+        let lost_delta = lost_total.saturating_sub(self.adapt_lost_seen);
+        self.adapt_lost_seen = lost_total;
+        if !self.adapt.step(lost_delta) {
+            return;
+        }
+        let new_enc = gs_encoder_bps(&self.cfg, self.adapt.budget_kbps, self.adapt.fec_pct);
+        if self.video.enc.reconfigure_bitrate(new_enc) {
+            self.enc_bps = new_enc;
+            self.fec_pct_live
+                .store(self.adapt.fec_pct, Ordering::Relaxed);
+            self.stream_bps.store(new_enc, Ordering::Relaxed);
+            tracing::info!(
+                lost = lost_delta,
+                fec_pct = self.adapt.fec_pct,
+                budget_kbps = self.adapt.budget_kbps,
+                enc_bps = new_enc,
+                "gamestream: adapted FEC/bitrate to client-reported loss"
+            );
+        } else {
+            self.adapt = GsAdapt::new(self.fec_pct, self.cfg.bitrate_kbps);
+            self.adapt_supported = false;
+            tracing::info!(
+                "gamestream: encoder can't retarget in place — loss adaptation off \
+                 for this session (FEC/bitrate stay at the configured values)"
+            );
+        }
+    }
+}
+
+/// [`encoder_bps_for_budget`] under the client's wire budget, `packetSize + 16 − 32` payload
+/// bytes a packet. No audio reservation: Moonlight's bitrate is video-only. PyroWave codes
+/// every frame to rate ÷ fps, so its rate stops where a frame would outgrow the wire.
+fn gs_encoder_bps(cfg: &StreamConfig, bitrate_kbps: u32, fec_pct: u8) -> u64 {
+    let bps = encoder_bps_for_budget(
+        bitrate_kbps,
+        0,
+        fec_pct,
+        (cfg.packet_size + 16).saturating_sub(32),
+        WireFraming::Moonlight,
+    );
+    if cfg.codec != Codec::PyroWave {
+        return bps;
+    }
+    let frame_cap = super::video::max_frame_bytes(cfg.packet_size) as u64;
+    bps.min(frame_cap * 8 * u64::from(cfg.fps.max(1)))
+}
+
+/// `PUNKTFUNK_GAMESTREAM_ADAPT` off pins the GameStream plane's loss adaptation off — FEC
+/// percent and wire budget stay at their configured values for the whole session (the A/B
+/// lever). A restart-class row, so the first read holds.
+fn gs_adapt_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pf_host_config::row_bool("PUNKTFUNK_GAMESTREAM_ADAPT"))
+}
+
+/// Loss-driven FEC percent and wire budget, stepped ~1 s from client `0x0201` reports.
+/// FEC climbs `+max(5, pct/2)` per lossy window (cap [`Self::FEC_MAX`]) and decays −5 per
+/// 8 clean (floor `base_pct`). Budget de-rates ×0.85 from the 2nd consecutive lossy window
+/// (floor max(¼ cap, 5 Mbps)) and climbs cap/20 per 4 clean. Apply site re-derives the
+/// encoder rate under (budget, percent) so the wire never exceeds the live budget.
+#[derive(Clone, Copy, Debug)]
+struct GsAdapt {
+    /// Decay floor.
+    base_pct: u8,
+    /// Recovery ceiling (client negotiated kbps).
+    cap_kbps: u32,
+    fec_pct: u8,
+    budget_kbps: u32,
+    clean: u32,
+    lossy: u32,
+}
+
+impl GsAdapt {
+    const FEC_MAX: u8 = 50;
+
+    fn new(base_pct: u8, cap_kbps: u32) -> GsAdapt {
+        GsAdapt {
+            base_pct,
+            cap_kbps,
+            fec_pct: base_pct,
+            budget_kbps: cap_kbps,
+            clean: 0,
+            lossy: 0,
+        }
+    }
+
+    /// Fold one window's client-reported loss in. Returns whether either lever moved.
+    fn step(&mut self, lost_delta: u64) -> bool {
+        let before = (self.fec_pct, self.budget_kbps);
+        if lost_delta > 0 {
+            self.clean = 0;
+            self.lossy += 1;
+            self.fec_pct = self
+                .fec_pct
+                .saturating_add((self.fec_pct / 2).max(5))
+                .min(Self::FEC_MAX);
+            if self.lossy >= 2 {
+                let floor = (self.cap_kbps / 4).max(5_000).min(self.cap_kbps);
+                self.budget_kbps = ((self.budget_kbps as u64 * 85 / 100) as u32).max(floor);
+            }
+        } else {
+            self.lossy = 0;
+            self.clean += 1;
+            if self.clean % 8 == 0 && self.fec_pct > self.base_pct {
+                self.fec_pct = self.fec_pct.saturating_sub(5).max(self.base_pct);
+            }
+            if self.clean % 4 == 0 && self.budget_kbps < self.cap_kbps {
+                self.budget_kbps = self
+                    .budget_kbps
+                    .saturating_add((self.cap_kbps / 20).max(500))
+                    .min(self.cap_kbps);
+            }
+        }
+        (self.fec_pct, self.budget_kbps) != before
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(title: &str, cmd: Option<&str>) -> super::super::apps::AppEntry {
+        super::super::apps::AppEntry {
+            id: 1,
+            title: title.to_string(),
+            compositor: None,
+            cmd: cmd.map(str::to_string),
+            library_id: None,
+            icon: None,
+            prep: Vec::new(),
+        }
+    }
+
+    /// Desktop / no command must take no lease — a plain desktop stream stays inert.
+    #[test]
+    fn only_an_entry_that_launches_something_gets_tracked() {
+        assert!(resolve_gs_app(None).is_none());
+        assert!(resolve_gs_app(Some(&entry("Desktop", None))).is_none());
+        assert!(resolve_gs_app(Some(&entry("Blank", Some("   ")))).is_none());
+
+        // Operator-typed command: title is the whole identity; no store id for box art.
+        let t = resolve_gs_app(Some(&entry(
+            "Steam Big Picture",
+            Some("  steam -gamepadui  "),
+        )))
+        .expect("a command entry is tracked");
+        assert_eq!(t.command.as_deref(), Some("steam -gamepadui"));
+        assert_eq!(t.game.id, None);
+        assert_eq!(t.game.store, None);
+        assert_eq!(t.game.title, "Steam Big Picture");
+        // PATH lookup, not an absolute executable — the host's child tracks it.
+        assert!(t.detect.is_empty());
+
+        let t = resolve_gs_app(Some(&entry("", Some("/opt/game/run")))).expect("tracked");
+        assert_eq!(t.game.title, "/opt/game/run");
+    }
+
+    /// Window is time, not frames: at 120 fps two intervals is 16.7 ms, under a ~30 ms re-ask.
+    #[test]
+    fn keyframe_coalesce_window_outlasts_a_clients_request_cadence() {
+        let at_120 = keyframe_coalesce_window(Duration::from_secs_f64(1.0 / 120.0));
+        assert!(
+            at_120 >= Duration::from_millis(100),
+            "120 fps window {at_120:?} does not outlast a ~30 ms request cadence"
+        );
+        // 60 fps is 33.3 ms — also under the floor.
+        assert!(keyframe_coalesce_window(Duration::from_secs_f64(1.0 / 60.0)) >= at_120);
+        // Slow stream keeps the frame-scaled window; the floor only raises.
+        assert_eq!(
+            keyframe_coalesce_window(Duration::from_millis(200)),
+            Duration::from_millis(400)
+        );
+    }
+
+    /// A driver present 5 ms back starts the processing clock 5 ms back.
+    #[test]
+    fn instant_of_maps_a_present_stamp_onto_the_monotonic_clock() {
+        let now_ns = punktfunk_core::quic::wall_clock_ns();
+        let age = instant_of(now_ns - 5_000_000).unwrap().elapsed();
+        assert!(
+            age >= Duration::from_millis(5) && age < Duration::from_millis(50),
+            "{age:?}"
+        );
+        assert!(instant_of(0).is_none());
+        assert!(instant_of(now_ns + 1_000_000_000).is_none());
+    }
+
+    #[test]
+    fn keyframe_gate_holds_a_request_until_the_window_passes() {
+        let t0 = Instant::now();
+        let w = Duration::from_millis(100);
+        let mut g = KeyframeGate::new(w);
+        assert!(g.due(true, t0), "first request emits");
+        assert!(!g.due(true, t0 + w / 5), "inside the window: held");
+        assert!(!g.due(false, t0 + w / 2));
+        assert!(
+            g.due(false, t0 + w),
+            "the held request fires once the window passes"
+        );
+        assert!(!g.due(false, t0 + w * 3), "settled: nothing owed");
+        g.owe();
+        assert!(
+            g.due(false, t0 + w * 3),
+            "a dropped frame is owed an IDR too"
+        );
+        g.owe();
+        g.emitted(t0 + w * 5);
+        assert!(
+            !g.due(false, t0 + w * 7),
+            "a rebuild's IDR settles what was owed"
+        );
+    }
+
+    /// End-to-end check of the send thread: batches pushed on the channel arrive, complete and
+    /// byte-identical, at a peer socket via the paced sendmmsg path.
+    #[test]
+    fn sender_delivers_batches() {
+        let rx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Saturated CI can starve this thread for seconds between recv() wakeups.
+        rx_sock
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let tx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx_sock.connect(rx_sock.local_addr().unwrap()).unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PacketBatch>(2);
+        let (pool_tx, pool_rx) = std::sync::mpsc::sync_channel::<PacketBatch>(4);
+        let spread = Arc::new(std::sync::Mutex::new(Vec::new()));
+        spawn_sender(
+            tx_sock,
+            rx,
+            Duration::from_millis(8),
+            Arc::new(std::sync::atomic::AtomicU64::new(3 * 20_000_000)),
+            pool_tx,
+            spread.clone(),
+            running.clone(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+
+        // Default rmem (~212 KB) holds ~80 × 1200 B datagrams (~2.5 KB truesize).
+        // A bigger burst is silently dropped if this thread never drains concurrently.
+        const PER_FRAME: usize = 20;
+        let mut sent = Vec::new();
+        for f in 0..3u8 {
+            let batch: PacketBatch = (0..PER_FRAME as u8)
+                .map(|i| {
+                    let mut p = vec![0u8; 1200];
+                    p[0] = f;
+                    p[1] = i;
+                    p
+                })
+                .collect();
+            sent.extend(batch.iter().cloned());
+            tx.send(batch).unwrap();
+        }
+        drop(tx);
+
+        let mut got = 0usize;
+        let mut buf = [0u8; 2048];
+        while got < sent.len() {
+            let n = rx_sock.recv(&mut buf).expect("packet within timeout");
+            assert_eq!(n, 1200);
+            let (f, i) = (buf[0] as usize, buf[1] as usize);
+            assert_eq!(&buf[..n], &sent[f * PER_FRAME + i][..], "payload intact");
+            got += 1;
+        }
+        assert_eq!(got, 3 * PER_FRAME);
+        assert!(running.load(Ordering::SeqCst), "no spurious client-gone");
+        // The sender records spread and recycles after its last send returns, so the final
+        // datagram can land first. Recycling follows the spread push in the same iteration.
+        for _ in 0..3 {
+            pool_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("sender must return spent batches to the pool");
+        }
+        assert_eq!(spread.lock().unwrap().len(), 3, "per-frame spread recorded");
+    }
+
+    fn cfg(slices: u32, hdr: bool) -> StreamConfig {
+        StreamConfig {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            packet_size: 1392,
+            bitrate_kbps: 20_000,
+            codec: Codec::H265,
+            chroma: encode::ChromaFormat::Yuv420,
+            min_fec: 0,
+            hdr,
+            slices,
+            encrypt_video: false,
+            studio_asked: crate::session_plan::StudioAsk::default(),
+            encoder: crate::encode::resolve(),
+        }
+    }
+
+    /// The plan the shared encoder open reads: 4:2:0 at the client's own slice count.
+    #[test]
+    fn the_plan_keeps_the_clients_slice_count() {
+        for slices in [1, 2, 4] {
+            let plan = gs_session_plan(&cfg(slices, false), false);
+            assert_eq!(plan.slices, slices);
+            assert_eq!(plan.chroma, encode::ChromaFormat::Yuv420);
+            assert_eq!(plan.bit_depth, 8);
+        }
+        assert_eq!(gs_session_plan(&cfg(1, true), false).bit_depth, 10);
+    }
+
+    /// Framing (32 B per 1376 B payload) and FEC parity fit inside the configured wire budget.
+    #[test]
+    fn encoder_rate_fits_inside_the_wire_budget() {
+        // 20 Mbps, 20 % FEC, packetSize 1392: enc = 20e6 × 1376/1408 × 100/120.
+        let hevc = cfg(1, false);
+        let enc = gs_encoder_bps(&hevc, 20_000, 20);
+        assert_eq!(enc, 16_287_878);
+        let wire = enc * 1408 / 1376 * 120 / 100;
+        assert!(wire <= 20_000_000, "wire {wire} exceeds the 20 Mbps budget");
+        assert!(
+            wire >= 19_800_000,
+            "wire {wire} leaves more than 1 % of the budget unused"
+        );
+        assert_eq!(gs_encoder_bps(&hevc, 20_000, 0), 20_000_000 * 1376 / 1408);
+        assert_eq!(gs_encoder_bps(&hevc, 0, 20), 500_000);
+    }
+
+    /// PyroWave's frame is rate ÷ fps, so its rate stops at the largest frame the wire carries
+    /// (1 Gbps at 60 fps would drop every frame); H.26x keeps the whole budget.
+    #[test]
+    fn pyrowave_rate_stops_at_the_wire_frame_ceiling() {
+        let hevc = cfg(1, false);
+        let pyro = StreamConfig {
+            codec: Codec::PyroWave,
+            ..hevc.clone()
+        };
+        let cap = super::super::video::max_frame_bytes(1392) as u64 * 8 * 60;
+        assert_eq!(gs_encoder_bps(&pyro, 1_000_000, 20), cap);
+        assert!(gs_encoder_bps(&hevc, 1_000_000, 20) > cap);
+        assert_eq!(
+            gs_encoder_bps(&pyro, 20_000, 20),
+            gs_encoder_bps(&hevc, 20_000, 20)
+        );
+    }
+
+    /// FEC climbs fast and decays slow; budget de-rates only under sustained loss.
+    #[test]
+    fn loss_adaptation_steps_and_bounds() {
+        let mut a = GsAdapt::new(20, 20_000);
+        for _ in 0..100 {
+            assert!(!a.step(0), "clean windows must not change anything at rest");
+        }
+        assert_eq!((a.fec_pct, a.budget_kbps), (20, 20_000));
+
+        // First lossy: FEC +10, budget holds (one window is a blip).
+        assert!(a.step(7));
+        assert_eq!((a.fec_pct, a.budget_kbps), (30, 20_000));
+        // Second consecutive: budget de-rates ×0.85.
+        assert!(a.step(3));
+        assert_eq!((a.fec_pct, a.budget_kbps), (45, 17_000));
+        for _ in 0..30 {
+            a.step(1);
+        }
+        assert_eq!(a.fec_pct, GsAdapt::FEC_MAX);
+        assert_eq!(a.budget_kbps, 5_000, "floor = max(cap/4, 5 Mbps)");
+
+        let mut changes = 0;
+        for _ in 0..400 {
+            if a.step(0) {
+                changes += 1;
+            }
+            assert!(a.fec_pct >= 20 && a.fec_pct <= GsAdapt::FEC_MAX);
+            assert!(a.budget_kbps >= 5_000 && a.budget_kbps <= 20_000);
+        }
+        assert_eq!((a.fec_pct, a.budget_kbps), (20, 20_000));
+        assert!(changes > 0, "recovery must actually step");
+        // Relapse resets the clean streak: one lossy window climbs FEC, does not de-rate.
+        let budget_before_relapse = a.budget_kbps;
+        a.step(2);
+        assert_eq!(a.budget_kbps, budget_before_relapse);
+        assert!(a.fec_pct > 20);
+    }
+
+    /// Budget floor cannot exceed the cap; a session below 5 Mbps never de-rates.
+    #[test]
+    fn loss_adaptation_tiny_session_never_derates_below_itself() {
+        let mut a = GsAdapt::new(20, 4_000);
+        for _ in 0..10 {
+            a.step(9);
+        }
+        assert_eq!(a.budget_kbps, 4_000, "floor clamps to the cap");
+        assert_eq!(a.fec_pct, GsAdapt::FEC_MAX);
+    }
+}

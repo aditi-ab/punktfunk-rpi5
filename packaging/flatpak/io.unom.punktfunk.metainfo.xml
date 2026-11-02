@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metainfo for the punktfunk Linux client flatpak. Validate with the appstream
+     check of ghcr.io/flathub-infra/flatpak-builder-lint. The component id MUST equal the flatpak app-id; the <launchable> MUST name the installed
+     desktop file (io.unom.punktfunk.desktop). Each stable tag adds a <release> on top. -->
+<component type="desktop-application">
+  <id>io.unom.punktfunk</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Punktfunk</name>
+  <summary>Stream your PC's games and desktop</summary>
+
+  <description>
+    <p>
+      Punktfunk plays games and uses the desktop of a computer running the Punktfunk host, with
+      low latency over your network. The stream arrives at this screen's resolution and refresh
+      rate, without scaling.
+    </p>
+    <p>
+      You need the Punktfunk host on the computer you stream from. It runs on Linux and Windows.
+    </p>
+    <ul>
+      <li>Hardware decoding with Vulkan Video or VA-API: H.264, HEVC and AV1, with HDR</li>
+      <li>A controller interface for the couch and the Steam Deck</li>
+      <li>Gamepads, including the DualSense touchpad, motion, adaptive triggers and lightbar</li>
+      <li>Game audio and your microphone</li>
+      <li>Finds hosts on your network and pairs with a PIN</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.unom.punktfunk.desktop</launchable>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Hosts on your network</caption>
+      <image>https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/flatpak/screenshots/hosts.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>A host's game library</caption>
+      <image>https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/flatpak/screenshots/library.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Pairing with a PIN</caption>
+      <image>https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/flatpak/screenshots/pair.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Settings</caption>
+      <image>https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/flatpak/screenshots/settings.png</image>
+    </screenshot>
+  </screenshots>
+
+  <categories>
+    <category>Network</category>
+    <category>Game</category>
+    <category>RemoteAccess</category>
+  </categories>
+
+  <keywords>
+    <keyword>streaming</keyword>
+    <keyword>remote</keyword>
+    <keyword>game</keyword>
+    <keyword>moonlight</keyword>
+  </keywords>
+
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>gamepad</control>
+  </supports>
+
+  <url type="homepage">https://punktfunk.unom.io/</url>
+  <url type="help">https://docs.punktfunk.unom.io/</url>
+  <url type="bugtracker">https://punktfunk.unom.io/community#bugs</url>
+  <url type="vcs-browser">https://git.unom.io/unom/punktfunk</url>
+
+  <developer id="io.unom">
+    <name>unom</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#a79ff8</color>
+    <color type="primary" scheme_preference="dark">#6c5bf3</color>
+  </branding>
+
+  <releases>
+    <release version="0.46.0" date="2026-11-01">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.46.0</url>
+      <description>
+        <p>Right colours on Snapdragon devices and AMD RX 9000 hosts, Umbriel as a host desktop, a steadier automatic bitrate, Bazzite hosts that survive a reboot, and Switch 2 pads.</p>
+      </description>
+    </release>
+    <release version="0.45.0" date="2026-10-25">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.45.0</url>
+      <description>
+        <p>Stream to every monitor, keep the stream through a dropped link, share the clipboard with the host, and get even frame pacing on the Steam Deck.</p>
+      </description>
+    </release>
+    <release version="0.44.1" date="2026-10-16">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.44.1</url>
+      <description>
+        <p>Players on a Linux host keep their controllers apart, hosts reachable without logging in serve their library, and video gets priority on Wi-Fi again.</p>
+      </description>
+    </release>
+    <release version="0.44.0" date="2026-10-15">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.44.0</url>
+      <description>
+        <p>Profiles let everyone on the host pick who is playing, every stream uses one port, and lost packets are sent again instead of freezing the picture. Needs a 0.44 host.</p>
+      </description>
+    </release>
+    <release version="0.43.1" date="2026-10-04">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.43.1</url>
+      <description>
+        <p>gamescope sessions on NVIDIA and Intel show a picture again, Windows hosts keep every frame of a capped game, and the network check reports fast links at their speed.</p>
+      </description>
+    </release>
+    <release version="0.43.0" date="2026-10-04">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.43.0</url>
+      <description>
+        <p>Hosts install games when you start them, a network check says what your link does and offers paced delivery, and controller rumble can be turned off.</p>
+      </description>
+    </release>
+    <release version="0.42.0" date="2026-10-01">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.42.0</url>
+      <description>
+        <p>The Linux client is redesigned with Hosts and Library tabs and decodes in hardware on ARM devices, controller mouse gains a Touchpad mode, and 4K streams at 120 fps and above keep up again.</p>
+      </description>
+    </release>
+    <release version="0.41.0" date="2026-09-28">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.41.0</url>
+      <description>
+        <p>A game you launched can be ended from any client, keys no longer stick when a packet is lost, and large libraries load a page at a time.</p>
+      </description>
+    </release>
+    <release version="0.40.0" date="2026-09-25">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.40.0</url>
+      <description>
+        <p>The console is rebuilt for the TV remote, with Hosts, Games, Controllers and Settings tabs and a Games tab laid out like the Mac library.</p>
+      </description>
+    </release>
+    <release version="0.39.0" date="2026-09-20">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.39.0</url>
+      <description>
+        <p>Two players can share one host, a launch waits for the game's window, and automatic bitrate measures the link before the first frame.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -105,8 +105,9 @@ final class VirtualPadTests: XCTestCase {
         XCTAssertEqual(wire(250, 0), [32767, 0])
         // Screen +y down is wire +y up.
         XCTAssertEqual(wire(0, -100), [0, 32767])
-        // Half way past the dead zone is half deflection (16383.5 rounds up).
-        XCTAssertEqual(wire(53, 0), [16384, 0])
+        // Past the gate the travel is the deflection, not rescaled from zero.
+        XCTAssertEqual(wire(7, 0), [2294, 0])
+        XCTAssertEqual(wire(30, 40), [9830, -13107])
     }
 
     func testTriggerPullsFromNothingAtTheTopToFullAtTheBottom() {

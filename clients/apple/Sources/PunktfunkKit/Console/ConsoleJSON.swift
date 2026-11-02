@@ -1,7 +1,8 @@
 // What this client hands the console, in the console's OWN model shapes (`HostRow`,
-// `WakeStatus`, `PairPhase`, `LibraryGame`, `KnownHosts`), so no Swift mirror type can drift
+// `WakeStatus`, `PairStatus`, `LibraryGame`, `KnownHosts`), so no Swift mirror type can drift
 // from the Rust structs that deserialize them. The Android client writes the same JSON
 // (`ConsoleJson.kt`) — a player who moves between a phone and an Apple TV finds one carousel.
+// An answer to a command carries that command's `req`, copied verbatim.
 
 import Foundation
 import PunktfunkShared
@@ -108,7 +109,7 @@ public enum ConsoleJSON {
             // sends no mDNS goodbye, so its record lingers long enough to keep the pip green.
             "online": online,
             "mgmt_port": Int(advert?.mgmtPort ?? host.effectiveMgmtPort),
-            "can_wake": !online && !host.wakeMacs.isEmpty,
+            "can_wake": !online && WakePolicy.canWake(host.wakeMacs),
             "clipboard_sync": host.clipboardSync ?? false,
             "last_used": host.lastConnected.map { Int($0.timeIntervalSince1970) } ?? NSNull(),
             "os": advert.map { $0.osChain.isEmpty ? (host.osChain ?? "") : $0.osChain }
@@ -117,8 +118,8 @@ public enum ConsoleJSON {
             "pin": NSNull(),
             "bound_preset": bound.map(chip) ?? NSNull(),
             "running": running[fp] ?? "",
-            // This client binds no preset per title yet, so the bind screen's marks are empty.
-            "game_presets": [String: String](),
+            "game_presets": host.gamePresets ?? [:],
+            "profile": host.pickedProfile?.bridgeJSON ?? NSNull(),
         ]
     }
 
@@ -238,8 +239,10 @@ public enum ConsoleJSON {
         j["gamepad"] = o.gamepadType.map(ConsoleSettings.padTypeName)
         j["refresh_hz"] = o.refreshHz
         j["bitrate_kbps"] = o.bitrateKbps
+        j["pyrowave_bpp"] = o.pyrowaveBpp
         j["render_scale"] = o.renderScale
         j["video_fit"] = o.videoFit
+        j["screens"] = o.screens
         j["codec"] = o.codec
         j["hdr_enabled"] = o.hdrEnabled
         j["enable_444"] = o.enable444
@@ -269,7 +272,8 @@ public enum ConsoleJSON {
     /// The keys `overrides(_:)` sends: exactly the ones a console save sets or clears.
     private static let consoleKeys: Set<String> = [
         "width", "height", "match_window", "compositor", "gamepad", "refresh_hz", "bitrate_kbps",
-        "render_scale", "video_fit", "codec", "hdr_enabled", "enable_444", "ten_bit_sdr",
+        "pyrowave_bpp", "render_scale", "video_fit", "screens", "codec", "hdr_enabled", "enable_444",
+        "ten_bit_sdr",
         "audio_channels", "audio_format", "mic_enabled", "echo_cancel", "keep_host_audio",
         "touch_mode", "mouse_mode", "invert_scroll", "overlay_actions", "inhibit_shortcuts",
         "gamepad_forwarding", "system_buttons", "guide_gesture", "stats_verbosity",
@@ -295,27 +299,41 @@ public enum ConsoleJSON {
 
     // MARK: - wake and pair
 
+    /// The `Wake`'s `req`; epoch 0 for a wake this app started on its own.
+    public static let unasked: [String: Any] = ["host": "", "epoch": 0]
+
     public static func wake(
-        key: String, name: String, seconds: Int, timedOut: Bool, online: Bool, thenConnect: Bool
+        req: Any, key: String, name: String, seconds: Int, timedOut: Bool, online: Bool,
+        thenConnect: Bool
     ) -> String {
         string([
-            "key": key, "name": name, "seconds": seconds, "timed_out": timedOut,
+            "req": req, "key": key, "name": name, "seconds": seconds, "timed_out": timedOut,
             "online": online, "then_connect": thenConnect,
         ])
     }
 
-    public static let pairIdle = "\"Idle\""
-    public static let pairBusy = "\"Busy\""
-    public static func pairFailed(_ why: String) -> String { string(["Failed": why]) }
-    public static func pairPaired(key: String) -> String { string(["Paired": ["key": key]]) }
+    public static func pairBusy(_ req: Any) -> String { pair(req, "Busy") }
+    public static func pairFailed(_ req: Any, _ why: String) -> String {
+        pair(req, ["Failed": why])
+    }
+    public static func pairPaired(_ req: Any, key: String) -> String {
+        pair(req, ["Paired": ["key": key]])
+    }
+
+    /// `PairStatus`: the phase under the `Pair` or `RequestAccess` command's `req`.
+    private static func pair(_ req: Any, _ phase: Any) -> String {
+        string(["req": req, "phase": phase])
+    }
 
     // MARK: - library
 
-    /// `[LibraryGame]` from this client's catalog — the desktop service's `to_model` mapping.
-    /// Without `stats` the Recent and Most played sorts fall back to host order.
-    public static func libraryGames(_ games: [GameEntry]) -> String {
-        string(
-            games.map { g in
+    /// `{"req", "games": [LibraryGame]}` from this client's catalog — the desktop service's
+    /// `to_model` mapping, under the `FetchLibrary` command's `req`. Without `stats` the Recent
+    /// and Most played sorts fall back to host order.
+    public static func libraryGames(_ req: Any, _ games: [GameEntry]) -> String {
+        string([
+            "req": req,
+            "games": games.map { g -> [String: Any] in
                 [
                     "id": g.id, "title": g.title, "store": g.store,
                     "launcher": g.role == "launcher",
@@ -336,7 +354,13 @@ public enum ConsoleJSON {
                         return o
                     } ?? NSNull(),
                 ]
-            })
+            },
+        ])
+    }
+
+    /// A library phase (`"Ready"`, `"Empty"`, `{"Error": …}`) under the `FetchLibrary`'s `req`.
+    public static func libraryPhase(_ req: Any, _ phase: Any) -> String {
+        string(["req": req, "phase": phase])
     }
 
     /// `/status` `downloads[]` and `grants`, as the console's `DownloadsPush`.
@@ -355,8 +379,10 @@ public enum ConsoleJSON {
             && t.allSatisfy { $0.isNumber || $0 == "-" || ($0.isLowercase && $0.isLetter) }
     }
 
-    public static func libraryError(title: String, body: String, canRetry: Bool) -> String {
-        string(["Error": ["title": title, "body": body, "can_retry": canRetry]])
+    public static func libraryError(_ req: Any, title: String, body: String, canRetry: Bool)
+        -> String
+    {
+        libraryPhase(req, ["Error": ["title": title, "body": body, "can_retry": canRetry]])
     }
 
     /// `/status` games; an entry without an id has no tile.

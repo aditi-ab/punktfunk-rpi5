@@ -1,0 +1,11 @@
+# The file capabilities every Linux channel grants: <binary> <capability> [<channel> ...].
+# '-' is none. A row with channels grants there and nowhere else.
+# scripts/ci/check-packaging-policy.py diffs each channel's recipe against this file before any
+# build; scripts/ci/assert-cap-matrix.sh reads the host and worker rows off the built package.
+#
+# The host carries none: a capability makes /proc/<pid>/exe unreadable to KWin, which then
+# cannot match the .desktop file and refuses every session. The worker is the one binary that
+# nothing has to identify.
+punktfunk-host           -
+punktfunk-encode-worker  cap_sys_nice=ep
+punktfunk-gamescope      cap_sys_nice=eip  arch steamdeck source

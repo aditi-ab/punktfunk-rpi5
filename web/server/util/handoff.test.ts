@@ -3,7 +3,15 @@
 // the one that matters most: it is a ticket the REAL Rust host minted, so this pins the
 // cross-language contract rather than testing this file against itself.
 import { describe, expect, test } from "bun:test";
-import { handoffMessage, safeEqualHex, verifyHandoff } from "./handoff";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	handoffMessage,
+	ownerHandoffKeys,
+	safeEqualHex,
+	verifyHandoff,
+} from "./handoff";
 
 const KEY = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8";
 
@@ -134,6 +142,35 @@ describe("verifyHandoff", () => {
 		expect(handoffMessage(String(ts), nonce)).toBe(
 			`pf-console-handoff:v1:${ts}:${nonce}`,
 		);
+	});
+});
+
+describe("a door's owner key", () => {
+	const OWNER = "0f".repeat(32);
+	const SEAT = "1e".repeat(32);
+
+	test("a ticket signed with the owner's host's token opens the door's console", async () => {
+		const now = 1_700_000_000_000;
+		const dir = mkdtempSync(join(tmpdir(), "pf-owner-key-"));
+		writeFileSync(join(dir, "owner-handoff-key"), `${OWNER}\n`);
+		const keys = [KEY, ...ownerHandoffKeys(dir)];
+		const owner = await mint(OWNER, now / 1000, "aa01");
+		expect(await verifyHandoff(owner, keys, new Map(), now)).toEqual({
+			ok: true,
+		});
+		// A contract seat's user can read their own host's token; it is no key here.
+		const seat = await mint(SEAT, now / 1000, "aa02");
+		expect(await verifyHandoff(seat, keys, new Map(), now)).toEqual({
+			ok: false,
+			reason: "bad-signature",
+		});
+	});
+
+	test("no file is no extra key", () => {
+		expect(ownerHandoffKeys(mkdtempSync(join(tmpdir(), "pf-none-")))).toEqual(
+			[],
+		);
+		expect(ownerHandoffKeys("")).toEqual([]);
 	});
 });
 

@@ -60,17 +60,34 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-# Keep the traditional "check $LASTEXITCODE myself" model: don't let pwsh 7.4 turn a non-zero native
-# exit into a terminating error (it would bypass Sign-File's timestamp-then-retry fallback below).
+# Keep the "check $LASTEXITCODE myself" model: a non-zero native exit must not throw before the
+# script reads it.
 $PSNativeCommandUseErrorActionPreference = $false
+. (Join-Path $PSScriptRoot 'signing.ps1')
+# A throw anywhere below must not leave the decoded signing key in $OutDir.
+trap { Remove-SigningPfx; break }
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Everything built here links the C runtime statically, as -TargetDir's exes must: a fresh Windows
+# Server has no Visual C++ runtime, and setup itself has to start there. On arm64 nothing but Opus
+# names lrintf or floor, and the linker only serves its imports from functions already in the link.
+if (-not $env:RUSTFLAGS) {
+    $env:RUSTFLAGS = '-C target-feature=+crt-static'
+    if ($Arch -eq 'arm64') { $env:RUSTFLAGS += ' -C link-arg=/INCLUDE:lrintf -C link-arg=/INCLUDE:floor' }
+}
 $triple = if ($Arch -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
 $archSuffix = if ($Arch -eq 'arm64') { '_arm64' } else { '' }
 $exe = Join-Path $TargetDir 'punktfunk-host.exe'
 if (-not (Test-Path $exe)) { throw "missing build artifact 'punktfunk-host.exe' in $TargetDir (did 'cargo build --release -p punktfunk-host --features nvenc' run?)" }
 $trayExe = Join-Path $TargetDir 'punktfunk-tray.exe'
 if (-not (Test-Path $trayExe)) { throw "missing build artifact 'punktfunk-tray.exe' in $TargetDir (did 'cargo build --release -p punktfunk-tray' run?)" }
+# The seat keeper builds in its own workspace (crates/host/pf-seat-keeper) into the same target dir.
+$keeperExe = Join-Path $TargetDir 'punktfunk-seat-keeper.exe'
+if (-not (Test-Path $keeperExe)) { throw "missing build artifact 'punktfunk-seat-keeper.exe' in $TargetDir (did 'cargo build --release --manifest-path crates/host/pf-seat-keeper/Cargo.toml' run?)" }
+# The host starts this beside itself to capture a monitor it did not create (a pinned monitor, a
+# shared screen). Without it those sessions fail; everything else streams.
+$workerExe = Join-Path $TargetDir 'punktfunk-capture-worker.exe'
+if (-not (Test-Path $workerExe)) { throw "missing build artifact 'punktfunk-capture-worker.exe' in $TargetDir (did 'cargo build --release -p punktfunk-capture-worker' run?)" }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 # The version goes into a copy: cargo re-links its own output on the next build.
 $stampedExe = Join-Path $OutDir 'punktfunk-host.exe'
@@ -78,155 +95,27 @@ Copy-Item -LiteralPath $exe -Destination $stampedExe -Force
 & (Join-Path $here 'stamp-version.ps1') -Path $stampedExe -Version $Version
 $exe = $stampedExe
 
-# --- locate signtool (Windows SDK) -----------------------------------------------------------
-function Find-SdkTool([string]$name) {
-    $root = 'C:\Program Files (x86)\Windows Kits\10\bin'
-    $hit = Get-ChildItem -Path $root -Recurse -Filter $name -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -match '\\(10\.0\.\d+\.\d+)\\x64\\' } |
-        Sort-Object { [version]([regex]::Match($_.FullName, '\\(10\.0\.\d+\.\d+)\\x64\\').Groups[1].Value) } |
-        Select-Object -Last 1
-    if (-not $hit) { throw "$name not found under $root - install the Windows 10/11 SDK." }
-    $hit.FullName
-}
-# Azure.CodeSigning.Dlib.dll ships in the Microsoft.Trusted.Signing.Client NuGet package, which has no
-# installer and no fixed location - hence an explicit override first, then the two paths the runner
-# setup uses (see packaging/windows/README.md). Newest version wins so a package update is picked up
-# without editing this script.
-function Find-AzureDlib([string]$Explicit) {
-    if ($Explicit) {
-        if (-not (Test-Path $Explicit)) { throw "AZURE_CODESIGNING_DLIB points at a missing file: $Explicit" }
-        return (Resolve-Path $Explicit).Path
-    }
-    $roots = @(
-        (Join-Path $env:USERPROFILE '.nuget\packages\microsoft.trusted.signing.client'),
-        'C:\trusted-signing\microsoft.trusted.signing.client'
-    ) | Where-Object { $_ -and (Test-Path $_) }
-    $hit = $roots | ForEach-Object { Get-ChildItem -Path $_ -Recurse -Filter 'Azure.CodeSigning.Dlib.dll' -ErrorAction SilentlyContinue } |
-        Where-Object { $_.FullName -match '\\bin\\x64\\' } |
-        Sort-Object LastWriteTime | Select-Object -Last 1
-    if (-not $hit) {
-        throw ("Azure.CodeSigning.Dlib.dll not found. Install the signing client on this box, e.g. " +
-               "``nuget install Microsoft.Trusted.Signing.Client -OutputDirectory " +
-               "`$env:USERPROFILE\.nuget\packages``, or set AZURE_CODESIGNING_DLIB to its full path.")
-    }
-    $hit.FullName
-}
-
-# --- signing cert (supplied stable pfx OR ephemeral self-signed) -----------------------------
-# FAIL CLOSED on a real release. The ephemeral fallback below exists so canary/CI/dev builds keep
-# working without the secret, but it is a per-build throwaway cert: nobody can pin it, and an
-# installer signed with one is indistinguishable from one signed by an attacker. Silently falling
-# back on a tag build would ship exactly that to users under the release's name - so on refs/tags/v*
-# a missing MSIX_CERT_PFX_B64 (or -NoSign) is a build failure, not a downgrade. ('auto' resolves from
-# GITHUB_REF so a workflow can't forget to opt in; -RequireSignedCert true/false overrides.)
-$requireCert = if ($RequireSignedCert -eq 'auto') { $env:GITHUB_REF -like 'refs/tags/v*' }
-               else { [Convert]::ToBoolean($RequireSignedCert) }
-if ($NoSign -and $requireCert) {
-    throw "release build ($env:GITHUB_REF) with -NoSign - refusing to publish an unsigned installer."
-}
-$pfxPath = Join-Path $OutDir 'signing.pfx'
+# --- signing backend (signing.ps1: Azure, then MSIX_CERT_PFX_B64, then ephemeral) ----------------
+# The .pfx modes export the .cer users import once (LocalMachine\TrustedPublisher) so SmartScreen
+# and UAC trust the setup.exe. Azure emits none, so HOST_CER_PATH stays unset.
 $cerPath = Join-Path $OutDir "punktfunk-host-windows_${Version}.cer"
-$azureMetadata = Join-Path $OutDir 'azure-codesigning.json'
-$signMode = 'none'
-$signtool = $null
-if (-not $NoSign) {
-    $signtool = Find-SdkTool 'signtool.exe'
-    Write-Host "signtool: $signtool"
-    if ($AzureEndpoint -and $AzureAccount -and $AzureProfile) {
-        $signMode = 'azure'
-        $AzureDlib = Find-AzureDlib $AzureDlib
-        # signtool reads the account/profile from this file (/dmdf) rather than the command line.
-        @{
-            Endpoint                = $AzureEndpoint
-            CodeSigningAccountName  = $AzureAccount
-            CertificateProfileName  = $AzureProfile
-        } | ConvertTo-Json | Set-Content -Path $azureMetadata -Encoding utf8
-        Write-Host "signing via Azure Artifact Signing: $AzureAccount/$AzureProfile at $AzureEndpoint"
-        Write-Host "  dlib: $AzureDlib"
-        foreach ($v in 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET') {
-            if (-not [Environment]::GetEnvironmentVariable($v)) {
-                throw ("Azure signing selected but $v is not set. The dlib authenticates with " +
-                       "DefaultAzureCredential; without the service-principal trio it falls through to " +
-                       "an interactive login that cannot complete on a runner and hangs the build.")
-            }
-        }
-    }
-    elseif ($PfxBase64) {
-        $signMode = 'pfx'
-        Write-Host "signing with supplied code-signing cert (MSIX_CERT_PFX_B64)"
-        [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($PfxBase64))
-    }
-    elseif ($requireCert) {
-        throw ("release build ($env:GITHUB_REF) with neither AZURE_CODESIGNING_* nor MSIX_CERT_PFX_B64 - " +
-               "refusing to fall back to an ephemeral self-signed cert. Restore the signing secrets " +
-               "(packaging/windows/README.md), or pass -RequireSignedCert false if this really is a test build.")
-    }
-    else {
-        $signMode = 'selfsigned'
-        Write-Host "no MSIX_CERT_PFX_B64 -> generating an ephemeral self-signed cert (subject $Publisher)"
-        if (-not $PfxPassword) { $PfxPassword = 'punktfunk' }
-        $tmp = New-SelfSignedCertificate -Type Custom -Subject $Publisher `
-            -KeyUsage DigitalSignature -FriendlyName 'punktfunk host (self-signed)' `
-            -CertStoreLocation 'Cert:\CurrentUser\My' `
-            -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
-        $sec = ConvertTo-SecureString -String $PfxPassword -Force -AsPlainText
-        Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($tmp.Thumbprint)" -FilePath $pfxPath -Password $sec | Out-Null
-        Remove-Item "Cert:\CurrentUser\My\$($tmp.Thumbprint)" -Force
-    }
-    # Export the public .cer for the .pfx-backed modes. For a self-signed cert it's the file users
-    # import once (LocalMachine\TrustedPublisher) so SmartScreen/UAC trusts the signed setup.exe.
-    # Azure signing has no .pfx to read and needs no import - the chain is publicly trusted - so it
-    # deliberately produces no .cer and HOST_CER_PATH stays unset.
-    if ($signMode -ne 'azure') {
-        $pwsec = if ($PfxPassword) { ConvertTo-SecureString -String $PfxPassword -Force -AsPlainText } else { $null }
-        $pubCert = if ($pwsec) { Get-PfxCertificate -FilePath $pfxPath -Password $pwsec } else { Get-PfxCertificate -FilePath $pfxPath }
-        Export-Certificate -Cert $pubCert -FilePath $cerPath | Out-Null
-        Write-Host "signing cert subject=$($pubCert.Subject) thumbprint=$($pubCert.Thumbprint)"
-    }
-}
-
-# A timestamp is best-effort for a .pfx whose cert outlives the release, but MANDATORY under Azure
-# signing: those leaf certs are minted per request and expire in ~3 days, so an untimestamped
-# signature stops verifying within days of shipping. Retrying without one there would produce an
-# artifact that passes on the runner and fails on every user's machine that weekend - so the
-# fallback is gated on the mode rather than applied blindly.
-function Sign-File([string]$Path) {
-    if ($NoSign) { return }
-    if ($signMode -eq 'azure') {
-        $signArgs = @('sign', '/fd', 'SHA256', '/dlib', $AzureDlib, '/dmdf', $azureMetadata)
-        $ts = 'http://timestamp.acs.microsoft.com'
-    }
-    else {
-        $signArgs = @('sign', '/fd', 'SHA256', '/f', $pfxPath)
-        if ($PfxPassword) { $signArgs += @('/p', $PfxPassword) }
-        $ts = 'http://timestamp.digicert.com'
-    }
-    # UAC names a signed file by /d. The exe's own FileDescription stays the one source.
-    $desc = (Get-Item $Path).VersionInfo.FileDescription
-    if ($desc) { $signArgs += @('/d', $desc) }
-    $signArgs += @('/du', 'https://punktfunk.unom.io')
-    & $signtool ($signArgs + @('/tr', $ts, '/td', 'SHA256', $Path))
-    if ($LASTEXITCODE -eq 0) { return }
-    if ($signMode -eq 'azure') {
-        throw ("timestamped sign failed for $Path ($LASTEXITCODE) - NOT retrying without a timestamp. " +
-               "An Azure signing cert is valid for ~3 days; an untimestamped signature would go " +
-               "untrusted within days of release.")
-    }
-    Write-Warning "timestamped sign failed for $Path - retrying without a timestamp"
-    & $signtool ($signArgs + @($Path))
-    if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for $Path ($LASTEXITCODE)" }
-}
+$signing = Resolve-SigningMode -OutDir $OutDir -Publisher $Publisher -FriendlyName 'punktfunk host (self-signed)' `
+    -PfxBase64 $PfxBase64 -PfxPassword $PfxPassword -AzureEndpoint $AzureEndpoint -AzureAccount $AzureAccount `
+    -AzureProfile $AzureProfile -AzureDlib $AzureDlib -RequireSignedCert $RequireSignedCert `
+    -CerPath $cerPath -NoSign:$NoSign
 
 # --- sign the inner exes before they're packed -------------------------------------------------
-Sign-File $exe
-Sign-File $trayExe
+Sign-File $signing $exe
+Sign-File $signing $trayExe
+Sign-File $signing $keeperExe
+Sign-File $signing $workerExe
 
 # --- resolve + validate the installer's source files ------------------------------------------
 $repoRoot = (Resolve-Path (Join-Path $here '..\..')).Path
 $hostEnvSrc = Join-Path $repoRoot 'scripts\windows\host.env.example'
 $readmeSrc = Join-Path $here 'README.md'
 $brandIco = Join-Path $here 'branding\punktfunk.ico'
-foreach ($p in @($exe, $trayExe, $hostEnvSrc, $readmeSrc, $brandIco)) {
+foreach ($p in @($exe, $trayExe, $keeperExe, $workerExe, $hostEnvSrc, $readmeSrc, $brandIco)) {
     if (-not (Test-Path -LiteralPath $p)) { throw "installer source file missing: $p" }
 }
 
@@ -342,12 +231,38 @@ if (Test-Path (Join-Path $layerSrc 'Cargo.toml')) {
         New-Item -ItemType Directory -Force -Path $layerStage | Out-Null
         Copy-Item $layerDll (Join-Path $layerStage 'pf_vkhdr_layer.dll') -Force
         Copy-Item (Join-Path $layerSrc 'pf_vkhdr_layer.json') (Join-Path $layerStage 'pf_vkhdr_layer.json') -Force
-        Sign-File (Join-Path $layerStage 'pf_vkhdr_layer.dll')
+        Sign-File $signing (Join-Path $layerStage 'pf_vkhdr_layer.dll')
         Write-Host "==> staged pf-vkhdr-layer -> $layerStage"
     }
     else { Write-Warning "pf-vkhdr-layer build failed ($layerExit) - installer built WITHOUT the HDR Vulkan layer" }
 }
 else { Write-Host "no pf-vkhdr-layer crate -> installer built WITHOUT the HDR Vulkan layer" }
+
+# --- pf_seat_audio.dll: the seat listener's audio endpoint enumerator (crates/host/pf-seat-audio).
+# Every process of a seat session that uses MMDevAPI loads it at its own bitness, so the x64
+# installer carries an x64 and an x86 build. ARM64 seats keep RDP-Tcp.
+$seatAudioStage = $null
+if ($Arch -eq 'x64') {
+    $seatAudioTarget = Join-Path $OutDir 'seat-audio-target'
+    $seatAudioStage = Join-Path $OutDir 'seat-audio'
+    $manifest = Join-Path $here '..\..\Cargo.toml'
+    $prevTarget = $env:CARGO_TARGET_DIR
+    $env:CARGO_TARGET_DIR = $seatAudioTarget
+    try {
+        foreach ($build in @(@('x64', 'x86_64-pc-windows-msvc'), @('x86', 'i686-pc-windows-msvc'))) {
+            Write-Host "==> building pf_seat_audio.dll ($($build[1]))"
+            & cargo build --release --locked --manifest-path $manifest -p pf-seat-audio --target $build[1]
+            if ($LASTEXITCODE -ne 0) { throw "pf-seat-audio build failed for $($build[1]) ($LASTEXITCODE)" }
+            $dir = Join-Path $seatAudioStage $build[0]
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            Copy-Item (Join-Path $seatAudioTarget "$($build[1])\release\pf_seat_audio.dll") $dir -Force
+            Sign-File $signing (Join-Path $dir 'pf_seat_audio.dll')
+        }
+    }
+    finally {
+        if ($prevTarget) { $env:CARGO_TARGET_DIR = $prevTarget } else { Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue }
+    }
+}
 
 # --- build the wizard + pack the installer -----------------------------------------------------
 $setup = Join-Path $OutDir "punktfunk-host-setup-$Version$archSuffix.exe"
@@ -384,7 +299,7 @@ $packer = if ($Arch -eq 'x64') { Join-Path $wizRel 'punktfunk-setup-pack.exe' } 
 $appStage = Join-Path $OutDir 'app'
 if (Test-Path $appStage) { Remove-Item $appStage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $appStage | Out-Null
-Copy-Item $exe, $trayExe, $hostEnvSrc -Destination $appStage -Force
+Copy-Item $exe, $trayExe, $keeperExe, $workerExe, $hostEnvSrc -Destination $appStage -Force
 Copy-Item $readmeSrc -Destination (Join-Path $appStage 'README.txt') -Force
 Copy-Item $brandIco -Destination $appStage -Force
 Copy-Item $licStage -Destination (Join-Path $appStage 'licenses') -Recurse -Force
@@ -395,6 +310,15 @@ if ($wantWeb -or $wantScripting) {
 if ($wantWeb) { Copy-Item $webStage -Destination (Join-Path $appStage 'web\.output') -Recurse -Force }
 if ($wantScripting) { Copy-Item $scrStage -Destination (Join-Path $appStage 'scripting') -Recurse -Force }
 if ($layerStage -and (Test-Path $layerStage)) { Copy-Item $layerStage -Destination (Join-Path $appStage 'vklayer') -Recurse -Force }
+# Seats copy these into System32/SysWOW64 when they turn on (pf-seats seat_listener.rs).
+if ($seatAudioStage) { Copy-Item $seatAudioStage -Destination (Join-Path $appStage 'seat-audio') -Recurse -Force }
+# The seats display driver stays on disk beside the host, since the extracted staging tree below is
+# deleted after setup. Setup never installs it: the console does, when the operator turns seats on.
+if (-not $NoDriver) {
+    $seatsDir = Join-Path $appStage 'staging\pfvdisplay'
+    New-Item -ItemType Directory -Force -Path $seatsDir | Out-Null
+    foreach ($f in 'pf_vdisplay_seats.inf', 'pf_vdisplay_seats.cat', 'pf_vdisplay.dll') { Copy-Item (Join-Path $stage $f) -Destination $seatsDir -Force }
+}
 # Driver payloads: extracted beside the wizard, handed to `driver install --dir <staging>\...`.
 $stagingRoot = Join-Path $OutDir 'staging'
 if (Test-Path $stagingRoot) { Remove-Item $stagingRoot -Recurse -Force }
@@ -408,7 +332,7 @@ if (-not $NoDriver) {
 $unins = Join-Path $appStage 'unins000.exe'
 & $packer pack-uninstaller --exe $wizExe --runtime $wizRel --version $Version --artifact host --out $unins
 if ($LASTEXITCODE -ne 0) { throw "pack-uninstaller failed ($LASTEXITCODE)" }
-Sign-File $unins
+Sign-File $signing $unins
 
 & $packer pack --exe $wizExe --runtime $wizRel --app $appStage --staging $stagingRoot --version $Version --artifact host --out $setup
 if ($LASTEXITCODE -ne 0) { throw "pack failed ($LASTEXITCODE)" }
@@ -417,21 +341,21 @@ if ($LASTEXITCODE -ne 0) { throw "inspect failed ($LASTEXITCODE)" }
 if (-not (Test-Path $setup)) { throw "expected installer not produced: $setup" }
 
 # --- sign the setup.exe + clean up ------------------------------------------------------------
-Sign-File $setup
-Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
-Remove-Item $azureMetadata -Force -ErrorAction SilentlyContinue
+Sign-File $signing $setup
+Remove-SigningPfx
+Remove-Item $signing.Metadata -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "==> installer: $setup"
-if ($signMode -eq 'azure') {
+if ($signing.Mode -eq 'azure') {
     Write-Host "==> signed by a publicly trusted CA - nothing for users to import."
 }
-elseif (-not $NoSign) {
+elseif ($signing.Mode -ne 'none') {
     Write-Host "==> trust the cert once per machine (self-signed builds), then the signed setup.exe is trusted:"
     Write-Host "    Import-Certificate -FilePath '$cerPath' -CertStoreLocation Cert:\LocalMachine\TrustedPublisher"
 }
 if ($env:GITHUB_ENV) {
     "HOST_SETUP_PATH=$setup" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
     "HOST_PACK_TOOL=$packer" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-    if (-not $NoSign -and $signMode -ne 'azure') { "HOST_CER_PATH=$cerPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+    if ($signing.Mode -notin 'none', 'azure') { "HOST_CER_PATH=$cerPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
 }

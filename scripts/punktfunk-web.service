@@ -16,14 +16,17 @@ Description=punktfunk management web console
 # because the host is Type=simple and systemd calls it started the moment it is spawned — seconds
 # before either file lands. Keep web-init in BOTH lists: the ordering is what makes it a gate.
 After=punktfunk-web-init.service punktfunk-host.service
+# Stands down while the door is on: its own console (punktfunk-web-door.service) serves this
+# port. The seat supervisor writes the owner's contract before any user manager starts, so this
+# holds at boot too, while the door's console still waits for the network.
+ConditionPathExists=!/run/punktfunk/seats/%u.env
+ConditionPathExists=!/run/punktfunk-web-door
 # Wants, not Requires: if the pre-start unit itself fails, still try — the Restart backstop below
 # recovers, where a hard dependency would leave the console down.
 Wants=punktfunk-web-init.service
-# Backstop for whatever the gate above cannot cover (web-init timed out; the host restarted and
-# re-minted its identity under a running console; someone deleted a file). Retry indefinitely:
-# systemd's default rate limit (5 starts / 10 s) plus RestartSec=2 gives up permanently after ~10 s
-# - so a console that hit a missing file stayed dead until someone restarted it by hand (the same
-# defect the Windows PunktfunkWeb task had).
+# Backstop for whatever the gate above cannot cover (web-init timed out; the host re-minted its
+# identity under a running console; someone deleted a file). Retry forever: a missing file must
+# not leave the console down.
 StartLimitIntervalSec=0
 
 [Service]
@@ -46,11 +49,8 @@ EnvironmentFile=-%h/.config/punktfunk/web-password
 # The host's ACTUAL mgmt port: `serve` writes this file (mgmt::publish_endpoint) with the port it
 # really bound, so moving the listener — the fix for sharing a box with a Sunshine fork, which owns
 # 47990 as its web UI — needs no edit here. Optional ('-'): an older host never wrote it, and the
-# server's own built-in default (https://127.0.0.1:47990, util/auth.ts) then applies unchanged.
-#
-# Deliberately NOT paired with an `Environment=PUNKTFUNK_MGMT_URL=` default line: whether a file or
-# an Environment= assignment wins is a question of directive order, and the answer differs between
-# this hand-written unit and the one the NixOS module generates. One source, no precedence puzzle.
+# server's own built-in default (https://127.0.0.1:47990, util/mgmt.ts) then applies unchanged.
+# No PUNKTFUNK_MGMT_URL default: an absent file leaves the server's own.
 EnvironmentFile=-%h/.config/punktfunk/mgmt-endpoint
 Environment=PORT=47992
 # Serve HTTPS (HTTP/1.1 over TLS) with the host's own identity cert; mark the

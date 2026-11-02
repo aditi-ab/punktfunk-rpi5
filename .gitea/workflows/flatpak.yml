@@ -40,34 +40,41 @@ on:
       - 'clients/linux/**'
       - 'clients/session/**'
       - 'clients/cli/**'
-      - 'crates/punktfunk-core/**'
-      - 'crates/pf-client-core/**'
-      - 'crates/pf-presenter/**'
-      - 'crates/pf-console-ui/**'
-      - 'crates/pf-bitstream/**'
-      - 'crates/pf-vkdecode/**'
-      - 'crates/pf-vaapi/**'
-      - 'crates/pf-v4l2dec/**'
-      - 'crates/pf-v4l2/**'
-      - 'crates/pf-libva/**'
-      - 'crates/pf-dmabuf/**'
-      - 'crates/pf-update-check/**'
-      - 'crates/pyrowave-sys/**'
+      - 'crates/client/pf-client-core/**'
+      - 'crates/client/pf-client-video/**'
+      - 'crates/client/pf-console-ui/**'
+      - 'crates/client/pf-presenter/**'
+      - 'crates/codec/pf-bitstream/**'
+      - 'crates/codec/pf-libva/**'
+      - 'crates/codec/pf-v4l2/**'
+      - 'crates/codec/pf-v4l2dec/**'
+      - 'crates/codec/pf-vaapi/**'
+      - 'crates/codec/pf-vkdecode/**'
+      - 'crates/codec/pyrowave-sys/**'
+      - 'crates/core/**'
       - 'packaging/flatpak/**'
+      - 'packaging/linux/io.unom.punktfunk.desktop'
+      - 'packaging/linux/io.unom.punktfunk.console.desktop'
+      - 'packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg'
+      - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/ci/pf-version.sh'
       # Both halves of this job's correctness, not of the bundle's content: a change to either
       # can only be proven by a real run, and there is no other trigger that would give it one.
       - '.gitea/workflows/flatpak.yml'
       - 'scripts/ci/flatpak-deps-present.sh'
+      - 'scripts/ci/flatpak-legacy-refs.sh'
     tags: ['v*']
   workflow_dispatch:
 
 env:
   REGISTRY: git.unom.io
   OWNER: unom
-  APP_ID: io.unom.Punktfunk
-  MANIFEST: packaging/flatpak/io.unom.Punktfunk.yml
+  APP_ID: io.unom.punktfunk
+  # The CamelCase id the client shipped under. Its refs stay published, end-of-life with a rebase
+  # onto APP_ID, so `flatpak update` moves an old install instead of failing on a missing ref.
+  LEGACY_APP_ID: io.unom.Punktfunk
+  MANIFEST: packaging/flatpak/io.unom.punktfunk.yml
   PACKAGE: punktfunk-client-flatpak     # generic-registry package name
   REPO_URL: https://flatpak.unom.io   # shared unom OSTree repo (reusable across unom apps)
   DEPLOY_DIR: unom-flatpak             # ~/<dir> on unom-1 (compose + ./site tree)
@@ -233,6 +240,9 @@ jobs:
           echo "BUNDLE=punktfunk-client-${PF_VERSION}${{ matrix.suffix }}.flatpak" >> "$GITHUB_ENV"
           echo "FLATPAK_BRANCH=$PF_CHANNEL" >> "$GITHUB_ENV"
           echo "ALIAS=$ALIAS" >> "$GITHUB_ENV"
+          # The manifest's cargo step reads this into PUNKTFUNK_BUILD_VERSION (the repo dir is
+          # the module source), so the binaries report the package version, canary suffix and all.
+          printf '%s\n' "$PF_VERSION" > packaging/flatpak/VERSION
           echo "flatpak version $PF_VERSION -> branch '$PF_CHANNEL' alias '$ALIAS'"
 
       - name: Generate offline cargo sources
@@ -257,7 +267,7 @@ jobs:
             "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/$GEN_REF/cargo/flatpak-cargo-generator.py"
           echo "$GEN_SHA  /tmp/flatpak-cargo-generator.py" | sha256sum -c - \
             || { echo "::error::flatpak-cargo-generator.py sha256 mismatch at $GEN_REF"; exit 1; }
-          # The manifest prune runs inside the sandbox (io.unom.Punktfunk.yml); its self-test
+          # The manifest prune runs inside the sandbox (io.unom.punktfunk.yml); its self-test
           # here fails the job before flatpak-builder spends its minutes.
           python3 packaging/flatpak/prune-windows-toml.py --self-test
           python3 packaging/flatpak/prune-windows-lock.py Cargo.lock /tmp/Cargo.flatpak.lock
@@ -265,46 +275,26 @@ jobs:
             -o packaging/flatpak/cargo-sources.json
 
       - name: Seed the local OSTree repo from the live server (keep BOTH channels in the summary)
-        # Each CI run builds only ONE branch (canary on main, stable on a tag). The deploy step's
-        # `flatpak build-update-repo` regenerates the repo SUMMARY from whatever refs are in the
-        # LOCAL repo, and the rsync publishes it (without --delete). A fresh single-branch local
-        # repo therefore produces a single-branch summary that CLOBBERS the other channel on the
-        # server — the exact bug that made `app/io.unom.Punktfunk/x86_64/stable` unresolvable
-        # ("No such ref") after a canary main-push overwrote the post-release summary, even though
-        # the stable commit's objects were still on disk. Fix: seed every published channel, of
-        # every arch, into the local repo first; the build below then only ADDS this run's commit
-        # and the regenerated+signed summary keeps every ref.
-        #
-        # HOW, and why not the rsync this replaces. Mirroring the whole published repo down over
-        # ssh transferred the entire thing every run, because the local repo starts empty and has
-        # nothing to diff against — rsync said so itself on run 18855:
-        #     received 3,835,169,389 bytes … total size is 3,845,084,524  speedup is 1.00
-        # 3.84 GB and 180 s off a Hetzner box, to publish a ~28 MB commit, growing by that much
-        # again every build (the repo is never pruned and the upload runs without --delete). What
-        # the summary actually needs is each channel's TIP, so pull exactly that over HTTP:
-        # `--depth=0` takes the requested commit and none of its parents, and `--mirror` writes
-        # refs/heads/* where build-update-repo looks for them. The current channel's tip is worth
-        # having for a second reason — it is the new commit's parent, so --generate-static-deltas
-        # can still emit the from-parent delta that makes `flatpak update` incremental.
-        #
-        # This needs no deploy secret at all (it reads the public repo), so unlike the ssh version
-        # it also seeds correctly on a fork or a secretless run. gpg verification is off for the
-        # same reason the rsync had none: every object pulled here is re-signed by the deploy step
-        # below before it is republished.
+        # build-update-repo writes a summary of the LOCAL repo's refs, so every published app ref
+        # of every arch is seeded first, or this run's summary drops the other channels.
+        # --depth=0 pulls each tip alone. The current channel's tip is also the static delta's
+        # parent. gpg verification is off: the deploy step re-signs everything it publishes.
         run: |
           set -euo pipefail
           mkdir -p "$PWD/repo"
           ostree --repo="$PWD/repo" init --mode=archive
           ostree --repo="$PWD/repo" remote add --if-not-exists --no-gpg-verify unom "$REPO_URL/repo/"
-          # Probe (retried) whether a published repo exists at all: ONLY a real 404 may continue
-          # with a fresh repo. A transient network failure must FAIL the job instead — treating a
-          # flaky link as "nothing published yet" is exactly how a single-branch summary comes to
-          # clobber the other channel (the bug described above).
+          # Only a real 404 starts a fresh repo. An unreachable server fails the job, or its
+          # summary would drop a channel.
           if bash scripts/ci/retry.sh 5 curl -fsS -o /dev/null "$REPO_URL/repo/summary"; then
             for ref in $(bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" remote refs unom); do
-              case "$ref" in unom:app/$APP_ID/*) ;; *) continue ;; esac
-              bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" pull --mirror --depth=0 \
-                unom "${ref#unom:}"
+              case "$ref" in unom:app/$APP_ID/* | unom:app/$LEGACY_APP_ID/*) ;; *) continue ;; esac
+              ref=${ref#unom:}
+              if ! bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" pull --mirror --depth=0 unom "$ref"; then
+                # This leg rebuilds its own ref, so a tip it can't fetch costs only the delta.
+                [ "$ref" = "app/$APP_ID/${{ matrix.arch }}/$FLATPAK_BRANCH" ] || exit 1
+                echo "::warning::$ref tip is not fetchable, publishing it without a delta"
+              fi
             done
             echo "SEEDED=1" >> "$GITHUB_ENV"
           elif [ "$(curl -sS -o /dev/null -w '%{http_code}' "$REPO_URL/repo/summary")" = 404 ]; then
@@ -409,7 +399,7 @@ jobs:
           # here is commit-pinned (see the manifest), so "don't update" is a semantic no-op.
           # Anything genuinely missing still downloads, so a cold state dir self-heals.
           #
-          # --default-branch=$FLATPAK_BRANCH pins the ref to app/io.unom.Punktfunk/<arch>/<branch>
+          # --default-branch=$FLATPAK_BRANCH pins the ref to app/io.unom.punktfunk/<arch>/<branch>
           # (canary or stable) so the matching hosted .flatpakref resolves deterministically
           # (manifest sets no branch).
           flatpak-builder --user --force-clean --disable-rofiles-fuse \
@@ -486,13 +476,17 @@ jobs:
             for ref in $REFS; do
               case "$ref" in
                 "unom:app/$APP_ID/${{ matrix.arch }}/$FLATPAK_BRANCH") continue ;;
-                unom:app/$APP_ID/*) ;;
+                unom:app/$APP_ID/* | unom:app/$LEGACY_APP_ID/*) ;;
                 *) continue ;;
               esac
               bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" pull --mirror --depth=0 \
                 unom "${ref#unom:}"
             done
           fi
+          # After the re-pull, which would reset a ref to the remote's commit. A legacy ref rebases
+          # onto the new id only where that arch and branch has published.
+          bash scripts/ci/flatpak-legacy-refs.sh "$PWD/repo" unom "$APP_ID" "$LEGACY_APP_ID" \
+            "$KEYID" "$GNUPGHOME"
           flatpak build-update-repo --generate-static-deltas \
             --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" "$PWD/repo"
           # The regenerated summary advertises exactly these refs — must include EVERY channel that
@@ -516,10 +510,18 @@ jobs:
           # published channel, not just this run's). The stable ref resolves for good once any
           # release has built the `stable` branch. A box installs ONE; `flatpak update` then tracks
           # that channel's branch.
+          # A channel installs the new id once it has published one, and its legacy refs until then.
+          channel_id() {  # <branch>
+            if ls -d "$PWD/repo/refs/heads/app/$APP_ID"/*/"$1" >/dev/null 2>&1; then
+              echo "$APP_ID"
+            else
+              echo "$LEGACY_APP_ID"
+            fi
+          }
           write_ref() {  # <filename> <branch> <title>
             cat > "site/$1" <<EOF
           [Flatpak Ref]
-          Name=$APP_ID
+          Name=$(channel_id "$2")
           Branch=$2
           Url=$REPO_URL/repo/
           Title=$3
@@ -530,20 +532,22 @@ jobs:
           EOF
           }
           write_ref "${APP_ID}.flatpakref"        stable "Punktfunk"
-          write_ref "${APP_ID}.Canary.flatpakref" canary "Punktfunk (Canary)"
+          write_ref "${APP_ID}.canary.flatpakref" canary "Punktfunk (Canary)"
+          # The CamelCase file names old links and docs use.
+          write_ref "${LEGACY_APP_ID}.flatpakref"        stable "Punktfunk"
+          write_ref "${LEGACY_APP_ID}.Canary.flatpakref" canary "Punktfunk (Canary)"
           cat > site/index.html <<EOF
           <!doctype html><meta charset=utf-8><title>unom flatpak repo</title>
           <h1>unom Flatpak repository</h1>
           <p>Install the Punktfunk Linux client (auto-adds Flathub for the GNOME runtime, then tracks updates).</p>
           <p><b>Stable</b> (recommended — only moves on releases):</p>
           <pre>flatpak install --user $REPO_URL/${APP_ID}.flatpakref
-          flatpak run $APP_ID</pre>
+          flatpak run $(channel_id stable)</pre>
           <p><b>Canary</b> (latest main build, unstable):</p>
-          <pre>flatpak install --user $REPO_URL/${APP_ID}.Canary.flatpakref</pre>
+          <pre>flatpak install --user $REPO_URL/${APP_ID}.canary.flatpakref</pre>
           <p>Or add the whole remote: <code>flatpak remote-add --user --if-not-exists unom $REPO_URL/unom.flatpakrepo</code></p>
           EOF
-          # 3) Ship to unom-1 and (re)start the static server. rsync WITHOUT --delete keeps old
-          #    objects so clients mid-update aren't broken; the fresh signed summary advertises latest.
+          # 3) Prune, ship to unom-1 and (re)start the static server.
           install -d -m700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy; chmod 600 ~/.ssh/deploy
           # Pin unom-1's host key instead of trusting whoever answers first. This step is holding
@@ -558,25 +562,26 @@ jobs:
           DEST="${DEPLOY_USER}@${DEPLOY_HOST}"
           # All idempotent, so a dropped dial or a stalled session just retries.
           bash scripts/ci/retry.sh 5 $SSH "$DEST" "mkdir -p ~/$DEPLOY_DIR/site/repo"
-          bash scripts/ci/retry.sh 5 rsync -az --info=stats1 -e "$SSH" repo/ "$DEST:$DEPLOY_DIR/site/repo/"
-          bash scripts/ci/retry.sh 5 rsync -az -e "$SSH" site/unom.flatpakrepo "site/${APP_ID}.flatpakref" "site/${APP_ID}.Canary.flatpakref" site/index.html "$DEST:$DEPLOY_DIR/site/"
+          # The prune and the upload hold one lock, so a prune never deletes an upload in flight.
+          LOCK="$DEPLOY_DIR/.publish.lock"
+          # Prune before the upload, so a full disk can't block it. Canary commits older than 30
+          # days go. Stable history stays (compliance/vendored-components.md), as does every tip.
+          # The host has no ostree, so it runs in a container as the deploy user. A failed prune
+          # never fails the deploy.
+          bash scripts/ci/retry.sh 3 $SSH "$DEST" \
+            "flock -w 900 $LOCK docker run --rm -e ID=\$(id -u):\$(id -g) -v \$HOME/$DEPLOY_DIR/site/repo:/repo alpine:3 \
+             sh -c 'apk add -q --no-cache ostree su-exec && cd /repo/refs/heads && for r in */*/*/canary; do set -- \"\$@\" --only-branch=\$r; done \
+             && su-exec \$ID ostree --repo=/repo prune --refs-only --keep-younger-than=\"30 days ago\" \"\$@\"'" \
+            || echo "::warning::prune step failed — published repo may be growing unbounded"
+          # No --delete: a client mid-update still finds its objects. --delay-updates renames every
+          # file into place after the last one lands, so a cut-off upload publishes nothing.
+          bash scripts/ci/retry.sh 5 rsync -az --delay-updates --rsync-path="flock -w 900 $LOCK rsync" \
+            --info=stats1 -e "$SSH" repo/ "$DEST:$DEPLOY_DIR/site/repo/"
+          bash scripts/ci/retry.sh 5 rsync -az -e "$SSH" site/unom.flatpakrepo "site/${APP_ID}.flatpakref" "site/${APP_ID}.canary.flatpakref" \
+            "site/${LEGACY_APP_ID}.flatpakref" "site/${LEGACY_APP_ID}.Canary.flatpakref" site/index.html "$DEST:$DEPLOY_DIR/site/"
           bash scripts/ci/retry.sh 5 rsync -az -e "$SSH" packaging/flatpak/server/compose.production.yml packaging/flatpak/server/Caddyfile "$DEST:$DEPLOY_DIR/"
           bash scripts/ci/retry.sh 5 $SSH "$DEST" "cd ~/$DEPLOY_DIR && docker compose -f compose.production.yml up -d"
           echo "deployed → $REPO_URL/${APP_ID}.flatpakref"
-          # 4) Bound the published repo. Every canary adds ~28 MB that nothing ever removed —
-          #    the upload runs without --delete (deliberately: see above) and the local repo is
-          #    no longer a full mirror that could carry a deletion over. Left alone it had
-          #    reached 3.84 GB, on a box that has run out of disk before. `ostree prune` is the
-          #    safe tool for it: --refs-only touches ONLY commits no ref points at (superseded
-          #    canaries), and --keep-younger-than spares anything recent, so a client mid-pull
-          #    or a box a few builds behind still resolves every object it asks for. Guarded on
-          #    ostree existing there, and never allowed to fail the deploy — the bundle and the
-          #    repo are already published by this point, and a full disk is a slower problem
-          #    than a red release.
-          bash scripts/ci/retry.sh 3 $SSH "$DEST" \
-            "command -v ostree >/dev/null && ostree --repo=\$HOME/$DEPLOY_DIR/site/repo prune --refs-only --keep-younger-than='30 days ago' \
-             || echo 'no ostree on the deploy host — repo not pruned'" \
-            || echo "::warning::prune step failed — published repo may be growing unbounded"
 
       - name: Attach bundle to the Gitea release (stable tags only)
         if: startsWith(gitea.ref, 'refs/tags/v')

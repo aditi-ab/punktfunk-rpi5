@@ -65,9 +65,9 @@ required SAND-to-I420 transfer and upload; this must not be described as softwar
 HEVC decoding. The rung intentionally rejects non-HEVC streams.
 
 Primary implementation files are
-[`video_v4l2_request.rs`](../crates/pf-client-core/src/video_v4l2_request.rs),
-[`video.rs`](../crates/pf-client-core/src/video.rs), and
-[`session.rs`](../crates/pf-client-core/src/session.rs). Commit
+[`video_v4l2_request.rs`](../crates/client/pf-client-video/src/video_v4l2_request.rs),
+[`video_ladder.rs`](../crates/client/pf-client-video/src/video_ladder.rs), and
+[`session.rs`](../crates/client/pf-client-core/src/session.rs). Commit
 [`a43c1327`](https://github.com/aditi-ab/punktfunk-rpi5/commit/a43c1327)
 adds compatibility with the older FFmpeg headers used by the Raspberry Pi build,
 and [`7ff28efa`](https://github.com/aditi-ab/punktfunk-rpi5/commit/7ff28efa)
@@ -117,7 +117,7 @@ Commit [`00920937`](https://github.com/aditi-ab/punktfunk-rpi5/commit/0092093793
 - recreates the swapchain after suboptimal acquire/present results.
 
 The implementation is in
-[`wayland_frame.rs`](../crates/pf-presenter/src/vk/wayland_frame.rs) and the
+[`wayland_frame.rs`](../crates/client/pf-presenter/src/vk/wayland_frame.rs) and the
 adjacent Vulkan presenter modules. It contains no 60 Hz timer: compositor
 callbacks follow the active output and therefore apply to 50, 60, 120 Hz, and
 other supported modes.
@@ -142,7 +142,7 @@ cadence.
 
 Commit [`012df8d7`](https://github.com/aditi-ab/punktfunk-rpi5/commit/012df8d710c473645951893bd59170e36e428ab9)
 carries `scissor_y` and `scissor_height` from
-[`skia_overlay.rs`](../crates/pf-console-ui/src/skia_overlay.rs) through the
+[`skia_overlay.rs`](../crates/client/pf-console-ui/src/skia_overlay.rs) through the
 overlay frame into the Vulkan render pass. Normal top and bottom chrome use a
 bounded band. Resize scrims, the quick ring, and simultaneous top-and-bottom
 chrome retain a full-surface pass so content is not clipped.
@@ -173,7 +173,7 @@ submitted to A/V synchronization; genuinely missing positions beyond the
 concealed span still receive normal PLC.
 
 The focused tests in
-[`session.rs`](../crates/pf-client-core/src/session.rs) are:
+[`session.rs`](../crates/client/pf-client-core/src/session.rs) are:
 
 - `delayed_audio_covered_by_drought_plc_is_not_queued_twice`; and
 - `sequence_gaps_consume_concealed_timeline_before_new_plc`.

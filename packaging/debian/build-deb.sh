@@ -48,7 +48,7 @@ TRAY_BIN="target/release/punktfunk-tray"
 # when the existing artifact was already resolved that way, and rebuilds it when it wasn't.
 echo "==> building punktfunk-tray (release, own invocation — see comment above)"
 cargo build --release -p punktfunk-tray --locked
-# The web-console-update root helper (dep-free; see crates/pf-update).
+# The web-console-update root helper (dep-free; see crates/install/pf-update).
 echo "==> building pf-update (release)"
 cargo build --release -p pf-update --locked
 
@@ -72,6 +72,9 @@ install -Dm0644 packaging/linux/49-punktfunk-update.rules \
                                                    "$STAGE/usr/share/polkit-1/rules.d/49-punktfunk-update.rules"
 # postinst runs this on configure and on the file trigger below (web, runner, bun).
 install -Dm0755 packaging/linux/restart-user-units.sh "$STAGE/usr/libexec/punktfunk/restart-user-units"
+# The host state postinst shares with every other format, and the groups it creates.
+install -Dm0755 packaging/linux/post-install.sh    "$STAGE/usr/libexec/punktfunk/post-install"
+install -Dm0644 packaging/linux/punktfunk.sysusers "$STAGE/usr/lib/sysusers.d/punktfunk.conf"
 install -Dm0644 scripts/60-punktfunk.rules         "$STAGE/usr/lib/udev/rules.d/60-punktfunk.rules"
 install -Dm0644 scripts/60-punktfunk-dualsense.conf "$STAGE/usr/share/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf"
 # ALSA UCM for the DualSense's own sound card — the `SpeakerHaptic` device alsa-ucm-conf has
@@ -136,15 +139,13 @@ sed -i 's#%h/punktfunk/scripts/headless/run-headless-kde.sh#/usr/share/punktfunk
 # host bind KWin's restricted zkde_screencast (virtual output) + fake_input globals on an
 # interactive Plasma session. Must ship with the host — KWin caches the per-exe grant on first
 # connect, so it has to be present before the host ever connects. See the file's header comment.
-install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
-    "$STAGE/usr/share/applications/io.unom.Punktfunk.Host.desktop"
-# Status tray: the per-user SNI icon + its XDG autostart entry (self-gating: --autostart exits
-# silently for users who don't run a host) + the hicolor status icons it names.
+install -Dm0644 packaging/linux/io.unom.punktfunk.host.desktop \
+    "$STAGE/usr/share/applications/io.unom.punktfunk.host.desktop"
+# Status tray: the per-user SNI icon + the hicolor status icons it names. Its autostart entry is
+# per user, written by the host from the tray_autostart setting.
 install -Dm0755 "$TRAY_BIN"                        "$STAGE/usr/bin/punktfunk-tray"
-install -Dm0644 packaging/linux/io.unom.Punktfunk.Tray.desktop \
-    "$STAGE/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop"
-install -Dm0644 packaging/linux/io.unom.Punktfunk.StartHost.desktop \
-    "$STAGE/usr/share/applications/io.unom.Punktfunk.StartHost.desktop"
+install -Dm0644 packaging/linux/io.unom.punktfunk.starthost.desktop \
+    "$STAGE/usr/share/applications/io.unom.punktfunk.starthost.desktop"
 for sz in 22x22 48x48; do
   for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
     install -Dm0644 "$png" "$STAGE/usr/share/icons/hicolor/$sz/apps/$(basename "$png")"
@@ -231,7 +232,9 @@ SHDEPS="$(printf '%s' "$SHDEPS_RAW" | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
 # Manual additions shlibdeps can't see:
 #  - libei1: input injection (libei) is loaded at runtime, not in DT_NEEDED.
 #  - pipewire/wireplumber: runtime services (the daemon + session manager), not linked libs.
-DEPENDS="$SHDEPS, libei1, pipewire, wireplumber"
+#  - punktfunk-seats (build-seats-deb.sh): profile seats and Reachable without logging in. It ships
+#    disabled and is pinned, because the host and the supervisor speak one socket protocol.
+DEPENDS="$SHDEPS, libei1, pipewire, wireplumber, punktfunk-seats (= $VERSION)"
 # gamescope = a ready compositor backend; pipewire-pulse = desktop audio.
 # mesa-va-drivers / intel-media-va-driver = the VAAPI encode drivers for AMD (radeonsi) and Intel
 # (iHD) — pulled by default so the auto-selected VAAPI backend works out of the box; NVIDIA boxes
@@ -261,10 +264,10 @@ Homepage: https://git.unom.io/unom/punktfunk
 Depends: $DEPENDS
 Recommends: $RECOMMENDS
 Suggests: $SUGGESTS
-Description: Low-latency desktop/game streaming host (Moonlight + punktfunk/1)
+Description: Low-latency desktop/game streaming host (Moonlight + punktfunk/2)
  punktfunk is a Linux-first, low-latency desktop and game streaming host. It speaks
  the Moonlight/GameStream protocol (pair a stock Moonlight client) and its own native
- punktfunk/1 protocol (GF(2^16) Leopard FEC + AES-GCM, mid-stream mode renegotiation,
+ punktfunk/2 protocol (GF(2^16) Leopard FEC + AES-GCM, mid-stream mode renegotiation,
  client microphone passthrough). Each session gets a virtual output at the client's
  exact resolution and refresh via a per-compositor backend (KWin, gamescope, Mutter,
  Sway/wlroots), captured zero-copy (dmabuf -> CUDA -> NVENC). Input (mouse, keyboard,
@@ -279,16 +282,6 @@ cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
-    # The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
-    getent group punktfunk-update >/dev/null 2>&1 || addgroup --system punktfunk-update 2>/dev/null || true
-    # Owns the usbip vhci attach/detach nodes (60-punktfunk.rules). Deliberately NOT 'input':
-    # writing 'attach' materialises an arbitrary emulated USB device — a root-only kernel
-    # primitive that must not ride on the group users are told to join for gamepads
-    # (security-review 2026-08-05 M-4). It is ALSO the group pf-dm-helper authorizes on (its
-    # polkit action must stay allow_any, so membership is the real gate), i.e. what a managed
-    # gamescope takeover needs to stop the display manager. Creating the group is necessary and
-    # NOT sufficient for either use: membership is.
-    getent group punktfunk >/dev/null 2>&1 || addgroup --system punktfunk 2>/dev/null || true
     # NO capability on the host binary — and an active removal of the one 0.26.0-1 granted here.
     #
     # 0.26.0-1 ran `setcap cap_sys_nice=ep` at this point for the GPU-priority lever, and that broke
@@ -329,11 +322,6 @@ if [ "$1" = "configure" ]; then
     if [ -x /usr/bin/punktfunk-encode-worker ]; then
         setcap 'cap_sys_nice=ep' /usr/bin/punktfunk-encode-worker 2>/dev/null || true
     fi
-    # Pick up the /dev/uinput rule without a reboot (best-effort, no-op in containers).
-    udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --subsystem-match=misc 2>/dev/null || true
-    # Apply the UDP socket-buffer tuning now (also auto-applied at boot by systemd-sysctl).
-    sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
     echo "punktfunk-host installed. Add yourself to the 'input' group for virtual gamepads:"
     echo "    sudo usermod -aG input \"\$USER\"   # then re-login"
     # Naming only the usbip pad here is how a Nobara host shipped broken: its owner had no Deck
@@ -355,50 +343,8 @@ if [ "$1" = "configure" ]; then
         echo "    sudo firewall-cmd --permanent --add-service=punktfunk-native && sudo firewall-cmd --reload"
         echo "    (use punktfunk-gamestream for the Moonlight-compat host)"
     fi
-    # An open firewall keeps the ports a profile had when it was allowed: ufw stores the expanded
-    # rules, firewalld serves the service it last loaded. Name each profile missing a port this
-    # package added. `ufw status verbose` prints expanded ports, so it can tell stale from current.
-    if command -v ufw >/dev/null 2>&1 &&
-       ufw status verbose 2>/dev/null | grep -q 'punktfunk-web' &&
-       ! ufw status verbose 2>/dev/null | grep -q '47993'; then
-        echo ""
-        echo "punktfunk: your ufw rule for 'punktfunk-web' predates TCP 47993 (plugin UIs, served"
-        echo "  from their own origin). Plugin interfaces will not load in the console until:"
-        echo "    sudo ufw app update punktfunk-web && sudo ufw reload"
-    fi
-    if command -v ufw >/dev/null 2>&1 &&
-       ufw status verbose 2>/dev/null | grep -q 'punktfunk-native' &&
-       ! ufw status verbose 2>/dev/null | grep -q '9778'; then
-        echo ""
-        echo "punktfunk: your ufw rule for 'punktfunk-native' predates UDP 9778 (browser streaming)."
-        echo "  A browser cannot connect to this host until:"
-        echo "    sudo ufw app update punktfunk-native && sudo ufw reload"
-    fi
-    # --info-service answers from the definition the daemon loaded, i.e. the stale one.
-    if command -v firewall-cmd >/dev/null 2>&1 &&
-       firewall-cmd --state >/dev/null 2>&1 &&
-       firewall-cmd --query-service=punktfunk-web >/dev/null 2>&1 &&
-       ! firewall-cmd --info-service=punktfunk-web 2>/dev/null | grep -q '47993'; then
-        echo ""
-        echo "punktfunk: the punktfunk-web firewalld service now also covers TCP 47993 (plugin UIs)."
-        echo "  Plugin interfaces will not load in the console until:  sudo firewall-cmd --reload"
-    fi
-    if command -v firewall-cmd >/dev/null 2>&1 &&
-       firewall-cmd --state >/dev/null 2>&1 &&
-       firewall-cmd --query-service=punktfunk-native >/dev/null 2>&1 &&
-       ! firewall-cmd --info-service=punktfunk-native 2>/dev/null | grep -q '9778'; then
-        echo ""
-        echo "punktfunk: the punktfunk-native firewalld service now also covers UDP 9778 (browser"
-        echo "  streaming). A browser cannot connect to this host until:  sudo firewall-cmd --reload"
-    fi
-    # Conflicting Moonlight-compatible host (Sunshine/Apollo/...): reuse the host's own detector so
-    # the warning lives in one place. Exit 1 = found; never fail the install on it.
-    if command -v punktfunk-host >/dev/null 2>&1; then
-        if ! conflict="$(punktfunk-host detect-conflicts 2>/dev/null)"; then
-            echo ""
-            echo "$conflict"
-        fi
-    fi
+    # Groups, udev, sysctl, the stale-firewall notes and the conflict check.
+    /usr/libexec/punktfunk/post-install
 fi
 # Restart the running services. configure restarts all three: dpkg may fold a pending trigger into it.
 case "$1" in configure|triggered) /usr/libexec/punktfunk/restart-user-units ;; esac

@@ -40,6 +40,8 @@ declare const SteamClient: {
     SetShortcutStartDir(appId: number, dir: string): void;
     SetShortcutIcon(appId: number, iconPath: string): void;
     SetAppLaunchOptions(appId: number, options: string): void;
+    // An empty name removes the app's forced compatibility tool.
+    SpecifyCompatTool?(appId: number, toolName: string): void;
     // assetType: 0 = grid (portrait capsule), 1 = hero, 2 = logo, 3 = wide grid.
     SetCustomArtworkForApp(
       appId: number,
@@ -464,8 +466,8 @@ interface ShortcutRole {
 /**
  * Ensure a role's shortcut exists and points at the current plugin dir: reuse the remembered
  * appId only while the shortcut is alive (a stale id must fall through, not be repointed), else
- * adopt or mint one. Then rewrite exe, start dir and name, visibility and art. Throws when the
- * launch wrapper is missing.
+ * adopt or mint one. Then rewrite exe, start dir, name, compatibility tool, visibility and art.
+ * Throws when the launch wrapper is missing.
  */
 async function ensureShortcutOnce(role: ShortcutRole): Promise<Ensured> {
   const info = await runnerInfo();
@@ -494,6 +496,8 @@ async function ensureShortcutOnce(role: ShortcutRole): Promise<Ensured> {
   SteamClient.Apps.SetShortcutExe(appId, SHELL);
   SteamClient.Apps.SetShortcutStartDir(appId, startDir);
   SteamClient.Apps.SetShortcutName(appId, role.name);
+  // A compatibility tool runs the wrapper in a container with no flatpak, so the launch dies.
+  SteamClient.Apps.SpecifyCompatTool?.(appId, "");
   if (role.launchOptions) {
     SteamClient.Apps.SetAppLaunchOptions(appId, role.launchOptions(info.runner, info.client_bin));
   }
@@ -900,6 +904,8 @@ export interface LaunchOpts {
    * store-qualified id (`steam:570`). The host resolves it; the Deck only names it.
    */
   gameId?: string;
+  /** Play as this profile, for this stream only (PF_AS → `--as`), by its id. */
+  profileId?: string;
   /**
    * Ask the host's operator to admit this Deck rather than typing a PIN (PF_REQUEST_ACCESS).
    * The connect PARKS until somebody approves it, and the launch runs SUPERVISED — see the
@@ -979,6 +985,9 @@ function validateLaunch(ref: string, opts: LaunchOpts): void {
   if (opts.gameId && !isSafeLaunchId(opts.gameId)) {
     throw new Error(`unsupported game id: ${opts.gameId}`);
   }
+  if (opts.profileId && !isSafeLaunchId(opts.profileId)) {
+    throw new Error(`unsupported profile id: ${opts.profileId}`);
+  }
 }
 
 function runShortcut(appId: number, options: string): void {
@@ -1006,6 +1015,9 @@ function launchOptions(ref: string, runner: string, clientBin: string, opts: Lau
   }
   if (opts.gameId) {
     env.push(`PF_GAME=${opts.gameId}`);
+  }
+  if (opts.profileId) {
+    env.push(`PF_AS=${opts.profileId}`);
   }
   if (opts.requestAccess) {
     env.push("PF_REQUEST_ACCESS=1");

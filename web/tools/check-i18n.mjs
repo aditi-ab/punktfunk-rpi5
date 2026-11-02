@@ -102,11 +102,13 @@ const limit = (key, isBase) =>
 	);
 
 const tooLong = [];
+const keys = {};
 for (const locale of settings.locales) {
 	const path = resolve(project, "..", pathPattern.replace("{locale}", locale));
 	if (!existsSync(path))
 		fail(`messages for locale "${locale}" missing at ${path}`);
 	const messages = JSON.parse(readFileSync(path, "utf8"));
+	keys[locale] = Object.keys(messages).filter((k) => !k.startsWith("$"));
 	for (const [key, value] of Object.entries(messages)) {
 		if (key.startsWith("$") || typeof value !== "string") continue;
 		if (LONG_OK.has(key)) continue;
@@ -123,6 +125,26 @@ if (tooLong.length > 0) {
 	);
 }
 
+// Locale parity. A key only a translation has is one the base locale dropped or never had, and
+// nothing renders it: that fails. A key a translation lacks is reported and passes — translating
+// it is work of its own, and the count is what shows the gap growing.
+const base = new Set(keys[settings.baseLocale]);
+const lacking = [];
+for (const locale of settings.locales) {
+	if (locale === settings.baseLocale) continue;
+	const orphans = keys[locale].filter((k) => !base.has(k));
+	if (orphans.length > 0) {
+		fail(
+			`${orphans.length} key(s) exist only in "${locale}" — remove them, or add them to ` +
+				`"${settings.baseLocale}":\n${orphans.map((k) => `  ${k}`).join("\n")}`,
+		);
+	}
+	const missing = base.size - keys[locale].length;
+	if (missing > 0) lacking.push(`${locale} lacks ${missing} of ${base.size}`);
+}
+
 console.log(
 	`✔ i18n check: ${emitted} compiled messages for ${settings.locales.join(", ")}, all within the copy budget`,
 );
+if (lacking.length > 0)
+	console.log(`  untranslated: ${lacking.join(", ")} keys`);

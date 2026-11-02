@@ -10,13 +10,14 @@
 #     all live under /home, which SteamOS updates never touch — so the rebuild is warm.
 #
 # Root is NOT needed: the /etc system tuning survives updates via the atomic-update keep list
-# (see punktfunk-atomic-keep.conf); only the binary has to chase the OS libraries.
+# (see punktfunk-atomic-keep.conf); only the binary has to chase the OS libraries. The copy the
+# door and seats run is the owner's, so update.sh refreshes it too (door.sh).
 set -euo pipefail
 
 # systemd user units get a minimal PATH — distrobox commonly lives in ~/.local/bin.
 export PATH="$HOME/.local/bin:$PATH"
-SRC="${PUNKTFUNK_SRC:-$HOME/punktfunk}"
-BIN="$SRC/target-steamos/release/punktfunk-host"
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 NEED=0
 if [ ! -x "$BIN" ]; then
@@ -32,13 +33,19 @@ fi
 # The HDR gamescope companion chases OS libraries the same way. Probe it only when host.env pins
 # it (build-gamescope.sh wires that line only while the binary works) — a break here would not
 # just lose HDR, it would break gamescope session SPAWNING via the stale absolute override, so it
-# rebuilds with the same urgency as the host binary.
-GS_BIN="$(sed -n 's/^PUNKTFUNK_GAMESCOPE_BIN=//p' "$HOME/.config/punktfunk/host.env" 2>/dev/null | head -1)"
+# rebuilds with the same urgency as the host binary. No host.env pins nothing.
+GS_BIN="$(sed -n 's/^PUNKTFUNK_GAMESCOPE_BIN=//p' "$HOME/.config/punktfunk/host.env" 2>/dev/null | head -1 || true)"
 if [ -n "$GS_BIN" ]; then
     if [ ! -x "$GS_BIN" ] || ldd "$GS_BIN" 2>/dev/null | grep -q "not found"; then
         echo "punktfunk-gamescope no longer loads after a SteamOS update — rebuilding it" >&2
         NEED=1
     fi
+fi
+
+# The door's supervisor links only glibc, so this should never fire. A rebuild can't replace it
+# without sudo, so it only says so.
+if [ -x "$PF_OPT/libexec/punktfunk-seats" ] && ldd "$PF_OPT/libexec/punktfunk-seats" 2>/dev/null | grep -q "not found"; then
+    echo "the seat supervisor no longer loads: run bash $SRC/scripts/steamdeck/update.sh in Konsole with your password" >&2
 fi
 
 [ "$NEED" = 0 ] && exit 0 # everything resolves — nothing to do (every normal boot)

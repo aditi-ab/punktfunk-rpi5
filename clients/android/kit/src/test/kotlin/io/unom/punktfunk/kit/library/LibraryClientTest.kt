@@ -2,6 +2,7 @@ package io.unom.punktfunk.kit.library
 
 import io.unom.punktfunk.kit.security.KnownHost
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -107,6 +108,16 @@ class LibraryClientTest {
         onWaking = { run.wakingCalls++ },
         sleep = { run.slept += it },
     )
+
+    /** A stream-port reply is two bytes of status, then a body that may be binary. */
+    @Test
+    fun a_stream_reply_is_its_status_then_its_body() {
+        val (code, body) = tunnelReply(byteArrayOf(0x01, 0x94.toByte(), 0x00, 0xff.toByte()))!!
+        assertEquals(404, code)
+        assertEquals(listOf<Byte>(0x00, 0xff.toByte()), body.toList())
+        assertEquals(200, tunnelReply(byteArrayOf(0x00, 0xc8.toByte()))?.first)
+        assertNull(tunnelReply(byteArrayOf(0x01)))
+    }
 
     /**
      * No packet without auto-wake on and a MAC to send to, and nothing may say "waking". A packet

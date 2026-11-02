@@ -7,7 +7,7 @@
 #
 # The signature is a raw 64-byte Ed25519 over the EXACT manifest bytes, base64 in the .sig —
 # the same format the plugin index uses and `store::index::verify_signature` checks. The
-# public half is pinned in the shared checker (OFFICIAL_UPDATE_KEYS in crates/pf-update-check);
+# public half is pinned in the shared checker (OFFICIAL_UPDATE_KEYS in crates/core/pf-update-check);
 # before signing, this script cross-checks the signing key against that constant and refuses
 # on mismatch — the most likely deploy mistake is signing with a key no host trusts (the
 # sysext publisher's fingerprint-crosscheck drill).
@@ -19,6 +19,7 @@
 #   CHANNEL              stable | canary                                   (required)
 #   VERSION              the announced host version string                 (required)
 #   CI_RUN               CI run number                                     (required for canary)
+#   COMMIT               full commit SHA of the build                      (optional; canary)
 #   WINDOWS_URL          immutable per-version installer URL               (required for stable)
 #   WINDOWS_SHA256       hex sha256 of that installer                      (paired with WINDOWS_URL)
 #   WINDOWS_ARM64_URL    the ARM64 installer's immutable URL               (optional; same pins/subject)
@@ -53,6 +54,9 @@ fi
 if [ "$CHANNEL" = stable ] && [ -z "${AUTHENTICODE_SHA256:-}" ]; then
   echo "stable manifests need AUTHENTICODE_SHA256 for existing clients" >&2; exit 1
 fi
+if [ -n "${COMMIT:-}" ] && ! printf '%s' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "COMMIT must be a full 40-hex commit SHA" >&2; exit 1
+fi
 if [ -n "${WINDOWS_URL:-}" ] && ! printf '%s' "${WINDOWS_SHA256:-}" | grep -Eq '^[0-9a-f]{64}$'; then
   echo "WINDOWS_SHA256 must be 64 hex chars when WINDOWS_URL is set" >&2; exit 1
 fi
@@ -84,9 +88,9 @@ fi
 # Cross-check: the key we are about to sign with must be one the host binary pins.
 PUB="ed25519:$(openssl pkey -in "$KEY" -pubout -outform DER | tail -c 32 | base64)"
 # The pin list moved to the shared checker when the Linux client started verifying the same
-# manifest (crates/pf-update-check/src/lib.rs, OFFICIAL_UPDATE_KEYS) — one list, so the host
+# manifest (crates/core/pf-update-check/src/lib.rs, OFFICIAL_UPDATE_KEYS) — one list, so the host
 # and the client can never disagree about who may announce a release.
-KEYS_FILE="crates/pf-update-check/src/lib.rs"
+KEYS_FILE="crates/core/pf-update-check/src/lib.rs"
 # A MISSING file is fatal, not a warning. This check is the guard against signing with a key
 # no build trusts; if its path ever goes stale the old `else` branch would have skipped it
 # silently and published an unverifiable manifest — the exact failure it exists to prevent.
@@ -122,10 +126,12 @@ jq -n \
   --argjson auth "$AUTH_JSON" \
   --arg auth_subject "${AUTHENTICODE_SUBJECT:-}" \
   --arg ci_run "${CI_RUN:-}" \
+  --arg commit "${COMMIT:-}" \
   '
   {schema: 1, channel: $channel, serial: $serial, published_at: $published_at, version: $version}
   + (if $notes_url != "" then {notes_url: $notes_url} else {} end)
   + (if $ci_run != "" then {ci_run: ($ci_run | tonumber)} else {} end)
+  + (if $commit != "" then {commit: $commit} else {} end)
   + (if $win_url != "" then {windows_host: ({url: $win_url, sha256: $win_sha, authenticode_sha256: $auth}
       + (if $auth_subject != "" then {authenticode_subject: $auth_subject} else {} end))} else {} end)
   + (if $a64_url != "" then {windows_host_arm64: ({url: $a64_url, sha256: $a64_sha, authenticode_sha256: $auth}

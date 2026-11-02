@@ -46,6 +46,10 @@ enum class SessionEndReason {
     val isNormal: Boolean
         get() = this != HOST_ERROR && this != LOST
 
+    /** Milliseconds before redial [attempt] (0-based), on the schedule every client shares; null = stay ended. */
+    fun redialDelayMs(attempt: Int): Long? =
+        NativeBridge.nativeRedialDelayMs(ordinal, attempt).takeIf { it >= 0 }
+
     companion object {
         /**
          * Decode the JNI byte. An unrecognized value becomes [NONE] rather than throwing: this

@@ -30,7 +30,7 @@ on:
 # never collide; every Rust job on every host feeds and reads one warm cache.
 #
 # RUSTC_WRAPPER covers RUST compilations and nothing else. The C/C++ half of this workspace —
-# aws-lc-sys, openh264-sys2's vendored C++, the CMake-built libopus behind audiopus_sys, pyrowave —
+# aws-lc-sys, openh264-sys2's vendored C++, the CMake-built libopus behind opusic-sys, pyrowave —
 # was paid in full on every run until the CMAKE_*_COMPILER_LAUNCHER / CC_* wiring below existed.
 # Linking is the third phase and is cacheable by nothing: that one is addressed in the builder
 # images with mold (ci/cargo-config-mold.toml).
@@ -158,7 +158,7 @@ jobs:
       # and constant must match.
       #
       # Only shaders whose rebuild command is plain `glslangValidator -V` belong here. The four
-      # pf-client-core blobs are compiled by their build.sh with `glslc -O`, so gating them would
+      # pf-client-video blobs are compiled by their build.sh with `glslc -O`, so gating them would
       # pin this diff to CI's spirv-opt version and go red on a toolchain bump, not on drift.
       #
       # Disassemble to FILES rather than `diff <(…) <(…)`: Gitea's runner executes a step's `run:`
@@ -168,15 +168,15 @@ jobs:
       - name: Shader SPIR-V drift gate (pf-zerocopy, pf-encode)
         run: |
           apt-get install -y --no-install-recommends glslang-tools spirv-tools
-          for p in crates/pf-zerocopy/src/imp/rgb2nv12_buf \
-                   crates/pf-zerocopy/src/imp/cursor_blend \
-                   crates/pf-zerocopy/src/imp/convert_img \
-                   crates/pf-zerocopy/src/imp/reframe_buf \
-                   crates/pf-encode/src/enc/linux/reframe \
-                   crates/pf-encode/src/enc/linux/rgb2yuv \
-                   crates/pf-encode/src/enc/linux/rgb2yuv10 \
-                   crates/pf-encode/src/enc/linux/rgb2yuv10_709 \
-                   crates/pf-encode/src/enc/linux/rgb2yuv444; do
+          for p in crates/host/pf-zerocopy/src/imp/rgb2nv12_buf \
+                   crates/host/pf-zerocopy/src/imp/cursor_blend \
+                   crates/host/pf-zerocopy/src/imp/convert_img \
+                   crates/host/pf-zerocopy/src/imp/reframe_buf \
+                   crates/host/pf-encode/src/enc/linux/reframe \
+                   crates/host/pf-encode/src/enc/linux/rgb2yuv \
+                   crates/host/pf-encode/src/enc/linux/rgb2yuv10 \
+                   crates/host/pf-encode/src/enc/linux/rgb2yuv10_709 \
+                   crates/host/pf-encode/src/enc/linux/rgb2yuv444; do
             s=${p##*/}
             glslangValidator -V "$p.comp" -o "/tmp/$s.spv" >/dev/null
             spirv-dis --no-header "$p.spv"      | grep -v OpSourceExtension > "/tmp/$s.committed"
@@ -243,12 +243,39 @@ jobs:
       - name: Unsafe-hygiene grep gates
         run: sh scripts/ci/check-unsafe-hygiene.sh
 
+      # The Android lane is label-gated on a pull request; this text check is not, so a JNI
+      # rename on one side fails here. No NDK.
+      - name: Android JNI name gate
+        run: sh scripts/ci/check-android-jni-names.sh
+
+      # Per crate a shipped binary links, the unsafe operations that are not an FFI call must
+      # equal the committed baseline. A rise fails. So does a baseline above today's count: that
+      # slack hides the next rise.
+      - name: Unsafe-census ratchet
+        run: |
+          python3 scripts/unsafe-census.py --self-test
+          python3 scripts/unsafe-census.py . --baseline scripts/ci/unsafe-census-baseline.json
+
       # A crate a platform workflow compiles but its `paths:` filter omits merges with no build
       # on that platform. Reads the per-target graph from `cargo metadata`, not a second list.
       - name: Workflow path-filter gate
         run: |
           python3 scripts/ci/check-workflow-paths.py --self-test
           python3 scripts/ci/check-workflow-paths.py
+
+      # A client crate that links a host crate drags the host stack into every client build.
+      - name: Crate group gate
+        run: |
+          python3 scripts/ci/check-crate-groups.py --self-test
+          python3 scripts/ci/check-crate-groups.py
+
+      # mgmt is the host crate's HTTP layer: game, library and plugin_host never import it, and
+      # the two under game never import game. plugin_host never imports library. An import
+      # upward closes a module cycle. Pure text, no cargo.
+      - name: Host module layering gate
+        run: |
+          python3 scripts/ci/check-host-layers.py --self-test
+          python3 scripts/ci/check-host-layers.py
 
       # The plugin runner's unit replaces the home with a tmpfs, so a config file it reads and the
       # unit does not bind is ENOENT at runtime — which is how plugin-tokens.json shipped unbound
@@ -357,7 +384,7 @@ jobs:
           cargo test -p pf-encode -p pf-encode-core --locked --features nvenc,vulkan-encode,pyrowave
 
       - name: C ABI harness (standalone link proof)
-        run: bash crates/punktfunk-ffi/tests/c/run.sh
+        run: bash crates/client/punktfunk-ffi/tests/c/run.sh
 
       - name: sccache stats (visibility only)
         run: sccache --show-stats
@@ -494,7 +521,8 @@ jobs:
       - name: Clippy for aarch64 (deny warnings)
         run: |
           cargo clippy --target aarch64-unknown-linux-gnu --all-targets --locked \
-            -p punktfunk-core -p punktfunk-ffi -p pf-client-core -p pf-presenter -p pf-console-ui \
+            -p punktfunk-core -p punktfunk-ffi -p pf-client-core -p pf-client-video -p pf-presenter \
+            -p pf-console-ui \
             -p punktfunk-client-session -p punktfunk-client-linux \
             --features punktfunk-ffi/quic -- -D warnings
 
@@ -534,7 +562,7 @@ jobs:
     if: ${{ needs.changes.outputs.web == 'true' && needs.changes.outputs.heavy == 'true' }}
     runs-on: ubuntu-24.04
     container:
-      image: oven/bun:1.4.2
+      image: oven/bun:1.4.4
     timeout-minutes: 30
     defaults:
       run:
@@ -585,7 +613,7 @@ jobs:
     if: ${{ needs.changes.outputs.docs_site == 'true' && needs.changes.outputs.heavy == 'true' }}
     runs-on: ubuntu-24.04
     container:
-      image: oven/bun:1.4.2
+      image: oven/bun:1.4.4
     timeout-minutes: 30
     defaults:
       run:
@@ -611,7 +639,7 @@ jobs:
     if: ${{ needs.changes.outputs.sdk_plugin_kit == 'true' }}
     runs-on: ubuntu-24.04
     container:
-      image: oven/bun:1.4.2
+      image: oven/bun:1.4.4
     timeout-minutes: 15
     steps:
       - name: Install git + CA certs
@@ -649,6 +677,10 @@ jobs:
           bun run check
           bun run typecheck
           bun run test
+      # A plugin in the field runs a RELEASED kit, and the runner swaps this SDK under it on the
+      # next host upgrade. The in-tree kit above moves with the SDK and cannot show that break.
+      - name: Newest released plugin kit against this SDK
+        run: bash sdk/scripts/check-released-kit.sh
 
   decky-typecheck:
     needs: changes
@@ -662,12 +694,17 @@ jobs:
         working-directory: clients/decky
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Typecheck
+      # `test` is the typecheck plus the host-row-vectors replay through mergeHosts.
+      - name: Typecheck + test
         run: |
           corepack enable
           corepack prepare pnpm@9 --activate
           pnpm install --frozen-lockfile
-          pnpm run typecheck
+          pnpm run test
+      # main.py's pure helpers against a stubbed `decky` module: argv shapes, exit codes, the
+      # Steam VDF editor. Stdlib only, Python 3.10 or newer; this image carries 3.11.
+      - name: Backend helpers
+        run: python3 scripts/test-backend.py
 
   # web/bun.nix and sdk/bun.nix are GENERATED from their bun.lock (bun2nix) and committed; the Nix
   # build fetches node_modules from nothing else. They regenerate only on a local `bun install` that
@@ -683,7 +720,7 @@ jobs:
   bun-nix:
     runs-on: ubuntu-24.04
     container:
-      image: oven/bun:1.4.2
+      image: oven/bun:1.4.4
     timeout-minutes: 15
     steps:
       # oven/bun ships neither git nor a real node, and the slim base has no CA bundle —
@@ -704,7 +741,7 @@ jobs:
   docs-drift:
     runs-on: ubuntu-24.04
     container:
-      image: oven/bun:1.4.2
+      image: oven/bun:1.4.4
     timeout-minutes: 15
     steps:
       # oven/bun ships neither git nor a real node, and the slim base has no CA bundle —

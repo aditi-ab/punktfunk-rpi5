@@ -55,7 +55,7 @@ A saved host's menu also has an explicit wake while it is offline and its MAC is
 ### From the command line
 
 `punktfunk`, the client command, ships with the Linux `punktfunk-client` packages and the Windows
-client. In the Flatpak it is `flatpak run --command=punktfunk io.unom.Punktfunk`.
+client. In the Flatpak it is `flatpak run --command=punktfunk io.unom.punktfunk`.
 
 ```bash
 punktfunk wake <host-ref> [--wait]

@@ -14,6 +14,7 @@ its **Health checks** catch most setup problems and give the command that fixes 
 - [pacman: database already registered](/docs/troubleshooting-startup#pacman-error-could-not-register-punktfunk-database-database-already-registered)
 - [The desktop won't start, or "GPU … not supported by EGL"](/docs/troubleshooting-startup#the-desktop-wont-start-or-gpu--not-supported-by-egl)
 - [The session fails right after editing host.env](/docs/troubleshooting-startup#the-session-fails-right-after-editing-hostenv)
+- [The game library is empty and the plugin runner has stopped](/docs/plugins#plugins-cant-be-sandboxed-here)
 - [Windows: the host or the web console won't start](/docs/troubleshooting-startup#windows-the-host-or-the-web-console-wont-start)
 - [Windows: the status icon is missing after an update](/docs/troubleshooting-startup#windows-the-status-icon-is-missing-after-an-update)
 
@@ -56,7 +57,6 @@ echo 'options nvidia-drm modeset=1' | sudo tee /etc/modprobe.d/nvidia-drm.conf
 - [No client can reach a Windows host](#windows-firewall)
 - [The host is asleep and won't wake](/docs/troubleshooting-connect#the-host-is-asleep-and-wont-wake)
 - [Pairing is rejected, or the client can't connect](/docs/troubleshooting-connect#pairing-is-rejected--the-client-cant-connect)
-- [Video is slow to start, or fails across subnets](/docs/troubleshooting-connect#video-is-slow-to-start-or-fails-across-subnets)
 - [A plugin's interface doesn't load](/docs/troubleshooting-connect#a-plugins-interface-doesnt-load)
 
 ### No client can reach a Windows host [#windows-firewall]
@@ -79,7 +79,7 @@ It opens the streaming ports on Public networks; the console's ports keep their 
 - [Black screen, but the client connects](/docs/troubleshooting-stream#black-screen--no-picture-but-the-client-connects)
 - [Black screen with sound (Windows)](/docs/troubleshooting-stream#black-screen-with-sound-windows)
 - [Capture fails: "Session creation inhibited" (GNOME)](/docs/troubleshooting-stream#capture-fails-session-creation-inhibited-gnome)
-- [Games open on a physical monitor, not on the stream (Hyprland, sway)](/docs/troubleshooting-stream#games-from-my-library-open-on-a-physical-monitor-not-on-the-stream-hyprland--sway)
+- [Games open on a physical monitor, not on the stream (Hyprland, sway, niri)](/docs/troubleshooting-stream#games-from-my-library-open-on-a-physical-monitor-not-on-the-stream-hyprland--sway--niri)
 - [Game Mode: black screen, or stuck at the box's resolution](/docs/troubleshooting-stream#game-mode-black-screen-on-connect-or-the-stream-is-stuck-at-the-boxs-resolution)
 - [The picture freezes for a moment, over and over (Windows)](/docs/troubleshooting-stream#the-picture-freezes-for-a-moment-over-and-over-windows)
 - [Stutter, drops, or high latency](/docs/troubleshooting-stream#stutter-drops-or-high-latency)

@@ -18,25 +18,11 @@ use pf_driver_proto::cursor::{CursorShm, ShapeRgba};
 
 use crate::encode::pool::Pool;
 
-/// Straight-alpha RGBA at its frame-relative top-left. `serial` is the OS shape id.
-#[derive(Clone)]
-pub struct CursorImage {
-    pub x: i32,
-    pub y: i32,
-    pub w: u32,
-    pub h: u32,
-    pub hot_x: u32,
-    pub hot_y: u32,
-    pub rgba: Arc<Vec<u8>>,
-    pub serial: u32,
-    pub visible: bool,
-}
+pub use pf_encode_session::targets::CursorImage;
 
-impl CursorImage {
-    /// What a viewer sees of this pointer: where it is, which shape, whether at all.
-    fn seen(&self) -> (i32, i32, u32, bool) {
-        (self.x, self.y, self.serial, self.visible)
-    }
+/// What a viewer sees of this pointer: where it is, which shape, whether at all.
+fn seen(image: &CursorImage) -> (i32, i32, u32, bool) {
+    (image.x, image.y, image.serial, image.visible)
 }
 
 /// See the module docs. The worker and the pool hold clones; neither pins the monitor.
@@ -45,7 +31,7 @@ pub struct CursorCell {
     pub image: Mutex<Option<CursorImage>>,
     blend: AtomicBool,
     /// A worker runs under a declared hardware cursor, so the blend can turn on at any moment.
-    /// The pool keeps a clean plate of every composed frame while this holds.
+    /// The pool plates the still-desktop stash and a session's first frame while this holds.
     armed: AtomicBool,
     /// The host's SDR-white scale for an FP16 frame, as `f32` bits; 0 until the first publish.
     pub sdr_white_scale: AtomicU32,
@@ -62,7 +48,7 @@ impl CursorCell {
         self.blend.load(Ordering::Relaxed)
     }
 
-    /// A worker runs under a declared hardware cursor: the pool keeps a clean plate.
+    /// A worker runs under a declared hardware cursor: the stash and the first frame get a plate.
     pub fn armed(&self) -> bool {
         self.armed.load(Ordering::Relaxed)
     }
@@ -98,10 +84,24 @@ impl CursorCell {
         self.dirty.swap(false, Ordering::AcqRel)
     }
 
+    /// Forget the last worker's pointer. A fresh worker publishes nothing until the OS reports
+    /// a visible shape, and until then the pool must blend no image at all: a hidden pointer
+    /// would otherwise stay baked in where the old worker last saw it. Damage while blending.
+    pub fn reset(&self) {
+        let had = crate::registry::lock(&self.image).take().is_some();
+        if had && self.blends() {
+            self.mark_dirty();
+        }
+    }
+
     /// Mark the pointer changed and wake the pool's encode thread. Also how a pointer-only
-    /// frame that could not be sent asks to be tried again.
+    /// frame that could not be sent asks to be tried again. Edge-triggered: the thread drains
+    /// every publish coalesced under one mark in one wake, and the drive loop re-checks the
+    /// mark whenever a slot comes back, so a second wake would only find nothing to do.
     pub fn mark_dirty(&self) {
-        self.dirty.store(true, Ordering::Release);
+        if self.dirty.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let pool = crate::registry::lock(&self.waker)
             .as_ref()
             .and_then(Weak::upgrade);
@@ -159,7 +159,7 @@ impl CursorCell {
         img.visible = visible;
         let changed = {
             let mut slot = crate::registry::lock(&self.image);
-            let changed = slot.as_ref().is_none_or(|old| old.seen() != img.seen());
+            let changed = slot.as_ref().is_none_or(|old| seen(old) != seen(img));
             *slot = Some(img.clone());
             changed
         };
@@ -241,6 +241,22 @@ mod tests {
             !cell.take_dirty(),
             "while the client draws, nothing more is damage"
         );
+    }
+
+    #[test]
+    fn a_fresh_worker_blends_nothing_from_its_predecessor() {
+        let cell = CursorCell::default();
+        let mut image = None;
+        cell.set_blend(true);
+        cell.publish(&mut image, &shm(10, 10, 1), Some(arrow()), true);
+        assert!(cell.to_blend().is_some());
+        let _ = cell.take_dirty();
+        // The replacement worker starts with no image, and a hidden pointer carries no shape.
+        let mut next = None;
+        cell.reset();
+        cell.publish(&mut next, &shm(10, 10, 1), None, false);
+        assert!(cell.to_blend().is_none(), "the old pointer is not blended");
+        assert!(cell.take_dirty(), "erasing it is one frame");
     }
 
     #[test]

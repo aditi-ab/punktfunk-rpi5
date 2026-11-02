@@ -30,8 +30,8 @@ set -euo pipefail
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
-APP_ID="io.unom.Punktfunk"
-MANIFEST="packaging/flatpak/io.unom.Punktfunk.yml"
+APP_ID="io.unom.punktfunk"
+MANIFEST="packaging/flatpak/io.unom.punktfunk.yml"
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0.0.1-dev)}"
 VERSION="${VERSION#v}"
 # `flatpak --default-arch` reports flatpak's own name for this machine (x86_64 / aarch64).
@@ -97,6 +97,8 @@ else
 fi
 
 # --- build into a local ostree repo, then export a single-file bundle --------------------
+# The manifest's cargo step stamps this into the binaries (PUNKTFUNK_BUILD_VERSION).
+printf '%s\n' "$VERSION" > packaging/flatpak/VERSION
 echo "==> flatpak-builder ($APP_ID, version $VERSION, arch $ARCH)"
 # --default-branch=stable matches CI / the hosted repo ref, so a locally-built install can also
 # track flatpak.unom.io. build-bundle must then be told the branch (else it defaults to `master`).

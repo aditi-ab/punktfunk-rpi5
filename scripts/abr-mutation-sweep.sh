@@ -23,11 +23,11 @@ cd "$(dirname "$0")/.." || exit 2
 
 # One constant per concern file. The table below names declarations without
 # their visibility, so a constant another module reads still matches.
-DIR=crates/punktfunk-core/src/abr
+DIR=crates/core/punktfunk-core/src/abr
 TEST="cargo test -p punktfunk-core --features quic --lib abr::"
 BACKUP=$(mktemp -d)
-cp "$DIR"/*.rs "$BACKUP/"
-restore() { cp "$BACKUP"/*.rs "$DIR/"; }
+cp -R "$DIR/." "$BACKUP/"
+restore() { cp -R "$BACKUP/." "$DIR/"; }
 trap 'restore; rm -rf "$BACKUP"' EXIT INT TERM
 
 # Constants whose mutation the simulator cannot see, with the reason.
@@ -53,6 +53,7 @@ CLEAN_WINDOWS_TO_INCREASE|const CLEAN_WINDOWS_TO_INCREASE: u32 = 6;|const CLEAN_
 CHANGE_COOLDOWN|const CHANGE_COOLDOWN: Duration = Duration::from_millis(1500);|const CHANGE_COOLDOWN: Duration = Duration::from_millis(3000);
 HEAVY_LOSS_PPM|const HEAVY_LOSS_PPM: u32 = 20_000;|const HEAVY_LOSS_PPM: u32 = 55_000;
 PROBE_AFTERMATH_WINDOWS|const PROBE_AFTERMATH_WINDOWS: u32 = 8;|const PROBE_AFTERMATH_WINDOWS: u32 = 0;
+TIMINGS_KEPT|const TIMINGS_KEPT: usize = 128;|const TIMINGS_KEPT: usize = 8;
 BLIP_CLEAN_WINDOWS|const BLIP_CLEAN_WINDOWS: u32 = 8;|const BLIP_CLEAN_WINDOWS: u32 = 40;
 RECOVERY_KF_BAD|const RECOVERY_KF_BAD: u32 = 2;|const RECOVERY_KF_BAD: u32 = 7;
 RECOVERY_KF_SEVERE|const RECOVERY_KF_SEVERE: u32 = 4;|const RECOVERY_KF_SEVERE: u32 = 9;
@@ -61,6 +62,7 @@ DECODE_RISE_US|const DECODE_RISE_US: i64 = 15_000;|const DECODE_RISE_US: i64 = 6
 DECODE_SEVERE_US|const DECODE_SEVERE_US: i64 = 45_000;|const DECODE_SEVERE_US: i64 = 180_000;
 DECODE_HOLD_PCT|const DECODE_HOLD_PCT: i64 = 80;|const DECODE_HOLD_PCT: i64 = 99;
 DECODE_RETREAT_PCT|const DECODE_RETREAT_PCT: i64 = 90;|const DECODE_RETREAT_PCT: i64 = 45;
+DECODE_WARMUP_WINDOWS|const DECODE_WARMUP_WINDOWS: u32 = 4;|const DECODE_WARMUP_WINDOWS: u32 = 0;
 ANSWER_PCT|const ANSWER_PCT: i64 = 5;|const ANSWER_PCT: i64 = 50;
 RETREAT_DIV|const RETREAT_DIV: u32 = 8;|const RETREAT_DIV: u32 = 3;
 VERDICT_WINDOWS|const VERDICT_WINDOWS: u32 = 2;|const VERDICT_WINDOWS: u32 = 4;
@@ -79,6 +81,8 @@ RAMP_STEP_MS|const RAMP_STEP_MS: u32 = 25;|const RAMP_STEP_MS: u32 = 200;
 RAMP_START_KBPS|const RAMP_START_KBPS: u32 = 5_000;|const RAMP_START_KBPS: u32 = 40_000;
 RAMP_STEP_BYTES|const RAMP_STEP_BYTES: u64 = 16_000_000;|const RAMP_STEP_BYTES: u64 = 300_000;
 RAMP_WALL_PCT|const RAMP_WALL_PCT: u64 = 90;|const RAMP_WALL_PCT: u64 = 50;
+RAMP_HOLD_US|const RAMP_HOLD_US: u64 = 15_000;|const RAMP_HOLD_US: u64 = 0;
+RAMP_HOLD_SWING|const RAMP_HOLD_SWING: u64 = 2;|const RAMP_HOLD_SWING: u64 = 0;
 RAMP_LOSS_SLACK_PCT|const RAMP_LOSS_SLACK_PCT: u64 = 5;|const RAMP_LOSS_SLACK_PCT: u64 = 50;
 RAMP_CEILING_PCT|const RAMP_CEILING_PCT: u32 = 70;|const RAMP_CEILING_PCT: u32 = 95;
 RAMP_START_PCT|const RAMP_START_PCT: u32 = 50;|const RAMP_START_PCT: u32 = 25;
@@ -118,6 +122,19 @@ PROBE_DELAY|const PROBE_DELAY: Duration = Duration::from_secs(2);|const PROBE_DE
 PROBE_TIMEOUT|const PROBE_TIMEOUT: Duration = Duration::from_secs(15);|const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 STILL_FRAMES_DIV|const STILL_FRAMES_DIV: u64 = 4;|const STILL_FRAMES_DIV: u64 = 40;
 ACK_GIVE_UP|const ACK_GIVE_UP: Duration = Duration::from_secs(10);|const ACK_GIVE_UP: Duration = Duration::from_secs(300);
+HEAD_MIN|const HEAD_MIN: u32 = 4;|const HEAD_MIN: u32 = 40;
+HEAD_RATIO|const HEAD_RATIO: u32 = 3;|const HEAD_RATIO: u32 = 10;
+WAKE_WINDOWS|const WAKE_WINDOWS: u8 = 2;|const WAKE_WINDOWS: u8 = 5;
+WAKE_OFF_SECS|const WAKE_OFF_SECS: u64 = 60;|const WAKE_OFF_SECS: u64 = 5;
+TAIL_MIN|const TAIL_MIN: u32 = 4;|const TAIL_MIN: u32 = 2;
+TAIL_RATIO|const TAIL_RATIO: u32 = 3;|const TAIL_RATIO: u32 = 1;
+LINK_FLOOR_KBPS|const LINK_FLOOR_KBPS: u32 = 800_000;|const LINK_FLOOR_KBPS: u32 = 500_000;
+NOTCH_DIV|const NOTCH_DIV: u32 = 8;|const NOTCH_DIV: u32 = 3;
+NOTCH_MAX|const NOTCH_MAX: u8 = 8;|const NOTCH_MAX: u8 = 2;
+NOTCH_CALM_WINDOWS|const NOTCH_CALM_WINDOWS: u32 = 40;|const NOTCH_CALM_WINDOWS: u32 = 4;
+LONE_DEAD_PER_MIN_PCT|const LONE_DEAD_PER_MIN_PCT: u64 = 1;|const LONE_DEAD_PER_MIN_PCT: u64 = 2;
+FLOOR_WINDOWS|const FLOOR_WINDOWS: u32 = 4;|const FLOOR_WINDOWS: u32 = 8;
+CLOCK_STEP_NS|const CLOCK_STEP_NS: i128 = 1_000_000;|const CLOCK_STEP_NS: i128 = 100_000_000;
 EOF
 )
 
@@ -126,8 +143,8 @@ printf '%s\n' "$MUTATIONS" | while IFS='|' read -r name from to; do
     restore
     # The declaration is a substring of its line (the visibility prefix is
     # not in the table), and carries no sed metacharacter.
-    file=$(grep -lF "$from" "$DIR"/*.rs | head -1)
-    [ -n "$file" ] && sed "s|$from|$to|" "$BACKUP/$(basename "$file")" > "$file"
+    file=$(grep -rlF --include='*.rs' "$from" "$DIR" | head -1)
+    [ -n "$file" ] && sed "s|$from|$to|" "$BACKUP/${file#"$DIR"/}" > "$file"
     if [ -z "$file" ] || ! grep -qF "$to" "$file"; then
         printf '::error::%-31s the mutation did not apply — the constant moved\n' "$name"
         echo "APPLY-FAILED $name" >> "$BACKUP.green"

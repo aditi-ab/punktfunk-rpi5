@@ -1,0 +1,303 @@
+//! The channels and shared values one session's control task and stream thread talk over.
+//!
+//! [`SessionWiring::new`] makes each pair once: the control task takes the [`ControlEnds`], the
+//! stream thread the [`StreamEnds`], the wire-MTU watcher the [`ShardEnds`], and the first two a
+//! clone each of [`SessionShared`]. A new per-session value is added here, not at every hand-off.
+
+use super::*;
+use crate::native::bitrate::EncoderCeiling;
+
+/// The mode and video format epoch `epoch` delivers, from the stream thread. `corrects`: the mode
+/// is not what the client was last told, so a client without `StreamConfig` gets a second
+/// `Reconfigured`.
+pub(crate) struct Delivered {
+    pub(crate) mode: punktfunk_core::Mode,
+    pub(crate) format: punktfunk_core::quic::VideoFormat,
+    pub(crate) epoch: u8,
+    pub(crate) corrects: bool,
+}
+
+/// The stream thread's answer to a codec ask: the codec it now encodes, or `None` when the
+/// rebuild failed and the old pipeline streams on.
+pub(crate) type FormatOutcome = Option<crate::encode::Codec>;
+
+/// What the screens past the first tell the client, on the control stream.
+pub(crate) enum ScreenTell {
+    /// One epoch of a further screen's stream, before its first packet.
+    Config(punktfunk_core::quic::v2::msg::StreamConfig),
+    /// Every screen built, after any change.
+    Layout(Vec<punktfunk_core::quic::v2::msg::Screen>),
+}
+
+/// What the control task and the screen loops share about the screens past the first.
+pub(crate) struct ScreenWire {
+    /// A keyframe the client asked of a stream ([`Feedback::stream`]), by stream id.
+    ///
+    /// [`Feedback::stream`]: punktfunk_core::quic::v2::dgram::Feedback::stream
+    keyframe: [AtomicBool; 16],
+    /// The first screen's share of the video, per mille.
+    pub(crate) primary_share: std::sync::atomic::AtomicU16,
+}
+
+impl ScreenWire {
+    pub(crate) fn new() -> Self {
+        ScreenWire {
+            keyframe: std::array::from_fn(|_| AtomicBool::new(false)),
+            primary_share: std::sync::atomic::AtomicU16::new(super::bitrate::SHARE_ALL),
+        }
+    }
+
+    pub(crate) fn ask_keyframe(&self, stream: u8) {
+        if let Some(f) = self.keyframe.get(usize::from(stream)) {
+            f.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a keyframe of `stream` was asked since the last take.
+    pub(crate) fn take_keyframe(&self, stream: u8) -> bool {
+        self.keyframe
+            .get(usize::from(stream))
+            .is_some_and(|f| f.swap(false, Ordering::Relaxed))
+    }
+}
+
+/// Values the control task and the stream thread both read or write. A clone shares them.
+#[derive(Clone)]
+pub(crate) struct SessionShared {
+    /// The encoder-applied rate, not the request. With [`Self::encoder_ceiling`] and
+    /// [`Self::cadence_degraded`], the encoder truth a `SetBitrate` resolves against.
+    pub(crate) live_bitrate: Arc<AtomicU32>,
+    /// A ceiling the encoder taught and re-tests (`0` = none). The data plane learns it; the
+    /// control task is the one place it decides an ask.
+    pub(crate) encoder_ceiling: Arc<std::sync::Mutex<EncoderCeiling>>,
+    /// While set, climbs are refused: more bits are not the fix.
+    pub(crate) cadence_degraded: Arc<AtomicBool>,
+    /// Behind-cadence score for the climb-refusal log (the flag alone has no evidence).
+    pub(crate) cadence_behind_score: Arc<AtomicU32>,
+    /// Client-received packet count, `u32::MAX` until the first feedback window. Tells a clean
+    /// link from a dead one: `loss_ppm = 0` means both.
+    pub(crate) client_packets_received: Arc<AtomicU32>,
+    /// FEC in force: what the packetizer runs. Only the stream loop writes it.
+    pub(crate) fec_target: Arc<AtomicU8>,
+    /// Adaptive-FEC proposals, published to `fec_target` only once the encoder accepts the
+    /// matching rate.
+    pub(crate) fec_requested: Arc<AtomicU8>,
+    /// The client's link rate (kbps) from its feedback, `0` until its ramp proved one. The
+    /// send loop paces a pinned stream against it.
+    pub(crate) link_kbps: Arc<AtomicU32>,
+    /// Raised by the stream loop's IDR storm or the control task's dead windows, read per
+    /// frame by the send loop's pacer.
+    pub(crate) refuted: Arc<crate::send_pacing::Refutation>,
+    /// The shape the client asked for (`Shape as u8`), read per frame by the send loop.
+    /// `PUNKTFUNK_DELIVERY` overrides it.
+    pub(crate) shape: Arc<AtomicU8>,
+    /// Both ends' ports, from the handshake: the pacer's floor and hard ceiling, and the
+    /// bound on every probe.
+    pub(crate) ports: crate::send_pacing::Ports,
+    /// Queues a resend of `(frame, shards)` beside the frames on the send thread; `false`
+    /// when its queue is full. `None` until the send thread exists.
+    pub(crate) resend: Arc<std::sync::Mutex<Option<ResendFn>>>,
+    /// The newest frame the client confirmed it decoded and the sixteen before it,
+    /// `last << 16 | mask`; [`NONE_ACKED`] until the first.
+    pub(crate) acked: Arc<AtomicU64>,
+    /// A report window showed loss. The stream loop takes it and holds the encoder on
+    /// confirmed references until ten seconds past the last.
+    pub(crate) lossy_window: Arc<AtomicBool>,
+    /// The bring-up ramp's window: probe requests are served on the bound data plane without
+    /// the control task's spacing until the send thread takes the session (`stream::ramp`).
+    /// Open from the handshake, because the client asks as soon as its session starts.
+    pub(crate) ramp_open: Arc<AtomicBool>,
+    /// `true` = the client draws the cursor (exclude + forward), `false` = the host composites.
+    /// Stays `true`, and inert, for a session without the cursor cap.
+    pub(crate) cursor_client_draws: Arc<AtomicBool>,
+    /// The capturer's arrival poke ([`pf_capture::Feed::arrival_poke`]), set by the
+    /// stream loop for each capturer it runs; the control task fires it with a recovery ask.
+    pub(crate) arrival_poke: ArrivalPoke,
+    /// UDP send offload for the media sender. The control task's loss guard clears it once
+    /// for the session; a cleared switch sends every packet on its own.
+    pub(crate) offload_switch: Arc<AtomicBool>,
+    /// Screens past the first: their keyframe asks and the first screen's share of the video.
+    pub(crate) screens: Arc<ScreenWire>,
+}
+
+/// [`SessionShared::acked`] before the client confirmed a frame.
+pub(crate) const NONE_ACKED: u64 = u64::MAX;
+
+/// `ShardPayloadAck`s held for the wire-MTU watcher: one change is in flight at a time, and
+/// only a grow drains them, so more are a client's noise and drop.
+pub(crate) const SHARD_ACK_DEPTH: usize = 4;
+
+/// [`SessionShared::resend`].
+pub(crate) type ResendFn = Box<dyn Fn(u32, Vec<u16>) -> bool + Send>;
+
+/// [`SessionShared::arrival_poke`]: the running capturer's poke, `None` without one.
+pub(crate) type ArrivalPoke = Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+/// The control task's halves.
+pub(crate) struct ControlEnds {
+    pub(crate) reconfig_tx: std::sync::mpsc::Sender<punktfunk_core::Mode>,
+    /// A codec ask the control task vetted; [`FormatOutcome`] comes back on `format_result_rx`.
+    pub(crate) format_tx: std::sync::mpsc::Sender<crate::encode::Codec>,
+    pub(crate) format_result_rx: tokio::sync::mpsc::UnboundedReceiver<FormatOutcome>,
+    pub(crate) keyframe_tx: std::sync::mpsc::Sender<()>,
+    /// LTR-RFI: the encode loop prefers `invalidate_ref_frames` over a full IDR when it can.
+    pub(crate) rfi_tx: std::sync::mpsc::Sender<(u32, u32)>,
+    pub(crate) bitrate_tx: std::sync::mpsc::Sender<u32>,
+    pub(crate) probe_tx: std::sync::mpsc::Sender<ProbeShaped>,
+    pub(crate) probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
+    pub(crate) reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Delivered>,
+    pub(crate) retarget_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, AckReason)>,
+    pub(crate) gap_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
+    /// Wire-MTU watcher → `ShardPayloadChanged`; this task is the control stream's sole
+    /// writer. The client's `ShardPayloadAck`s go back on `shard_ack_tx` and gate a grow.
+    pub(crate) shard_change_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
+    pub(crate) shard_ack_tx: tokio::sync::mpsc::Sender<u16>,
+    pub(crate) cursor_shape_rx:
+        tokio::sync::watch::Receiver<Option<punktfunk_core::quic::CursorShape>>,
+    /// The client's `Screens`, to the stream thread.
+    pub(crate) screens_tx: std::sync::mpsc::Sender<Vec<punktfunk_core::quic::v2::msg::Screen>>,
+    pub(crate) screen_tell_rx: tokio::sync::mpsc::UnboundedReceiver<ScreenTell>,
+}
+
+/// The stream thread's halves.
+pub(crate) struct StreamEnds {
+    pub(crate) reconfig: std::sync::mpsc::Receiver<punktfunk_core::Mode>,
+    pub(crate) format_rx: std::sync::mpsc::Receiver<crate::encode::Codec>,
+    pub(crate) format_result_tx: tokio::sync::mpsc::UnboundedSender<FormatOutcome>,
+    pub(crate) keyframe: std::sync::mpsc::Receiver<()>,
+    /// Lost-frame range `(first, last)`.
+    pub(crate) rfi: std::sync::mpsc::Receiver<(u32, u32)>,
+    pub(crate) bitrate_rx: std::sync::mpsc::Receiver<u32>,
+    /// Shard re-keys, validated and ack-gated by the wire-MTU watcher. Applied between AUs.
+    pub(crate) shard_rx: std::sync::mpsc::Receiver<usize>,
+    pub(crate) probe_rx: std::sync::mpsc::Receiver<ProbeShaped>,
+    pub(crate) probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    /// The accept ack goes out before the rebuild; what each epoch then delivers follows here.
+    pub(crate) reconfig_result_tx: tokio::sync::mpsc::UnboundedSender<Delivered>,
+    /// The rate the encoder settled on and what settled it, forwarded as `BitrateChanged` so
+    /// the client's climb base tracks the encoder: a rebuild re-resolving Automatic is
+    /// `Granted`, a short apply `EncoderLimit`.
+    pub(crate) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
+    /// Rebuild gap (ms) → `PipelineGap`, so the client discards that ABR window as congestion.
+    pub(crate) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    /// Depth-1 latest-wins: the encode loop overwrites a shape the control task has not
+    /// drained, so a stalled peer can't grow the host.
+    pub(crate) cursor_shape_tx:
+        tokio::sync::watch::Sender<Option<punktfunk_core::quic::CursorShape>>,
+    pub(crate) screens_rx: std::sync::mpsc::Receiver<Vec<punktfunk_core::quic::v2::msg::Screen>>,
+    pub(crate) screen_tell_tx: tokio::sync::mpsc::UnboundedSender<ScreenTell>,
+}
+
+/// The wire-MTU watcher's halves of shard renegotiation ([`wire_mtu::ShardReneg`]). A session
+/// that does not renegotiate drops them, which closes the ends the others hold.
+pub(crate) struct ShardEnds {
+    pub(crate) change_tx: tokio::sync::mpsc::UnboundedSender<u16>,
+    pub(crate) ack_rx: tokio::sync::mpsc::Receiver<u16>,
+    pub(crate) apply_tx: std::sync::mpsc::Sender<usize>,
+}
+
+pub(crate) struct SessionWiring {
+    pub(crate) control: ControlEnds,
+    pub(crate) stream: StreamEnds,
+    pub(crate) shard: ShardEnds,
+    pub(crate) shared: SessionShared,
+}
+
+impl SessionWiring {
+    /// Seeded from what Welcome promised. Synthetic-abr aliases `fec_requested` to
+    /// `fec_target`: it re-derives frame bytes from FEC every frame and has no retarget to
+    /// coordinate.
+    pub(crate) fn new(
+        welcome: &Welcome,
+        source: Punktfunk1Source,
+        ports: crate::send_pacing::Ports,
+    ) -> SessionWiring {
+        let (reconfig_tx, reconfig) = std::sync::mpsc::channel();
+        let (format_tx, format_rx) = std::sync::mpsc::channel();
+        let (format_result_tx, format_result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (keyframe_tx, keyframe) = std::sync::mpsc::channel();
+        let (rfi_tx, rfi) = std::sync::mpsc::channel();
+        let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel();
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let (probe_result_tx, probe_result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reconfig_result_tx, reconfig_result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (retarget_tx, retarget_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gap_tx, gap_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cursor_shape_tx, cursor_shape_rx) = tokio::sync::watch::channel(None);
+        let (change_tx, shard_change_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (shard_ack_tx, ack_rx) = tokio::sync::mpsc::channel(SHARD_ACK_DEPTH);
+        let (apply_tx, shard_rx) = std::sync::mpsc::channel();
+        let (screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let (screen_tell_tx, screen_tell_rx) = tokio::sync::mpsc::unbounded_channel();
+        let fec_target = Arc::new(AtomicU8::new(welcome.fec.fec_percent));
+        let fec_requested = match source {
+            Punktfunk1Source::SyntheticAbr(_) => fec_target.clone(),
+            _ => Arc::new(AtomicU8::new(welcome.fec.fec_percent)),
+        };
+        SessionWiring {
+            control: ControlEnds {
+                reconfig_tx,
+                format_tx,
+                format_result_rx,
+                keyframe_tx,
+                rfi_tx,
+                bitrate_tx,
+                probe_tx,
+                probe_result_rx,
+                reconfig_result_rx,
+                retarget_rx,
+                gap_rx,
+                shard_change_rx,
+                shard_ack_tx,
+                cursor_shape_rx,
+                screens_tx,
+                screen_tell_rx,
+            },
+            stream: StreamEnds {
+                reconfig,
+                format_rx,
+                format_result_tx,
+                keyframe,
+                rfi,
+                bitrate_rx,
+                shard_rx,
+                probe_rx,
+                probe_result_tx,
+                reconfig_result_tx,
+                retarget_tx,
+                gap_tx,
+                cursor_shape_tx,
+                screens_rx,
+                screen_tell_tx,
+            },
+            shard: ShardEnds {
+                change_tx,
+                ack_rx,
+                apply_tx,
+            },
+            shared: SessionShared {
+                live_bitrate: Arc::new(AtomicU32::new(welcome.bitrate_kbps)),
+                encoder_ceiling: Arc::new(std::sync::Mutex::new(EncoderCeiling::new())),
+                cadence_degraded: Arc::new(AtomicBool::new(false)),
+                cadence_behind_score: Arc::new(AtomicU32::new(0)),
+                client_packets_received: Arc::new(AtomicU32::new(u32::MAX)),
+                fec_target,
+                fec_requested,
+                link_kbps: Arc::new(AtomicU32::new(0)),
+                refuted: Arc::default(),
+                arrival_poke: Arc::new(std::sync::Mutex::new(None)),
+                offload_switch: Arc::new(AtomicBool::new(true)),
+                shape: Arc::new(AtomicU8::new(0)),
+                ports,
+                resend: Arc::default(),
+                acked: Arc::new(AtomicU64::new(NONE_ACKED)),
+                lossy_window: Arc::default(),
+                ramp_open: Arc::new(AtomicBool::new(
+                    welcome.host_caps2 & punktfunk_core::quic::HOST_CAP2_RAMP != 0,
+                )),
+                cursor_client_draws: Arc::new(AtomicBool::new(true)),
+                screens: Arc::new(ScreenWire::new()),
+            },
+        }
+    }
+}

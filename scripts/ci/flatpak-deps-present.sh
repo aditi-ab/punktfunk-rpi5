@@ -60,7 +60,7 @@ sdk-extensions:
 command: punktfunk-client
 YML
   # A manifest this script cannot read (the fail-open case).
-  printf 'app-id: io.unom.Punktfunk\n' > "$tmp/unparseable.yml"
+  printf 'app-id: io.unom.punktfunk\n' > "$tmp/unparseable.yml"
 
   # Stub `flatpak`: $INSTALLED is the newline-separated set of refs it admits to having.
   mkdir -p "$tmp/bin"

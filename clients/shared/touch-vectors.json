@@ -1,0 +1,27 @@
+{
+  "$comment": "The touch-to-mouse tuning both touchscreen clients share, replayed by the Apple TouchVectorTests (TouchTuning) and the Android TouchVectorTest (TouchTuning, pointerAccel). `tuning` holds the values that must match: times in milliseconds, angles in degrees, `keyboard_swipe_fraction` of the view height, `dial_slop_in_tap_slops` as the dial's slop over the tap slop. Distances that gate a tap are not here: Android measures them in pixels and Apple in points. `accel` is the pointer gain for a finger speed in physical pixels per millisecond: 1 up to the floor, rising by `accel_gain` per px/ms, capped at `accel_max` (compared within 1e-4).",
+  "version": 1,
+  "tuning": {
+    "tap_drag_ms": 250,
+    "long_press_ms": 500,
+    "pointer_sens": 1.3,
+    "accel_gain": 0.6,
+    "accel_speed_floor": 0.3,
+    "accel_max": 3.0,
+    "keyboard_swipe_fraction": 0.1,
+    "dial_arm_deg": 10,
+    "dial_commit_deg": 30,
+    "dial_slop_in_tap_slops": 2
+  },
+  "accel": [
+    { "speed": 0.0, "expect": 1.0 },
+    { "speed": 0.3, "expect": 1.0 },
+    { "speed": 0.5, "expect": 1.12 },
+    { "speed": 1.0, "expect": 1.42 },
+    { "speed": 2.0, "expect": 2.02 },
+    { "speed": 3.0, "expect": 2.62 },
+    { "speed": 3.5, "expect": 2.92 },
+    { "speed": 4.0, "expect": 3.0 },
+    { "speed": 100.0, "expect": 3.0 }
+  ]
+}

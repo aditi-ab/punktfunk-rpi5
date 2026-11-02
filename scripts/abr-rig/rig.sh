@@ -5,6 +5,9 @@
 #   rig.sh <profile> [seconds]
 #
 # Everything it needs is in the container; run.sh is the wrapper that starts it.
+#
+# netem sits before segmentation and drops a GSO train whole, which no wire does,
+# so the host sends one packet per skb here unless PUNKTFUNK_GSO says otherwise.
 set -euo pipefail
 
 PROFILE=${1:?usage: rig.sh <profile> [seconds]}
@@ -15,11 +18,14 @@ HERE=$(dirname "$0")
 . "$HERE/profiles.sh"
 profile "$PROFILE"
 
+export PUNKTFUNK_GSO=${PUNKTFUNK_GSO:-0}
 export CARGO_TARGET_DIR=/target
 export CARGO_HOME=${CARGO_HOME:-/cargohome}
 BIN=$CARGO_TARGET_DIR/release
 HOST_IP=10.77.0.1
 CLIENT_IP=10.77.0.2
+# Where a roam profile moves the client (REBIND_AT).
+CLIENT_IP_MOVED=10.77.0.3
 PORT=9777
 # A fresh PIN per run: nothing to check in, and the ceremony is the real one.
 PIN=$(shuf -i 1000-9999 -n 1)
@@ -32,6 +38,7 @@ cleanup() {
   set +e
   [ -n "${HOST_PID:-}" ] && kill "$HOST_PID" 2>/dev/null
   [ -n "${WANDER_PID:-}" ] && kill "$WANDER_PID" 2>/dev/null
+  [ -n "${REBIND_PID:-}" ] && kill "$REBIND_PID" 2>/dev/null
   ip netns pids h 2>/dev/null | xargs -r kill 2>/dev/null
   ip netns pids c 2>/dev/null | xargs -r kill 2>/dev/null
   ip netns del h 2>/dev/null
@@ -156,6 +163,8 @@ fi
 # neither leaves the shaper alone.
 if [ -n "$TRACE" ] || [ "$WANDER_PCT" != 0 ]; then
   (
+    # A subshell reseeds RANDOM, so the seed is set here: one PF_RIG_SEED, one capacity trace.
+    if [ -n "${PF_RIG_SEED:-}" ]; then RANDOM=$PF_RIG_SEED; fi
     at=0
     base=$RATE_KBIT
     live=$RATE_KBIT
@@ -206,6 +215,22 @@ run_probe() {
     --link "$ACHIEVABLE_KBPS:$RATE_KBIT" --profile "$PROFILE" \
     > "$OUT/$PROFILE-$n.log" 2>&1
 }
+# The roam: the client's address moves and the path may shrink with it. The new address is
+# added first; promote_secondaries keeps it when the old primary goes.
+if [ "$REBIND_AT" != 0 ]; then
+  (
+    sleep "$REBIND_AT"
+    echo "[rig] client moves to $CLIENT_IP_MOVED at ${REBIND_AT}s (mtu $REBIND_MTU, 0 = unchanged)"
+    ip netns exec c sysctl -qw net.ipv4.conf.vc.promote_secondaries=1
+    ip -n c addr add $CLIENT_IP_MOVED/24 dev vc
+    ip -n c addr del $CLIENT_IP/24 dev vc
+    if [ "$REBIND_MTU" != 0 ]; then
+      ip -n c link set vc mtu "$REBIND_MTU"
+      ip -n h link set vh mtu "$REBIND_MTU"
+    fi
+  ) &
+  REBIND_PID=$!
+fi
 for n in $(seq "$PROBES"); do
   run_probe "$n" &
 done
@@ -214,18 +239,52 @@ wait $(jobs -p | grep -v "${HOST_PID}" | grep -v "${WANDER_PID:-x}") 2>/dev/null
 # ---- the summary, beside the simulator's row --------------------------------
 echo
 echo "== $PROFILE: ${SECONDS_RUN}s on a ${RATE_KBIT}kbit/${DELAY_MS}ms/${BUFFER_MS}ms path =="
-head -1 /w/crates/punktfunk-core/src/abr/sim/baseline.tsv
-grep -h "^$PROFILE	" /w/crates/punktfunk-core/src/abr/sim/baseline.tsv \
+# The host's columns sum its whole-minute `link health` lines for that probe's session.
+printf '%s\tunrec_10min\trfi_10min\tidr_10min\tkf_req_10min\n' \
+  "$(head -1 /w/crates/core/punktfunk-core/src/abr/sim/baseline.tsv)"
+grep -h "^$PROFILE	" /w/crates/core/punktfunk-core/src/abr/sim/baseline.tsv \
   | sed 's/^/sim  /' || true
+clean() { sed 's/\x1b\[[0-9;]*m//g' "$@"; }
+# Host session ids rise in open order, so the k-th probe to open owns the k-th id.
+mapfile -t SIDS < <(clean "$OUT/$PROFILE-host.log" \
+  | grep -o 'link health session=[0-9]*' | cut -d= -f2 | sort -nu)
+declare -A SID
+k=0
+for n in $(for n in $(seq "$PROBES"); do
+             echo "$(clean "$OUT/$PROFILE-$n.log" | grep -m1 'trajectory session open' | cut -c1-27) $n"
+           done | sort | awk '{print $NF}'); do
+  SID[$n]=${SIDS[$k]:-none}; k=$(( k + 1 ))
+done
 for n in $(seq "$PROBES"); do
-  tail -1 "$OUT/$PROFILE-$n.jsonl" | tr -d '{}"' | awk -F'[:,]' -v p="$PROFILE" '
+  host=$(clean "$OUT/$PROFILE-host.log" | awk -v sid="${SID[$n]}" '
+    /link health/ && / secs=60 / && index($0, " session=" sid " ") {
+      for (i = 1; i <= NF; i++) { split($i, kv, "="); s[kv[1]] += kv[2] } }
+    END { print s["unrecovered"] + 0, s["rfi"] + 0, s["idr"] + 0, s["keyframe_req"] + 0 }')
+  tail -1 "$OUT/$PROFILE-$n.jsonl" | tr -d '{}"' | awk -F'[:,]' -v p="$PROFILE" -v h="$host" '
     { for (i = 1; i <= NF; i += 2) v[$i] = $(i+1) }
-    END { printf "rig  %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p,
+    END { split(h, d, " "); f = 600000 / (v["duration_ms"] > 0 ? v["duration_ms"] : 1)
+          printf "rig  %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\n", p,
           v["under5_pct"], v["to90_s"], v["cuts_per_10min"], v["lost_per_10min"],
           v["queue_p95_ms"], v["over_cap_kb_10s"], v["blip_recover_s"],
-          v["fairness_x1000"], v["decisions_fnv1a"] }'
+          v["fairness_x1000"], v["decisions_fnv1a"],
+          d[1] * f, d[2] * f, d[3] * f, d[4] * f }'
 done
 echo "trajectories: $OUT/$PROFILE-*.jsonl   host log: $OUT/$PROFILE-host.log"
+
+# ---- the roam ---------------------------------------------------------------
+# What the host's MTU watch did, and the delivered rate per window around the move: a
+# frozen picture reads as a run of zeros, a heal as the rate coming back.
+if [ "$REBIND_AT" != 0 ]; then
+  echo
+  echo "== roam at ${REBIND_AT}s (mtu $REBIND_MTU, 0 = unchanged) =="
+  clean "$OUT/$PROFILE-host.log" | grep 'wire MTU' | sed 's/^/host  /'
+  grep -h '^{"t_ms"' "$OUT/$PROFILE-1.jsonl" | tr -d '{}"' | awk -F'[:,]' \
+    -v from=$(( (REBIND_AT - 5) * 1000 )) -v to=$(( (REBIND_AT + 20) * 1000 )) '
+    { for (i = 1; i <= NF; i += 2) v[$i] = $(i+1)
+      if (v["t_ms"] >= from && v["t_ms"] <= to) printf "%.1fs:%d ", v["t_ms"] / 1000, v["delivered_kbps"] }
+    END { print "" }' | sed 's/^/kbps  /'
+  clean "$OUT/$PROFILE-1.log" | grep -i -m3 'lost\|session ended' | sed 's/^/probe /' || true
+fi
 
 # ---- the ramp guard ---------------------------------------------------------
 # A ramp step the HOST could not fill reads as a floor under the link, never a wall, and the

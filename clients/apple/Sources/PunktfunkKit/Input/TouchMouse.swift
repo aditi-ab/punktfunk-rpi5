@@ -43,6 +43,47 @@ public enum TouchInputMode: String, CaseIterable, Sendable {
     public static var sessionOverride: TouchInputMode?
 }
 
+/// Gesture/ballistics tuning. Distances are in points where they gate gestures; the
+/// relative ballistics work in PHYSICAL pixels (point deltas × screen scale) so the
+/// acceleration curve matches the Android client's pixel-based constants 1:1, which
+/// `TouchVectorTests` checks against `clients/shared/touch-vectors.json`.
+enum TouchTuning {
+    /// Movement under this (pt) still counts as a tap, not a drag.
+    static let tapSlop: CGFloat = 8
+    /// A new touch this soon (s) after a tap, near it, starts a held left-button drag.
+    static let tapDragWindow: TimeInterval = 0.25
+    /// One finger held still this long (s) presses the left button and drags until it
+    /// lifts — the touch idiom for "pick this up".
+    static let longPress: TimeInterval = 0.5
+    /// Wire scroll units per point of two-finger pan: points are DIP, so the Q24.8
+    /// distance is the centroid travel × 256 — the content travels with the fingers.
+    static let scrollUnitsPerPt: CGFloat = 256
+    /// Base finger-px → host-px gain (~1:1, never twitchy). The acceleration below lets a
+    /// flick cross the screen while a slow drag stays precise.
+    static let pointerSens: CGFloat = 1.3
+    /// Above `accelSpeedFloor` px/ms the gain ramps by `accelGain` per px/ms, capped at
+    /// `accelMax` (so a fast swipe can't fling the cursor uncontrollably).
+    static let accelGain: CGFloat = 0.6
+    static let accelSpeedFloor: CGFloat = 0.3
+    static let accelMax: CGFloat = 3.0
+    /// Three-finger vertical swipe: the fraction of the view height the centroid must
+    /// travel to summon (up) / dismiss (down) the local soft keyboard.
+    static let keyboardSwipeFraction: CGFloat = 0.10
+    /// The dial (design/touch-client-overlay.md §2.1): a two-finger TWIST opens the
+    /// quick-action ring. Below `dialArmDeg` the gesture is still a scroll candidate —
+    /// natural scrolls rotate a few degrees, and this absorbs them; at `dialCommitDeg` the
+    /// ring commits and stays open after the fingers lift. The scroll never waits: until
+    /// the centroid travels `dialSlop` (pt) the twist can still arm, past it never.
+    static let dialArmDeg: CGFloat = 10
+    static let dialCommitDeg: CGFloat = 30
+    static let dialSlop: CGFloat = 2 * tapSlop
+
+    /// Acceleration multiplier for a finger speed in physical px per ms.
+    static func accel(forSpeed speed: CGFloat) -> CGFloat {
+        min(1 + accelGain * max(speed - accelSpeedFloor, 0), accelMax)
+    }
+}
+
 #if os(iOS) || os(visionOS)
 import PunktfunkCore
 import UIKit
@@ -52,45 +93,7 @@ import UIKit
 /// entirely on the main thread (UIKit touch delivery). Touches are tracked by identity key
 /// with positions cached per event — `UITouch` objects are never retained.
 final class TouchMouse {
-    /// Gesture/ballistics tuning. Distances are in points where they gate gestures; the
-    /// relative ballistics work in PHYSICAL pixels (point deltas × screen scale) so the
-    /// acceleration curve matches the Android client's pixel-based constants 1:1.
-    enum Tuning {
-        /// Movement under this (pt) still counts as a tap, not a drag.
-        static let tapSlop: CGFloat = 8
-        /// A new touch this soon (s) after a tap, near it, starts a held left-button drag.
-        static let tapDragWindow: TimeInterval = 0.25
-        /// One finger held still this long (s) presses the left button and drags until it
-        /// lifts — the touch idiom for "pick this up".
-        static let longPress: TimeInterval = 0.5
-        /// Wire scroll units per point of two-finger pan: points are DIP, so the Q24.8
-        /// distance is the centroid travel × 256 — the content travels with the fingers.
-        static let scrollUnitsPerPt: CGFloat = 256
-        /// Base finger-px → host-px gain (~1:1, never twitchy). The acceleration below lets a
-        /// flick cross the screen while a slow drag stays precise.
-        static let pointerSens: CGFloat = 1.3
-        /// Above `accelSpeedFloor` px/ms the gain ramps by `accelGain` per px/ms, capped at
-        /// `accelMax` (so a fast swipe can't fling the cursor uncontrollably).
-        static let accelGain: CGFloat = 0.6
-        static let accelSpeedFloor: CGFloat = 0.3
-        static let accelMax: CGFloat = 3.0
-        /// Three-finger vertical swipe: the fraction of the view height the centroid must
-        /// travel to summon (up) / dismiss (down) the local soft keyboard.
-        static let keyboardSwipeFraction: CGFloat = 0.10
-        /// The dial (design/touch-client-overlay.md §2.1): a two-finger TWIST opens the
-        /// quick-action ring. Below `dialArmDeg` the gesture is still a scroll candidate —
-        /// natural scrolls rotate a few degrees, and this absorbs them; at `dialCommitDeg` the
-        /// ring commits and stays open after the fingers lift. The scroll never waits: until
-        /// the centroid travels `dialSlop` (pt) the twist can still arm, past it never.
-        static let dialArmDeg: CGFloat = 10
-        static let dialCommitDeg: CGFloat = 30
-        static let dialSlop: CGFloat = 2 * tapSlop
-
-        /// Acceleration multiplier for a finger speed in physical px per ms.
-        static func accel(forSpeed speed: CGFloat) -> CGFloat {
-            min(1 + accelGain * max(speed - accelSpeedFloor, 0), accelMax)
-        }
-    }
+    typealias Tuning = TouchTuning
 
     /// Wire events out (the owner gates them on its capture state).
     var send: ((PunktfunkInputEvent) -> Void)?

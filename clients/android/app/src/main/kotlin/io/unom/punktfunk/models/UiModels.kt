@@ -36,6 +36,8 @@ data class PendingTrust(
      */
     val preset: String? = null,
     val launch: String? = null,
+    /** Opened by a link: pairing on its way continues into the link's connect. */
+    val fromLink: Boolean = false,
 ) {
     enum class Kind { TRUST_NEW, FP_CHANGED, PAIR, REQUEST_ACCESS }
 }
@@ -54,6 +56,7 @@ data class PendingLinkConnect(
     val host: KnownHost,
     val preset: String? = null,
     val launch: String? = null,
+    val asProfile: String? = null,
 )
 
 /**
@@ -103,6 +106,8 @@ data class ActiveSession(
      * poster until the host reports the game running. Null for a desktop connect or a launcher tile.
      */
     val launchHold: LaunchHold? = null,
+    /** The dial that started this session, for a redial after the connection is lost. */
+    val redial: io.unom.punktfunk.DialSpec? = null,
 )
 
 /**
@@ -116,6 +121,7 @@ data class LaunchHold(
     val mgmtPort: Int,
     val fpHex: String,
     val sourceRect: Rect? = null,
+    val streamPort: Int = 0,
 )
 
 /**

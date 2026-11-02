@@ -1,6 +1,7 @@
 package io.unom.punktfunk.kit.security
 
 import android.content.Context
+import io.unom.punktfunk.kit.ProfilePick
 import java.util.UUID
 import org.json.JSONArray
 import org.json.JSONObject
@@ -63,11 +64,6 @@ data class KnownHost(
      */
     val presetId: String? = null,
     /**
-     * The delivery profile to ask this host for (`1` capped, `2` smooth), set from a network
-     * check's finding. Per host: a Wi-Fi TV and a wired desk differ. `0` asks nothing.
-     */
-    val delivery: Int = 0,
-    /**
      * Presets pinned as their own cards for this host (design §5.2a). Presentation only: order is
      * card order, and this is NOT the default binding ([presetId] is). Duplicates and presets
      * that no longer exist are dropped when the cards are rendered.
@@ -93,6 +89,10 @@ data class KnownHost(
     /** Unix seconds of the last session that connected; `null` until one has. Mirrors the Rust
      *  `KnownHost.last_used` and the Apple client's `StoredHost.lastConnected`. */
     val lastUsed: Long? = null,
+    /** The profile on the host this device plays as, `null` until one is picked. */
+    val asProfile: ProfilePick? = null,
+    /** The name the host last advertised; empty until learned. See [followingName]. */
+    val advertName: String = "",
 ) {
     /** This record re-pointed at [to]:[toPort], remembering the address it leaves. */
     fun movedTo(to: String, toPort: Int): KnownHost = copy(
@@ -100,6 +100,16 @@ data class KnownHost(
         port = toPort,
         prevAddresses = (listOf(address) + prevAddresses).filter { it != to }.distinct()
             .take(PREV_ADDRESSES_MAX),
+    )
+
+    /**
+     * This record with [advertised] as the host's own name. [name] moves with it only while it
+     * is still the name the host last advertised, so a name the player typed stays. Mirrors the
+     * Rust `KnownHost::follow_advert_name`.
+     */
+    fun followingName(advertised: String): KnownHost = copy(
+        name = if (advertName.isNotEmpty() && name == advertName) advertised else name,
+        advertName = advertised,
     )
 
     companion object {
@@ -245,6 +255,18 @@ class KnownHostStore(context: Context) {
         val h = byId(host.id) ?: return
         if (h.os == os) return
         save(h.copy(os = os))
+    }
+
+    /**
+     * Follow the name [host] advertises ([KnownHost.followingName]) — same contract as
+     * [learnMac]. Returns whether anything was written.
+     */
+    fun learnName(host: KnownHost, advertised: String): Boolean {
+        if (advertised.isEmpty()) return false
+        val h = byId(host.id) ?: return false
+        if (h.advertName == advertised) return false
+        save(h.followingName(advertised))
+        return true
     }
 
     /**
@@ -399,7 +421,6 @@ class KnownHostStore(context: Context) {
             .put("mgmt", host.mgmtPort ?: 0)
             .put("clip", host.clipboardSync)
             .put("preset", host.presetId ?: "")
-            .put("delivery", host.delivery)
             .put("pins", JSONArray(host.pinnedPresetIds))
             .put("game_presets", JSONObject(host.gamePresets))
             // The pre-rename keys too, so an older build of this app keeps the bindings.
@@ -408,6 +429,9 @@ class KnownHostStore(context: Context) {
             .put("prev_addrs", JSONArray(host.prevAddresses))
             .put("added", host.addedAt ?: 0)
             .put("last_used", host.lastUsed ?: 0)
+            // Not `profile`: that key is the old spelling of the settings preset.
+            .put("as_profile", host.asProfile?.toJson() ?: JSONObject.NULL)
+            .put("advert_name", host.advertName)
             .toString()
 
         /** One stored record, or null when it does not parse. */
@@ -431,7 +455,6 @@ class KnownHostStore(context: Context) {
                 clipboardSync = j.optBoolean("clip", false),
                 // `profile` and `game_profiles` are the pre-rename keys, read when the new key is absent.
                 presetId = j.optString(newOrOld(j, "preset", "profile"), "").ifEmpty { null },
-                delivery = j.optInt("delivery", 0),
                 pinnedPresetIds = stringList(j.optJSONArray("pins")),
                 gamePresets = stringMap(
                     j.optJSONObject(newOrOld(j, "game_presets", "game_profiles")),
@@ -440,6 +463,8 @@ class KnownHostStore(context: Context) {
                 // 0 (or absent) = never stamped, the same sentinel as `mgmt`.
                 addedAt = j.optLong("added", 0).takeIf { it > 0 },
                 lastUsed = j.optLong("last_used", 0).takeIf { it > 0 },
+                asProfile = ProfilePick.fromJson(j.optJSONObject("as_profile")),
+                advertName = j.optString("advert_name", ""),
             )
         }.getOrNull()
 

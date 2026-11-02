@@ -204,7 +204,7 @@ extension ShotMock {
             connect: {}, pair: {}, forget: {}, remove: {},
             browseLibrary: paired ? {} : nil, speedTest: paired ? {} : nil,
             sendLogs: paired ? {} : nil,
-            wake: pinned == nil && !online && !host.wakeMacs.isEmpty ? {} : nil,
+            wake: pinned == nil && !online && WakePolicy.canWake(host.wakeMacs) ? {} : nil,
             copyLink: {}, showDetails: pinned == nil ? {} : nil,
             power: pinned == nil && paired && online ? powerGrant : [],
             presets: HostPresetMenu(

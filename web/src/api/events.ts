@@ -54,6 +54,7 @@ import {
 } from "@/api/gen/store/store";
 import { getGetUpdateStatusQueryKey } from "@/api/gen/update/update";
 import { boostPluginPolling } from "@/api/plugins";
+import { seatClientIfAny } from "@/api/seat";
 import { HOST_EVENT_KINDS, type HostEventKind } from "@/lib/event-kinds";
 import { m } from "@/paraglide/messages";
 import { type ActivityEntry, mergeActivity } from "./activity-ring";
@@ -253,6 +254,8 @@ let replayed: ActivityEntry[] = [];
 const replayedKeys = new Map<string, readonly unknown[]>();
 let replayedResync = false;
 let replayedBoost = false;
+/** Seats whose events were replayed: their caches are as stale as the box's. */
+const replayedSeats = new Set<string>();
 let replayTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** An older host sends no `live` marker: past this, apply what arrived rather than hold it. */
@@ -262,15 +265,32 @@ function startReplay(): void {
 	live = false;
 	replayed = [];
 	replayedKeys.clear();
+	replayedSeats.clear();
 	replayedResync = false;
 	replayedBoost = false;
 	if (replayTimer) clearTimeout(replayTimer);
 	replayTimer = setTimeout(finishReplay, REPLAY_DEADLINE_MS);
 }
 
+/** On a door, the seat whose host raised the frame's event; the box's own frames name none. */
+function seatOf(ev: Event): string | null {
+	try {
+		const seat = (JSON.parse((ev as MessageEvent).data) as { seat?: unknown })
+			.seat;
+		return typeof seat === "string" ? seat : null;
+	} catch {
+		return null;
+	}
+}
+
 /** Note what a replayed frame WOULD have done, deduplicated, instead of doing it now. */
-function holdReplayed(kind: HostEventKind, entry: ActivityEntry | null): void {
+function holdReplayed(
+	kind: HostEventKind,
+	entry: ActivityEntry | null,
+	seat: string | null,
+): void {
 	if (entry) replayed.push(entry);
+	if (seat) replayedSeats.add(seat);
 	for (const key of INVALIDATES[kind])
 		replayedKeys.set(JSON.stringify(key), key);
 	if (kind === "plugins.changed" || kind === "store.changed")
@@ -297,7 +317,10 @@ function finishReplay(): void {
 		else for (const key of replayedKeys.values()) invalidate(client, key);
 		if (replayedBoost) boostPluginPolling();
 	}
+	// A seat's cache is a few pages' worth: one refetch of all of it is the cheap answer.
+	for (const seat of replayedSeats) seatClientIfAny(seat)?.invalidateQueries();
 	replayedKeys.clear();
+	replayedSeats.clear();
 	replayedResync = false;
 	replayedBoost = false;
 }
@@ -314,8 +337,9 @@ function attach(): void {
 	for (const kind of HOST_EVENT_KINDS) {
 		source.addEventListener(kind, (ev) => {
 			const entry = parseEntry(kind, ev);
+			const seat = seatOf(ev);
 			if (!live) {
-				holdReplayed(kind, entry);
+				holdReplayed(kind, entry, seat);
 				return;
 			}
 			// Record it first: the feed should show an event even for a kind we invalidate nothing for.
@@ -330,6 +354,10 @@ function attach(): void {
 			if (kind === "plugins.changed" || kind === "store.changed")
 				boostPluginPolling();
 			for (const key of INVALIDATES[kind]) invalidate(client, key);
+			// A seat's event moved that seat's pages too, wherever the console reached them.
+			const seatClient = seat ? seatClientIfAny(seat) : undefined;
+			if (seatClient)
+				for (const key of INVALIDATES[kind]) invalidate(seatClient, key);
 			// `host.started` names no keys — the host is NEW, so everything we hold predates it.
 			if (kind === "host.started") resyncAll(client);
 		});
@@ -375,7 +403,7 @@ function announceKnock(entry: ActivityEntry | null): void {
 		description: name ? m.pairing_knock_desc({ name }) : undefined,
 		action: {
 			label: m.pairing_knock_action(),
-			onClick: () => window.location.assign("/pairing"),
+			onClick: () => window.location.assign("/devices"),
 		},
 	});
 }

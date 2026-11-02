@@ -16,7 +16,8 @@ import {
 	useStoreJobs,
 } from "@/api/store";
 import { useDialogs } from "@/components/dialogs";
-import { usePasswordFailure } from "@/components/password-confirm";
+import { passwordFailure } from "@/components/password-confirm";
+import { SeatScope, SeatTitle } from "@/components/seat-scope";
 import { Stagger } from "@/components/stagger";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useLocale } from "@/lib/i18n";
@@ -29,7 +30,6 @@ import {
 } from "./InstallDialogs";
 import { InstalledTab } from "./Installed";
 import { BatchPendingCard, JobProgressSection } from "./JobProgress";
-import { PluginUis } from "./PluginUis";
 import { SourcesTab } from "./Sources";
 
 type StoreTab = "browse" | "installed" | "sources";
@@ -57,14 +57,19 @@ interface UpdateRun {
  * install/uninstall mutations, the confirm dialogs their trust tier dictates, and the job the host
  * hands back (which must stay visible whichever tab you switch to while it runs).
  */
-export const SectionStore: FC = () => {
+export const SectionStore: FC = () => (
+	<SeatScope page="plugins">
+		<Store />
+	</SeatScope>
+);
+
+const Store: FC = () => {
 	useLocale();
 	const { confirm } = useDialogs();
 	const [tab, setTab] = useState<StoreTab>("browse");
 	// The catalog entry awaiting its install confirmation, and the raw-spec dialog's open state.
 	const [target, setTarget] = useState<CatalogEntry | null>(null);
 	const [specOpen, setSpecOpen] = useState(false);
-	const specRefusal = usePasswordFailure();
 	// The job the host is running for us, if any. Cleared by the operator, not by completion — a
 	// finished job's log is the only record of what happened.
 	const [jobId, setJobId] = useState<string | null>(null);
@@ -121,20 +126,17 @@ export const SectionStore: FC = () => {
 	};
 
 	const onConfirmSpec = async (spec: string, password: string) => {
-		specRefusal.reset();
 		try {
 			const { job } = await install.mutateAsync({
 				spec,
 				accept_unverified: true,
 				password,
 			});
-			setSpecOpen(false);
 			setJobId(job);
 		} catch (e) {
 			// A refused password keeps the dialog open with everything the operator typed still in
-			// it; anything else is an ordinary install failure.
-			if (specRefusal.classify(e)) return;
-			setSpecOpen(false);
+			// it; anything else closes it as an ordinary install failure.
+			if (passwordFailure(e)) throw e;
 			failed(e, m.store_install_failed());
 		}
 	};
@@ -237,9 +239,13 @@ export const SectionStore: FC = () => {
 	return (
 		<Section maxWidth={false}>
 			<div className="flex flex-col gap-card">
-				<div className="space-y-1">
-					<h1 className="text-2xl font-semibold">{m.store_title()}</h1>
-					<p className="text-sm text-muted-foreground">{m.store_subtitle()}</p>
+				<div className="flex flex-wrap items-start justify-between gap-4">
+					<div className="space-y-1">
+						<SeatTitle title={m.store_title()} />
+						<p className="text-sm text-muted-foreground">
+							{m.store_subtitle()}
+						</p>
+					</div>
 				</div>
 
 				{jobId ? (
@@ -254,8 +260,6 @@ export const SectionStore: FC = () => {
 					// back with one. Only reachable mid-run; a lone install has nothing to show here.
 					step && <BatchPendingCard step={step} />
 				)}
-
-				<PluginUis />
 
 				<Tabs value={tab} onValueChange={(v) => setTab(v as StoreTab)}>
 					<TabsList>
@@ -331,12 +335,7 @@ export const SectionStore: FC = () => {
 				/>
 				<SpecInstallDialog
 					open={specOpen}
-					isPending={install.isPending}
-					failure={specRefusal.failure}
-					onCancel={() => {
-						setSpecOpen(false);
-						specRefusal.reset();
-					}}
+					onClose={() => setSpecOpen(false)}
 					onConfirm={onConfirmSpec}
 				/>
 			</div>

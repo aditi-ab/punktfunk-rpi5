@@ -2,73 +2,17 @@
 // and the grant that follows a save. Only paths new in that save are granted: the form's old value
 // came from the plugin, and a path the plugin filled in itself is not the operator's word. A save
 // that drops a path lets the form go of it; the host keeps what another form or the operator holds.
+import {
+	type HandedPath,
+	keepAfterDrop,
+	newlyHanded,
+} from "../../src/lib/handed-paths";
 import { mgmtFetch } from "./forward";
 import { callPlugin } from "./pluginProxy";
-
-interface Node {
-	type?: string;
-	format?: string;
-	properties?: Record<string, Node>;
-	items?: Node;
-	allOf?: Node[];
-}
-
-export interface HandedPath {
-	path: string;
-	write: boolean;
-}
 
 export interface GrantOutcome {
 	granted: string[];
 	refused: { path: string; error: string }[];
-}
-
-// A checked schema nests its annotations under `allOf`.
-const flatten = (n: Node): Node =>
-	(n.allOf ?? []).reduce<Node>((acc, b) => Object.assign(acc, b), { ...n });
-
-/** Every handed path in `value`, found by walking `schema` (the kit's `{schema: {…}}` document). */
-export function handedPaths(schema: unknown, value: unknown): HandedPath[] {
-	const out = new Map<string, HandedPath>();
-	const walk = (raw: Node | undefined, v: unknown): void => {
-		if (!raw) return;
-		const n = flatten(raw);
-		if (n.format === "pf:path" || n.format === "pf:path:write") {
-			const path = typeof v === "string" ? v.trim() : "";
-			const write = n.format === "pf:path:write";
-			if (path) out.set(path, { path, write: write || !!out.get(path)?.write });
-		} else if (n.type === "array" && Array.isArray(v)) {
-			for (const item of v) walk(n.items, item);
-		} else if (n.properties && v && typeof v === "object") {
-			for (const [k, child] of Object.entries(n.properties))
-				walk(child, (v as Record<string, unknown>)[k]);
-		}
-	};
-	walk((schema as { schema?: Node } | null)?.schema, value);
-	return [...out.values()];
-}
-
-/** The handed paths `after` holds that `before` did not. */
-export function newlyHanded(
-	schema: unknown,
-	before: unknown,
-	after: unknown,
-): HandedPath[] {
-	const had = new Set(handedPaths(schema, before).map((p) => p.path));
-	return handedPaths(schema, after).filter((p) => !had.has(p.path));
-}
-
-/** What `after` still hands over when it dropped a path `before` handed, else `null`. */
-export function keepAfterDrop(
-	schema: unknown,
-	before: unknown,
-	after: unknown,
-): string[] | null {
-	const kept = handedPaths(schema, after).map((p) => p.path);
-	const dropped = handedPaths(schema, before).some(
-		(p) => !kept.includes(p.path),
-	);
-	return dropped ? kept : null;
 }
 
 const accessPost = (id: string, route: string, body: unknown) =>
@@ -114,30 +58,40 @@ export async function grantHandedPaths(
 }
 
 /** PUT a form's value to the plugin's `path`, then grant the paths this save handed over and let
- * `form` go of the ones it dropped. The value before the save is read first; if that read fails,
- * nothing is granted or let go. A failed release leaves the grant in place. */
+ * `form` go of the ones it dropped. `ask` runs first when the save hands over a path, and a throw
+ * from it saves nothing. The value before the save is read first; if that read fails, nothing is
+ * granted or let go. A failed release leaves the grant in place. */
 export async function putAndGrant(
 	id: string,
 	path: string,
 	body: Uint8Array | undefined,
 	form: string,
+	ask: () => Promise<void>,
 ): Promise<{ res: Response | null; access?: GrantOutcome }> {
-	const before = await callPlugin(id, path, "GET");
+	const before = await callPlugin(id, path, { method: "GET" });
 	const prior = before?.ok
 		? ((await before.json().catch(() => null)) as {
 				schema?: unknown;
 				value?: unknown;
 			} | null)
 		: null;
-	const res = await callPlugin(id, path, "PUT", body);
-	if (!res?.ok || !prior || !body) return { res };
 	let value: unknown;
 	try {
-		value = JSON.parse(new TextDecoder().decode(body));
+		value = body && JSON.parse(new TextDecoder().decode(body));
 	} catch {
-		return { res };
+		value = undefined;
 	}
-	const handed = newlyHanded(prior.schema, prior.value, value);
+	const handed =
+		prior && value !== undefined
+			? newlyHanded(prior.schema, prior.value, value)
+			: [];
+	if (handed.length) await ask();
+	const res = await callPlugin(id, path, {
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body,
+	});
+	if (!res?.ok || !prior || value === undefined) return { res };
 	const access = handed.length
 		? await grantHandedPaths(id, handed, form)
 		: undefined;

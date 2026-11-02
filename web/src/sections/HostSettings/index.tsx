@@ -1,8 +1,8 @@
-// Container for Host → Settings: the settings query, one-setting writes, the restart flow, and
+// Container for Host's settings: the settings query, one-setting writes, the restart flow, and
 // the app list the voice-chat picker suggests from. Everything visual is in `view.tsx`.
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
-import { type FC, useEffect, useState } from "react";
+import { type FC, type ReactNode, useEffect, useState } from "react";
 import { useListActions } from "@/api/gen/actions/actions";
 import {
 	getGetHostSettingsQueryKey,
@@ -10,18 +10,22 @@ import {
 	useGetHostSettings,
 	useGetPlayingApps,
 } from "@/api/gen/host/host";
+import { PasswordConfirmDialog } from "@/components/password-confirm";
 import { apiErrorMessage } from "@/lib/errors";
 import { useLocale } from "@/lib/i18n";
+import { touchesPlane } from "@/lib/password-gates";
 import { m } from "@/paraglide/messages";
+import { GpuRow } from "../Host/GpuRow";
 import { ConfirmDialog } from "../Host/PowerCard";
 import { labelOf } from "./controls";
 import { RestartBanner } from "./RestartBanner";
+import { SessionGameRows } from "./SessionGameRows";
 import { HostSettingsView } from "./view";
 
 /** How long a restart may take before the page stops waiting and says so. */
 const RESTART_PATIENCE_MS = 90_000;
 
-export const SectionHostSettings: FC = () => {
+export const HostSettings: FC<{ top?: ReactNode }> = ({ top }) => {
 	useLocale();
 	const qc = useQueryClient();
 	// Set when a restart is accepted; the page polls until the new process answers.
@@ -73,12 +77,26 @@ export const SectionHostSettings: FC = () => {
 			return next;
 		});
 
+	// A plane setting waits for the console password; until then the control shows the stored value.
+	const [asking, setAsking] = useState<{ id: string; value: unknown } | null>(
+		null,
+	);
+	const askingRow = state.data?.settings.find((s) => s.id === asking?.id);
+
 	// One key per request: the answer is the whole new state, so it replaces the cache outright.
+	const save = async (id: string, value: unknown, password?: string) => {
+		// The console's server reads the password from the body and strips it.
+		const next = await patchHostSettings({ [id]: value, password });
+		qc.setQueryData(getGetHostSettingsQueryKey(), next);
+	};
 	const onSet = async (id: string, value: unknown) => {
+		if (touchesPlane({ [id]: value })) {
+			setAsking({ id, value });
+			return;
+		}
 		settle(id, true);
 		try {
-			const next = await patchHostSettings({ [id]: value });
-			qc.setQueryData(getGetHostSettingsQueryKey(), next);
+			await save(id, value);
 		} catch (e) {
 			toast.error(apiErrorMessage(e) ?? m.host_settings_save_failed());
 			qc.invalidateQueries({ queryKey: getGetHostSettingsQueryKey() });
@@ -99,6 +117,8 @@ export const SectionHostSettings: FC = () => {
 				pending={pending}
 				onSet={onSet}
 				playingApps={apps.data?.apps}
+				extra={{ video: <GpuRow />, session: <SessionGameRows /> }}
+				top={top}
 				banner={
 					<RestartBanner
 						names={waiting}
@@ -107,6 +127,20 @@ export const SectionHostSettings: FC = () => {
 						onRestart={() => setConfirming(true)}
 					/>
 				}
+			/>
+			<PasswordConfirmDialog
+				open={asking !== null}
+				id="host-settings-password"
+				title={m.host_settings_confirm_title({
+					name: askingRow ? labelOf(askingRow) : "",
+				})}
+				body={m.host_settings_confirm_body()}
+				submitLabel={m.common_save()}
+				failedText={m.host_settings_save_failed()}
+				onSubmit={async (password) => {
+					if (asking) await save(asking.id, asking.value, password);
+				}}
+				onClose={() => setAsking(null)}
 			/>
 			{confirming && restartAction && (
 				<ConfirmDialog

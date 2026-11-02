@@ -1,0 +1,61 @@
+{
+  "$comment": "The nativeConnect request (Android). `input` is the ConnectRequest.kt constructor, `json` is what toJson() writes and session/connect.rs reads. Pinned by the Kotlin ConnectRequestVectorTest and the Rust request_vectors test: a key renamed on one side fails there instead of reading as its default. Hand-written: this file is the contract. A new field adds its key to every case.",
+  "cases": [
+    {
+      "name": "plain desktop connect",
+      "input": {
+        "host": "10.0.0.2", "port": 9777, "width": 1920, "height": 1080, "refreshHz": 60,
+        "certPem": "", "keyPem": "", "pinHex": "", "bitrateKbps": 0,
+        "compositorPref": 0, "gamepadPref": 0,
+        "hdrEnabled": false, "tenBitSdr": false, "multiSliceOk": false, "framePartsOk": false,
+        "audioChannels": 2, "audioRateHz": 0, "audioBits": 0,
+        "videoCodecs": 0, "preferredCodec": 0, "timeoutMs": 8000,
+        "launch": null, "deviceName": null, "padAudioOk": false, "keepHostAudio": false, "clientCursor": false,
+        "videoFit": "fit", "dialer": "", "presetId": null, "presetName": null,
+        "deliveryFlags": 0, "profile": null, "pyrowaveBppX100": 0, "studioRange": false
+      },
+      "json": {
+        "host": "10.0.0.2", "port": 9777, "width": 1920, "height": 1080, "refresh_hz": 60,
+        "cert_pem": "", "key_pem": "", "pin_hex": "", "bitrate_kbps": 0, "pyrowave_bpp_x100": 0,
+        "compositor_pref": 0, "gamepad_pref": 0,
+        "hdr_enabled": false, "ten_bit_sdr": false, "multi_slice_ok": false, "frame_parts_ok": false,
+        "audio_channels": 2, "audio_rate_hz": 0, "audio_bits": 0,
+        "video_codecs": 0, "preferred_codec": 0, "delivery_flags": 0, "timeout_ms": 8000,
+        "launch": null, "device_name": null, "pad_audio_ok": false, "keep_host_audio": false, "client_cursor": false,
+        "video_fit": "fit", "dialer": "", "preset_id": null, "preset_name": null, "profile": null,
+        "studio_range": false
+      }
+    },
+    {
+      "name": "every field set",
+      "input": {
+        "host": "host.example", "port": 9778, "width": 2560, "height": 1440, "refreshHz": 120,
+        "certPem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+        "keyPem": "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+        "pinHex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "bitrateKbps": 80000, "compositorPref": 2, "gamepadPref": 3,
+        "hdrEnabled": true, "tenBitSdr": true, "multiSliceOk": true, "framePartsOk": true,
+        "audioChannels": 6, "audioRateHz": 96000, "audioBits": 24,
+        "videoCodecs": 7, "preferredCodec": 4, "timeoutMs": 190000,
+        "launch": "steam:570", "deviceName": "Pixel \"9\" Pro", "padAudioOk": true, "keepHostAudio": true, "clientCursor": true,
+        "videoFit": "crop", "dialer": "android 0.43.1 console/library",
+        "presetId": "couch", "presetName": "Couch",
+        "deliveryFlags": 2, "profile": "p1", "pyrowaveBppX100": 120, "studioRange": true
+      },
+      "json": {
+        "host": "host.example", "port": 9778, "width": 2560, "height": 1440, "refresh_hz": 120,
+        "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+        "key_pem": "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+        "pin_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "bitrate_kbps": 80000, "pyrowave_bpp_x100": 120, "compositor_pref": 2, "gamepad_pref": 3,
+        "hdr_enabled": true, "ten_bit_sdr": true, "multi_slice_ok": true, "frame_parts_ok": true,
+        "audio_channels": 6, "audio_rate_hz": 96000, "audio_bits": 24,
+        "video_codecs": 7, "preferred_codec": 4, "delivery_flags": 2, "timeout_ms": 190000,
+        "launch": "steam:570", "device_name": "Pixel \"9\" Pro", "pad_audio_ok": true, "keep_host_audio": true, "client_cursor": true,
+        "video_fit": "crop", "dialer": "android 0.43.1 console/library",
+        "preset_id": "couch", "preset_name": "Couch", "profile": "p1",
+        "studio_range": true
+      }
+    }
+  ]
+}

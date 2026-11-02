@@ -1,0 +1,69 @@
+#version 450
+// RGB(A) -> NV12 (BT.709, full or studio range by `FULL_RANGE`). One invocation per chroma
+// sample = 2x2 luma block.
+// Optionally blends a straight-alpha RGBA cursor bitmap over the RGB *before* the YUV conversion
+// (so the chroma stays correct) — cursor-as-metadata for the GPU zero-copy paths. The blend is
+// gated by the push constant and touches only the cursor's small rectangle, so a disabled or
+// off-screen cursor costs one compare per invocation.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D rgb;                  // packed RGB input (sampled; BGRA import ok)
+layout(binding = 1, r8)  uniform writeonly image2D yImg;    // full-res Y
+layout(binding = 2, rg8) uniform writeonly image2D uvImg;   // half-res UV (interleaved)
+layout(binding = 3) uniform sampler2D cursorTex;            // straight-alpha RGBA cursor (top-left)
+
+layout(push_constant) uniform Push {
+    ivec2 curOrigin;   // top-left of the cursor in frame pixels (position - hotspot)
+    ivec2 curSize;     // cursor w,h in pixels; x <= 0 => disabled
+} pc;
+
+// The session's range, a pipeline specialization constant: full (the default, whose arithmetic
+// is unchanged) or studio (Y 16..235, CbCr 16..240).
+layout(constant_id = 0) const bool FULL_RANGE = true;
+
+float lumaY(vec3 c) {
+    if (!FULL_RANGE) return 16.0/255.0 + 0.1826*c.r + 0.6142*c.g + 0.0620*c.b;
+    return 0.2126*c.r + 0.7152*c.g + 0.0722*c.b;
+}
+
+// Blend the cursor over `col` at frame pixel `p`, when `p` falls inside the cursor rectangle.
+vec3 withCursor(ivec2 p, vec3 col) {
+    if (pc.curSize.x <= 0) return col;
+    ivec2 cp = p - pc.curOrigin;
+    if (cp.x < 0 || cp.y < 0 || cp.x >= pc.curSize.x || cp.y >= pc.curSize.y) return col;
+    vec4 c = texelFetch(cursorTex, cp, 0);
+    return mix(col, c.rgb, c.a);
+}
+
+// Source may be SMALLER than the coded (16-aligned) Y plane — e.g. 1080 source vs 1088 coded. Clamp
+// every fetch to the source edge so the alignment-padding rows duplicate the last real row instead
+// of reading out of bounds (undefined → green garbage that shows if a client ignores the SPS
+// conformance-window crop). `textureSize` gives the bound source's real extent.
+void main() {
+    ivec2 sz = imageSize(yImg);
+    ivec2 rmax = textureSize(rgb, 0) - 1;
+    ivec2 uvc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 p = uvc * 2;
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    vec3 c00 = withCursor(p,               texelFetch(rgb, min(p,               rmax), 0).rgb);
+    vec3 c10 = withCursor(p + ivec2(1, 0), texelFetch(rgb, min(p + ivec2(1, 0), rmax), 0).rgb);
+    vec3 c01 = withCursor(p + ivec2(0, 1), texelFetch(rgb, min(p + ivec2(0, 1), rmax), 0).rgb);
+    vec3 c11 = withCursor(p + ivec2(1, 1), texelFetch(rgb, min(p + ivec2(1, 1), rmax), 0).rgb);
+    imageStore(yImg, p,               vec4(lumaY(c00), 0, 0, 1));
+    imageStore(yImg, p + ivec2(1, 0), vec4(lumaY(c10), 0, 0, 1));
+    imageStore(yImg, p + ivec2(0, 1), vec4(lumaY(c01), 0, 0, 1));
+    imageStore(yImg, p + ivec2(1, 1), vec4(lumaY(c11), 0, 0, 1));
+    // Left-sited chroma (H.273 type 0, what decoders assume): [1 2 1] over columns p.x-1..p.x+1.
+    ivec2 pl = max(p + ivec2(-1, 0), ivec2(0));
+    vec3 cl0 = withCursor(pl,               texelFetch(rgb, min(pl,               rmax), 0).rgb);
+    vec3 cl1 = withCursor(pl + ivec2(0, 1), texelFetch(rgb, min(pl + ivec2(0, 1), rmax), 0).rgb);
+    vec3 a = (cl0 + 2.0 * c00 + c10 + cl1 + 2.0 * c01 + c11) * 0.125;
+    float U, V;
+    if (!FULL_RANGE) {
+        U = 128.0/255.0 - 0.1006*a.r - 0.3386*a.g + 0.4392*a.b;
+        V = 128.0/255.0 + 0.4392*a.r - 0.3989*a.g - 0.0403*a.b;
+    } else {
+        U = 128.0/255.0 - 0.1146*a.r - 0.3854*a.g + 0.5000*a.b;
+        V = 128.0/255.0 + 0.5000*a.r - 0.4542*a.g - 0.0458*a.b;
+    }
+    imageStore(uvImg, uvc, vec4(U, V, 0, 1));
+}

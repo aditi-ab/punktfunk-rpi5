@@ -21,18 +21,9 @@ pub(crate) fn codec_mime(codec: u8) -> &'static str {
     }
 }
 
-/// A short human label for the codec the host resolved, for the stats HUD's video-feed line
-/// (`"H.264"` / `"HEVC"` / `"AV1"` / `"PyroWave"`). Mirrors [`codec_mime`]'s fallback: anything
-/// not H.264/AV1/PyroWave is reported as HEVC (every pre-negotiation host emitted HEVC). Kept
-/// beside [`codec_mime`] because the MIME collapses PyroWave onto `video/hevc` and so can't name it.
-pub(crate) fn codec_label(codec: u8) -> &'static str {
-    match codec {
-        punktfunk_core::quic::CODEC_H264 => "H.264",
-        punktfunk_core::quic::CODEC_AV1 => "AV1",
-        punktfunk_core::quic::CODEC_PYROWAVE => "PyroWave",
-        _ => "HEVC",
-    }
-}
+/// The codec the host resolved, as every overlay names it: empty for an id this build does not
+/// know, which the stream notification leaves out.
+pub(crate) use punktfunk_core::hud::codec_label;
 
 /// Create the decoder: prefer the specific codec Kotlin ranked from `MediaCodecList`
 /// (`from_codec_name`), falling back to the platform's default decoder for the MIME
@@ -178,23 +169,18 @@ pub(crate) fn boost_thread_priority() {
 /// floor, so both are dlsym-resolved at runtime (a hard import of a >floor symbol makes
 /// `dlopen`/`System.load` fail on every API-28/29 device, even where this path is never hit —
 /// mirrors [`crate::adpf`]):
-///   - On a **TV** (`is_tv`): `ANativeWindow_setFrameRateWithChangeStrategy` (**API 31**) with
-///     `changeFrameRateStrategy = ALWAYS`, which actively drives the HDMI output into the matching
-///     mode (e.g. 60↔120) instead of leaving the panel at its default and judder-matching. The
-///     forced switch may blank the panel briefly — acceptable once at stream start, not wanted on a
-///     phone. Falls through to the 2-arg hint on API 30.
-///   - Otherwise: `ANativeWindow_setFrameRate` (**API 30**) — the seamless-preferred hint for
-///     phones/tablets and the universal fallback.
+///   - `always` ([`super::DecodeOptions::force_rate_switch`]):
+///     `ANativeWindow_setFrameRateWithChangeStrategy` (**API 31**) with strategy `ALWAYS`, which
+///     may switch the panel non-seamlessly (a brief blank once at stream start). Falls through to
+///     the 2-arg hint on API 30.
+///   - Otherwise: `ANativeWindow_setFrameRate` (**API 30**), the seamless-only hint.
 ///
-/// Both paths pass `compatibility = FIXED_SOURCE` (1): the stream is fixed-rate video content the
-/// client cannot re-pace, which is exactly what that value declares — `DEFAULT` (0) told the
-/// platform the app could adapt to whatever rate it picked, an invitation some OEM refresh
-/// governors accepted by simply not switching. (The window-level `preferredDisplayModeId` pin in
-/// `MainActivity.setStreamDisplayMode` is the phone-side belt to this braces.)
+/// Both pass `compatibility = FIXED_SOURCE` (1): the stream is fixed-rate video the client cannot
+/// re-pace. `DEFAULT` (0) invites an OEM governor to simply not switch.
 ///
 /// Returns `true` when the platform accepted a hint; `false` on API < 30 (symbols absent) or a
 /// decline.
-pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: bool) -> bool {
+pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, always: bool) -> bool {
     // int32_t ANativeWindow_setFrameRate(ANativeWindow*, float frameRate, int8_t compatibility)
     type SetFrameRateFn = unsafe extern "C" fn(*mut c_void, f32, i8) -> i32;
     // int32_t ANativeWindow_setFrameRateWithChangeStrategy(
@@ -210,9 +196,8 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
         }
         // ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE — fixed-rate video content.
         const FIXED_SOURCE: i8 = 1;
-        // TV: prefer the API-31 change-strategy form to force the mode switch (strategy 1 =
-        // ALWAYS). Absent on API 30 ⇒ fall through to the 2-arg hint below.
-        if is_tv {
+        // Strategy 1 = ALWAYS. Absent on API 30 ⇒ fall through to the 2-arg hint below.
+        if always {
             if let Some(set) = crate::sym::<SetFrameRateStrategyFn>(
                 lib,
                 c"ANativeWindow_setFrameRateWithChangeStrategy",
@@ -266,7 +251,7 @@ pub(super) fn android_hdr_static_info(m: &punktfunk_core::quic::HdrMeta) -> [u8;
 /// regardless — this adds the luminance the tone-mapper needs. `None` on an SDR session.
 /// The newest entry, not the first: the host follows its generic baseline with the source's grade.
 pub(super) fn hdr_static(client: &NativeClient) -> Option<punktfunk_core::quic::HdrMeta> {
-    if !client.color.is_hdr() {
+    if !client.video_format().color.is_hdr() {
         return None;
     }
     match client.latest_hdr_meta(Duration::from_millis(250)) {
@@ -282,9 +267,23 @@ pub(super) fn hdr_static(client: &NativeClient) -> Option<punktfunk_core::quic::
 }
 
 /// Overrides the low-latency profile: `standard` (the default), `off` (no standard `low-latency`
-/// key), `mtk-tv` (no standard key; the TV decoder's game keys and `operating-rate` = fps instead).
-/// `adb shell setprop debug.punktfunk.low_latency_key standard`.
+/// key), `mtk-tv` (no standard key; the TV decoder's game keys and `operating-rate` = fps instead),
+/// `mtk-boost` (standard plus MediaTek's `vendor.mtk.vdec.cpu.boost.mode.value`: the codec asks
+/// PowerHAL for a CPU minimum-clock lock for its life, which the MediaTek library reads at init).
+/// `mtk-boost` stays opt-in because it spends power; a decoder without the key ignores it.
+/// `qti-fence` (standard plus Qualcomm's output-fence keys, [`qti_fence_eligible`]): the codec
+/// returns each output when the input is consumed, with a fence that signals when the pixels are
+/// written. Opt-in until the glass gain is measured; the `pf.present` line's `fenceTailMs` is
+/// the codec time the HUD `decode` then no longer sees.
+/// `adb shell setprop debug.punktfunk.low_latency_key mtk-boost`.
 pub(super) const LOW_LATENCY_KEY_PROP: &std::ffi::CStr = c"debug.punktfunk.low_latency_key";
+
+/// The Qualcomm output-fence keys fit a Codec2 Qualcomm decoder on Android 13+. Only
+/// `CCodecBufferChannel` since 13 forwards the codec's fence to the consumer; earlier releases
+/// queue the buffer unfenced, and SurfaceFlinger would show it unfinished.
+fn qti_fence_eligible(codec_name: &str, sdk: u32) -> bool {
+    codec_name.to_ascii_lowercase().starts_with("c2.qti") && sdk >= 33
+}
 
 /// TV platforms that show half the stream rate, as (`ro.product.manufacturer`, `ro.product.device`):
 /// Philips' Pentonic 1000 sets (OLED809/810/888, PUS8508) and TCL's Pentonic 700 `G08` (C6K, C755,
@@ -305,8 +304,9 @@ fn half_rate_tv() -> bool {
         .any(|(m, d)| maker.eq_ignore_ascii_case(m) && device == *d)
 }
 
-/// The decoder's configure format: the mode, an input buffer generous enough that a large keyframe
-/// AU is never truncated, the HDR static info, and the low-latency keys for `codec_name`.
+/// The decoder's configure format: the mode, the stream rate (`frame-rate`, the standard key a
+/// decoder's clock table may read), an input buffer generous enough that a large keyframe AU is
+/// never truncated, the HDR static info, and the low-latency keys for `codec_name`.
 /// `keys` is `Some(aggressive)` for [`configure_low_latency`]'s profile, `None` for no
 /// low-latency key at all. A `c2.mtk` decoder on a [`HALF_RATE_TVS`] platform swaps the `Some`
 /// profile for `mtk-tv`; [`LOW_LATENCY_KEY_PROP`] overrides either way.
@@ -322,6 +322,9 @@ pub(super) fn low_latency_format(
     format.set_str("mime", mime);
     format.set_i32("width", mode.width as i32);
     format.set_i32("height", mode.height as i32);
+    if mode.refresh_hz > 0 {
+        format.set_i32("frame-rate", mode.refresh_hz as i32);
+    }
     format.set_i32(
         "max-input-size",
         (mode.width * mode.height).max(2_000_000) as i32,
@@ -329,24 +332,53 @@ pub(super) fn low_latency_format(
     if let Some(aggressive) = keys {
         let forced = sysprop(LOW_LATENCY_KEY_PROP);
         let profile = match forced.as_deref() {
-            Some(p @ ("standard" | "off" | "mtk-tv")) => p,
+            Some(p @ ("standard" | "off" | "mtk-tv" | "mtk-boost" | "qti-fence")) => p,
             _ if codec_name.to_ascii_lowercase().starts_with("c2.mtk") && half_rate_tv() => {
                 "mtk-tv"
             }
             _ => "standard",
         };
-        configure_low_latency(&mut format, codec_name, aggressive, profile == "standard");
+        let standard_key = matches!(profile, "standard" | "mtk-boost" | "qti-fence");
+        configure_low_latency(&mut format, codec_name, aggressive, standard_key);
         if profile != "standard" {
-            log::info!("decode: low-latency profile {profile} — standard low-latency key left out");
+            log::info!("decode: low-latency profile {profile}");
         }
-        if profile == "mtk-tv" {
-            format.set_i32("vendor.mtk-codec2.game-mode", 1);
-            format.set_i32("vendor.mtk-codec2.low-latency-mode", 1);
-            format.set_i32("operating-rate", mode.refresh_hz as i32);
+        match profile {
+            "mtk-tv" => {
+                format.set_i32("vendor.mtk-codec2.game-mode", 1);
+                format.set_i32("vendor.mtk-codec2.low-latency-mode", 1);
+                format.set_i32("operating-rate", mode.refresh_hz as i32);
+            }
+            "mtk-boost" => format.set_i32("vendor.mtk.vdec.cpu.boost.mode.value", 1),
+            "qti-fence" if qti_fence_eligible(codec_name, crate::sys::sdk_int()) => {
+                // Decode-order output is the fence's prerequisite. The sw-fence key is the
+                // 8 Gen 2 spelling, the output-fence pair the 8 Gen 3 / 8 Elite one (type 1:
+                // the driver signals). A codec without a key ignores it.
+                format.set_i32("vendor.qti-ext-dec-picture-order.enable", 1);
+                format.set_i32("vendor.qti-ext-output-sw-fence-enable.value", 1);
+                format.set_i32("vendor.qti-ext-output-fence.enable", 1);
+                format.set_i32("vendor.qti-ext-output-fence.fence_type", 1);
+            }
+            "qti-fence" => log::warn!("decode: qti-fence needs a c2.qti decoder on Android 13+"),
+            _ => {}
         }
     }
     if let Some(meta) = hdr_static {
         format.set_buffer("hdr-static-info", &android_hdr_static_info(meta));
     }
     format
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qti_fence_eligible;
+
+    #[test]
+    fn qti_fence_needs_a_codec2_qualcomm_decoder_on_13() {
+        assert!(qti_fence_eligible("c2.qti.hevc.decoder.low_latency", 33));
+        assert!(qti_fence_eligible("C2.QTI.avc.decoder", 35));
+        assert!(!qti_fence_eligible("c2.qti.hevc.decoder", 32));
+        assert!(!qti_fence_eligible("omx.qcom.video.decoder.hevc", 34));
+        assert!(!qti_fence_eligible("c2.mtk.hevc.decoder", 34));
+    }
 }

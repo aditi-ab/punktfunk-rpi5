@@ -1,0 +1,40 @@
+{
+  "demo": {
+    "grants": [
+      {
+        "path": "/mnt/roms",
+        "write": false,
+        "at": "2026-01-01T00:00:00Z",
+        "by": "console"
+      },
+      {
+        "path": "/mnt/saves",
+        "write": true,
+        "at": "2026-01-01T00:00:00Z",
+        "by": "form",
+        "forms": [
+          "config",
+          "game:steam:440"
+        ]
+      },
+      {
+        "path": "/mnt/old",
+        "write": false,
+        "at": "",
+        "by": "legacy"
+      }
+    ],
+    "denied": [
+      "/mnt/private"
+    ],
+    "links": {
+      "/home/u/Games": "/mnt/roms/games"
+    }
+  },
+  "quiet": {
+    "grants": [],
+    "denied": [
+      "/mnt/private"
+    ]
+  }
+}

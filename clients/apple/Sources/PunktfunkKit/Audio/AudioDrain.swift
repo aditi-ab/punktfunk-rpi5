@@ -14,7 +14,9 @@ private let log = ClientLog(category: "audio")
 
 enum AudioDrain {
     /// Start the drain thread. Every argument is read on the CALLER's thread, because the values
-    /// derive from the connection and the loop must not hold the owner to ask.
+    /// derive from the connection and the loop must not hold the owner to ask. `onFormat` runs
+    /// on this thread as it ends because the host moved the audio format: the owner rebuilds
+    /// playback, and a new drain, at the new one.
     static func start(
         connection: PunktfunkConnection,
         flag: StopFlag,
@@ -24,7 +26,8 @@ enum AudioDrain {
         channels: Int,
         rateHz: Int,
         frameUs: Int,
-        frameMS: Int
+        frameMS: Int,
+        onFormat: @escaping @Sendable () -> Void
     ) {
     let thread = Thread { [connection, flag, done] in
         defer { done.signal() }
@@ -60,6 +63,13 @@ enum AudioDrain {
             {
                 // One undecodable packet costs that packet, as on the desktop: not the audio.
                 return true
+            } catch PunktfunkClientError.status(let rc)
+                where rc == PUNKTFUNK_STATUS_AUDIO_FORMAT.rawValue
+            {
+                // This ring and loop are sized for the old format; the next frame waits in core.
+                log.info("audio: the host changed the audio format — rebuilding playback")
+                onFormat()
+                return false
             } catch {
                 return false // session closed
             }

@@ -173,25 +173,20 @@ public final class GamepadFeedback {
             while alive, !flag.isStopped {
                 alive = autoreleasepool { () -> Bool in
                 do {
-                    // Poll the feedback planes NON-BLOCKING. A blocking poll (timeoutMs > 0) holds
-                    // the connection's shared feedback lock for its whole wait; the video pump drains
-                    // HDR mastering metadata (nextHdrMeta) on the SAME lock every frame, so a blocking
-                    // poll here starved it and throttled HDR to ~1 fps (SDR, which never drains HDR
-                    // meta, was unaffected). Pacing with a short sleep OUTSIDE the lock (below) keeps
-                    // rumble/HID latency low while leaving the lock free between polls.
-                    //
-                    // Rumble arrives as EFFECTIVE commands from the core's shared policy engine
-                    // (design/rumble-root-fix.md §D): the engine owns leases, legacy staleness,
-                    // and close-drain zeros, and its per-pad mailbox already coalesces — a
-                    // stalled drain wakes to ONE current-level command per pad, and a stop can
-                    // never be shed by a queue. Apply verbatim, in order.
+                    // The pull blocks: the core wakes it on a wire update, and the timeout is the
+                    // HID-output cadence. HDR metadata has its own lock, so nothing starves.
+                    // Commands are EFFECTIVE levels from the core's policy engine
+                    // (design/rumble-root-fix.md §D): leases, staleness and close-drain zeros are
+                    // its, and the per-pad mailbox coalesces. Apply verbatim, in order.
+                    let idle = self?.hasNoTarget ?? true // no pad to drive: 20 Hz is plenty
                     var rumbleBurst = 0
-                    while rumbleBurst < 64, !flag.isStopped,
-                          let c = try connection.nextRumbleCommand(timeoutMs: 0) {
+                    var next = try connection.nextRumbleCommand(timeoutMs: idle ? 50 : 8)
+                    while rumbleBurst < 64, !flag.isStopped, let c = next {
                         self?.routeRumble(
                             pad: UInt8(truncatingIfNeeded: c.pad), low: c.low, high: c.high,
                             leftTrigger: c.leftTrigger, rightTrigger: c.rightTrigger)
                         rumbleBurst += 1
+                        next = try connection.nextRumbleCommand(timeoutMs: 0)
                     }
                     // Drain a BOUNDED burst of hidout events so sustained 0xCD traffic (a game writing
                     // per-frame LED/trigger reports) can't spin here or block stop() past one cycle.
@@ -206,11 +201,6 @@ public final class GamepadFeedback {
                     return false // .closed (or fatal) — the session is over
                 }
                 }
-                // ~8 ms poll cadence (≈125 Hz), slept OUTSIDE the feedback lock — low rumble/HID
-                // latency without holding the lock the HDR-meta drain needs. With no pad to drive
-                // every command is dropped anyway, so idle at 20 Hz.
-                let idle = self?.hasNoTarget ?? true
-                if alive, !flag.isStopped { Thread.sleep(forTimeInterval: idle ? 0.05 : 0.008) }
             }
             drainDone.signal()
         }
@@ -305,7 +295,10 @@ public final class GamepadFeedback {
         // the main-actor hop would only add latency to Steam's 25–40 ms rumble resends.
         if case let .hidRaw(pad, kind, data) = ev {
             let sink = withRouting { hidRawSink }
-            sink?(pad, kind, data)
+            // Controller rumble off plays Steam's rumble report as a stop, like every pad's.
+            let rumbleOff = UserDefaults.standard.object(forKey: DefaultsKey.padRumble) as? Bool == false
+            let muted = rumbleOff && kind == 0 && data.first == 0x80
+            sink?(pad, kind, muted ? [0x80] + [UInt8](repeating: 0, count: 9) : data)
             return
         }
         DispatchQueue.main.async {

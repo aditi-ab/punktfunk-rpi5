@@ -95,6 +95,25 @@ enum LaunchedEntry {
     }
 }
 
+/// The values the views read for one session, each documented on its `SessionModel` property.
+/// `disconnect` assigns a fresh one, so the next session starts with no hold, hint or mute.
+struct SessionUI {
+    var phase: SessionPhase = .idle
+    var launchHold: LaunchHoldTarget?
+    var launchWindowWait = false
+    var launchDownload: HostDownload?
+    var streamedGame: RunningGame?
+    var hudLines: [PunktfunkConnection.HudLine] = []
+    var notices = SessionNotices()
+    var resizing = false
+    var mouseCaptured = false
+    var micMuted = false
+    var virtualPadShown = false
+    var clipboardEnabled = false
+    var isBackgrounded = false
+    var backgroundDeadline: Date?
+}
+
 /// How long the launch hold waits on a title the host still calls `launching`, or `running` without
 /// its window (a cold Steam boot with shader work runs to minutes), and on one the host never lists
 /// at all (the launch did not resolve; the host logs it and streams on).
@@ -106,17 +125,12 @@ private let demoLaunchHold: TimeInterval = 3
 
 @MainActor
 final class SessionModel: ObservableObject {
-    enum Phase: Equatable {
-        case idle
-        case connecting
-        /// Connected to an unpinned host: the stream is live (and pumping — the opening
-        /// IDR must not be missed) but input/cursor capture wait for the user to confirm
-        /// the observed fingerprint.
-        case awaitingTrust(fingerprint: Data)
-        case streaming
-    }
+    typealias Phase = SessionPhase
 
-    @Published private(set) var phase: Phase = .idle
+    /// What the views show for this session, one field per property below. `disconnect`
+    /// resets it whole.
+    @Published private var ui = SessionUI()
+    private(set) var phase: Phase { get { ui.phase } set { ui.phase = newValue } }
     @Published private(set) var connection: PunktfunkConnection? {
         didSet {
             #if os(macOS)
@@ -149,14 +163,14 @@ final class SessionModel: ObservableObject {
     /// Raised at `connect`, not at first frame: the shelf is still on screen at the tap, which is
     /// the only moment the cover has somewhere to fly FROM, and holding from there means one
     /// unbroken screen from the tap to the game rather than a stream of the launcher in between.
-    @Published private(set) var launchHold: LaunchHoldTarget?
+    private(set) var launchHold: LaunchHoldTarget? { get { ui.launchHold } set { ui.launchHold = newValue } }
     /// The console's own launch hold is up, as the console reports it: the console stays over
     /// the stream it dialled, and the stream takes no input, until the console lets go.
     @Published var consoleHold = false
     /// The launched game is up and the host is waiting for its window.
-    @Published private(set) var launchWindowWait = false
+    private(set) var launchWindowWait: Bool { get { ui.launchWindowWait } set { ui.launchWindowWait = newValue } }
     /// The launched title's files, while the host fetches them before it opens the stream.
-    @Published private(set) var launchDownload: HostDownload?
+    private(set) var launchDownload: HostDownload? { get { ui.launchDownload } set { ui.launchDownload = newValue } }
     private var launchWatch: Task<Void, Never>?
     /// Counts launches, so each hold is a view of its own — see `LaunchHoldTarget.seq`.
     private var launchSeq = 0
@@ -171,6 +185,28 @@ final class SessionModel: ObservableObject {
     /// Every window's dialing or live host. A host replaces a second session from this device,
     /// so a connect to one already live elsewhere would end that window's stream.
     private static var activeHosts: [ObjectIdentifier: StoredHost.ID] = [:]
+
+    /// One connect's arguments, kept so a lost session or a waking host can dial them again,
+    /// and which redial attempt that is.
+    struct Redial {
+        var host: StoredHost
+        let effective: EffectiveSettings
+        let gamepad: PunktfunkConnection.GamepadType
+        let launchID: String?
+        let profileID: String?
+        let shelf: LibraryTarget?
+        var attempt: UInt32 = 0
+        var allowTofu = false
+        /// Auto-wake was on: a host that refuses setup before streaming is dialed again.
+        var autoWake = false
+        /// When that host first refused; nil until it has.
+        var wakeSince: ContinuousClock.Instant?
+    }
+    /// The last connect's arguments.
+    private var lastDial: Redial?
+    /// A lost session waiting to dial again, or dialing: the connect overlay stays up for it.
+    /// Cleared once a redial streams, fails for good, or the user cancels.
+    @Published private(set) var redial: Redial?
     /// The library entry this session was launched with (`connect(launchID:)`), or nil if the user
     /// just connected to the host's desktop. Kept because where the client should go when the
     /// session ends depends on where it came FROM: a title launched out of the library belongs back
@@ -195,10 +231,10 @@ final class SessionModel: ObservableObject {
     @Published var errorMessage: String?
     /// The stats overlay's lines for the live tier and vocabulary: formatted by the core each
     /// second and on every tier change (`renderHud`).
-    @Published private(set) var hudLines: [PunktfunkConnection.HudLine] = []
+    private(set) var hudLines: [PunktfunkConnection.HudLine] { get { ui.hudLines } set { ui.hudLines = newValue } }
     /// Mirrors StreamView's capture state (it owns the input capture; this drives the
     /// HUD's "click to capture" / "⌘⎋ releases" hint).
-    @Published var mouseCaptured = false
+    var mouseCaptured: Bool { get { ui.mouseCaptured } set { ui.mouseCaptured = newValue } }
     /// The USER's in-stream mic mute (the HUD button, the Stream menu's ⌃⌥⇧A, the captured-state
     /// chord, the iOS mic disc) — session state, deliberately NOT persisted: a mute is for the
     /// people in the room right now, so every new session starts live if the mic is on at all.
@@ -206,49 +242,15 @@ final class SessionModel: ObservableObject {
     /// `applyMicMute` composes them — a user mute survives a trip through the background, and the
     /// background's privacy mute never clears the user's choice. Local and instant: it gates
     /// capture on this device, nothing is sent to the host.
-    @Published private(set) var micMuted = false
-    /// The kind a controller declared when it turned out this session cannot carry its motion —
-    /// set once per such pad, cleared after `motionHintSeconds`. Nil the rest of the time.
-    ///
-    /// It exists because the failure is otherwise entirely silent: the gyro simply does nothing,
-    /// with no way for the player to tell a dead sensor from a session that resolved a backend
-    /// without a motion plane. The fix is a settings change, so the hint has to name it.
-    @Published private(set) var motionUnreachableKind: PunktfunkConnection.GamepadType?
-    /// Drops `motionUnreachableKind` again — held so a second pad's hint replaces the first
-    /// cleanly, and so ending the session cancels a pending clear rather than letting it fire
-    /// into a torn-down model.
-    private var motionHintTimer: Task<Void, Never>?
-    /// How long the motion hint stays up — the start-of-stream shortcut banner's 6 s, since the
-    /// two share the bottom-centre stack and a player reads them the same way.
-    private static let motionHintSeconds: UInt64 = 6
-    /// True while the "Steam Controller passing through" badge shows — set on the SC2
-    /// capture's claim edge (stream start, or the pad powering on mid-session), auto-dropped
-    /// after `motionHintSeconds` like the motion hint it stacks with, and dropped EARLY on a
-    /// release edge so the badge can never outlive the passthrough it announces. The badge is
-    /// the capture's ONLY UI surface: the raw BLE device never enters GameController, so the
-    /// Controllers page cannot list it.
-    @Published private(set) var sc2CapturedHint = false
-    /// True while the exit hint shows: from stream start for `motionHintSeconds`, unless the
-    /// player turned it off (`DefaultsKey.exitHint`).
-    @Published private(set) var exitHintShown = false
-    /// Drops `exitHintShown` — cancelled on teardown, like `motionHintTimer`.
-    private var exitHintTimer: Task<Void, Never>?
-    /// Drops `sc2CapturedHint` — same contract as `motionHintTimer` (restart on a new claim,
-    /// cancel on teardown rather than firing into a torn-down model). Only `noteSc2Phase` and
-    /// the disconnect teardown touch it.
-    private var sc2HintTimer: Task<Void, Never>?
-    /// The touch model is passthrough, but this host drops contacts (no `HOST_CAP2_TOUCH`): the
-    /// stream view runs the trackpad model instead, and this says so once, for
-    /// `motionHintSeconds`, in the same bottom-centre slot. Otherwise the setting is silently
-    /// ignored and every finger vanishes.
-    @Published private(set) var touchFallbackNotice = false
-    private var touchHintTimer: Task<Void, Never>?
+    private(set) var micMuted: Bool { get { ui.micMuted } set { ui.micMuted = newValue } }
+    /// The stream's hints, notices and access chip.
+    private(set) var notices: SessionNotices { get { ui.notices } set { ui.notices = newValue } }
     /// Resize overlay (design/midstream-resolution-resize.md — client resize UX): true from the
     /// instant a Match-window resize starts steering toward a new size until a frame at that size
     /// decodes (or a safety timeout). Drives the blur+spinner so the unavoidable host-rebuild delay
     /// reads as a deliberate, acknowledged transition instead of a stutter. Pure state lives in
     /// `ResizeIndicator`; this mirrors its `active` for SwiftUI.
-    @Published private(set) var resizing = false
+    private(set) var resizing: Bool { get { ui.resizing } set { ui.resizing = newValue } }
     /// START = follower steering (main actor), END = a new-mode IDR's coded dims (decode pump,
     /// hopped to main), TIMEOUT = safety net for a rejected/capped switch that never yields a
     /// differently-sized frame. Ticked from the 1 Hz stats timer.
@@ -264,14 +266,17 @@ final class SessionModel: ObservableObject {
     let clientQueue = LatencyMeter()
     /// Its p50 over the last window, for `hudFacts`.
     private var queueP50Ms: Double?
-    private var statsTimer: Timer?
-    private var audio: SessionAudio?
-    private var gamepadCapture: GamepadCapture?
+    /// Everything this session started. `disconnect` stops it in reverse start order.
+    private let resources = SessionResources()
+    private var audio: SessionAudio? { resources.part() }
+    private var gamepadCapture: GamepadCapture? { resources.part() }
     /// The in-stream ring's pad path (design/touch-client-overlay.md §2.6), forwarded from the
     /// capture so the view can wire them once per session. The chord carries the pad's wire
     /// index; a remote's Back and a captured Steam Controller carry none.
     var onRingChord: ((UInt32?) -> Void)?
     var onRingNav: ((RingNav) -> Void)?
+    /// A connect the host parked for its operator: the view shows the approval wait.
+    var onAwaitingApproval: ((StoredHost) -> Void)?
 
     /// The ring is up: the pad belongs to it (flushed on the host, edges become navigation).
     func setRingOpen(_ open: Bool) {
@@ -291,12 +296,25 @@ final class SessionModel: ObservableObject {
         gamepadCapture?.tapButton(bit)
     }
 
+    /// The ring's Controller type slot: what every forwarded pad declares, whether one is
+    /// forwarded, and the step to the next type. This stream only; the next starts from Settings.
+    var padType: PunktfunkConnection.GamepadType { gamepadCapture?.padType ?? .auto }
+
+    var padTypeAvailable: Bool {
+        virtualPadAvailable && gamepadCapture?.hasForwardedPads == true
+    }
+
+    func cyclePadType() {
+        guard let capture = gamepadCapture else { return }
+        capture.setPadType(capture.padType.nextInRing)
+    }
+
     /// The virtual on-screen controller (design/touch-client-overlay.md §4): shown from the
     /// ring's `pad` slot, per session. While up it holds one wire pad, so the host sees one
     /// controller arrive and, on hide, one leave (§9). Never toggled by the ring's own open and
     /// close (§8 trap 4).
-    @Published private(set) var virtualPadShown = false
-    private(set) var virtualPad: VirtualPadWire?
+    private(set) var virtualPadShown: Bool { get { ui.virtualPadShown } set { ui.virtualPadShown = newValue } }
+    var virtualPad: VirtualPadWire? { resources.part() }
 
     /// Whether the pad's input can reach the host at all: the forwarding setting and the
     /// session's controller grant, the two gates a real pad's sends have.
@@ -307,66 +325,36 @@ final class SessionModel: ObservableObject {
     func toggleVirtualPad() {
         if let pad = virtualPad {
             pad.close()
-            virtualPad = nil
+            resources.remove(pad)
             virtualPadShown = false
             return
         }
         guard let conn = connection, let pad = VirtualPadWire(connection: conn, manager: .shared) else { return }
         // Toggled from the ring, so the ring is up: the pad starts masked and unmasks on close.
         pad.masked = gamepadCapture?.ringOpen ?? false
-        virtualPad = pad
+        // Started last, so it closes first: its pad leaves the wire before any capture stops.
+        resources.add(pad, stop: pad.close)
         virtualPadShown = true
     }
-    private var gamepadFeedback: GamepadFeedback?
     /// The live session's Steam Controller 2 as-is passthrough (`settings.sc2Capture` &&
-    /// `settings.gamepadForwarding`) — built beside GamepadCapture/GamepadFeedback in
-    /// `beginStreaming`, torn down in `disconnect` in the Android order (unhook the hidRaw
-    /// sink → feedback stops → capture stops, which also frees its wire index).
-    private var sc2Capture: Sc2Capture?
+    /// `settings.gamepadForwarding`), started in `beginStreaming`.
+    private var sc2Capture: Sc2Capture? { resources.part() }
     #if !os(tvOS)
-    /// The live session's clipboard bridge (design/clipboard-and-file-transfer.md §5) — created
-    /// by `beginStreaming` when the per-host toggle is on and the host advertises
-    /// `HOST_CAP_CLIPBOARD`; stopped (off-main, drain joined) in `disconnect`.
-    private var clipboardSync: ClipboardSync?
+    /// The live session's clipboard bridge (design/clipboard-and-file-transfer.md §5), when the
+    /// per-host toggle is on and the host advertises `HOST_CAP_CLIPBOARD`.
+    private var clipboardSync: ClipboardSync? { resources.part() }
     #endif
     /// Whether clipboard sync is live (host-acked `ClipState.enabled`) — drives the Stream menu
     /// item's title and the settings footnote. Always false on tvOS, which has no pasteboard.
-    @Published private(set) var clipboardEnabled = false
+    private(set) var clipboardEnabled: Bool { get { ui.clipboardEnabled } set { ui.clipboardEnabled = newValue } }
     /// The host's last `ClipState.reason` (`CLIP_REASON_*`) — why an enable was refused
     /// (backend unavailable / policy disabled / …); 0 = OK.
 
-    // MARK: - Per-client access (design/per-client-access.md §7)
-
-    /// The session's access preset, derived live from the grants mask (§3.2 — the label is
-    /// never stored). `.fullControl` against every old host and for every full-grant device,
-    /// so nothing below changes today's look there.
-    @Published private(set) var accessLevel: PunktfunkConnection.AccessLevel = .fullControl
-    /// Seconds until this session's access expires; `0` = permanent. Ticks down at the 1 Hz
-    /// stats cadence — the chip's countdown renders straight from it.
-    @Published private(set) var accessRemainingSecs: UInt32 = 0
-    /// Anything about this session's access differs from full-and-permanent — the visibility
-    /// gate for the chip (and the tvOS stats-overlay line). False = today's look, untouched.
-    @Published private(set) var accessLimited = false
-    /// The transient expiry-warning toast ("Access ends in 5 m") — non-nil for a few seconds
-    /// around the T−5 m / T−1 m marks the host also warns at via `AccessUpdate`.
-    @Published private(set) var accessWarning: String?
-    /// One-shot latches for the two warning marks (reset per session).
-    private var accessWarned5m = false
-    private var accessWarned1m = false
-    /// Auto-dismiss for `accessWarning` — held so a newer warning replaces a pending clear.
-    private var accessWarningTimer: Task<Void, Never>?
-    /// The host's line for a launch that did not give the player their game, up for
-    /// `launchNoticeSeconds`. `launchNoticeShown` keeps one verdict from re-raising it.
-    @Published private(set) var launchNotice: String?
-    private var launchNoticeShown: String?
-    private var launchNoticeTimer: Task<Void, Never>?
-    /// Long enough to read a sentence with its cause.
-    private static let launchNoticeSeconds: UInt64 = 10
     #if os(tvOS)
     /// Siri Remote → host pointer while streaming (touch surface moves, press = left click,
     /// Play/Pause = right click) + the remote's deliberate exit (hold Back ≥ 1 s). See
     /// SiriRemotePointer — same trust gate/lifecycle as the gamepad capture above.
-    private var remotePointer: SiriRemotePointer?
+    private var remotePointer: SiriRemotePointer? { resources.part() }
     #endif
 
     var isBusy: Bool { phase != .idle }
@@ -374,12 +362,10 @@ final class SessionModel: ObservableObject {
     /// True while a streaming session is running in the background under the opt-in keep-alive
     /// (audio plays, video dropped, timeout armed). Drives the Live Activity's stage/countdown (M3)
     /// and is cleared on foreground or teardown. iOS/iPadOS only in practice.
-    @Published private(set) var isBackgrounded = false
+    private(set) var isBackgrounded: Bool { get { ui.isBackgrounded } set { ui.isBackgrounded = newValue } }
     /// When the backgrounded keep-alive will auto-disconnect (nil unless backgrounded) — drives the
-    /// Live Activity countdown. Set alongside `backgroundTimer`.
-    @Published private(set) var backgroundDeadline: Date?
-    /// Bounded auto-disconnect for a backgrounded keep-alive session. Fires on `.main`.
-    private var backgroundTimer: DispatchSourceTimer?
+    /// Live Activity countdown. Set alongside the background timer.
+    private(set) var backgroundDeadline: Date? { get { ui.backgroundDeadline } set { ui.backgroundDeadline = newValue } }
 
     /// Holds off display sleep (and, on macOS, the screen saver) for the life of a session —
     /// nothing about watching a stream looks like user activity to the OS, least of all a
@@ -411,6 +397,8 @@ final class SessionModel: ObservableObject {
     func connect(to host: StoredHost, effective: EffectiveSettings,
                  gamepad: PunktfunkConnection.GamepadType = .auto,
                  launchID: String? = nil,
+                 /// The host profile to play as; nil lets the host choose.
+                 profileID: String? = nil,
                  /// The library shelf this session started from, so its end can return there —
                  /// the title's shelf for a launch, and the shelf itself for a Resume, which
                  /// launches nothing. nil for a connect that did not come off one.
@@ -418,6 +406,13 @@ final class SessionModel: ObservableObject {
                  allowTofu: Bool = false,
                  autoTrust: Bool = false,
                  requestAccess: Bool = false,
+                 /// Auto-wake is on (Settings → General).
+                 autoWake: Bool = false,
+                 /// When the host first refused as still waking; nil on a first dial.
+                 wakeSince: ContinuousClock.Instant? = nil,
+                 /// The host refused `profileID` as unknown. Return true to re-dial: the error
+                 /// is then not shown.
+                 onProfileUnknown: (@MainActor () -> Bool)? = nil,
                  onUnreachable: (@MainActor () -> Void)? = nil) {
         guard phase == .idle else { return }
         guard !Self.activeHosts.contains(where: { $0.key != ObjectIdentifier(self) && $0.value == host.id })
@@ -427,6 +422,10 @@ final class SessionModel: ObservableObject {
         }
         connectSeq += 1
         let attempt = connectSeq
+        lastDial = Redial(
+            host: host, effective: effective, gamepad: gamepad, launchID: launchID,
+            profileID: profileID, shelf: shelf, allowTofu: allowTofu,
+            autoWake: autoWake && !requestAccess, wakeSince: wakeSince)
         phase = .connecting
         activeHost = host
         launchedTitleID = launchID
@@ -441,13 +440,22 @@ final class SessionModel: ObservableObject {
         settings = effective
         statsVerbosity = StatsVerbosity(rawValue: effective.statsVerbosity) ?? .normal
         #if os(iOS)
-        // An attached monitor shows the picture (StreamViewController), so its size and rate win.
+        // An attached monitor shows the picture (StreamViewController), so Native is its mode.
         let mode = ExternalDisplay.streamMode(effective)
             ?? effective.streamMode(native: NativeDisplay.mode)
         #else
         let mode = effective.streamMode(native: NativeDisplay.mode)
         #endif
         let pin = host.pinnedSHA256
+        // Screens (main-actor — screen APIs): with All monitors, a host screen per display now and
+        // the promise to show more as displays come.
+        #if os(macOS)
+        let showsScreens = effective.screens == "all"
+        let screenAsk = showsScreens ? ScreenAsk.ofThisMac(mode: mode) : .none
+        #else
+        let showsScreens = false
+        let screenAsk = ScreenAsk.none
+        #endif
         // Capability gate (main-actor — screen APIs): only advertise HDR when this display can
         // actually present it, so the host sends a proper SDR stream to an SDR display rather than
         // BT.2020 PQ the panel would mis-tone-map. The display self-tone-maps HDR from the mastering
@@ -472,7 +480,7 @@ final class SessionModel: ObservableObject {
             #elseif os(visionOS)
                 return true // every Vision Pro display presents HDR
             #else
-                return UIScreen.main.potentialEDRHeadroom > 1.0
+                return NativeDisplay.screen.potentialEDRHeadroom > 1.0
             #endif
         }()
         Task.detached(priority: .userInitiated) {
@@ -503,15 +511,20 @@ final class SessionModel: ObservableObject {
                 audioRateHz: offer.audioRateHz, audioBits: offer.audioBits,
                 videoCodecs: offer.videoCodecs, preferredCodec: offer.preferredCodec,
                 clientCaps: offer.clientCaps, videoFit: offer.videoFit,
-                launchID: launchID,
+                launchID: launchID, profileID: profileID,
                 // Delegated approval: the host holds this connect open until the operator approves
                 // it (~180 s) — outwait that window so a slow approval still lands here. Normal
                 // connects keep the snappy default.
                 timeoutMs: requestAccess ? 185_000 : 10_000,
-                // The profile a network check left on this host's record; a host that does not
-                // read the ask streams as it always has.
-                deliveryProfile: UInt8(clamping: host.delivery ?? 0),
-                settings: effective) }
+                settings: effective,
+                screens: screenAsk, showsScreens: showsScreens,
+                onPending: { [weak self] in
+                    Task { @MainActor in
+                        guard let self, self.connectSeq == attempt, self.phase == .connecting
+                        else { return }
+                        self.onAwaitingApproval?(host)
+                    }
+                }) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 // The user may have abandoned this attempt (window closed, another host
@@ -542,10 +555,20 @@ final class SessionModel: ObservableObject {
                     // otherwise nothing here does. It would sit over the home screen until the
                     // next session, and on tvOS it makes the host grid unfocusable behind it.
                     self.revealStream()
+                    // true: the caller re-dials and says what it ends in.
+                    if case PunktfunkClientError.rejected(.profileUnknown, _) = error,
+                       onProfileUnknown?() == true {
+                        return
+                    }
+                    let wake = PunktfunkConnection.wakeRedialDelay(
+                        after: error, autoWake: self.lastDial?.autoWake ?? false,
+                        sinceFirst: self.sinceFirstWake)
+                    if self.redialWhileWaking(self.lastDial, after: wake) { return }
                     if let message = ConnectOffer.failureMessage(
                         error, hostName: host.displayName, pinned: pin != nil,
                         requestAccess: requestAccess, callerRecovers: onUnreachable != nil)
                     {
+                        self.redial = nil
                         self.errorMessage = message
                     } else {
                         // The caller owns recovery (wake-and-retry); its overlay explains it.
@@ -571,6 +594,7 @@ final class SessionModel: ObservableObject {
             + "shard=\(conn.shardPayload) compositor=\(conn.resolvedCompositor.rawValue) "
             + "gamepad=\(conn.resolvedGamepad.rawValue) mgmt=\(conn.hostMgmtPort)"
         sessionLog.info("\(landed, privacy: .public)")
+        redial = nil
         if trusted {
             connection = conn
             noteTouchFallback(conn)
@@ -612,9 +636,16 @@ final class SessionModel: ObservableObject {
             // The timer fires on `.main`, so the actor's executor is the main thread here.
             MainActor.assumeIsolated { self?.disconnect(deliberate: false) }
         }
-        backgroundTimer?.cancel()
-        backgroundTimer = timer
+        cancelBackgroundTimer()
+        resources.add(timer, stop: { timer.cancel() })
         timer.resume()
+    }
+
+    /// The keep-alive's auto-disconnect, the one dispatch source a session starts.
+    private func cancelBackgroundTimer() {
+        guard let timer: DispatchSourceTimer = resources.part() else { return }
+        timer.cancel()
+        resources.remove(timer)
     }
 
     /// Return to foreground: cancel the timeout, resume mic + video, and force a clean re-anchor —
@@ -624,8 +655,7 @@ final class SessionModel: ObservableObject {
         guard isBackgrounded else { return }
         isBackgrounded = false
         backgroundDeadline = nil
-        backgroundTimer?.cancel()
-        backgroundTimer = nil
+        cancelBackgroundTimer()
         applyMicMute() // back to the user's own choice — which may well still be "muted"
         if let conn = connection {
             conn.setVideoDropped(false)
@@ -656,57 +686,81 @@ final class SessionModel: ObservableObject {
     }
 
     /// Flip the user's mute. The in-stream surfaces (HUD button, Stream menu, ⌃⌥⇧A while
-    /// captured, the iOS mic disc) all land here.
+    /// captured, the iOS mic disc, the dial) all land here.
     func toggleMicMute() {
         setMicMuted(!micMuted)
     }
 
-    /// Set the user's mute directly (the badge's tap-to-unmute). Ignored when the session has no
-    /// microphone, so a stale surface can't leave a phantom "muted" badge over a session that was
-    /// never sending anything.
+    /// Set the user's mute, and say so for a moment in either direction. Ignored when the
+    /// session has no microphone, so a stale surface can't raise a "muted" notice over a
+    /// session that was never sending anything.
     func setMicMuted(_ muted: Bool) {
         guard micAvailable, micMuted != muted else { return }
         micMuted = muted
         applyMicMute()
+        flash(\.micMute, muted)
     }
 
-    /// A forwarded controller has a gyro this session cannot carry (see
-    /// `GamepadCapture.onMotionUnreachable`). Show it briefly, then let it go.
-    ///
-    /// Last pad wins, and its timer restarts: two such pads are the same one fact to a player, and
-    /// a second hint appearing under a still-visible first would only read as a stutter.
-    /// Raise `touchFallbackNotice` when the passthrough touch model meets a host without touch
-    /// injection — the same fallback `StreamLayerUIView` applies to the fingers themselves.
+    /// Show `value` in the notice at `slot` for `seconds`. Last one wins and its clock restarts:
+    /// a second hint under a still-visible first would only read as a stutter.
+    private func flash<Value>(
+        _ slot: WritableKeyPath<SessionNotices, Flash<Value>>, _ value: Value,
+        for seconds: UInt64 = SessionNotices.hintSeconds
+    ) {
+        notices[keyPath: slot].show(value, for: seconds) { [weak self] in
+            self?.notices[keyPath: slot].clear()
+        }
+    }
+
+    /// Say so when the passthrough touch model meets a host without touch injection — the same
+    /// fallback `StreamLayerUIView` applies to the fingers themselves.
     private func noteTouchFallback(_ conn: PunktfunkConnection) {
         #if os(iOS) || os(visionOS)
         guard TouchInputMode.current(conn.settings) == .touch, !conn.hostSupportsTouch else { return }
-        touchFallbackNotice = true
-        touchHintTimer?.cancel()
-        touchHintTimer = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
-            guard !Task.isCancelled else { return }
-            self?.touchFallbackNotice = false
-        }
+        flash(\.touchFallback, true)
         #endif
     }
 
-    /// Show the exit hint for `motionHintSeconds` at stream start, unless it is turned off.
-    private func noteStreamStart() {
-        exitHintTimer?.cancel()
-        guard UserDefaults.standard.object(forKey: DefaultsKey.exitHint) as? Bool ?? true else {
-            exitHintShown = false
-            return
-        }
-        exitHintShown = true
-        exitHintTimer = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
-            guard !Task.isCancelled else { return }
-            self?.exitHintShown = false
+    /// Hold the screen awake or hand it back, as "Keep screen awake" and the player's input
+    /// say. Each second while streaming; `beginStreaming` holds it first.
+    private func holdScreen(_ conn: PunktfunkConnection) {
+        guard phase == .streaming else { return }
+        let keepAwake = UserDefaults.standard.object(forKey: DefaultsKey.keepAwake) as? Bool
+            ?? SettingDefault.keepAwake
+        if conn.holdsScreenAwake(keepAwake: keepAwake) {
+            displaySleepGuard.acquire()
+        } else {
+            displaySleepGuard.release()
         }
     }
 
+    /// Show the exit hint at stream start, unless it is turned off. On macOS 26 with an
+    /// adaptive-sync panel, also the variable-refresh stutter notice, unless the player muted it.
+    private func noteStreamStart() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: DefaultsKey.exitHint) as? Bool ?? SettingDefault.exitHint {
+            flash(\.exitHint, true)
+        } else {
+            notices.exitHint.clear()
+        }
+        #if os(macOS)
+        notices.vrrWarning = StreamLayerView.warnsAboutVrr(
+            osMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+            adaptive: StreamLayerView.isAdaptiveSync(NSScreen.main),
+            muted: defaults.object(forKey: DefaultsKey.vrrWarningMuted) as? Bool
+                ?? SettingDefault.vrrWarningMuted)
+        #endif
+    }
+
+    /// Take the variable-refresh notice down; `forever` keeps it down across sessions.
+    func dismissVrrWarning(forever: Bool) {
+        notices.vrrWarning = false
+        if forever { UserDefaults.standard.set(true, forKey: DefaultsKey.vrrWarningMuted) }
+    }
+
     /// How to leave, in one line, for the input in hand: the pad chord when a controller is
-    /// forwarded, else this device's own way out.
+    /// forwarded, else this device's own way out. Touch passthrough reads no twist, so it
+    /// names the edge pull (`EdgeDial`) instead.
     var exitHintText: String {
         if connection?.settings.gamepadForwarding ?? true, !GCController.controllers().isEmpty {
             return "Hold L1 + R1 + Start + Select to leave"
@@ -716,37 +770,27 @@ final class SessionModel: ObservableObject {
         #elseif os(macOS)
         return "⌃⌥⇧D to leave"
         #else
-        return GCKeyboard.coalesced != nil
-            ? "⌃⌥⇧D to leave" : "Two-finger twist opens quick actions"
+        if GCKeyboard.coalesced != nil { return "⌃⌥⇧D to leave" }
+        return touchPassthrough
+            ? "Pull two fingers in from a side edge for quick actions"
+            : "Two-finger twist opens quick actions"
         #endif
     }
 
-    private func noteMotionUnreachable(_ kind: PunktfunkConnection.GamepadType) {
-        motionUnreachableKind = kind
-        motionHintTimer?.cancel()
-        motionHintTimer = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
-            guard !Task.isCancelled else { return }
-            self?.motionUnreachableKind = nil
-        }
+    /// Fingers reach the host as wire touches, so no twist opens the ring.
+    var touchPassthrough: Bool {
+        guard let conn = connection else { return false }
+        return TouchInputMode.current(conn.settings) == .touch && conn.hostSupportsTouch
     }
 
     /// The SC2 passthrough's claim/release edges (`Sc2Capture.onPhaseChange`, delivered on
-    /// main). A claim shows the badge briefly — motion-hint style; a release drops it at
-    /// once, because a badge still saying "passing through" over a released slot would be
-    /// exactly the silent lie the badge exists to prevent.
+    /// main). A claim shows the badge briefly; a release drops it at once; a refused open says
+    /// where the grant lives.
     private func noteSc2Phase(_ phase: Sc2Capture.Phase) {
-        sc2HintTimer?.cancel()
         switch phase {
-        case .captured:
-            sc2CapturedHint = true
-            sc2HintTimer = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
-                guard !Task.isCancelled else { return }
-                self?.sc2CapturedHint = false
-            }
-        case .released:
-            sc2CapturedHint = false
+        case .captured: flash(\.sc2Captured, true)
+        case .released: notices.sc2Captured.clear()
+        case .refused: flash(\.sc2Refused, true, for: SessionNotices.launchSeconds)
         }
     }
 
@@ -763,17 +807,18 @@ final class SessionModel: ObservableObject {
 
     /// Refresh the published access state from the connection's LIVE grants + countdown —
     /// called by the 1 Hz stats tick, which is also what makes a mid-session `AccessUpdate`
-    /// (a console edit) reach the chip and the capture gates within a second. The equality
-    /// guards keep a full-and-permanent session (every old host) from publishing anything.
+    /// (a console edit) reach the chip and the capture gates within a second. Every write is
+    /// guarded: `notices` publishes on any assignment, and a full-and-permanent session (every
+    /// old host) must publish nothing.
     private func updateAccessState() {
         guard let conn = connection else { return }
         let grants = conn.accessGrants
         let level = PunktfunkConnection.AccessLevel(grants: grants)
         let remaining = conn.accessExpiresInSeconds
-        if accessLevel != level { accessLevel = level }
-        if accessRemainingSecs != remaining { accessRemainingSecs = remaining }
+        if notices.accessLevel != level { notices.accessLevel = level }
+        if notices.accessRemainingSecs != remaining { notices.accessRemainingSecs = remaining }
         let limited = level != .fullControl || remaining != 0
-        if accessLimited != limited { accessLimited = limited }
+        if notices.accessLimited != limited { notices.accessLimited = limited }
         // A mid-session edit that removed BOTH input classes releases an engaged capture:
         // holding a frozen cursor and swallowed keys over input the host now drops is
         // exactly the "keyboard does nothing and nobody says why" failure §7 exists to
@@ -789,43 +834,29 @@ final class SessionModel: ObservableObject {
         // that extends the deadline back above a mark re-arms it.
         guard remaining != 0 else { return }
         if remaining > 300 {
-            accessWarned5m = false
-            accessWarned1m = false
-        } else if remaining > 60 {
-            accessWarned1m = false
-            if !accessWarned5m {
-                accessWarned5m = true
-                showAccessWarning("Access ends in \(Self.accessCountdown(remaining))")
+            // The 1 m latch never stands without the 5 m one.
+            if notices.accessWarned5m {
+                notices.accessWarned5m = false
+                notices.accessWarned1m = false
             }
-        } else if !accessWarned1m {
-            accessWarned1m = true
-            accessWarned5m = true
-            showAccessWarning("Access ends in under a minute")
+        } else if remaining > 60 {
+            if notices.accessWarned1m { notices.accessWarned1m = false }
+            if !notices.accessWarned5m {
+                notices.accessWarned5m = true
+                flash(\.accessWarning, "Access ends in \(Self.accessCountdown(remaining))")
+            }
+        } else if !notices.accessWarned1m {
+            notices.accessWarned1m = true
+            notices.accessWarned5m = true
+            flash(\.accessWarning, "Access ends in under a minute")
         }
     }
 
-    /// Put one warning toast up for a few seconds (the motion hint's pattern: last one wins,
-    /// its timer restarts, teardown cancels a pending clear).
-    private func showAccessWarning(_ text: String) {
-        accessWarning = text
-        accessWarningTimer?.cancel()
-        accessWarningTimer = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
-            guard !Task.isCancelled else { return }
-            self?.accessWarning = nil
-        }
-    }
-
-    /// Same transient contract as `showAccessWarning`, on its own timer so neither hides the other.
+    /// The host's launch line, once per verdict, on its own clock so it never hides the access
+    /// warning.
     private func showLaunchNotice(_ text: String) {
-        launchNoticeShown = text
-        launchNotice = text
-        launchNoticeTimer?.cancel()
-        launchNoticeTimer = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(Self.launchNoticeSeconds))
-            guard !Task.isCancelled else { return }
-            self?.launchNotice = nil
-        }
+        notices.launchShown = text
+        flash(\.launch, text, for: SessionNotices.launchSeconds)
     }
 
     /// "1 h 58 m" / "12 m" / "45 s" — the countdown wording the chip and the warnings share.
@@ -869,144 +900,54 @@ final class SessionModel: ObservableObject {
         disconnect()
     }
 
-    /// Tear the session down. `deliberate` (the default) means a user-initiated quit — signal
-    /// `disconnectQuit()` so the host skips the keep-alive linger; `sessionEnded()` (a host-ended /
-    /// dropped session) passes `false` to leave the linger intact.
+    /// Tear the session down: stop what it started, then reset `ui` whole. `deliberate` (the
+    /// default) means a user-initiated quit — signal `disconnectQuit()` so the host skips the
+    /// keep-alive linger; `sessionEnded()` (a host-ended / dropped session) passes `false` to
+    /// leave the linger intact.
     func disconnect(deliberate: Bool = true) {
+        if deliberate { redial = nil }
         if connection != nil {
             let line = "disconnect \(activeHost?.displayName ?? "-") deliberate=\(deliberate) phase=\(phase)"
             sessionLog.info("\(line, privacy: .public)")
         }
-        statsTimer?.invalidate()
-        statsTimer = nil
         // What this host has up is about to change, so the cards must ask again rather than wait
         // out the cache's TTL naming the game the user just left.
         if let host = activeHost { NowPlayingStore.shared.invalidate(host) }
-        // No-op when this session never reached `.streaming` (a refused/aborted connect).
-        displaySleepGuard.release()
-        // Drop any armed background keep-alive (incl. the timeout that just fired us).
-        backgroundTimer?.cancel()
-        backgroundTimer = nil
-        isBackgrounded = false
-        backgroundDeadline = nil
-        // The mic mute is per-session and never persisted: the next stream starts live (if the
-        // mic is enabled), rather than silently carrying a mute nobody remembers making.
-        micMuted = false
-        // Cancel before clearing: a pending clear firing into a torn-down session would be
-        // harmless but pointless, and leaving the hint set would carry it into the next stream.
-        motionHintTimer?.cancel()
-        motionHintTimer = nil
-        motionUnreachableKind = nil
-        exitHintTimer?.cancel()
-        exitHintTimer = nil
-        exitHintShown = false
-        touchHintTimer?.cancel()
-        touchHintTimer = nil
-        touchFallbackNotice = false
-        // Access state is per-session: back to the invisible full-and-permanent default, and
-        // no warning latch may carry into the next stream (same discipline as the mic mute).
-        accessWarningTimer?.cancel()
-        accessWarningTimer = nil
-        accessWarning = nil
-        launchNoticeTimer?.cancel()
-        launchNoticeTimer = nil
-        launchNotice = nil
-        launchNoticeShown = nil
-        accessLevel = .fullControl
-        accessRemainingSecs = 0
-        accessLimited = false
-        accessWarned5m = false
-        accessWarned1m = false
-        let audio = self.audio
-        self.audio = nil
-        // The virtual pad's slot goes the same way, while the connection is still up.
-        virtualPad?.close()
-        virtualPad = nil
-        virtualPadShown = false
-        // Gamepad capture is main-actor (releases held buttons on the wire while the
-        // connection is still up); the feedback drain joins off-main like audio.
-        gamepadCapture?.stop()
-        gamepadCapture = nil
-        // Android's teardown order: unhook the hidRaw sink first (no raw replay onto a dying
-        // capture), then the capture — its stop sends gamepadRemove and frees the wire index
-        // while the connection is still up. The feedback drain joins off-main below.
-        gamepadFeedback?.setHidRawSink(nil)
-        sc2Capture?.stop()
-        sc2Capture = nil
-        // The stop path CANNOT rely on the capture's `.released` edge: `sc2Capture = nil`
-        // above deallocates it before its main-queue release hop runs, so the weakly-held
-        // callback is already gone. Clear the badge directly — same cancel-before-clear
-        // discipline as the motion hint above, and same reason: a "passing through" badge
-        // carried into the next stream would be a lie about a session that no longer exists.
-        sc2HintTimer?.cancel()
-        sc2HintTimer = nil
-        sc2CapturedHint = false
-        #if os(tvOS)
-        remotePointer?.stop() // releases any held click while the connection is still up
-        remotePointer = nil
+        let conn = connection
+        #if os(macOS)
+        let closing = Self.closing
+        closing.enter()
         #endif
-        let feedback = gamepadFeedback
-        gamepadFeedback = nil
-        #if !os(tvOS)
-        let clipboard = clipboardSync
-        clipboardSync = nil
-        #endif
-        clipboardEnabled = false
-        if let conn = connection {
+        // Every part's main half now, while the connection is up; the joins, then the close,
+        // off-main. A deliberate quit must reach the host before the close.
+        resources.stop {
+            if deliberate { conn?.disconnectQuit() }
+            conn?.close()
             #if os(macOS)
-            let closing = Self.closing
-            closing.enter()
+            closing.leave()
             #endif
-            // Drain-thread teardown waits the pullers out and close() waits out in-flight
-            // polls + joins the Rust worker threads — keep all of it off the main actor,
-            // in this order (no poll left on any plane when the handle is freed).
-            Task.detached {
-                #if os(macOS)
-                defer { closing.leave() }
-                #endif
-                audio?.stop()
-                feedback?.stop()
-                #if !os(tvOS)
-                // Disables sync on the wire while the connection is still up — and on iOS pulls a
-                // host offer the user has not pasted yet down to real bytes, which needs that
-                // connection, so it must stay ahead of the close below.
-                clipboard?.stop()
-                #endif
-                // Deliberate user quit → tell the host to skip the keep-alive linger (must precede close).
-                if deliberate { conn.disconnectQuit() }
-                conn.close()
-            }
-        } else {
-            Task.detached {
-                audio?.stop()
-                feedback?.stop()
-                #if !os(tvOS)
-                clipboard?.stop()
-                #endif
-            }
         }
-        connection = nil
-        activeHost = nil
         // A user-ended stream that STARTED on a shelf goes back to it — the same rule a game
         // exit follows, because "I'm done with this game" arrives both ways. Gated on having
         // actually streamed, so a refused or cancelled dial still ends where it was raised
-        // from. `sessionEnded` has already set this for the paths it owns; it disconnects
-        // non-deliberately, so the two can never both fire.
+        // from. `sessionEnded` sets it for the paths it owns, and disconnects non-deliberately.
         if deliberate, phase == .streaming, let shelf = launchedShelf {
             returnToLibrary = shelf
         }
-        streamedGame = nil
+        // After the captures: the SC2 capture's `.released` edge never lands once it is
+        // deallocated, so the reset drops its badge, and no pending clear fires into the next.
+        notices.cancelTimers()
+        ui = SessionUI()
+        launchWatch?.cancel()
+        launchWatch = nil
+        connection = nil
+        activeHost = nil
         // Read by `sessionEnded` BEFORE it calls us, so clearing here can't rob it of the answer.
         launchedTitleID = nil
         launchedShelf = nil
-        revealStream()
-        phase = .idle
-        hudLines = []
         // Drop the previous session's grant too — the shared box outlives the session, and a new
         // link may never come up (a non-deadline rung has none at all).
         PresentLinkInfo.shared.clear()
-        mouseCaptured = false
-        resizing = false
         resizeIndicator = ResizeIndicator() // no stale target/timer into the next session
     }
 
@@ -1032,7 +973,20 @@ final class SessionModel: ObservableObject {
         let endLine = "session ended by \(name) reason=\(reason) "
             + "rejection=\(rejection.map { String(describing: $0) } ?? "-")"
         sessionLog.info("\(endLine, privacy: .public)")
+        // The streamed session proved the host's identity, so its redial is pinned to it.
+        let lostDial = lastDial.map { plan -> Redial in
+            var plan = plan
+            plan.host.pinnedSHA256 = conn.hostFingerprint
+            return plan
+        }
+        let wake = conn.wakeRedialDelay(
+            autoWake: lastDial?.autoWake ?? false, sinceFirst: sinceFirstWake)
         disconnect(deliberate: false) // host/network ended it — keep the linger for a reconnect
+        if redialWhileWaking(lastDial, after: wake) { return }
+        if reason == .lost, rejection == nil, let lostDial {
+            redialAfterLoss(lostDial)
+            return
+        }
         if let rejection {
             // The host's sentence, else the shared typed-rejection wording
             // ("Your access to this host has expired…").
@@ -1061,6 +1015,54 @@ final class SessionModel: ObservableObject {
         }
     }
 
+    /// Dial a lost session again on the schedule every client shares, with the dial that started
+    /// it; the host resumes the session it still holds. A redial that can't reach the host is the
+    /// next attempt, and a spent schedule says the connection is lost.
+    private func redialAfterLoss(_ plan: Redial) {
+        guard let wait = PunktfunkConnection.SessionEndReason.lost.redialDelay(attempt: plan.attempt)
+        else {
+            redial = nil
+            errorMessage = "Lost the connection to \(plan.host.displayName)"
+            return
+        }
+        var next = plan
+        next.attempt += 1
+        redial = next
+        sessionLog.info("connection lost — redial \(next.attempt) after \(wait, privacy: .public)")
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: wait)
+            guard let self, self.redial?.attempt == next.attempt, self.phase == .idle else { return }
+            self.connect(
+                to: next.host, effective: next.effective, gamepad: next.gamepad,
+                launchID: next.launchID, profileID: next.profileID, shelf: next.shelf,
+                onUnreachable: { [weak self] in self?.redialAfterLoss(next) })
+        }
+    }
+
+    /// Time since the host this dial is for first refused as a host still waking.
+    private var sinceFirstWake: Duration? { lastDial?.wakeSince.map { ContinuousClock.Instant.now - $0 } }
+
+    /// Dial `plan` again after `wait`, the core's answer for a woken host that answered before
+    /// it could stream. True when that redial is on its way; the connect overlay stays up for it,
+    /// and Cancel ends it. A refusal past the window shows as it always has.
+    private func redialWhileWaking(_ plan: Redial?, after wait: Duration?) -> Bool {
+        guard let wait, var next = plan else { return false }
+        next.wakeSince = next.wakeSince ?? .now
+        redial = next
+        let seq = connectSeq
+        sessionLog.info("host not ready to stream — dialing again after \(wait, privacy: .public)")
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: wait)
+            guard let self, self.connectSeq == seq, self.redial != nil, self.phase == .idle
+            else { return }
+            self.connect(
+                to: next.host, effective: next.effective, gamepad: next.gamepad,
+                launchID: next.launchID, profileID: next.profileID, shelf: next.shelf,
+                allowTofu: next.allowTofu, autoWake: next.autoWake, wakeSince: next.wakeSince)
+        }
+        return true
+    }
+
     /// Resize overlay START (main actor — from the Match-window follower's `onResizeTarget`): the
     /// window began differing from the live mode, so a `Reconfigure` toward `(width, height)` is
     /// imminent. Show the blur+spinner immediately, before the debounced request even leaves.
@@ -1080,18 +1082,15 @@ final class SessionModel: ObservableObject {
 
     /// The game this device launched that this stream plays (`RunningGame.streamedHere`): the
     /// ring's End game. Read from `/status` when the stream starts and when the ring opens.
-    @Published private(set) var streamedGame: RunningGame?
+    private(set) var streamedGame: RunningGame? { get { ui.streamedGame } set { ui.streamedGame = newValue } }
 
     /// Ask the host what this stream plays. Best-effort: a failed read keeps the last answer.
     func refreshStreamedGame() {
         guard let host = activeHost, !DemoMode.isDemo(host),
-              let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
-        let port = connection.map(\.hostMgmtPort).flatMap { $0 > 0 ? $0 : nil } ?? host.effectiveMgmtPort
+              case .success(let target) = MgmtTarget.make(host: host, port: connection?.hostMgmtPort)
+        else { return }
         Task { [weak self] in
-            let games = await LibraryClient.running(
-                address: host.address, port: port,
-                certPEM: identity.certPEM, keyPEM: identity.keyPEM,
-                hostFingerprint: host.pinnedSHA256)
+            let games = await LibraryClient.running(target)
             guard let self, self.activeHost?.id == host.id, self.phase == .streaming else { return }
             self.streamedGame = games.first(where: \.streamedHere)
         }
@@ -1100,13 +1099,10 @@ final class SessionModel: ObservableObject {
     /// End the streamed game on the host, then the stream. A refusal keeps the stream and says why.
     func endStreamedGame() {
         guard let game = streamedGame, let appID = game.appID, let host = activeHost,
-              let pin = host.pinnedSHA256,
-              let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
-        let port = connection.map(\.hostMgmtPort).flatMap { $0 > 0 ? $0 : nil } ?? host.effectiveMgmtPort
+              case .success(let target) = MgmtTarget.make(host: host, port: connection?.hostMgmtPort)
+        else { return }
         Task { [weak self] in
-            let outcome = await LibraryClient.endGame(
-                appID: appID, address: host.address, port: port,
-                certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
+            let outcome = await LibraryClient.endGame(appID: appID, on: target)
             guard let self, self.activeHost?.id == host.id else { return }
             if outcome.gameGone {
                 self.disconnect()
@@ -1139,8 +1135,8 @@ final class SessionModel: ObservableObject {
             }
             return
         }
-        let port = connection.map(\.hostMgmtPort).flatMap { $0 > 0 ? $0 : nil } ?? host.effectiveMgmtPort
-        guard let identity = (try? ClientIdentityStore.shared.load())?.identity else {
+        guard case .success(let target) = MgmtTarget.make(host: host, port: connection?.hostMgmtPort)
+        else {
             revealStream()
             return
         }
@@ -1148,10 +1144,7 @@ final class SessionModel: ObservableObject {
         launchWatch = Task { [weak self] in
             var began = Date()
             while !Task.isCancelled {
-                let status = await LibraryClient.status(
-                    address: host.address, port: port,
-                    certPEM: identity.certPEM, keyPEM: identity.keyPEM,
-                    hostFingerprint: host.pinnedSHA256)
+                let status = await LibraryClient.status(target)
                 let game = status.games.first { $0.appID == hold.id }
                 let state = game?.state
                 let download = status.downloads.first { $0.appID == hold.id }
@@ -1190,6 +1183,14 @@ final class SessionModel: ObservableObject {
         }
     }
 
+    /// Start what a trusted session runs: audio and the pads wait for the trust decision, so no
+    /// host sound, mic uplink or forwarded pad comes before it.
+    ///
+    /// `resources` stops the parts newest first, so they start here in the reverse of the
+    /// teardown order. On main, while the connection is up: `GamepadCapture` before
+    /// `Sc2Capture`, whose claim release would otherwise re-forward the SC2's twin onto a live
+    /// capture; then the remote pointer. Off-main: audio, the feedback drain, then the
+    /// clipboard, which still needs the connection, then the close.
     private func beginStreaming() {
         guard let conn = connection else { return }
         // Input capture itself is owned by StreamView (engaged by the captureEnabled
@@ -1198,11 +1199,21 @@ final class SessionModel: ObservableObject {
         watchLaunch()
         refreshStreamedGame()
         displaySleepGuard.acquire()
+        resources.add(displaySleepGuard, stop: displaySleepGuard.release)
         noteStreamStart()
-        // Audio starts with streaming, not during the trust prompt — no host sound (or
-        // mic uplink!) before the user trusted the host. Devices and the mic switch come from the
-        // session's resolved settings ("" = system default), so a preset that turns the mic on
-        // for work calls applies to the uplink too.
+        #if !os(tvOS)
+        // Opt-in per host, advertised by the host, and granted to this device (per-client access
+        // §5): the host would refuse an ungranted ask anyway, and not asking keeps the UI honest.
+        if activeHost?.clipboardSync == true, conn.hostSupportsClipboard, conn.canUseClipboard {
+            startClipboardSync(conn)
+        }
+        #endif
+        // The host's rumble, lightbar, player LEDs and triggers, back onto the pad each names.
+        let feedback = GamepadFeedback(connection: conn, manager: .shared)
+        feedback.start()
+        resources.add(feedback, join: { feedback.stop() })
+        // Devices and the mic switch come from the session's resolved settings ("" = system
+        // default), so a preset that turns the mic on applies to the uplink too.
         let audio = SessionAudio(connection: conn)
         audio.start(
             speakerUID: settings.speakerUID,
@@ -1212,25 +1223,41 @@ final class SessionModel: ObservableObject {
             // uplink at all — a capture the host would only drop is pure privacy downside.
             micEnabled: settings.micEnabled && conn.canUseMic,
             echoCancel: settings.echoCancel,
-            // The A/V sync reference: `endToEnd` is capture→on-glass, the one figure that says
-            // where the picture actually IS, and the audio ring steers its depth to land with it.
-            // The same meter object the presenter writes per presented frame, so audio reads the
-            // video plane's own measurement rather than a second estimate of it — and under the
-            // stage-1 fallback presenter, which stamps nothing, it stays empty and the loop
-            // correctly declines to correct.
+            spatialAudio: settings.spatialAudio,
+            // The A/V sync reference: the presenter's own capture→on-glass meter. The stage-1
+            // fallback stamps nothing, so the loop then declines to correct.
             videoLatency: endToEnd)
-        self.audio = audio
-        // Gamepads: forward every controller GamepadManager selected — each on its own wire pad
-        // index (a pin forwards only one, Automatic forwards all) — and render the host's feedback
-        // back to the pad it's addressed to (rumble always; lightbar/player-LEDs/adaptive-triggers
-        // when a pad's virtual device is a DualSense). Same trust gate as audio — nothing is
-        // forwarded during the trust prompt.
-        // `gamepadForwarding` off means the host gets this device's pads from somewhere else
-        // (USB passthrough, or a pad plugged into the host) — capture still runs, and still
-        // watches for the escape chord, but puts nothing on the wire.
-        // System-button routing: whether raw guide/share presses ride the wire, and whether
-        // hold-Select arms as the alternate guide route (auto = on everywhere but macOS —
-        // iOS reserves the physical Home press, tvOS never delivers it).
+        resources.add(audio, join: { audio.stop() })
+        #if os(tvOS)
+        let pointer = SiriRemotePointer(connection: conn)
+        pointer.onDisconnectRequest = { [weak self] in self?.disconnect() }
+        // The remote's short Back is the ring's opener on tvOS — the same hook the pad chord
+        // uses, so the view wires one closure for both.
+        pointer.onShortBack = { [weak self] in self?.onRingChord?(nil) }
+        pointer.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
+        pointer.start()
+        resources.add(pointer, stop: pointer.stop)
+        #endif
+        // Steam Controller 2 as-is passthrough (opt-in, gated like Android and on the controller
+        // grant): its raw reports go to the host, and Steam's writes come back through the
+        // feedback's hidRaw sink. The wire slot is claimed on the first state report.
+        if settings.sc2Capture, settings.gamepadForwarding, conn.canSendGamepad {
+            Sc2Capture.holdTwins(manager: .shared) // before GamepadCapture forwards a twin
+            let sc2 = Sc2Capture(connection: conn, manager: .shared)
+            // A captured SC2's raw feed bypasses GC, so it brings its own escape chord.
+            sc2.onDisconnectRequest = { [weak self] in self?.disconnect() }
+            // The ring's pad path, the same two hooks GamepadCapture gets below.
+            sc2.onRingChord = { [weak self] in self?.onRingChord?(nil) }
+            sc2.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
+            // Claim/release → the bottom-stack badge (the capture's only UI surface).
+            sc2.onPhaseChange = { [weak self] phase in self?.noteSc2Phase(phase) }
+            feedback.setHidRawSink(sc2.onHidRaw)
+            sc2.start()
+            // The sink goes first: no raw replay onto a dying capture.
+            resources.add(sc2, stop: { feedback.setHidRawSink(nil); sc2.stop() })
+        }
+        // Every controller GamepadManager selected, each on its own wire pad. With forwarding
+        // off the host gets the pads elsewhere: capture still watches for the escape chord.
         let capture = GamepadCapture(
             connection: conn, manager: .shared, forwarding: settings.gamepadForwarding,
             systemForward: settings.systemButtonsForward,
@@ -1240,74 +1267,26 @@ final class SessionModel: ObservableObject {
         capture.onDisconnectRequest = { [weak self] in self?.disconnect() }
         // A pad with a gyro that this session cannot carry — say so once, briefly, and name the
         // setting that fixes it. Already main-actor (GamepadCapture fires it there).
-        capture.onMotionUnreachable = { [weak self] kind in self?.noteMotionUnreachable(kind) }
+        capture.onMotionUnreachable = { [weak self] kind in self?.flash(\.motionUnreachable, kind) }
         capture.onRingChord = { [weak self] pad in self?.onRingChord?(pad) }
         capture.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
         capture.start()
-        gamepadCapture = capture
-        let feedback = GamepadFeedback(connection: conn, manager: .shared)
-        feedback.start()
-        gamepadFeedback = feedback
         capture.onOwnershipChange = { [weak feedback] owned in feedback?.setSilenced(!owned) }
-        // Steam Controller 2 as-is passthrough (opt-in): capture an OS-paired SC2's vendor GATT
-        // service and forward its raw reports — the host mirrors a real 28DE:1302 that its
-        // Steam drives directly, and Steam's rumble/settings writes come back through the
-        // feedback drain's hidRaw sink onto the physical controller. Gated like Android
-        // (StreamScreen's `sc2Capture && gamepadForwarding`); started after GamepadFeedback so
-        // the sink's drain is already up. The wire slot is claimed lazily on the first state
-        // report, so an absent controller costs nothing but the 2 s acquisition poll.
-        // Also grant-gated (per-client access §7, the clipboard's "not asking keeps the UI
-        // honest" rule): in a controller-excluded session the connection would silently drop
-        // the arrival and every report — holding the BLE radio, claiming a wire slot, and
-        // showing a "passing through" badge for a passthrough that cannot happen. A grant
-        // added mid-session engages on the next stream, exactly like the clipboard.
-        if settings.sc2Capture, settings.gamepadForwarding, conn.canSendGamepad {
-            let sc2 = Sc2Capture(connection: conn, manager: .shared)
-            // The same escape-chord contract as GamepadCapture — a captured SC2's raw feed
-            // bypasses GC entirely, so it brings its own way out of the stream.
-            sc2.onDisconnectRequest = { [weak self] in self?.disconnect() }
-            // The ring's pad path, the same two hooks GamepadCapture gets above.
-            sc2.onRingChord = { [weak self] in self?.onRingChord?(nil) }
-            sc2.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
-            // Claim/release → the bottom-stack badge (the capture's only UI surface).
-            sc2.onPhaseChange = { [weak self] phase in self?.noteSc2Phase(phase) }
-            feedback.setHidRawSink(sc2.onHidRaw)
-            sc2.start()
-            sc2Capture = sc2
-        }
-        #if !os(tvOS)
-        // Shared clipboard: opt-in per host AND host-advertised (older hosts / operator-disabled
-        // hosts never see a ClipControl) AND granted to this device (per-client access §5 —
-        // without the bit the host would refuse with CLIP_REASON_NOT_PERMITTED anyway; not
-        // asking keeps the UI honest). Same trust gate as audio — nothing is announced
-        // during the trust prompt.
-        if activeHost?.clipboardSync == true, conn.hostSupportsClipboard, conn.canUseClipboard {
-            startClipboardSync(conn)
-        }
-        #endif
-        #if os(tvOS)
-        let pointer = SiriRemotePointer(connection: conn)
-        pointer.onDisconnectRequest = { [weak self] in self?.disconnect() }
-        // The remote's short Back is the ring's opener on tvOS — the same hook the pad chord
-        // uses, so the view wires one closure for both.
-        pointer.onShortBack = { [weak self] in self?.onRingChord?(nil) }
-        pointer.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
-        pointer.start()
-        remotePointer = pointer
-        #endif
+        resources.add(capture, stop: capture.stop)
     }
 
     #if !os(tvOS)
     /// Create + start the session's clipboard bridge and route its host acks into the published
     /// UI state. `ClipboardSync.start()` sends the enable; the host's `.state` answer flips
-    /// `clipboardEnabled`, or leaves it false.
+    /// `clipboardEnabled`, or leaves it false. Its stop disables sync on the wire and, on iOS,
+    /// pulls an unpasted host offer down to bytes, so it joins before the connection closes.
     private func startClipboardSync(_ conn: PunktfunkConnection) {
         let sync = ClipboardSync(connection: conn)
         sync.onState = { [weak self] enabled, _, _ in
             Task { @MainActor in self?.clipboardEnabled = enabled }
         }
         sync.start()
-        clipboardSync = sync
+        resources.add(sync, join: { sync.stop() })
     }
     #endif
 
@@ -1318,7 +1297,7 @@ final class SessionModel: ObservableObject {
         #if !os(tvOS)
         guard let conn = connection, phase == .streaming else { return }
         if let sync = clipboardSync {
-            clipboardSync = nil
+            resources.remove(sync)
             clipboardEnabled = false
             Task.detached { sync.stop() }
         } else if conn.hostSupportsClipboard, conn.canUseClipboard {
@@ -1349,7 +1328,8 @@ final class SessionModel: ObservableObject {
                 // readout also walks the countdown and picks up mid-session grant edits.
                 self.updateAccessState()
                 guard let conn = self.connection else { return }
-                if let notice = conn.launchNotice, notice != self.launchNoticeShown {
+                self.holdScreen(conn)
+                if let notice = conn.launchNotice, notice != self.notices.launchShown {
                     self.showLaunchNotice(notice)
                 }
                 let (frames, _) = self.meter.drain()
@@ -1372,7 +1352,7 @@ final class SessionModel: ObservableObject {
         }
         // .common so the HUD keeps updating during window drags / menu tracking.
         RunLoop.main.add(timer, forMode: .common)
-        statsTimer = timer
+        resources.add(timer, stop: timer.invalidate)
     }
 
     /// Re-format the overlay from the last drained window: each second, and at once on a tier
@@ -1387,13 +1367,14 @@ final class SessionModel: ObservableObject {
         if lines != hudLines { hudLines = lines } // an unchanged overlay must not re-render
     }
 
-    /// What only the app knows: the floor policy (macOS presents straight to the display, so
-    /// nothing is shaved there), this app's audio ring, the preset, and the Apple-only lines.
+    /// What only the app knows: the floor policy, this app's audio ring, the preset, and the
+    /// Apple-only lines. Display and end-to-end charge what the client controls. The deadline
+    /// link's pick → glass lead is pipeline depth no client paces under, so it comes off both
+    /// and Detailed names it, as on Android. macOS presents straight to the display and feeds
+    /// no floor, so nothing is shaved there.
     private func hudFacts() -> PunktfunkConnection.HudFacts {
         var f = PunktfunkConnection.HudFacts()
-        #if os(macOS)
-        f.shaveOsFloor = false
-        #else
+        #if !os(macOS)
         f.shaveOsFloor = true
         #endif
         if let a = audio?.stats {

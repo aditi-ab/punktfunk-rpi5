@@ -41,6 +41,23 @@ public enum RenderScale {
         return min(max(raw, range.lowerBound), range.upperBound)
     }
 
+    /// A typed percent as a multiplier, sanitized. A percent, because whole percents keep every
+    /// client storing the same hundredths. Mirrors core's `from_percent`.
+    public static func fromPercent(_ percent: Int) -> Double {
+        sanitize(Double(percent) / 100)
+    }
+
+    /// The whole percent a stored multiplier reads as.
+    public static func percent(_ scale: Double) -> Int {
+        Int((sanitize(scale) * 100).rounded())
+    }
+
+    /// Which of `presets` a stored multiplier is; nil for a typed one. Compared in hundredths: a
+    /// client that stores a float reads 0.67 back as 0.6700000167.
+    public static func presetIndex(_ scale: Double) -> Int? {
+        presets.firstIndex { abs($0 - scale) < 0.005 }
+    }
+
     /// Apply `scale` to a base pixel size, preserving aspect, even-flooring each axis, and clamping
     /// uniformly so neither axis exceeds `maxDimension` (the larger axis lands on the cap, the ratio
     /// is kept). Also floors each axis at `minWidth`/`minHeight` (the host never accepts < 320×200).

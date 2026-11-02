@@ -1,0 +1,170 @@
+//! What a session pressed and has not released. The injector outlives every session, so a
+//! client that vanishes mid-press leaves the button, key or finger latched for the next one
+//! (Mutter keeps the implicit grab; the Windows touch refresher re-injects a held contact).
+
+use punktfunk_core::input::{InputEvent, InputKind};
+use std::collections::{HashMap, HashSet};
+
+/// Per kind. A flood of never-released codes cannot grow the sets; codes past it stay latched.
+const MAX_HELD: usize = 256;
+
+/// Fed every event on its way to the injector; [`Self::release`] at session end.
+#[derive(Clone, Default)]
+pub struct HeldInput {
+    buttons: HashSet<u32>,
+    /// Code → the press's [`crate::KEY_FLAG_SEMANTIC_VK`]: the release resolves a semantic key
+    /// through the host layout, a positional one through the fixed table.
+    keys: HashMap<u32, u32>,
+    touch: HashSet<u32>,
+}
+
+impl HeldInput {
+    /// Record `ev`; `true` when it changes what is held. A down for a code already held, an up
+    /// for one that is not, a down past the cap and every other kind are `false`.
+    pub fn note(&mut self, ev: &InputEvent) -> bool {
+        match ev.kind {
+            InputKind::KeyDown
+                if self.keys.len() < MAX_HELD || self.keys.contains_key(&ev.code) =>
+            {
+                return self
+                    .keys
+                    .insert(ev.code, ev.flags & crate::KEY_FLAG_SEMANTIC_VK)
+                    .is_none();
+            }
+            InputKind::KeyDown => return false,
+            InputKind::KeyUp => return self.keys.remove(&ev.code).is_some(),
+            _ => {}
+        }
+        let (set, down) = match ev.kind {
+            InputKind::MouseButtonDown => (&mut self.buttons, true),
+            InputKind::MouseButtonUp => (&mut self.buttons, false),
+            // Only an Up ends a contact: the refresher defeats Windows' own staleness lift.
+            InputKind::TouchDown => (&mut self.touch, true),
+            // Windows opens a contact on a move whose Down was lost, so a move holds one there.
+            #[cfg(windows)]
+            InputKind::TouchMove => (&mut self.touch, true),
+            InputKind::TouchUp => (&mut self.touch, false),
+            _ => return false,
+        };
+        if down {
+            set.len() < MAX_HELD && set.insert(ev.code)
+        } else {
+            set.remove(&ev.code)
+        }
+    }
+
+    /// The key codes held, in no order.
+    pub fn keys(&self) -> impl Iterator<Item = u32> + '_ {
+        self.keys.keys().copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buttons.is_empty() && self.keys.is_empty() && self.touch.is_empty()
+    }
+
+    /// The matching up for everything still held; leaves nothing held.
+    pub fn release(&mut self) -> Vec<InputEvent> {
+        self.release_classes(true, true)
+    }
+
+    /// [`Self::release`] for keys and/or pointer (buttons and touches): a session that loses
+    /// one grant mid-press keeps what the other holds.
+    pub fn release_classes(&mut self, keys: bool, pointer: bool) -> Vec<InputEvent> {
+        let up = |kind, code| InputEvent {
+            kind,
+            _pad: [0; 3],
+            code,
+            x: 0,
+            y: 0,
+            flags: 0,
+        };
+        let mut out = Vec::new();
+        if pointer {
+            out.extend(
+                self.buttons
+                    .drain()
+                    .map(|c| up(InputKind::MouseButtonUp, c)),
+            );
+        }
+        if keys {
+            out.extend(self.keys.drain().map(|(c, flags)| InputEvent {
+                flags,
+                ..up(InputKind::KeyUp, c)
+            }));
+        }
+        if pointer {
+            out.extend(self.touch.drain().map(|c| up(InputKind::TouchUp, c)));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(kind: InputKind, code: u32) -> InputEvent {
+        InputEvent {
+            kind,
+            _pad: [0; 3],
+            code,
+            x: 0,
+            y: 0,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn a_withdrawn_class_lets_go_of_its_own_only() {
+        let mut held = HeldInput::default();
+        held.note(&ev(InputKind::KeyDown, 30));
+        held.note(&ev(InputKind::MouseButtonDown, 1));
+        let ups = held.release_classes(true, false);
+        assert_eq!(ups.len(), 1);
+        assert!(matches!(ups[0].kind, InputKind::KeyUp));
+        let ups = held.release();
+        assert_eq!(ups.len(), 1);
+        assert!(matches!(ups[0].kind, InputKind::MouseButtonUp));
+    }
+
+    #[test]
+    fn only_what_is_still_down_is_released_once() {
+        let mut held = HeldInput::default();
+        for e in [
+            ev(InputKind::MouseButtonDown, 1),
+            ev(InputKind::MouseButtonDown, 3),
+            ev(InputKind::MouseButtonUp, 1),
+            ev(InputKind::KeyDown, 42),
+            ev(InputKind::TouchDown, 7),
+            ev(InputKind::MouseMove, 0),
+        ] {
+            held.note(&e);
+        }
+        let mut ups: Vec<_> = held.release().iter().map(|e| (e.kind, e.code)).collect();
+        ups.sort_by_key(|&(k, c)| (k as u8, c));
+        assert_eq!(
+            ups,
+            [
+                (InputKind::KeyUp, 42),
+                (InputKind::MouseButtonUp, 3),
+                (InputKind::TouchUp, 7)
+            ]
+        );
+        assert!(held.is_empty());
+        assert!(held.release().is_empty());
+    }
+
+    /// A semantic press releases semantically, or a non-US layout lifts a different scancode.
+    #[test]
+    fn a_held_key_releases_with_its_semantic_flag() {
+        let mut held = HeldInput::default();
+        held.note(&InputEvent {
+            flags: crate::KEY_FLAG_SEMANTIC_VK | 1,
+            ..ev(InputKind::KeyDown, 0x5A)
+        });
+        held.note(&ev(InputKind::KeyDown, 0x41));
+        let mut ups: Vec<_> = held.release().iter().map(|e| (e.code, e.flags)).collect();
+        ups.sort();
+        assert_eq!(ups, [(0x41, 0), (0x5A, crate::KEY_FLAG_SEMANTIC_VK)]);
+    }
+}

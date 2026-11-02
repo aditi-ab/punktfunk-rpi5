@@ -98,21 +98,52 @@ describe("S2 — JSON Schema derivation for __config", () => {
 		});
 	});
 
-	test("annotations pass through — they are the ONLY source of labels and defaults", () => {
+	test("annotations pass through — they are the ONLY source of labels", () => {
 		const p = props();
 		expect(p.enabled.title).toBe("Enable scanning");
 		expect(p.enabled.description).toBe(
 			"Whether this source contributes titles.",
 		);
-		// The derivation does NOT infer `default` from withDecodingDefaultKey, so an un-annotated
-		// field shows the form no placeholder at all. Annotate every field.
 		expect(p.enabled.default).toBe(true);
 		expect(p.artSource.default).toBe("both");
-		// A CHECKED schema (Int is String-plus-a-check) nests its annotations under `allOf`, so a
-		// form reading `default` must merge allOf branches rather than only looking at the top level.
-		expect(p.pollMinutes.allOf).toEqual([
-			{ default: 15, title: "Poll interval (minutes)" },
-		]);
+		// A CHECKED schema (Int is String-plus-a-check) keeps its annotations on the property itself.
+		expect(p.pollMinutes).toMatchObject({
+			default: 15,
+			title: "Poll interval (minutes)",
+		});
+	});
+
+	test("a decoding default is the form's `default`, over an annotated one", () => {
+		const omit = { encodingStrategy: "omit" } as const;
+		const p = (
+			deriveConfigJsonSchema(
+				Schema.Struct({
+					on: Schema.Boolean.pipe(
+						Schema.withDecodingDefaultKey(Effect.succeed(true), omit),
+					),
+					stale: Schema.Boolean.annotate({ default: false }).pipe(
+						Schema.withDecodingDefaultKey(Effect.succeed(true), omit),
+					),
+					root: Schema.optionalKey(Schema.String.annotate({ default: "/g" })),
+				}),
+			) as { schema: { properties: Record<string, Record<string, unknown>> } }
+		).schema.properties;
+		// Unset in the file, a box the form showed clear would be on in the plugin.
+		expect(p.on.default).toBe(true);
+		expect(p.stale.default).toBe(true);
+		expect(p.root.default).toBe("/g");
+		expect(props().extraRoots.default).toEqual([]);
+	});
+
+	test("a key with no default still derives", () => {
+		const doc = deriveConfigJsonSchema(
+			Schema.Struct({
+				name: Schema.String,
+				on: Schema.Boolean.annotate({ default: true }),
+			}),
+		) as { schema: { properties: Record<string, Record<string, unknown>> } };
+		expect(doc.schema.properties.on.default).toBe(true);
+		expect(doc.schema.properties.name.default).toBeUndefined();
 	});
 
 	test("a decoding default is an Effect, not a thunk — and it actually applies", () => {

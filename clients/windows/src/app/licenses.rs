@@ -1,9 +1,9 @@
 //! Static screen: the app's own license + the third-party software notices (reached from
 //! Settings).
 
-use super::lucide;
 use super::style::*;
-use super::{AppCtx, Screen};
+use super::{AppCtx, AsyncSetState, Screen};
+use pf_fluent::{Palette, Token};
 use std::sync::Arc;
 use windows_reactor::*;
 
@@ -22,10 +22,13 @@ const APP_LICENSE: &str = concat!(
 /// — a false statement to the user's face, three lines under a card saying otherwise.
 const THIRD_PARTY_NOTICES: &str = include_str!("../../THIRD-PARTY-NOTICES.txt");
 
-pub(crate) fn licenses_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Element {
-    let back_btn = button("Back")
-        .accent()
-        .icon(lucide::icon("arrow-left"))
+pub(crate) fn licenses_page(
+    pal: &Palette,
+    ctx: &Arc<AppCtx>,
+    set_screen: &AsyncSetState<Screen>,
+) -> View {
+    let back_btn = icon_button("arrow-left", "Back")
+        .style(ButtonStyle::Accent)
         .on_click({
             let (c, ss) = (ctx.clone(), set_screen.clone());
             move || {
@@ -38,53 +41,59 @@ pub(crate) fn licenses_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen
 
     let app_card = card(
         vstack((
-            text_block("Punktfunk").font_size(15.0).semibold(),
-            text_block("Licensed under MIT OR Apache-2.0, at your option.")
+            text("Punktfunk")
+                .font_size(15.0)
+                .font_weight(FontWeight::SEMI_BOLD),
+            text("Licensed under MIT OR Apache-2.0, at your option.")
                 .font_size(12.0)
-                .wrap()
-                .foreground(ThemeRef::SecondaryText),
-            text_block(APP_LICENSE)
+                .text_wrapping(TextWrapping::Wrap)
+                .foreground(pal.get(Token::SecondaryText)),
+            text(APP_LICENSE)
                 .font_size(11.0)
-                .wrap()
-                .foreground(ThemeRef::SecondaryText),
+                .text_wrapping(TextWrapping::Wrap)
+                .foreground(pal.get(Token::SecondaryText)),
         ))
         .spacing(8.0),
     );
 
     let natives_card = card(
         vstack((
-            text_block("Bundled components").font_size(15.0).semibold(),
-            text_block(
+            text("Bundled components")
+                .font_size(15.0)
+                .font_weight(FontWeight::SEMI_BOLD),
+            text(
                 "SDL 3 (Zlib) and the Windows App SDK (Microsoft) are linked; their notices ship \
                  in the installed licenses\\ folder. Video decoding uses Windows' own DXVA and \
                  Vulkan Video, with OpenH264 and rav1d (both BSD-2-Clause) as the CPU fallback — \
                  no FFmpeg is bundled.",
             )
             .font_size(12.0)
-            .wrap()
-            .foreground(ThemeRef::SecondaryText),
+            .text_wrapping(TextWrapping::Wrap)
+            .foreground(pal.get(Token::SecondaryText)),
         ))
         .spacing(8.0),
     );
 
     let notices_card = card(
         vstack((
-            text_block("Rust crates").font_size(15.0).semibold(),
-            text_block(THIRD_PARTY_NOTICES)
+            text("Rust crates")
+                .font_size(15.0)
+                .font_weight(FontWeight::SEMI_BOLD),
+            text(THIRD_PARTY_NOTICES)
                 .font_size(11.0)
-                .wrap()
-                .foreground(ThemeRef::SecondaryText),
+                .text_wrapping(TextWrapping::Wrap)
+                .foreground(pal.get(Token::SecondaryText)),
         ))
         .spacing(8.0),
     );
 
     page(vec![
         page_header("Third-party licenses", back_btn),
-        section("PUNKTFUNK"),
+        section(pal, "PUNKTFUNK"),
         app_card.into(),
-        section("BUNDLED"),
+        section(pal, "BUNDLED"),
         natives_card.into(),
-        section("OPEN SOURCE"),
+        section(pal, "OPEN SOURCE"),
         notices_card.into(),
     ])
 }

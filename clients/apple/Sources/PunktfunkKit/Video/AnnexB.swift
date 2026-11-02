@@ -83,7 +83,12 @@ public enum AnnexB {
             var i = 0
             var start = -1
             while i + 2 < count {
-                if base[i] == 0, base[i + 1] == 0, base[i + 2] == 1 {
+                // A code ends in 01: a third byte above 1 rules out a code starting at any
+                // of these three positions, so the walk skips them. Most payload bytes do.
+                let third = base[i + 2]
+                if third > 1 {
+                    i += 3
+                } else if third == 1, base[i] == 0, base[i + 1] == 0 {
                     var codeStart = i
                     while codeStart > 0, base[codeStart - 1] == 0 {
                         codeStart -= 1
@@ -214,12 +219,18 @@ public enum AnnexB {
         return out
     }
 
-    /// Wrap one AU as a decode-ready CMSampleBuffer. The AVCC form is packed directly into
-    /// the CMBlockBuffer's allocation, with no intermediate Data. One scan finds the payload
-    /// NALs and sizes the block; the pack copies from the ranges it found.
+    /// Wrap one AU as a decode-ready CMSampleBuffer. An AU in `pool` is rewritten where it lies
+    /// when it can be (`sampleInPlace`); otherwise the AVCC form is packed directly into the
+    /// CMBlockBuffer's allocation, with no intermediate Data: one scan finds the payload NALs
+    /// and sizes the block, the pack copies from the ranges it found.
     public static func sampleBuffer(
-        au: AccessUnit, format: CMVideoFormatDescription, codec: VideoCodec
+        au: AccessUnit, format: CMVideoFormatDescription, codec: VideoCodec,
+        in pool: AccessUnitSlotPool? = nil
     ) -> CMSampleBuffer? {
+        if let pool, let placed = au.inPlace,
+           let sample = sampleInPlace(au: au, placed: placed, pool: pool, format: format, codec: codec) {
+            return sample
+        }
         var payload: [Range<Int>] = []
         payload.reserveCapacity(8)
         var total = 0
@@ -250,5 +261,45 @@ public enum AnnexB {
                 }
             }
         }
+    }
+
+    /// The AVCC form written over the AU in its pool slot: each start code becomes its NAL's
+    /// length, and the sample's block is the slot. Needs every start code 4 bytes long (a NAL
+    /// behind a 3-byte code has no room for its length) and no parameter-set NAL (those stay
+    /// out of the sample, which only the repack can do). nil = repack.
+    private static func sampleInPlace(
+        au: AccessUnit, placed: AccessUnit.InPlace, pool: AccessUnitSlotPool,
+        format: CMVideoFormatDescription, codec: VideoCodec
+    ) -> CMSampleBuffer? {
+        guard let slotStart = pool.slotStart(placed.token), placed.offset >= slotStart,
+              placed.count <= slotStart + pool.capacity - placed.offset
+        else { return nil }
+        var nals: [Range<Int>] = []
+        nals.reserveCapacity(8)
+        var previousEnd = 0
+        var fits = true
+        forEachNAL(in: au.data) { base, range in
+            // The code is what lies between the previous NAL's end and this one's start: a
+            // longer run means a 3-byte code plus trailing zeros, or zero bytes the repack drops.
+            guard range.lowerBound - previousEnd == 4, !codec.isParameterSet(base[range.lowerBound])
+            else {
+                fits = false
+                return false
+            }
+            nals.append(range)
+            previousEnd = range.upperBound
+            return true
+        }
+        guard fits, !nals.isEmpty, previousEnd == placed.count else { return nil }
+        let base = pool.pointer(placed.offset)
+        for range in nals {
+            var len = UInt32(range.count).bigEndian
+            withUnsafeBytes(of: &len) {
+                base.advanced(by: range.lowerBound - 4).copyMemory(from: $0.baseAddress!, byteCount: 4)
+            }
+        }
+        return SamplePack.sample(
+            in: pool, token: placed.token, offset: placed.offset, length: placed.count,
+            ptsNs: au.ptsNs, format: format)
     }
 }

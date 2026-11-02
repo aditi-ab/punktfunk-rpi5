@@ -1,14 +1,25 @@
+import type { PAGE_SEGMENT } from "@punktfunk/plugin-kit/wire";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { toast } from "@unom/ui/toast";
+import { ExternalLink } from "lucide-react";
 import { type FC, useState } from "react";
 import type { PluginSummary } from "@/api/gen/model";
+import {
+	pluginSurface,
+	pluginSurfaceOrThrow,
+	refusalText,
+} from "@/api/pluginSurface";
 import { gamePlugins, usePlugins } from "@/api/plugins";
+import { usePluginsReachable } from "@/api/seat";
+import { PasswordConfirmDialog } from "@/components/password-confirm";
 import {
 	type JsonObject,
 	type JsonSchemaDoc,
 	SchemaForm,
 } from "@/components/schema-form";
 import { Button } from "@/components/ui/button";
+import { newlyHanded } from "@/lib/handed-paths";
 import { m } from "@/paraglide/messages";
 import { Group } from "./fields";
 import type { PluginTabSpec } from "./view";
@@ -22,7 +33,14 @@ interface Section {
 	schema: JsonSchemaDoc | null;
 	value: JsonObject | null;
 	status?: StatusLine[];
+	/** The entry's route in the plugin's own page. */
+	page?: string;
 }
+
+/** One segment the plugin route carries; the kit drops anything else, and so does this. Typed
+ * as the kit's own rule, so tsc fails when the two differ. */
+const PAGE: typeof PAGE_SEGMENT = "^[A-Za-z0-9._~-]{1,200}$";
+const PAGE_RE = new RegExp(PAGE);
 
 type Loaded =
 	| { tag: "ready"; section: Section }
@@ -39,26 +57,20 @@ const sectionKey = (plugin: string, entry: string) => [
 ];
 
 async function loadSection(plugin: string, entry: string): Promise<Loaded> {
-	const res = await fetch(sectionUrl(plugin, entry), {
-		credentials: "same-origin",
-	});
-	const body = (await res.json().catch(() => null)) as
-		| (Section & { error?: string; issue?: string; noSection?: boolean })
-		| null;
-	if (res.status === 404 && body?.noSection) return { tag: "none" };
-	if (!res.ok) {
-		return {
-			tag: "offline",
-			issue: body?.issue ?? body?.error ?? `${res.status}`,
-		};
+	const r = await pluginSurface<Section | null>(sectionUrl(plugin, entry));
+	if (r.ok) {
+		return { tag: "ready", section: r.body ?? { schema: null, value: {} } };
 	}
-	return { tag: "ready", section: body ?? { schema: null, value: {} } };
+	if (r.status === 404 && r.body?.noSection) return { tag: "none" };
+	return { tag: "offline", issue: refusalText(r.body) };
 }
 
 /** A tab per plugin with a section for this entry. A plugin that answers "none" adds no tab. */
 export function usePluginTabs(entryId: string | null): PluginTabSpec[] {
 	const { data } = usePlugins();
-	const plugins = entryId ? gamePlugins(data) : [];
+	const reachable = usePluginsReachable();
+	// A plugin's section is read from a plugin runner the console reaches.
+	const plugins = entryId && reachable ? gamePlugins(data) : [];
 	const results = useQueries({
 		queries: plugins.map((p) => ({
 			queryKey: sectionKey(p.id, entryId ?? ""),
@@ -88,6 +100,8 @@ const PluginTab: FC<{
 	const [draft, setDraft] = useState<JsonObject | null>(stored);
 	const [saving, setSaving] = useState(false);
 	const [refused, setRefused] = useState<{ path: string; error: string }[]>([]);
+	// A save that hands a folder over waits for the console password.
+	const [asking, setAsking] = useState(false);
 
 	if (loaded.tag === "offline") {
 		return (
@@ -103,41 +117,56 @@ const PluginTab: FC<{
 	}
 
 	const dirty = JSON.stringify(draft) !== JSON.stringify(stored);
+	const put = async (value: JsonObject, password?: string) => {
+		const saved = await pluginSurfaceOrThrow<{
+			access?: { refused?: { path: string; error: string }[] };
+		} | null>(sectionUrl(plugin.id, entryId), {
+			method: "PUT",
+			body: value,
+			password,
+		});
+		setRefused(saved?.access?.refused ?? []);
+		toast.success(m.library_entry_saved());
+		await qc.invalidateQueries({ queryKey: sectionKey(plugin.id, entryId) });
+	};
 	const save = async () => {
 		if (!draft) return;
+		if (newlyHanded(loaded.section.schema, stored, draft).length) {
+			setAsking(true);
+			return;
+		}
 		setSaving(true);
 		try {
-			const res = await fetch(sectionUrl(plugin.id, entryId), {
-				method: "PUT",
-				credentials: "same-origin",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify(draft),
-			});
-			const body = (await res.json().catch(() => null)) as {
-				error?: string;
-				issue?: string;
-				access?: { refused?: { path: string; error: string }[] };
-			} | null;
-			if (!res.ok) {
-				toast.error(
-					m.library_entry_plugin_save_failed({
-						plugin: plugin.title,
-						issue: body?.issue ?? body?.error ?? `${res.status}`,
-					}),
-				);
-				return;
-			}
-			setRefused(body?.access?.refused ?? []);
-			toast.success(m.library_entry_saved());
-			await qc.invalidateQueries({ queryKey: sectionKey(plugin.id, entryId) });
+			await put(draft);
+		} catch (e) {
+			toast.error(
+				m.library_entry_plugin_save_failed({
+					plugin: plugin.title,
+					issue: e instanceof Error ? e.message : String(e),
+				}),
+			);
 		} finally {
 			setSaving(false);
 		}
 	};
 
 	const status = loaded.section.status ?? [];
+	const page = loaded.section.page;
 	return (
 		<Group title={plugin.title}>
+			{page && PAGE_RE.test(page) && (
+				<div>
+					<Button asChild size="sm" variant="outline">
+						<Link
+							to="/plugins/$pluginId/$"
+							params={{ pluginId: plugin.id, _splat: page }}
+						>
+							<ExternalLink className="size-3.5" />
+							{m.library_entry_plugin_open({ plugin: plugin.title })}
+						</Link>
+					</Button>
+				</div>
+			)}
 			{status.length > 0 && (
 				<ul className="space-y-1">
 					{status.map((line) => (
@@ -178,6 +207,17 @@ const PluginTab: FC<{
 					{m.library_save()}
 				</Button>
 			</div>
+			<PasswordConfirmDialog
+				open={asking}
+				id={`plugin-game-password-${plugin.id}`}
+				title={m.plugin_form_confirm_title()}
+				body={m.plugin_form_confirm_body({ plugin: plugin.title })}
+				submitLabel={m.library_save()}
+				onSubmit={async (password) => {
+					if (draft) await put(draft, password);
+				}}
+				onClose={() => setAsking(false)}
+			/>
 		</Group>
 	);
 };

@@ -14,6 +14,7 @@ import {
 	useSourceStatus,
 } from "@/api/metadata";
 import { usePlugins } from "@/api/plugins";
+import { usePluginsReachable } from "@/api/seat";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -50,9 +51,11 @@ export const ChooseArtDialog: FC<{
 	const nameOf = useSourceNames();
 	const [pasted, setPasted] = useState("");
 	const running = new Set((plugins.data ?? []).map((p) => p.id));
-	const sources = (list.data ?? []).filter(
-		(s) => s.enabled && running.has(s.id),
-	);
+	const reachable = usePluginsReachable();
+	// An Art & Metadata source answers from a plugin runner the console reaches.
+	const sources = reachable
+		? (list.data ?? []).filter((s) => s.enabled && running.has(s.id))
+		: [];
 	const usePasted = (e: FormEvent) => {
 		e.preventDefault();
 		if (isHttpUrl(pasted.trim())) onPick(pasted.trim());
@@ -95,7 +98,11 @@ export const ChooseArtDialog: FC<{
 								placeholder="https://"
 								onChange={(e) => setPasted(e.target.value)}
 							/>
-							<Button type="submit" disabled={!isHttpUrl(pasted.trim())}>
+							<Button
+								size="input"
+								type="submit"
+								disabled={!isHttpUrl(pasted.trim())}
+							>
 								{m.library_media_use()}
 							</Button>
 						</div>
@@ -196,7 +203,7 @@ const SourcePanel: FC<{
 						value={term}
 						onChange={(e) => setTerm(e.target.value)}
 					/>
-					<Button type="submit" disabled={busy || !term.trim()}>
+					<Button size="input" type="submit" disabled={busy || !term.trim()}>
 						{m.library_media_search()}
 					</Button>
 				</form>

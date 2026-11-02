@@ -6,23 +6,21 @@
 //! ("Browse library…"); picking a title starts a normal stream carrying `--launch id` —
 //! the host launches the app during the connect handshake.
 //!
-//! Poster bytes land in a small disk cache (`%LOCALAPPDATA%\punktfunk\art-cache`) and the
-//! `Image` widget loads `file:///` URIs from it — reactor's `ImageSource` has no
-//! from-bytes constructor, and the cache makes revisits (and offline browsing) instant.
+//! Poster bytes land in a small disk cache (`%LOCALAPPDATA%\punktfunk\art-cache`), which the
+//! `Image` loads them from: revisits (and offline browsing) are instant.
 //!
-//! Re-render discipline: the fetch and the art stream complete on worker threads, so the
-//! whole [`LibraryState`] lives in ROOT state (see the app module docs) and arrives here
-//! as a prop; `Shared::library_gen` invalidates a superseded fetch exactly like the
-//! speed test's generation guard.
+//! The fetch and the art stream complete on worker threads into the root's [`LibraryState`];
+//! `Shared::library_gen` invalidates a superseded fetch exactly like the speed test's
+//! generation guard.
 
 use super::connect::{initiate_launch, initiate_waking};
-use super::embedded_png::file_uri;
 use super::lucide;
 use super::style::*;
-use super::{AppCtx, Screen, Svc};
+use super::{AppCtx, AsyncSetState, Msg, Screen, Shell, Svc, Target};
 use pf_client_core::collate::{self, Collatable, SortKey};
 use pf_client_core::library::{self, initials, store_label, DESKTOP_ID};
 use pf_client_core::trust::Settings;
+use pf_fluent::{Palette, Token};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -49,10 +47,10 @@ pub(crate) struct Game {
     /// Host free-form display string (`"PC"`, `"PS2"`, …). Carried so this shelf can sort and
     /// bucket by it like every other client — dropping it here was why Platform sorted flat.
     pub(crate) platform: Option<String>,
-    /// The `file:///` URI of this entry's brand mark, already resolved by
-    /// [`super::launcher_icons::uri`] — `None` when the entry names no mark or one we don't ship.
-    /// Resolved at decode time rather than per render: the shelf re-renders on every art arrival.
-    pub(crate) icon_uri: Option<String>,
+    /// This entry's brand mark ([`super::launcher_icons::image`]) — `None` when the entry
+    /// names no mark or one we don't ship. Resolved at decode time rather than per render: the
+    /// shelf re-renders on every art arrival.
+    pub(crate) icon: Option<EncodedImage>,
 }
 
 /// Streaming the desktop was the host tile's click, two pages back from a shelf. Built here
@@ -64,7 +62,7 @@ fn desktop_entry() -> Game {
         store: String::new(),
         launcher: false,
         platform: None,
-        icon_uri: None,
+        icon: None,
     }
 }
 
@@ -97,7 +95,7 @@ pub(crate) enum LibraryPhase {
 }
 
 /// The page's whole thread-driven state: the fetch phase plus poster art as it lands
-/// (game id → `file:///` URI into the disk cache).
+/// (game id → its file in the disk cache).
 #[derive(Clone, PartialEq, Default)]
 pub(crate) struct LibraryState {
     pub(crate) phase: LibraryPhase,
@@ -107,8 +105,8 @@ pub(crate) struct LibraryState {
     pub(crate) running: HashMap<String, bool>,
 }
 
-/// End game's two moments: the title awaiting a yes, and what the host said. Root state, like
-/// `HostsProps::forget`: a flyout click and a worker thread set it.
+/// End game's two moments: the title awaiting a yes, and what the host said. Root state: a
+/// menu click and a worker thread set it.
 #[derive(Clone, PartialEq, Default)]
 pub(crate) struct EndGameUi {
     /// `(id, title)` the confirmation asks about.
@@ -116,19 +114,12 @@ pub(crate) struct EndGameUi {
     pub(crate) said: Option<String>,
 }
 
-/// Props for the library page: the services plus the fetch/art state driving re-render.
-#[derive(Clone)]
-pub(crate) struct LibraryProps {
-    pub(crate) svc: Svc,
-    pub(crate) state: LibraryState,
-    pub(crate) end_game: EndGameUi,
-    pub(crate) set_end_game: AsyncSetState<EndGameUi>,
-}
-
-impl PartialEq for LibraryProps {
-    fn eq(&self, other: &Self) -> bool {
-        self.svc == other.svc && self.state == other.state && self.end_game == other.end_game
-    }
+/// Show `target`'s library. The target becomes `Shared::target`, which the grid launches
+/// through, so a pinned card's preset rides along; then the fetch starts and the screen shows.
+pub(crate) fn open_library(svc: &Svc, target: Target) {
+    *svc.ctx.shared.target.lock().unwrap() = target;
+    start_fetch(&svc.ctx, &svc.set_library);
+    svc.set_screen.call(Screen::Library);
 }
 
 /// Fetch the library for `Shared::target` off the UI thread, publishing into root state:
@@ -147,7 +138,11 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
     std::thread::Builder::new()
         .name("pf-library".into())
         .spawn(move || {
-            let pin = target.fp_hex.as_deref().and_then(crate::trust::parse_hex32);
+            let pin = target
+                .host
+                .fp_hex
+                .as_deref()
+                .and_then(crate::trust::parse_hex32);
             let publish = |state: &LibraryState| {
                 if shared.library_gen.load(Ordering::SeqCst) == generation {
                     set.call(state.clone());
@@ -155,8 +150,9 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
             };
             let mut state = LibraryState::default();
             let games = match library::fetch_games(
-                &target.addr,
-                target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
+                &target.host.addr,
+                target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
+                target.host.port,
                 &identity,
                 pin,
             ) {
@@ -173,13 +169,13 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
 
             // Seed cached posters; queue the art pipeline for the rest.
             let base = library::base_url(
-                &target.addr,
-                target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
+                &target.host.addr,
+                target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
             );
             let cache = art_cache_dir();
             let mut jobs: VecDeque<(String, Vec<String>)> = VecDeque::new();
             for g in &games {
-                match cache.as_deref().and_then(|d| cached_art_uri(d, &g.id)) {
+                match cache.as_deref().and_then(|d| cached_art(d, &g.id)) {
                     Some(uri) => {
                         state.art.insert(g.id.clone(), uri);
                     }
@@ -200,15 +196,16 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
                         store: g.store.clone(),
                         launcher: g.is_launcher(),
                         platform: g.platform.clone(),
-                        icon_uri: super::launcher_icons::uri(g.icon_token()),
+                        icon: super::launcher_icons::image(g.icon_token()),
                     })
                     .collect(),
             );
             publish(&state);
 
             // After the titles: a slow `/status` must not hold the shelf back.
-            let mgmt = target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
-            for g in library::fetch_running(&target.addr, mgmt, &identity, pin) {
+            let mgmt = target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
+            let port = target.host.port;
+            for g in library::fetch_running(&target.host.addr, mgmt, port, &identity, pin) {
                 if let Some(id) = g.app_id.clone().filter(|_| g.is_up()) {
                     *state.running.entry(id).or_default() |= g.endable;
                 }
@@ -220,7 +217,8 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
             if jobs.is_empty() {
                 return;
             }
-            let rx = library::spawn_art_fetch(base, identity, pin, jobs);
+            let api = library::HostApi::new(&target.host.addr, mgmt, port, &identity, pin);
+            let rx = library::spawn_art_fetch(api, jobs);
             while let Ok((id, bytes)) = rx.recv_blocking() {
                 if shared.library_gen.load(Ordering::SeqCst) != generation {
                     return; // superseded — stop touching state (and the cache is shared anyway)
@@ -234,9 +232,8 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
         .ok();
 }
 
-/// `%LOCALAPPDATA%\punktfunk\art-cache` — poster bytes by game id, so the `Image` widget
-/// has a `file:///` URI to load and revisits skip the network entirely. Small (one poster
-/// per library entry); no eviction yet.
+/// `%LOCALAPPDATA%\punktfunk\art-cache` — poster bytes by game id, so revisits skip the
+/// network entirely. Small (one poster per library entry); no eviction yet.
 fn art_cache_dir() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")?;
     Some(PathBuf::from(base).join("punktfunk").join("art-cache"))
@@ -252,21 +249,20 @@ fn art_file(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{safe}.img"))
 }
 
-fn cached_art_uri(dir: &Path, id: &str) -> Option<String> {
+fn cached_art(dir: &Path, id: &str) -> Option<String> {
     let p = art_file(dir, id);
-    p.exists().then(|| file_uri(&p))
+    p.exists().then(|| p.display().to_string())
 }
 
 fn store_art(dir: &Path, id: &str, bytes: &[u8]) -> Option<String> {
     std::fs::create_dir_all(dir).ok()?;
     let p = art_file(dir, id);
     std::fs::write(&p, bytes).ok()?;
-    Some(file_uri(&p))
+    Some(p.display().to_string())
 }
 
-/// The tile overflow's only entry today — the per-GAME half of the pairing the host tiles
-/// already offer (design/client-deep-links.md §5 names the library game context menu as an
-/// attach point for exactly this).
+/// The per-GAME half of the link the host tiles offer (design/client-deep-links.md §5 names
+/// the library game menu as an attach point for exactly this).
 const MENU_COPY_LINK: &str = "Copy link";
 /// Only on a title this device launched and the host still runs.
 const MENU_END_GAME: &str = "End game";
@@ -282,44 +278,36 @@ const MENU_END_GAME: &str = "End game";
 fn game_link(target: &super::Target, game_id: &str) -> Option<String> {
     pf_client_core::deeplink::saved_host_link(
         &crate::trust::KnownHosts::load(),
-        target.fp_hex.as_deref(),
-        &target.addr,
-        target.port,
+        target.host.fp_hex.as_deref(),
+        &target.host.addr,
+        target.host.port,
         target.preset.as_deref().filter(|p| !p.is_empty()),
         Some(game_id),
     )
 }
 
-/// A small group label above a tile grid ("Launchers" / "Games"). Only drawn when the page shows
-/// both groups — a single unlabelled grid is what every launcher-less library looked like before.
 /// The shelf's sort picker. Presentation only, like the console's bar: it writes the shared
 /// `library_sort` and re-renders what is already fetched — nothing is refetched, and no other
 /// setting on the page is touched, so a load-modify-save of the whole file is honest here.
-/// The stored sort. `use_state` evaluates its seed on every render and this page re-renders on
-/// each poster that lands, so the file is read once per process; a pick updates this too, since
-/// the page remounts on every visit.
-static STORED_SORT: std::sync::Mutex<Option<SortKey>> = std::sync::Mutex::new(None);
-
-fn sort_row(current: SortKey, on_pick: impl Fn(SortKey) + 'static) -> Element {
+fn sort_row(pal: &Palette, current: SortKey, set_sort: AsyncSetState<SortKey>) -> View {
     let names: Vec<String> = SortKey::ALL.iter().map(|k| k.label().to_string()).collect();
     let index = SortKey::ALL.iter().position(|k| *k == current).unwrap_or(0);
     hstack((
-        text_block("Sort")
+        muted(pal, "Sort")
             .font_size(12.0)
-            .foreground(ThemeRef::SecondaryText),
-        ComboBox::new(names)
-            .selected_index(index as i32)
-            .on_selection_changed(move |i: i32| {
-                // -1 is "nothing selected": not a pick of the first sort.
-                let Some(key) = usize::try_from(i).ok().and_then(|i| SortKey::ALL.get(i)) else {
+            .vertical_alignment(VerticalAlignment::Center),
+        ComboBox::new()
+            .items_source(names)
+            .selected_index(index)
+            .on_selection_changed(move |i: Option<usize>| {
+                let Some(key) = i.and_then(|i| SortKey::ALL.get(i)).copied() else {
                     return;
                 };
-                let key = *key;
-                let mut settings = Settings::load();
-                settings.library_sort = key.id().to_string();
-                settings.save();
-                *STORED_SORT.lock().unwrap() = Some(key);
-                on_pick(key);
+                Settings::update(|s| {
+                    s.library_sort = key.id().to_string();
+                    true
+                });
+                set_sort.call(key);
             }),
     ))
     .spacing(8.0)
@@ -327,85 +315,87 @@ fn sort_row(current: SortKey, on_pick: impl Fn(SortKey) + 'static) -> Element {
     .into()
 }
 
-fn group_heading(text: &str) -> Element {
-    text_block(text)
+/// A small group label above a tile grid ("Launchers" / "Games").
+fn group_heading(pal: &Palette, label: &str) -> View {
+    muted(pal, label)
         .font_size(12.0)
-        .semibold()
-        .foreground(ThemeRef::SecondaryText)
+        .font_weight(FontWeight::SEMI_BOLD)
         .margin(edges(2.0, 8.0, 2.0, 2.0))
         .into()
 }
 
 /// One poster tile: the artwork (or a monogram placeholder while it loads) with the store
 /// badge overlaid top-left, the title below, tap-to-launch across the whole tile.
+#[allow(clippy::too_many_arguments)]
 fn poster_tile(
+    pal: &Palette,
     game: &Game,
-    art_uri: Option<&str>,
+    art: Option<&str>,
     poster_h: f64,
-    on_tap: Box<dyn Fn()>,
+    tap: Box<dyn Fn()>,
     on_copy_link: Box<dyn Fn()>,
     // `Some` while the host runs it; `Some(true)` when this device may end it.
     up: Option<bool>,
     on_end_game: Box<dyn Fn()>,
-) -> Element {
-    let poster: Element = match art_uri {
-        Some(uri) => Image::new_with_uri(uri)
-            .stretch(Stretch::UniformToFill)
+) -> View {
+    let placeholder = |face: View| -> View {
+        Border::new()
+            .content(face)
+            .background(pal.get(Token::SubtleFill))
             .height(poster_h)
-            .into(),
+            .into()
+    };
+    let cached = art.and_then(|path| {
+        Image::new()
+            .source_file(path)
+            .ok()
+            .map(|i| i.stretch(Stretch::UniformToFill).height(poster_h))
+    });
+    let poster: View = match cached {
+        Some(image) => image.into(),
         // A launcher rarely has poster art, and an art-less launcher drawn like an art-less game
         // reads as "a game whose cover failed to load". Its brand mark, when we ship one, IS the
-        // poster; failing that it names its launcher. Either way the frame below picks up the
-        // accent stroke.
-        //
-        // `Uniform`, not `UniformToFill`: the marks keep their masters' aspect ratios (Steam is
-        // 496x512, Playnite 1024x1024), and filling a 2:3 frame would crop them to a strip — the
-        // very thing that kept launcher tiles art-less in the first place.
-        None => match game.icon_uri.as_deref() {
-            Some(uri) => border(
-                Image::new_with_uri(uri)
+        // poster; failing that it names its launcher. Either way the frame picks up the accent
+        // stroke. `Uniform`, not `UniformToFill`: filling a 2:3 frame would crop a mark to a strip.
+        None => match &game.icon {
+            Some(mark) => placeholder(
+                Image::new()
+                    .source_data(mark.clone())
                     .stretch(Stretch::Uniform)
-                    .margin(uniform(poster_h * 0.28)),
-            )
-            .background(ThemeRef::SubtleFill)
-            .height(poster_h)
-            .into(),
-            // The desktop tile's mark is not a brand, so it comes from the shell's UI icon set
-            // rather than `launcher_icons` — which here means Lucide's font, the one form this
-            // shell can size and tint (see `lucide`).
-            None if game.id == DESKTOP_ID => border(
-                text_block(lucide::glyph(library::DESKTOP_ICON))
-                    .font_family(lucide::FAMILY)
+                    .margin(uniform(poster_h * 0.28))
+                    .into(),
+            ),
+            // The desktop tile's mark is not a brand, so it comes from the shell's UI icon set.
+            None if game.id == DESKTOP_ID => placeholder(
+                lucide::mark(library::DESKTOP_ICON)
                     .font_size(poster_h * 0.3)
-                    .foreground(ThemeRef::SecondaryText)
+                    .foreground(pal.get(Token::SecondaryText))
                     .horizontal_alignment(HorizontalAlignment::Center)
-                    .vertical_alignment(VerticalAlignment::Center),
-            )
-            .background(ThemeRef::SubtleFill)
-            .height(poster_h)
-            .into(),
-            None => border(
-                text_block(if game.launcher {
-                    store_label(&game.store).to_string()
-                } else {
-                    initials(&game.title)
-                })
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .into(),
+            ),
+            None => placeholder(
+                muted(
+                    pal,
+                    if game.launcher {
+                        store_label(&game.store).to_string()
+                    } else {
+                        initials(&game.title)
+                    },
+                )
                 .font_size(if game.launcher { 18.0 } else { 28.0 })
-                .semibold()
-                .foreground(ThemeRef::SecondaryText)
+                .font_weight(FontWeight::SEMI_BOLD)
                 .horizontal_alignment(HorizontalAlignment::Center)
-                .vertical_alignment(VerticalAlignment::Center),
-            )
-            .background(ThemeRef::SubtleFill)
-            .height(poster_h)
-            .into(),
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+            ),
         },
     };
-    let mut layers = vec![
+    let mut layers: Vec<View> = vec![
         poster,
-        // `Pill::Info` rather than a solid accent fill — `style.rs` is explicit that
-        // white-on-bright is unreadable here.
+        // `Pill::Info` rather than a solid accent fill: white-on-bright is unreadable here.
         pill(
+            pal,
             store_label(&game.store),
             if game.launcher {
                 Pill::Info
@@ -420,114 +410,111 @@ fn poster_tile(
     ];
     if up.is_some() {
         layers.push(
-            pill("Running", Pill::Neutral)
+            pill(pal, "Running", Pill::Neutral)
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .vertical_alignment(VerticalAlignment::Bottom)
                 .margin(uniform(6.0))
                 .into(),
         );
     }
-    let framed = border(grid(layers))
+    let framed = Border::new()
+        .content(Grid::new().children(layers))
         .corner_radius(8.0)
         .border_brush(if game.launcher {
-            ThemeRef::Accent
+            ThemeBrush::Accent
         } else {
-            ThemeRef::CardStroke
+            ThemeBrush::CardStroke
         })
         .border_thickness(uniform(1.0));
 
-    let tappable = border(
-        vstack((
-            framed,
-            text_block(&game.title)
-                .font_size(12.0)
-                .wrap()
-                .margin(edges(2.0, 6.0, 2.0, 0.0)),
-        ))
-        .spacing(0.0),
-    )
-    .background(hit_test_backstop())
-    .on_tapped(on_tap);
+    let tappable = on_tap(
+        Border::new()
+            .content(vstack((
+                framed,
+                text(&game.title)
+                    .font_size(12.0)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .margin(edges(2.0, 6.0, 2.0, 0.0)),
+            )))
+            .background(hit_test_backstop()),
+        tap,
+    );
 
-    // This entry's own actions, opposite the store badge. A button rather than a right-click
-    // context flyout because the reactor hangs `menu_flyout` off buttons only — and a menu a
-    // mouse user cannot see is one they never find.
-    //
-    // A SIBLING of the tappable area, not a child of it: `host_tile` on the hosts page splits
-    // the two exactly this way, and that split is what keeps a click on the overflow from also
-    // launching the title underneath it.
-    grid(vec![
-        tappable.into(),
-        button("")
-            .icon(lucide::icon("ellipsis"))
-            .subtle()
-            .tooltip("More options")
-            .automation_name(format!("More options for {}", game.title))
-            .menu_flyout(if up == Some(true) {
-                vec![menu_item(MENU_COPY_LINK), menu_item(MENU_END_GAME)]
-            } else {
-                vec![menu_item(MENU_COPY_LINK)]
-            })
-            .on_item_clicked(move |item: String| match item.as_str() {
-                MENU_COPY_LINK => on_copy_link(),
-                MENU_END_GAME => on_end_game(),
-                _ => {}
-            })
-            .horizontal_alignment(HorizontalAlignment::Right)
-            .vertical_alignment(VerticalAlignment::Top)
-            .margin(edges(0.0, 4.0, 4.0, 0.0))
-            .into(),
-    ])
-    .into()
+    // This entry's own actions, opposite the store badge: a button, because a menu a mouse user
+    // cannot see is one they never find. A SIBLING of the tappable area, as on the host tiles,
+    // so a click on the overflow never also launches the title underneath it.
+    let mut items = vec![MenuItem::item("copy", MENU_COPY_LINK)];
+    if up == Some(true) {
+        items.push(MenuItem::item("end", MENU_END_GAME));
+    }
+    let menu = Menu::new(items, move |key: Key| match key.as_str() {
+        Some("copy") => on_copy_link(),
+        Some("end") => on_end_game(),
+        _ => {}
+    });
+    let more = format!("More options for {}", game.title);
+    Grid::new()
+        .children((
+            tappable,
+            mark_button("ellipsis", &more)
+                .style(ButtonStyle::Subtle)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .vertical_alignment(VerticalAlignment::Top)
+                .margin(edges(0.0, 4.0, 4.0, 0.0))
+                .menu(menu)
+                .tooltip("More options"),
+        ))
+        .into()
 }
 
-pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
-    let ctx = &props.svc.ctx;
+pub(crate) fn library_page(shell: &Shell) -> View {
+    let svc = shell.svc();
+    let (ctx, pal) = (&svc.ctx, &svc.pal);
+    let state = &shell.library;
     let target = ctx.shared.target.lock().unwrap().clone();
-    let (ss, st) = (props.svc.set_screen.clone(), props.svc.set_status.clone());
+    let (ss, st) = (svc.set_screen.clone(), svc.set_status.clone());
+    let set_end_game = shell.set(Msg::EndGame);
 
-    // Responsive poster columns from the live window width (the hosts page's pattern).
-    let window = cx.use_inner_size();
-    // Shared `library_sort`: the same four orders the console's bar and the GTK dialog offer.
-    let seed = *STORED_SORT
-        .lock()
-        .unwrap()
-        .get_or_insert_with(|| SortKey::parse(&Settings::load().library_sort));
-    let (sort, set_sort) = cx.use_state(seed);
-    let content_w = (window.width - 64.0).clamp(POSTER_MIN_WIDTH, 1120.0);
+    // Responsive poster columns from the window width (the hosts page's pattern).
+    let content_w = (shell.width - 64.0).clamp(POSTER_MIN_WIDTH, 1120.0);
     let cols =
         (((content_w + POSTER_GAP) / (POSTER_MIN_WIDTH + POSTER_GAP)).floor() as usize).clamp(2, 6);
     let tile_w = (content_w - POSTER_GAP * (cols as f64 - 1.0)) / cols as f64;
     let poster_h = tile_w * POSTER_RATIO;
 
-    let back_btn = button("Back").icon(lucide::icon("arrow-left")).on_click({
-        let (ss, se) = (ss.clone(), props.set_end_game.clone());
+    let back_btn = icon_button("arrow-left", "Back").on_click({
+        let (ss, se) = (ss.clone(), set_end_game.clone());
         move || {
             se.call(EndGameUi::default());
             ss.call(Screen::Hosts)
         }
     });
-    let title = if target.name.is_empty() {
+    let title = if target.host.name.is_empty() {
         "Game library".to_string()
     } else {
-        format!("Game library \u{00B7} {}", target.name)
+        format!("Game library \u{00B7} {}", target.host.name)
     };
-    let mut body: Vec<Element> = vec![page_header(&title, back_btn)];
-    if let Some(said) = &props.end_game.said {
+    let mut body: Vec<View> = vec![page_header(&title, back_btn)];
+    if let Some(said) = &shell.end_game.said {
         body.push(
-            InfoBar::new("End game")
-                .message(said.clone())
+            InfoBar::new()
+                .title("End game")
+                .message(said)
+                .is_open(true)
                 .is_closable(false)
                 .into(),
         );
     }
 
-    match &props.state.phase {
+    match &state.phase {
         LibraryPhase::Loading => body.push(
             card(
                 hstack((
-                    ProgressRing::indeterminate().width(18.0).height(18.0),
-                    text_block("Loading the library\u{2026}").foreground(ThemeRef::SecondaryText),
+                    ProgressRing::new()
+                        .is_indeterminate(true)
+                        .width(18.0)
+                        .height(18.0),
+                    muted(pal, "Loading the library\u{2026}"),
                 ))
                 .spacing(12.0),
             )
@@ -535,17 +522,18 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
         ),
         LibraryPhase::Failed(msg) => {
             body.push(
-                InfoBar::new("Couldn't load the library")
-                    .message(msg.clone())
-                    .error()
+                InfoBar::new()
+                    .title("Couldn't load the library")
+                    .message(msg)
+                    .severity(InfoBarSeverity::Error)
+                    .is_open(true)
                     .is_closable(false)
                     .into(),
             );
-            let (ctx2, set_library) = (ctx.clone(), props.svc.set_library.clone());
+            let (ctx2, set_library) = (ctx.clone(), svc.set_library.clone());
             body.push(
-                button("Retry")
-                    .accent()
-                    .icon(lucide::icon("refresh-cw"))
+                icon_button("refresh-cw", "Retry")
+                    .style(ButtonStyle::Accent)
                     .on_click(move || start_fetch(&ctx2, &set_library))
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .into(),
@@ -553,27 +541,28 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
         }
         LibraryPhase::Empty => body.push(
             card(
-                text_block(
+                muted(
+                    pal,
                     "No games yet \u{2014} add titles to the host's library (its console or web \
                      UI) and they appear here.",
                 )
-                .wrap()
-                .foreground(ThemeRef::SecondaryText),
+                .text_wrapping(TextWrapping::Wrap),
             )
             .into(),
         ),
         LibraryPhase::Ready(games) => {
-            let tile = |g: &Game| -> Element {
+            let tile = |g: &Game| -> View {
                 let (ctx2, ss, st) = (ctx.clone(), ss.clone(), st.clone());
                 let (target, id) = (target.clone(), g.id.clone());
-                let (se, ask) = (props.set_end_game.clone(), (g.id.clone(), g.title.clone()));
+                let (se, ask) = (set_end_game.clone(), (g.id.clone(), g.title.clone()));
                 let (link_target, link_id) = (target.clone(), id.clone());
                 // The desktop tile is the host, not one of its titles: it streams with no
                 // launch id, and wakes first because it is often the first dial of the day.
                 let desktop = g.id == DESKTOP_ID;
                 poster_tile(
+                    pal,
                     g,
-                    props.state.art.get(&g.id).map(String::as_str),
+                    state.art.get(&g.id).map(String::as_str),
                     poster_h,
                     Box::new(move || {
                         if desktop {
@@ -589,7 +578,7 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
                         Some(url) => pf_client_core::clipboard::set_text(&url),
                         None => tracing::warn!(id = %link_id, "no saved host to build a link from"),
                     }),
-                    props.state.running.get(&g.id).copied(),
+                    state.running.get(&g.id).copied(),
                     Box::new(move || {
                         se.call(EndGameUi {
                             ask: Some(ask.clone()),
@@ -600,9 +589,8 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
             };
             // Design D4: launcher entries get their own shelf above the titles, never
             // interleaved. `collate` is the shared policy — launchers lead as their own group
-            // and the sort applies inside a group, never across. Headings appear only when
-            // both groups exist, so a launcher-less library renders as it did before.
-            let groups = collate::collate(&games[..], sort, None);
+            // and the sort applies inside a group, never across.
+            let groups = collate::collate(&games[..], shell.library_sort, None);
             let of_group = |key: collate::GroupKey| -> Vec<&Game> {
                 groups
                     .iter()
@@ -617,23 +605,26 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
             // title, and it means the shelf is never a dead end for the desktop-only user.
             let desktop = desktop_entry();
             let leading: Vec<&Game> = std::iter::once(&desktop).chain(launchers).collect();
-            {
-                body.push(sort_row(sort, move |k| set_sort.call(k)));
-                body.push(group_heading(if leading.len() == 1 {
+            body.push(sort_row(
+                pal,
+                shell.library_sort,
+                shell.set(Msg::LibrarySort),
+            ));
+            body.push(group_heading(
+                pal,
+                if leading.len() == 1 {
                     "Host"
                 } else {
                     "Launchers"
-                }));
-                body.push(tile_grid(
-                    leading.iter().map(|g| tile(g)).collect(),
-                    cols,
-                    POSTER_GAP,
-                ));
-            }
+                },
+            ));
+            body.push(tile_grid(
+                leading.iter().map(|g| tile(g)).collect(),
+                cols,
+                POSTER_GAP,
+            ));
             if !titles.is_empty() {
-                {
-                    body.push(group_heading("Games"));
-                }
+                body.push(group_heading(pal, "Games"));
                 body.push(tile_grid(
                     titles.iter().map(|g| tile(g)).collect(),
                     cols,
@@ -643,53 +634,55 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
         }
     }
 
-    // ALWAYS MOUNTED in a stable trailing slot, `is_open` arming it — the hosts page's forget
-    // confirmation, for the same reactor reason.
-    let end_confirm: Element = {
-        let pending = props.end_game.ask.clone();
-        let (se, ctx2, set_library) = (
-            props.set_end_game.clone(),
-            ctx.clone(),
-            props.svc.set_library.clone(),
-        );
-        let content = pending
-            .as_ref()
-            .map(|(_, title)| {
-                format!("End {title} on the host? Unsaved progress in the game is lost.")
-            })
-            .unwrap_or_default();
-        ContentDialog::new("End game?")
-            .content(content)
-            .primary_button_text("End game")
-            .close_button_text("Cancel")
-            .is_open(pending.is_some())
-            .on_closed(move |r: ContentDialogResult| {
-                se.call(EndGameUi::default());
-                let Some((id, title)) = pending
-                    .clone()
-                    .filter(|_| r == ContentDialogResult::Primary)
-                else {
-                    return;
-                };
-                let (se, ctx2, set_library) = (se.clone(), ctx2.clone(), set_library.clone());
-                let _ = std::thread::Builder::new()
-                    .name("punktfunk-endgame".into())
-                    .spawn(move || {
-                        let target = ctx2.shared.target.lock().unwrap().clone();
-                        let pin = target.fp_hex.as_deref().and_then(crate::trust::parse_hex32);
-                        let mgmt = target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
-                        let outcome =
-                            library::end_game(&target.addr, mgmt, &ctx2.identity, pin, &id);
-                        tracing::info!(app = %id, ?outcome, "end game");
-                        se.call(EndGameUi {
-                            ask: None,
-                            said: Some(outcome.notice(&title)),
-                        });
-                        start_fetch(&ctx2, &set_library);
-                    });
-            })
-            .into()
-    };
+    page_wide(body).content_dialog(end_game_dialog(&svc, &shell.end_game, set_end_game))
+}
 
-    grid(vec![page_wide(body), end_confirm]).into()
+/// The End game confirmation, armed by `is_open`. A yes ends the title on a worker thread,
+/// says what the host answered, and refetches the shelf.
+fn end_game_dialog(
+    svc: &Svc,
+    end_game: &EndGameUi,
+    set_end_game: AsyncSetState<EndGameUi>,
+) -> ContentDialog {
+    let pending = end_game.ask.clone();
+    let (se, ctx2, set_library) = (set_end_game, svc.ctx.clone(), svc.set_library.clone());
+    let content = pending
+        .as_ref()
+        .map(|(_, title)| format!("End {title} on the host? Unsaved progress in the game is lost."))
+        .unwrap_or_default();
+    ContentDialog::new()
+        .title("End game?")
+        .content(content)
+        .primary_button_text("End game")
+        .close_button_text("Cancel")
+        .is_open(pending.is_some())
+        .on_closed(move |r: ContentDialogResult| {
+            se.call(EndGameUi::default());
+            let Some((id, title)) = pending
+                .clone()
+                .filter(|_| r == ContentDialogResult::Primary)
+            else {
+                return;
+            };
+            let (se, ctx2, set_library) = (se.clone(), ctx2.clone(), set_library.clone());
+            let _ = std::thread::Builder::new()
+                .name("punktfunk-endgame".into())
+                .spawn(move || {
+                    let target = ctx2.shared.target.lock().unwrap().clone();
+                    let pin = target
+                        .host
+                        .fp_hex
+                        .as_deref()
+                        .and_then(crate::trust::parse_hex32);
+                    let mgmt = target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
+                    let (addr, port) = (&target.host.addr, target.host.port);
+                    let outcome = library::end_game(addr, mgmt, port, &ctx2.identity, pin, &id);
+                    tracing::info!(app = %id, ?outcome, "end game");
+                    se.call(EndGameUi {
+                        ask: None,
+                        said: Some(outcome.notice(&title)),
+                    });
+                    start_fetch(&ctx2, &set_library);
+                });
+        })
 }

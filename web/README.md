@@ -1,6 +1,6 @@
 # punktfunk web — management console
 
-The browser UI for the punktfunk host's **management REST API** (`crates/punktfunk-host/src/mgmt.rs`,
+The browser UI for the punktfunk host's **management REST API** (`crates/host/punktfunk-host/src/mgmt.rs`,
 OpenAPI at `api/openapi.json`). It shows live status, host capabilities, paired
 clients, the pairing-PIN flow, and session controls.
 
@@ -28,7 +28,7 @@ bun run dev               # http://localhost:47992
 Start a host with the management API up:
 
 ```sh
-# from the repo root — `serve` brings up the native punktfunk/1 plane + the mgmt API (the console
+# from the repo root — `serve` brings up the native punktfunk/2 plane + the mgmt API (the console
 # only needs the mgmt API; add --gamestream too if you also want the Moonlight surface):
 WAYLAND_DISPLAY=wayland-kde XDG_CURRENT_DESKTOP=KDE \
   cargo run -rp punktfunk-host -- serve
@@ -126,5 +126,5 @@ src/
     gen/             GENERATED react-query hooks + models (orval)
   lib/i18n.ts        reactive Paraglide locale hook
   paraglide/         GENERATED i18n runtime (paraglide)
-messages/{en,de}.json   translation sources
+messages/{en,de,es}.json   translation sources
 ```

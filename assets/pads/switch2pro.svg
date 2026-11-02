@@ -16,8 +16,8 @@
 <circle class="glyph" cx="67.1" cy="42.1" r="1.6" data-on="Misc" stroke-width="0.45"/>
 <circle class="button" id="Guide" cx="84.9" cy="42.1" r="3.7"/>
 <path class="glyph" data-on="Guide" stroke-width="0.45" d="M83.55 43.38v-1.42l1.35 -1.15 1.35 1.15v1.42z"/>
-<rect class="button" x="73" y="71.1" width="6" height="6" rx="1"/>
-<text class="label" data-on="" x="76" y="74.1" font-size="3.6">C</text>
+<rect class="button" id="C" x="73" y="71.1" width="6" height="6" rx="1"/>
+<text class="label" data-on="C" x="76" y="74.1" font-size="3.6">C</text>
 <rect class="button" id="Up" x="50.7" y="52" width="7.8" height="8.1" rx="1.4"/>
 <rect class="button" id="Down" x="50.7" y="66.1" width="7.8" height="8.1" rx="1.4"/>
 <rect class="button" id="Left" x="43.5" y="59.2" width="8.1" height="7.8" rx="1.4"/>

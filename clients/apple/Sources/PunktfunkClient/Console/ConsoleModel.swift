@@ -17,13 +17,14 @@ import SwiftUI
 final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
     /// What the console asks the app to do: connect, launch, wake, pair.
     struct Actions {
-        var connect: (StoredHost, PresetSelection) -> Void
+        /// The trailing `String?` is the profile id the console's picker chose.
+        var connect: (StoredHost, PresetSelection, String?) -> Void
         var connectDiscovered: (DiscoveredHost) -> Void
         /// The Pair screen's "Request access": the long approval dial. A discovered host is
         /// saved first.
         var requestAccess: (StoredHost) -> Void
         var requestAccessDiscovered: (DiscoveredHost) -> Void
-        var launchTitle: (LibraryTarget, String) -> Void
+        var launchTitle: (LibraryTarget, String, String?) -> Void
         var connectShelf: (LibraryTarget) -> Void
         var wakeOnly: (StoredHost) -> Void
         var cancelConnect: () -> Void
@@ -48,6 +49,9 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
     let actions: Actions
     /// The pairing ceremony the console's PIN screen drives.
     let ceremony = PairCeremony()
+    /// The request access whose answer the Pair screen waits on; a later pairing of either
+    /// kind supersedes it.
+    var accessRequest = UUID()
     private let pads = GamepadMenuInput(manager: .shared)
     private let haptics = MenuHaptics(manager: .shared)
     /// When the pad last drove the console. A pulse from a remote, keyboard or finger is
@@ -83,8 +87,14 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
     var fetching: Task<Void, Never>?
     /// Bumped by each list fetch. A running-titles answer from before it is another host's.
     var fetchSerial = 0
+    /// The last `FetchLibrary`'s host and `req`: that shelf's list and phase go up under it.
+    var fetchReq: (fp: String, req: Any) = ("", ConsoleJSON.unasked)
+    /// The console's `Wake` in flight: the row it woke and its `req`.
+    var wakeReq: (key: String, req: Any)?
     /// The posters of the last list fetch; a new fetch cancels it.
     var artTask: Task<Void, Never>?
+    /// Titles the current list fetch already has a poster for.
+    var artShown = Set<String>()
 
     init?(entry: StoredHost?, pin: StreamPreset?, store: HostStore, discovery: HostDiscovery,
           presets: PresetStore, power: HostPowerStore, nowPlaying: NowPlayingStore,
@@ -242,9 +252,12 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
             // off switch always has somewhere to land.
             "fallback_ui": true,
             "tv": isTV,
+            "spatial": isVision,
             // tvOS types through its own keyboard, where iPhone typing and dictation live.
             "system_keyboard": isTV,
             "av1_ok": AV1.hardwareDecodeSupported,
+            // This app answers `FetchProfiles` and `SetProfile`.
+            "profiles": true,
             "pyrowave_ok": MetalWaveletDecoder.supported,
             "settings": settings(hosts),
             "presets": presets.map { ["id": $0.id, "name": $0.name, "overrides": [:] as [String: Any]] },
@@ -270,6 +283,14 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
         #endif
     }
 
+    private static var isVision: Bool {
+        #if os(visionOS)
+        return true
+        #else
+        return false
+        #endif
+    }
+
     /// Skia's budget for posters and glyph atlases. A share of this device's memory, floored
     /// so a TV still holds a shelf and capped so a Mac does not hoard.
     private static var gpuCacheBytes: Int {
@@ -281,10 +302,8 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
     /// Pro's window is not a panel, and a TV's is standard, so none of them sends one.
     private static var screenSize: (Int, Int)? {
         #if os(iOS)
-        let bounds = UIScreen.main.nativeBounds
-        let long = Int(max(bounds.width, bounds.height))
-        let short = Int(min(bounds.width, bounds.height))
-        return (long, short)
+        let mode = NativeDisplay.mode
+        return (mode.width, mode.height)
         #else
         return nil
         #endif
@@ -489,6 +508,7 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
         let port = UInt16(a["port"] as? Int ?? 0)
         let preset: PresetSelection = (a["preset"] as? String).map { .preset($0) } ?? .inherit
         let requestAccess = a["request_access"] as? Bool ?? false
+        let profile = a["profile"] as? String
         guard let host = host(fp: fp, addr: addr, port: port) else {
             // Not saved yet: the row came from an advert, so dial it as a discovery does.
             if let found = discovery.hosts.first(where: { $0.host == addr && $0.port == port }) {
@@ -503,9 +523,9 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
         if requestAccess {
             actions.requestAccess(host)
         } else if let title = a["launch"] as? String {
-            actions.launchTitle(LibraryTarget(host: host, preset: preset), title)
+            actions.launchTitle(LibraryTarget(host: host, preset: preset), title, profile)
         } else {
-            actions.connect(host, preset)
+            actions.connect(host, preset, profile)
         }
     }
 

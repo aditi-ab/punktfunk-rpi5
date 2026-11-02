@@ -4,7 +4,7 @@
 
 use super::tables::{
     resolution_caption, BITRATE_CAPTION, CODEC_CAPTION, MOUSE_MODE_CAPTIONS,
-    PRESENT_PRIORITY_CAPTIONS, TOUCH_MODE_CAPTIONS, VIDEO_FIT_CAPTIONS,
+    PRESENT_PRIORITY_CAPTIONS, SCREENS_CAPTIONS, TOUCH_MODE_CAPTIONS, VIDEO_FIT_CAPTIONS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +124,7 @@ specs! {
         Display, false, Stream;
     BITRATE: "bitrate_kbps", "Bitrate", BITRATE_CAPTION, Display, false, Stream;
     VIDEO_FIT: "video_fit", "Picture fit", VIDEO_FIT_CAPTIONS[0], Display, false, Stream;
+    SCREENS: "screens", "Screens", SCREENS_CAPTIONS[0], Display, false, Stream;
     HDR: "hdr_enabled", "10-bit HDR",
         "Advertise 10-bit HDR10 so the host upgrades HDR content \u{2014} shown in HDR where the \
          display supports it, tone-mapped otherwise", Display, false, Stream;
@@ -135,7 +136,8 @@ specs! {
     RENDER_SCALE: "render_scale", "Render scale",
         "Above 1\u{d7} supersamples for sharpness; below is lighter on the host",
         Display, true, Stream;
-    CODEC: "codec", "Video codec", CODEC_CAPTION, Display, true, Stream;
+    CODEC: "codec", "Video codec", CODEC_CAPTION, Display, false, Stream;
+    PYROWAVE_QUALITY: "pyrowave_bpp", "PyroWave quality", "", Display, false, Stream;
     CHROMA: "enable_444", "Full chroma (4:4:4)",
         "Full-colour video: crisp small text and thin lines, at more bandwidth. HEVC only, and \
          only where the host can encode it.", Display, true, Stream;
@@ -156,6 +158,8 @@ specs! {
     DECODER: "decoder", "Video decoder",
         "Automatic picks the best hardware decode, then software", Display, true, Device;
     ADAPTER: "adapter", "GPU", "Decodes and presents the stream", Display, true, Device;
+    KEEP_AWAKE: "keep_awake", "Keep screen awake",
+        "Off, a stream keeps the screen awake only while you play", Display, true, Device;
 
     TOUCH: "touch_mode", "Touch input", TOUCH_MODE_CAPTIONS[0], Input, false, Stream;
     MOUSE: "mouse_mode", "Mouse input", MOUSE_MODE_CAPTIONS[0], Input, false, Stream;
@@ -241,8 +245,10 @@ mod tests {
         ("cursor_gestures", "a TV remote's missing second button"),
         ("rumble_on_phone", "a phone's own hardware"),
         ("gyro_on_phone", "a phone's own hardware"),
-        ("sc2_capture", "Android and Apple only"),
+        ("sc2_capture", "Apple only"),
         ("ds_capture", "Android and webOS only"),
+        ("spatial_audio", "a Vision Pro's room"),
+        ("screen", "a Vision Pro's room"),
     ];
 
     /// Rows with no catalog entry: this client's own variants and device pickers.

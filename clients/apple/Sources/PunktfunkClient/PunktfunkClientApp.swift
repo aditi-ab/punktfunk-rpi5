@@ -28,18 +28,24 @@ struct PunktfunkClientApp: App {
         // Put Geist on the navigation titles before any bar is built.
         BrandTheme.apply()
         #endif
-        Self.warmIdentity()
+        Self.warmAtLaunch()
     }
 
     /// The identity's first load is blocking Keychain work, and most of its callers sit on the
-    /// main actor. Loaded here, off it, they find both halves cached.
-    private static func warmIdentity() {
+    /// main actor. Loaded here, off it, they find both halves cached. The decoder probes follow:
+    /// each is a one-off decode or shader compile that would otherwise sit on the first connect.
+    private static func warmAtLaunch() {
         #if DEBUG
         if ScreenshotMode.isActive { return }
         #endif
         DispatchQueue.global(qos: .utility).async {
-            guard let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
-            LibraryClient.warmIdentity(identity)
+            if let identity = (try? ClientIdentityStore.shared.load())?.identity {
+                LibraryClient.warmIdentity(identity)
+            }
+            _ = MetalWaveletDecoder.supported
+            _ = AV1.hardwareDecodeSupported
+            _ = Stage444Probe.hwDecode444_8bit
+            _ = Stage444Probe.hwDecode444_10bit
         }
     }
 
@@ -91,6 +97,20 @@ struct PunktfunkClientApp: App {
         #elseif !os(tvOS)
         .commands { StreamCommands() }
         #endif
+        #if os(visionOS)
+        // No system glass or corner clip: ContentView draws the glass only where it belongs.
+        .windowStyle(.plain)
+        #endif
+        #if os(visionOS)
+        // A session's curved screen, by the id `CurveStage` gave it. 0.45 m holds 1000R at a
+        // 1.6 m chord; dynamic scaling grows it with distance, as a window does.
+        WindowGroup("Curved screen", id: CurveScene.sceneID, for: UUID.self) { $id in
+            CurveScene(id: id)
+        }
+        .windowStyle(.volumetric)
+        .defaultSize(width: 1.6, height: 0.9, depth: 0.45, in: .meters)
+        .defaultWorldScaling(.dynamic)
+        #endif
         #if os(macOS)
         // A host's page, one window per host.
         WindowGroup("Host", id: MacHostWindow.sceneID, for: StoredHost.ID.self) { $hostID in
@@ -106,12 +126,6 @@ struct PunktfunkClientApp: App {
             SettingsView()
                 .tint(.brand)
         }
-        #endif
-        #if os(visionOS)
-        ImmersiveSpace(id: TheaterStage.spaceID) {
-            TheaterView()
-        }
-        .immersionStyle(selection: .constant(TheaterStage.style), in: TheaterStage.style)
         #endif
     }
 }
@@ -140,8 +154,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 #elseif os(iOS)
 final class AppDelegate: NSObject, UIApplicationDelegate {
-    /// An attached monitor's scene goes to `ExternalDisplaySceneDelegate`, so a stream can fill it
-    /// instead of the letterboxed mirror. Every other scene stays SwiftUI's.
+    /// Before iOS 27 an attached monitor's scene arrives here and goes to
+    /// `ExternalDisplaySceneDelegate`, so a stream can fill it instead of the letterboxed mirror.
+    /// iOS 27 offers it only to the stream's scene accessory. Every other scene stays SwiftUI's.
     func application(
         _ application: UIApplication,
         configurationForConnecting session: UISceneSession,
@@ -152,6 +167,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             config.delegateClass = ExternalDisplaySceneDelegate.self
         }
         return config
+    }
+
+    func application(
+        _ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?
+    ) -> UIInterfaceOrientationMask {
+        LandscapeLock.mask(for: window)
     }
 }
 #endif

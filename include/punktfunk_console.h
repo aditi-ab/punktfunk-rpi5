@@ -15,10 +15,11 @@
 // `[HostRow]` — the home carousel.
 #define PUNKTFUNK_CONSOLE_PUSH_HOSTS 0
 
-// `"Idle"`, `"Busy"`, `{"Failed": "why"}` or `{"Paired": {"key": "…"}}`.
+// `{"req": …, "phase": "Busy" | {"Failed": "why"} | {"Paired": {"key": "…"}}}`, `req` the
+// `Pair` or `RequestAccess` command's.
 #define PUNKTFUNK_CONSOLE_PUSH_PAIR 1
 
-// `WakeStatus`, or `null` to clear.
+// `WakeStatus` under the `Wake`'s `req`, or `null` when the wake ended.
 #define PUNKTFUNK_CONSOLE_PUSH_WAKE 2
 
 // A JSON string: a one-shot toast.
@@ -30,13 +31,14 @@
 // Any JSON: a library fetch is starting for the shelf on screen.
 #define PUNKTFUNK_CONSOLE_PUSH_LIBRARY_BEGIN 5
 
-// `"Loading"`, `"Empty"`, `"Ready"` or `{"Error": {"title", "body", "can_retry"}}`.
+// `{"req": …, "phase": "Loading" | "Empty" | "Ready" | {"Error": {"title", "body",
+// "can_retry"}}}`, `req` the `FetchLibrary`'s.
 #define PUNKTFUNK_CONSOLE_PUSH_LIBRARY_PHASE 6
 
-// `[LibraryGame]` — the fetched catalog.
+// `{"req": …, "games": [LibraryGame]}` — the fetched catalog for that `FetchLibrary`.
 #define PUNKTFUNK_CONSOLE_PUSH_LIBRARY_GAMES 7
 
-// `[LibraryGame]` — the cached catalog, shown while the fetch runs.
+// `{"req": …, "games": [LibraryGame]}` — the cached catalog, shown while the fetch runs.
 #define PUNKTFUNK_CONSOLE_PUSH_LIBRARY_CACHED 8
 
 // `[{"app_id": "steam:570", "state": "running"}]` — the host's running games.
@@ -75,6 +77,10 @@
 // `{"held": [..], "axes": [[name, v]]}` — the pad's reading while the `PadTest` command is on.
 #define PUNKTFUNK_CONSOLE_PUSH_PAD_TEST 18
 
+// `{"fp_hex": "…", "answer": ProfilesAnswer}` — the answer to the `FetchProfiles` command:
+// `{"Listed": [rows]}`, `"NoProfiles"` or `{"Failed": "why"}`.
+#define PUNKTFUNK_CONSOLE_PUSH_PROFILES 20
+
 // One console. Opaque to C.
 typedef struct PunktfunkConsole PunktfunkConsole;
 
@@ -107,13 +113,13 @@ PunktfunkConsole *punktfunk_console_new(const char *options_json,
 // `c` is NULL or from `punktfunk_console_new`, and is not used again.
 void punktfunk_console_free(PunktfunkConsole *c);
 
-// Draw one frame into `mtl_texture` (BGR10A2 or BGRA8, `width`×`height`) and submit it to the queue.
+// Draw one frame into `mtl_texture` (`width`×`height`) and submit it to the queue.
 // `scale` is design units per pixel; `0` takes the shell's own formula. `false` = nothing
 // drawn (idle, or the texture could not be wrapped): present nothing.
 //
 // # Safety
 // `c` is live. `mtl_texture` is an `id<MTLTexture>` from the console's device, render-target
-// usable, BGRA8Unorm, at least `width`×`height`.
+// usable, BGR10A2Unorm, RGB10A2Unorm or BGRA8Unorm, at least `width`×`height`.
 bool punktfunk_console_frame(const PunktfunkConsole *c,
                              void *mtl_texture,
                              uint32_t width,
@@ -187,6 +193,15 @@ void punktfunk_console_art(const PunktfunkConsole *c,
                            const char *id,
                            const uint8_t *bytes,
                            uintptr_t len);
+
+// A profile's picture, encoded, under the URL `ConsoleCmd::FetchAvatar` named.
+//
+// # Safety
+// `c` is live; `url` is a NUL-terminated string; `bytes` is `len` readable bytes.
+void punktfunk_console_avatar(const PunktfunkConsole *c,
+                              const char *url,
+                              const uint8_t *bytes,
+                              uintptr_t len);
 
 // The next event the shell raised, or NULL when there is none: `{"action": OverlayAction}`,
 // `{"pulse": "move"|"confirm"|"boundary"}`, `{"editing": bool}`, `{"announce": "…"}` or

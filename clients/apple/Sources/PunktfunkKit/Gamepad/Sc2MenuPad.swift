@@ -89,10 +89,13 @@ final class Sc2MenuPad {
     }
 
     /// One report off the link queue. Only state reports matter — battery and wireless status
-    /// carry nothing a menu can navigate with.
+    /// carry nothing a menu can navigate with. A 2015 pad's arrive as wired frames.
     private func handle(_ framed: [UInt8]) {
         var parsed = Sc2Device.State()
-        guard Sc2Device.parseState(framed, into: &parsed) else { return }
+        let isState = link.isClassic
+            ? Sc1Device.parseState(framed, into: &parsed)
+            : Sc2Device.parseState(framed, into: &parsed)
+        guard isState else { return }
         lock.lock()
         let wasAttached = state != nil
         state = parsed

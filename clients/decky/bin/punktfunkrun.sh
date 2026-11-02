@@ -16,10 +16,11 @@
 #   PF_PRESET  preset id for a pinned card (old name: PF_PROFILE)         (optional)
 #   PF_GAME    store-qualified library id (steam:570) the host launches into the stream —
 #              set by a stream started from a Steam game's page          (optional)
+#   PF_AS      profile id to play as, for this stream only               (optional)
 #   PF_REQUEST_ACCESS  non-empty = ask the host's operator to admit this device instead of
 #                      pairing with a PIN. The connect PARKS until somebody approves it.
 #   PF_BROWSE  non-empty = open the client's console home instead of streaming
-#   PF_APPID   flatpak app id                        (default io.unom.Punktfunk)
+#   PF_APPID   flatpak app id                        (default io.unom.punktfunk)
 #   PF_FLATPAK override the flatpak binary path      (default: `flatpak` on PATH)
 #   PF_CLIENT_BIN  absolute path of a NATIVE client  (optional; set by the plugin when it
 #                  resolved a non-flatpak install — then the client is run directly and
@@ -39,8 +40,33 @@
 # chmod), so the launch path must never depend on +x. Keep this script POSIX-sh clean.
 set -u
 
-APPID="${PF_APPID:-io.unom.Punktfunk}"
+APPID="${PF_APPID:-io.unom.punktfunk}"
 FLATPAK="${PF_FLATPAK:-flatpak}"
+# A Deck still on the CamelCase id runs that until its next client update rebases it.
+if [ -z "${PF_APPID:-}" ] && [ -z "${PF_CLIENT_BIN:-}" ] \
+    && ! "$FLATPAK" info "$APPID" >/dev/null 2>&1 \
+    && "$FLATPAK" info io.unom.Punktfunk >/dev/null 2>&1; then
+    APPID=io.unom.Punktfunk
+fi
+
+# Steam's launch environment is a game's. Its LD_LIBRARY_PATH names the Steam runtime and
+# shim libraries a native client must not load, and LD_PRELOAD is the overlay hook. Steam
+# keeps the pre-launch value in SYSTEM_LD_LIBRARY_PATH; `flatpak run` drops both itself.
+if [ -n "${SYSTEM_LD_LIBRARY_PATH+x}" ]; then
+    export LD_LIBRARY_PATH="$SYSTEM_LD_LIBRARY_PATH"
+fi
+unset LD_PRELOAD
+
+# The flatpak manifest binds gamescope's socket as `gamescope-0`. Where Steam's gamescope is a
+# later one (Armada starts a splash gamescope first), the vendored WSI layer reaches nobody:
+# no HDR, no bypass. Hand the sandbox the live name and its socket.
+FLATPAK_ARGS=""
+case "${GAMESCOPE_WAYLAND_DISPLAY:-}" in
+    gamescope-[0-9] | gamescope-[0-9][0-9])
+        FLATPAK_ARGS="--env=GAMESCOPE_WAYLAND_DISPLAY=$GAMESCOPE_WAYLAND_DISPLAY \
+--filesystem=xdg-run/$GAMESCOPE_WAYLAND_DISPLAY"
+        ;;
+esac
 
 # The client is not always the flatpak: a sysext, a .deb/.rpm, an AUR build or a nix profile
 # installs a native `punktfunk-client` with the CLI as its sibling, and the plugin passes the
@@ -55,14 +81,16 @@ run_cli() {
         # PATH at all — which is the environment a Steam launch option can leave us in.
         exec "${PF_CLIENT_BIN%/*}/punktfunk" "$@"
     fi
-    exec "$FLATPAK" run --command=punktfunk "$APPID" "$@"
+    # shellcheck disable=SC2086 # FLATPAK_ARGS is two options, split on purpose
+    exec "$FLATPAK" run $FLATPAK_ARGS --command=punktfunk "$APPID" "$@"
 }
 
 run_session() {
     if [ -n "${PF_CLIENT_BIN:-}" ]; then
         exec "$PF_CLIENT_BIN" "$@"
     fi
-    exec "$FLATPAK" run "$APPID" "$@"
+    # shellcheck disable=SC2086
+    exec "$FLATPAK" run $FLATPAK_ARGS "$APPID" "$@"
 }
 
 # What we are about to run, for the log line each branch prints.
@@ -92,6 +120,9 @@ fi
 # against its own library — the Deck never learns what the launch recipe is.
 if [ -n "${PF_GAME:-}" ]; then
     set -- --game "$PF_GAME" "$@"
+fi
+if [ -n "${PF_AS:-}" ]; then
+    set -- --as "$PF_AS" "$@"
 fi
 
 # REQUEST ACCESS RUNS SUPERVISED — no `--exec`. Under --exec the CLI BECOMES the session, so no

@@ -3,7 +3,7 @@
   Report whether a multi-seat host can actually give its seats a pf-vdisplay display.
 
 .DESCRIPTION
-  The seats add-on needs `pf_vdisplay_seats.inf` to win the hardware id `RdpIdd_IndirectDisplay`,
+  A seat needs `pf_vdisplay_seats.inf` to win the hardware id `RdpIdd_IndirectDisplay`,
   and losing it is SILENT: the seat session still starts, on Microsoft's own remote display adapter,
   and only the missing stream says otherwise. So this asserts the thing that matters - WHICH driver
   bound each seat devnode - rather than that a session came up.
@@ -28,12 +28,14 @@ $PSNativeCommandUseErrorActionPreference = $false
 function Say([string]$m) { if (-not $Quiet) { Write-Output $m } }
 
 # --- 1. SKU ------------------------------------------------------------------------------------
-# ProductType 1 = workstation, 2 = domain controller, 3 = server. Concurrent seats need a Server
-# SKU plus RDS CALs; a client SKU serves ONE session, so the display can be perfect and the second
-# seat still never arrives. Warn rather than fail: a single-seat client box is a legitimate setup.
+# ProductType 1 = workstation, 2 = domain controller, 3 = server. A client SKU serves ONE session
+# unless TermService loads a wrapper DLL instead of termsrv.dll. Warn rather than fail: a
+# single-seat client box is a legitimate setup.
 $os = Get-CimInstance Win32_OperatingSystem
+$serviceDll = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\TermService\Parameters' -EA SilentlyContinue).ServiceDll
 Say "OS        : $($os.Caption) (build $($os.BuildNumber), ProductType $($os.ProductType))"
-if ($os.ProductType -eq 1) {
+Say "TermService DLL : $serviceDll"
+if ($os.ProductType -eq 1 -and (Split-Path -Leaf "$serviceDll") -eq 'termsrv.dll') {
     Write-Warning ("client SKU: Windows serves one session at a time here, so concurrent seats " +
         "need Windows Server plus an RDS CAL per seat. See https://docs.punktfunk.unom.io/docs/developers/multi-seat-contract.")
 }

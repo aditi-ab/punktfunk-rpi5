@@ -1,0 +1,178 @@
+# Flathub manifest for the punktfunk Linux client. The self-hosted build is
+# packaging/flatpak/io.unom.punktfunk.yml; this one differs where Flathub requires it:
+# the source is a release tag, and Skia builds from source instead of a prebuilt archive.
+#
+# Per release: bump the tag and commit, then regenerate cargo-sources.json from that tag's
+# Cargo.lock with the generator pinned in packaging/flatpak/build-flatpak.sh, after
+# packaging/flatpak/prune-windows-lock.py.
+id: io.unom.punktfunk
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+command: punktfunk-client
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  # libclang for bindgen (sdl3-sys, pyrowave-sys, skia-bindings) and clang for Skia.
+  - org.freedesktop.Sdk.Extension.llvm22
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # GPU render node for Vulkan Video and VAAPI decode, evdev pads, and the hidraw nodes
+  # SDL's HIDAPI needs for DualSense touchpad, motion, triggers and lightbar.
+  - --device=all
+  # Audio and microphone use the native PipeWire protocol.
+  - --filesystem=xdg-run/pipewire-0
+  # QUIC streaming and mDNS host discovery.
+  - --share=network
+  # HDR under gamescope: the bundled WSI layer reaches gamescope over its own socket and
+  # only activates when this variable names it.
+  - --env=ENABLE_GAMESCOPE_WSI=1
+  - --env=GAMESCOPE_WAYLAND_DISPLAY=gamescope-0
+  - --filesystem=xdg-run/gamescope-0
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /lib/cmake
+  - /share/aclocal
+  - /man
+  - /share/man
+  - '*.a'
+  - '*.la'
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
+  env:
+    PKG_CONFIG_PATH: /app/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
+    LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+  arch:
+    aarch64:
+      env:
+        PKG_CONFIG_PATH: /app/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
+modules:
+  # The runtime's SDL3 trails the sdl3-sys pin in Cargo.lock; keep this version equal to it.
+  - name: sdl3
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DSDL_SHARED=ON
+      - -DSDL_STATIC=OFF
+      - -DSDL_HIDAPI=ON
+      - -DSDL_TEST_LIBRARY=OFF
+      - -DSDL_EXAMPLES=OFF
+    cleanup:
+      - /bin
+    sources:
+      - type: archive
+        url: https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
+        sha256: 9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
+
+  # gamescope's Vulkan WSI layer: the only route to HDR10 surfaces under gamescope, which
+  # offers no Wayland colour-management protocol. Only the layer is built, not gamescope.
+  # The commit matches packaging/gamescope/PKGBUILD so the client's layer and the host's
+  # gamescope come from one tree.
+  - name: gamescope-wsi-layer
+    buildsystem: simple
+    build-commands:
+      # glm and stb ship no meson.build; their wraps' patch directories supply it.
+      - cp -r subprojects/packagefiles/glm/. subprojects/glm/
+      - cp -r subprojects/packagefiles/stb/. subprojects/stb/
+      - meson setup _build --prefix=/app --libdir=lib --wrap-mode=nodownload
+        -Denable_gamescope=false -Denable_gamescope_wsi_layer=true
+        -Denable_tests=false -Denable_openvr_support=false
+      - ninja -C _build
+      - ninja -C _build install
+    cleanup:
+      - /share/gamescope
+    sources:
+      - type: git
+        url: https://github.com/ValveSoftware/gamescope.git
+        commit: 6867f509874f9bc52e12d6f4c4596cdf0d5be6b4
+        disable-submodules: true
+      # The submodule and wrap pins at that commit; the layer needs nothing else.
+      - type: git
+        url: https://github.com/Joshua-Ashton/vkroots
+        commit: 5106d8a0df95de66cc58dc1ea37e69c99afc9540
+        dest: subprojects/vkroots
+      - type: git
+        url: https://github.com/g-truc/glm.git
+        commit: 0af55ccecd98d4e5a8d1fad7de25ba429d60e863
+        dest: subprojects/glm
+      - type: git
+        url: https://github.com/nothings/stb.git
+        commit: 5736b15f7ea0ffb08dd38af21067c314d6a3aae9
+        dest: subprojects/stb
+
+  # Skia's build tool. The commit is the revision skia/bin/fetch-gn pins for the Skia below.
+  - name: gn
+    buildsystem: simple
+    build-commands:
+      - python3 build/gen.py --no-last-commit-position --out-path out
+      - install -Dm644 last_commit_position.h out/last_commit_position.h
+      - ninja -C out gn
+      - install -Dm755 out/gn /app/bin/gn
+    cleanup:
+      - '*'
+    sources:
+      - type: git
+        url: https://gn.googlesource.com/gn
+        commit: b2afae122eeb6ce09c52d63f67dc53fc517dbdc8
+      - type: inline
+        contents: |
+          #define LAST_COMMIT_POSITION_NUM 0
+          #define LAST_COMMIT_POSITION "0 (b2afae122eeb)"
+        dest-filename: last_commit_position.h
+
+  - name: punktfunk-client
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/punktfunk-client/cargo
+        CARGO_NET_OFFLINE: 'true'
+        # A source dir makes skia-bindings build Skia offline instead of downloading it.
+        # Image codecs, fonts, ICU and HarfBuzz come from the runtime.
+        SKIA_SOURCE_DIR: /run/build/punktfunk-client/skia
+        SKIA_USE_SYSTEM_LIBRARIES: '1'
+        SKIA_GN_COMMAND: /app/bin/gn
+        SKIA_NINJA_COMMAND: /usr/bin/ninja
+    build-commands:
+      # cargo-sources.json leaves out the windows-rs git crates, and cargo --offline needs a
+      # source for every declared dependency. The Windows members leave the workspace and the
+      # Linux members drop their cfg(windows) pins.
+      - sed -i '\#"clients/windows",#d' Cargo.toml
+      - sed -i '\#"crates/install/punktfunk-setup-win",#d' Cargo.toml
+      - sed -i '\#"crates/core/pf-fluent",#d' Cargo.toml
+      - python3 packaging/flatpak/prune-windows-toml.py crates/client/pf-client-core/Cargo.toml
+          crates/client/pf-client-video/Cargo.toml crates/client/pf-presenter/Cargo.toml
+      - cargo --offline build --release -p punktfunk-client-linux -p punktfunk-client-session
+          -p punktfunk-cli
+      - install -Dm755 target/release/punktfunk-client -t ${FLATPAK_DEST}/bin
+      - install -Dm755 target/release/punktfunk-session -t ${FLATPAK_DEST}/bin
+      - install -Dm755 target/release/punktfunk -t ${FLATPAK_DEST}/bin
+      - install -Dm644 packaging/linux/io.unom.punktfunk.desktop -t ${FLATPAK_DEST}/share/applications
+      - install -Dm644 packaging/linux/io.unom.punktfunk.console.desktop -t ${FLATPAK_DEST}/share/applications
+      - install -Dm644 packaging/flatpak/io.unom.punktfunk.metainfo.xml -t ${FLATPAK_DEST}/share/metainfo
+      - install -Dm644 packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg
+          -t ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps
+      - install -Dm644 LICENSE-MIT LICENSE-APACHE -t ${FLATPAK_DEST}/share/licenses/${FLATPAK_ID}
+    sources:
+      - type: git
+        url: https://git.unom.io/unom/punktfunk.git
+        tag: v0.44.1
+        commit: 57d97448db16f12135aa1146e7b5bf51e6fb4462
+      - cargo-sources.json
+      # rust-skia's Skia fork at the tag skia-bindings 0.153.3 names in its Cargo.toml.
+      - type: git
+        url: https://github.com/rust-skia/skia.git
+        tag: m153-0.101.2
+        commit: 61e7ca4e99062cdd0ab69445d5963fb3365778f6
+        dest: skia
+      # The two Skia externals the runtime cannot supply, at the commits skia/DEPS pins:
+      # the Vulkan memory allocator and the wuffs GIF decoder.
+      - type: git
+        url: https://chromium.googlesource.com/external/github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+        commit: eb744ea7a2b17040121b4bbb4d6f9e8a77e3cae7
+        dest: skia/third_party/externals/vulkanmemoryallocator
+      - type: git
+        url: https://skia.googlesource.com/external/github.com/google/wuffs-mirror-release-c.git
+        commit: e3f919ccfe3ef542cfc983a82146070258fb57f8
+        dest: skia/third_party/externals/wuffs

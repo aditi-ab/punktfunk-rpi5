@@ -89,18 +89,19 @@ edits YOUR config. It will ask for sudo where it genuinely needs it (ufw, group 
 # ── ufw (D4) ───────────────────────────────────────────────────────────────────────────────────
 #
 # LAN-scoped rules tagged so `remove` can find them, using the package's app profiles so the port
-# list lives in one place. Ufw accepts a named interface before it exists; that rule stays dormant
-# until tailscale0 appears and remains scoped to that interface.
+# list lives in one place. Ufw accepts a named interface before it exists; such a rule stays dormant
+# until the interface appears and remains scoped to it.
 
-# RFC1918 plus tailscale0. The interface rule is safe to install before the link exists.
+# RFC1918 plus the Tailscale and NetBird interfaces. Their rules are safe to install before the
+# link exists.
 lan_sources() {
-  printf '%s\n' 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 tailscale0
+  printf '%s\n' 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 tailscale0 wt0
 }
 
 ufw_rule() {  # ufw_rule <source> <to-any spec…> — idempotent (ufw dedupes identical rules)
   local src="$1"; shift
-  if [[ "$src" == tailscale0 ]]; then
-    sudo ufw allow in on tailscale0 to any "$@" comment "$TAG" >/dev/null
+  if [[ "$src" != */* ]]; then
+    sudo ufw allow in on "$src" to any "$@" comment "$TAG" >/dev/null
   else
     sudo ufw allow from "$src" to any "$@" comment "$TAG" >/dev/null
   fi
@@ -108,8 +109,8 @@ ufw_rule() {  # ufw_rule <source> <to-any spec…> — idempotent (ufw dedupes i
 
 ufw_unrule() {  # ufw_unrule <source> <to-any spec…>
   local src="$1"; shift
-  if [[ "$src" == tailscale0 ]]; then
-    sudo ufw --force delete allow in on tailscale0 to any "$@" >/dev/null 2>&1 || true
+  if [[ "$src" != */* ]]; then
+    sudo ufw --force delete allow in on "$src" to any "$@" >/dev/null 2>&1 || true
   else
     sudo ufw --force delete allow from "$src" to any "$@" >/dev/null 2>&1 || true
   fi
@@ -302,15 +303,15 @@ setup_webapp() {
   step "App menu"
   have omarchy-webapp-install || { warn "omarchy-webapp-install not found — skipping"; return 0; }
   # The icon is an ICON NAME, not a path — the desktop spec resolves it through the icon theme, and
-  # the scalable `io.unom.Punktfunk` the host package ships scales to whatever size the launcher
+  # the scalable `io.unom.punktfunk` the host package ships scales to whatever size the launcher
   # asks for. Passing a path to a file that did not exist is how the first version produced an
   # entry with a blank `Icon=` and no picture in the launcher.
   # ⚠ `omarchy-webapp-install` takes an icon URL and derives a name with `${ref%.*}` + slugify, so a
-  # DOTTED theme name comes out mangled — `io.unom.Punktfunk` became `Icon=io-unom`, which resolves
+  # DOTTED theme name comes out mangled — `io.unom.punktfunk` became `Icon=io-unom`, which resolves
   # to nothing. Their tool is built for downloading a site's favicon; ours is already installed by
   # the package. So let it create the entry, then set the two lines we own (below), which is what
   # we already do for Exec.
-  local icon=io.unom.Punktfunk
+  local icon=io.unom.punktfunk
   find /usr/share/icons -name "${icon}.*" -print -quit 2>/dev/null | grep -q . \
     || icon=punktfunk-tray   # older package: the tray mark is the only one installed
   # Migrate a pre-rename install: an entry with the OLD name is ours only when it lives in the
@@ -504,23 +505,19 @@ plugin_known() {
   done
   return 1
 }
-tray_override() { printf '%s/autostart/io.unom.Punktfunk.Tray.desktop' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
-
 # The widget carries status, pairing and the console, so the tray would be a second punktfunk
-# mark in the same bar. A user entry of the same name shadows the package's autostart file;
-# deleting /etc/xdg/autostart would return on the next upgrade and hit every user on the box.
+# mark in the same bar. The host's tray_autostart setting owns the tray's autostart entry.
 hide_tray() {
-  local f; f="$(tray_override)"
-  mkdir -p "${f%/*}"
-  printf '[Desktop Entry]\nType=Application\nName=punktfunk host status\nHidden=true\n' >"$f"
-  ok "tray hidden — the bar widget replaces it"
+  if punktfunk-host settings set tray_autostart false >/dev/null 2>&1; then
+    ok "tray hidden — the bar widget replaces it"
+  else
+    warn "could not turn the tray off — set Tray autostart off in the console"
+  fi
 }
 
 restore_tray() {
-  local f; f="$(tray_override)"
-  [[ -f "$f" ]] || return 0
-  rm -f "$f"
-  ok "tray restored"
+  punktfunk-host settings set tray_autostart null >/dev/null 2>&1 && ok "tray restored"
+  return 0
 }
 
 setup_plugin() {
@@ -851,14 +848,6 @@ cmd_status() {
   else
     warn "xdg-desktop-portal-hyprland not running (screen capture needs it)"
   fi
-
-  # The data plane is an EPHEMERAL UDP port, so there is no rule to add for it and `punched=false`
-  # under ufw is expected, not broken: the host's first outbound packet creates the conntrack state
-  # the return path rides. Say so here, because "hole punch failed" in a log reads like a fault.
-  say ""
-  say "  The video data plane uses an ephemeral UDP port and needs no ufw rule — the host's own"
-  say "  outbound packet opens the return path. Pin it with PUNKTFUNK_DATA_PORT + one more rule"
-  say "  only if you want strict egress control (costs you concurrent sessions on that port)."
 }
 
 # ── capture mode / pairing TUIs (menu) ─────────────────────────────────────────────────────────

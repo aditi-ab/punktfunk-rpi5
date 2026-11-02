@@ -316,6 +316,51 @@ class PadButtonsTest {
         assertEquals(KeyEvent.KEYCODE_BUTTON_START, wrong.correct(0x137, KeyEvent.KEYCODE_BUTTON_R1))
     }
 
+    /**
+     * Switchroot's combined Joy-Cons (`057e:2008`): the kernel sends faces by position, the ROM's
+     * layout names them by engraved letter. Pairs are (scancode, keycode that layout delivers).
+     * AOSP's Pro Controller layout already answers positionally, so there this changes nothing.
+     */
+    @Test
+    fun `a Nintendo pad's faces come from the scancode, not the ROM layout`() {
+        val engraved = listOf(
+            0x131 to KeyEvent.KEYCODE_BUTTON_A, // engraved A, east
+            0x130 to KeyEvent.KEYCODE_BUTTON_B, // engraved B, south
+            0x133 to KeyEvent.KEYCODE_BUTTON_X, // engraved X, north
+            0x134 to KeyEvent.KEYCODE_BUTTON_Y, // engraved Y, west
+        )
+        val positional = listOf(
+            KeyEvent.KEYCODE_BUTTON_B,
+            KeyEvent.KEYCODE_BUTTON_A,
+            KeyEvent.KEYCODE_BUTTON_Y,
+            KeyEvent.KEYCODE_BUTTON_X,
+        )
+        for (pid in listOf(0x2008, 0x2009)) {
+            for ((i, row) in engraved.withIndex()) {
+                assertEquals(positional[i], Gamepad.nintendoFace(0x057E, pid, row.first))
+            }
+        }
+        // D-pad, ZL and Home keep their layout; other pads and unverified Nintendo ids are untouched.
+        for (scan in listOf(0x220, 0x138, 0x13c)) assertEquals(null, Gamepad.nintendoFace(0x057E, 0x2008, scan))
+        assertEquals(null, Gamepad.nintendoFace(0x045E, 0x2008, 0x131))
+        assertEquals(null, Gamepad.nintendoFace(0x057E, 0x2069, 0x131))
+    }
+
+    /** Nintendo pads declare the kind the SDL clients' `pref_for_ids` and `pref_for_type` give. */
+    @Test
+    fun `a Nintendo pad declares its own kind`() {
+        val kinds = mapOf(
+            0x2009 to Gamepad.PREF_SWITCHPRO,
+            0x2069 to Gamepad.PREF_SWITCH2PRO,
+            0x2073 to Gamepad.PREF_SWITCH2GAMECUBE,
+            0x2008 to Gamepad.PREF_JOYCONPAIR, // joycond's combined Joy-Cons
+            0x2068 to Gamepad.PREF_JOYCONPAIR, // SDL's combined Joy-Con 2
+            0x2006 to Gamepad.PREF_XBOX360, // a single half
+            0x2067 to Gamepad.PREF_XBOX360,
+        )
+        for ((pid, kind) in kinds) assertEquals("057e:%04x".format(pid), kind, Gamepad.prefFor(0x057E, pid))
+    }
+
     /** Past the gate, which straight-through order to read is still the question it always was. */
     @Test
     fun `an unnamed-trigger pad still resolves its report order`() {

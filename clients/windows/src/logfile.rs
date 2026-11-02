@@ -164,12 +164,12 @@ mod tests {
     #[test]
     fn verbatim_disk_prefix_comes_off_for_the_package_local_cache() {
         let p = PathBuf::from(
-            r"\\?\C:\Users\ada\AppData\Local\Packages\unom.Punktfunk_8wekyb3d8bbwe\LocalCache\Local\punktfunk\logs",
+            r"\\?\C:\Users\ada\AppData\Local\Packages\io.unom.punktfunk_8wekyb3d8bbwe\LocalCache\Local\punktfunk\logs",
         );
         assert_eq!(
             strip_verbatim(p),
             PathBuf::from(
-                r"C:\Users\ada\AppData\Local\Packages\unom.Punktfunk_8wekyb3d8bbwe\LocalCache\Local\punktfunk\logs"
+                r"C:\Users\ada\AppData\Local\Packages\io.unom.punktfunk_8wekyb3d8bbwe\LocalCache\Local\punktfunk\logs"
             )
         );
     }

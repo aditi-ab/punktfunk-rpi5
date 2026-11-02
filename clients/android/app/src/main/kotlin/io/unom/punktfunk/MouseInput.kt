@@ -76,8 +76,8 @@ internal fun wireScrollSource(motionSource: Int): Int = when {
  * Physical mouse → wire, in two modes (the iPadOS/desktop model):
  *  * **uncaptured** (default): hover/drag positions forward as absolute cursor moves
  *    (`MouseMoveAbs`, host-normalized against the window size) — desktop-style pointing. The
- *    local cursor is hidden over the stream (StreamScreen sets a TYPE_NULL pointer icon); the
- *    host's own cursor, composited into the video, is the one you see.
+ *    local pointer wears the host's shape when the host forwards its cursor ([HostCursor]);
+ *    otherwise it is hidden and the host's cursor in the video is the one you see.
  *  * **captured**: the OS pointer is grabbed ([android.view.View.requestPointerCapture]) and raw
  *    relative deltas forward as `MouseMove` — FPS mouse-look. Engaged at stream start / by
  *    clicking into the stream when the "Capture pointer for games" setting is on, and toggled
@@ -102,17 +102,18 @@ class MouseForwarder(
     /** Display density (px per DIP), pricing a touchpad's distance in device-independent units. */
     private val density: Float,
     /**
-     * The picture's rect in WINDOW coordinates — where the letterboxed video actually sits, which is
-     * the frame absolute positions must be measured against. Events arrive from the activity's
-     * dispatch overrides in window coordinates, so a stream narrower than the panel needs the origin
-     * subtracted as well as the size divided; `null` while the surface isn't laid out yet.
+     * Window point → `[x, y, frameWidth, frameHeight, onPicture]` on the letterboxed picture, with
+     * `onPicture` 1 or 0: a point on a bar clamps to the picture's edge. `null` before layout.
      */
-    /** Window point → `[x, y, frameWidth, frameHeight]` on the picture; `null` before layout. */
     private val frameAt: (Float, Float) -> IntArray?,
 ) {
     /** Capture plumbing, owned by StreamScreen (the focusable capture view). */
     var onRequestCapture: (() -> Unit)? = null
     var onReleaseCapture: (() -> Unit)? = null
+
+    /** Where an absolute move put the host pointer, in frame pixels, and whether the mouse is on
+     *  the picture ([HostCursor.mouseAt]). */
+    var onAbs: ((Int, Int, Boolean) -> Unit)? = null
 
     /**
      * Whether this session's access includes the POINTER grant ([io.unom.punktfunk.kit.SessionAccess.POINTER])
@@ -127,6 +128,7 @@ class MouseForwarder(
     var pointerGranted: Boolean = true
 
     /** Live capture state, updated from [android.app.Activity.onPointerCaptureChanged]. */
+    @Volatile
     var captured = false
         private set
 
@@ -293,8 +295,9 @@ class MouseForwarder(
     private fun sendAbs(ev: MotionEvent) {
         // Clamped onto the picture: a pointer out on a bar has no host position of its own, and the
         // edge is the honest answer for it.
-        val (x, y, w, h) = frameAt(ev.x, ev.y) ?: return
+        val (x, y, w, h, onPicture) = frameAt(ev.x, ev.y) ?: return
         NativeBridge.nativeSendPointerAbs(handle, x, y, w, h)
+        onAbs?.invoke(x, y, onPicture == 1)
     }
 
     /**

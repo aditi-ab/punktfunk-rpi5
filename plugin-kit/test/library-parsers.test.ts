@@ -33,10 +33,12 @@ import {
 	steamCdnUrl,
 	steamLibraryDirs,
 	steamListedLibraries,
+	validRegKey,
 	vdfPaths,
 	vdfValue,
 	withReadOnlyDb,
 } from "../src/library/parsers/index.js";
+import { valueText } from "../src/library/parsers/registry.js";
 
 const tmp = (name: string): string => {
 	const dir = path.join(os.tmpdir(), `pf-kit-${name}-${process.pid}`);
@@ -501,8 +503,88 @@ describe("openReadOnly", () => {
 // scanner found IRON NEST, the plugin found nothing.
 //
 // The fixture is the verbatim output from .173 (a blank line, then one subkey row).
+// A service account's HKCU is its own empty hive, so a read there would report no games where
+// the user has many. The home path is what tells a service from a signed-in user.
+describe("valueText", () => {
+	const wide = (text: string) => Buffer.from(text, "utf16le");
+
+	test("prints each type as reg.exe does, UTF-16 intact", () => {
+		expect(valueText("REG_SZ", wide("D:\\\u00dcber\0"))).toBe("D:\\\u00dcber");
+		expect(valueText("REG_DWORD", Buffer.from([1, 0, 0, 0]))).toBe("0x1");
+		expect(valueText("REG_QWORD", Buffer.from([0, 1, 0, 0, 0, 0, 0, 0]))).toBe(
+			"0x100",
+		);
+		expect(valueText("REG_BINARY", Buffer.from([0xab, 0x01]))).toBe("AB01");
+		expect(valueText("REG_MULTI_SZ", wide("a\0b\0\0"))).toBe("a\\0b");
+		expect(valueText("REG_NONE", Buffer.alloc(4))).toBe("");
+	});
+
+	test("a number too short for its type reads as zero", () => {
+		expect(valueText("REG_DWORD", Buffer.alloc(0))).toBe("0x0");
+		expect(valueText("REG_QWORD", Buffer.alloc(3))).toBe("0x0");
+	});
+});
+
+describe("validRegKey", () => {
+	const USER = "C:\\Users\\enrico";
+	const LOCAL_SERVICE = "C:\\WINDOWS\\ServiceProfiles\\LocalService";
+	const SYSTEM = "C:\\WINDOWS\\system32\\config\\systemprofile";
+
+	test("HKLM reads under any account", () => {
+		expect(validRegKey("HKLM\\SOFTWARE\\Valve\\Steam", USER)).toBe(true);
+		expect(validRegKey("HKLM\\SOFTWARE\\Valve\\Steam", LOCAL_SERVICE)).toBe(
+			true,
+		);
+		expect(validRegKey("HKLM\\SOFTWARE\\Valve\\Steam", SYSTEM)).toBe(true);
+	});
+
+	test("HKCU reads under a user's profile and nowhere else", () => {
+		expect(validRegKey("HKCU\\System\\GameConfigStore", USER)).toBe(true);
+		expect(validRegKey("HKCU\\System\\GameConfigStore", LOCAL_SERVICE)).toBe(
+			false,
+		);
+		expect(validRegKey("HKCU\\System\\GameConfigStore", SYSTEM)).toBe(false);
+	});
+
+	test("a named hive reads under any account", () => {
+		const key = "HKU\\S-1-5-21-1-2-3\\SOFTWARE\\Ubisoft";
+		expect(validRegKey(key, USER)).toBe(true);
+		expect(validRegKey(key, LOCAL_SERVICE)).toBe(true);
+	});
+
+	test("other hives and malformed keys are refused", () => {
+		expect(validRegKey("HKCR\\Foo", USER)).toBe(false);
+		expect(validRegKey("HKCU\\", USER)).toBe(false);
+		expect(validRegKey("HKCU\\Software\\..\\Other", USER)).toBe(false);
+	});
+});
+
 describe("parseRegSubKeys", () => {
 	const KEY = "HKLM\\SOFTWARE\\WOW6432Node\\GOG.com\\Games";
+
+	test("an HKCU key matches the full hive name reg.exe prints", () => {
+		const stdout = [
+			"",
+			"HKEY_CURRENT_USER\\System\\GameConfigStore\\Children",
+			"HKEY_CURRENT_USER\\System\\GameConfigStore\\Parents",
+			"",
+		].join("\r\n");
+		expect(parseRegSubKeys(stdout, "HKCU\\System\\GameConfigStore")).toEqual([
+			"Children",
+			"Parents",
+		]);
+	});
+
+	test("an HKU key and HKEY_USERS itself match what reg.exe prints", () => {
+		const row =
+			"HKEY_USERS\\S-1-5-21-1\\SOFTWARE\\Ubisoft\\Launcher\\Installs\\4502";
+		const key = "HKU\\S-1-5-21-1\\SOFTWARE\\Ubisoft\\Launcher\\Installs";
+		expect(parseRegSubKeys(row, key)).toEqual(["4502"]);
+		// As `regLoadedHives` falls back on it.
+		expect(parseRegSubKeys("HKEY_USERS\\S-1-5-19", "HKEY_USERS")).toEqual([
+			"S-1-5-19",
+		]);
+	});
 
 	test("returns subkey NAMES from real reg.exe output", () => {
 		const stdout = [

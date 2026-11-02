@@ -675,9 +675,9 @@ private struct ShotConsole: View {
                     store: store, model: model, discovery: discovery, waker: waker,
                     entry: .constant(nil), notice: .constant(nil), pairing: .constant(nil),
                     linkConfirm: .constant(nil), runLink: { _ in }, onFailed: {},
-                    onPaired: { _, _ in }, connect: { _, _ in }, connectDiscovered: { _ in },
+                    onPaired: { _, _ in }, connect: { _, _, _ in }, connectDiscovered: { _ in },
                     requestAccess: { _ in }, requestAccessDiscovered: { _ in },
-                    launchTitle: { _, _ in }, connectShelf: { _ in }, wakeOnly: { _ in })
+                    launchTitle: { _, _, _ in }, connectShelf: { _ in }, wakeOnly: { _ in })
             }
         }
         .task {
@@ -854,10 +854,11 @@ private struct ShotTrust: View {
 // MARK: - Stream hero
 
 /// The marketing hero: a stand-in streamed frame with the real glass HUD chip on top.
-/// StreamView can't render here (it needs a live punktfunk/1 connection), so the frame is
-/// synthetic — set `PUNKTFUNK_SHOT_HERO=/path/to/frame.png` to drop in a real captured frame.
+/// StreamView needs a live connection, so the frame is synthetic: set
+/// `PUNKTFUNK_SHOT_HERO=/path/to/frame.png` to drop in a real captured frame.
 /// The frame fills the display; the HUD stays inside the safe area. The status bar and home
-/// indicator hide, as they do for a live session.
+/// indicator hide, as they do for a live session. visionOS hangs the stream window's ornament
+/// above it.
 private struct ShotStreamHero: View {
     #if os(macOS)
     /// The App Store canvas's scale: a 1× monitor still shoots the 2× Mac.
@@ -880,6 +881,11 @@ private struct ShotStreamHero: View {
         #if os(iOS) || os(visionOS)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        #endif
+        #if os(visionOS)
+        .ornament(attachmentAnchor: .scene(.top), contentAlignment: .bottom) {
+            StreamOrnament(quickActions: {})
+        }
         #endif
     }
 }

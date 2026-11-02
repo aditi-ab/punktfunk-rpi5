@@ -1,10 +1,12 @@
 # CI builder for the punktfunk RPM. The Fedora version is parameterized so one Dockerfile
 # serves every target whose sonames must match: Fedora 43 == Bazzite's base (group "bazzite"),
-# Fedora 44 == the Fedora KDE spin (group "fedora-44"). The RPM's auto-generated library
+# Fedora 44 == the Fedora KDE spin (group "fedora-44"), Fedora 45 == Bazzite 45 and Fedora 45
+# (group "fedora-45"). The RPM's auto-generated library
 # Requires pin to exactly what the chosen base — and thus the target — ships. Used by .gitea/workflows/rpm.yml; built+pushed by .gitea/workflows/docker.yml.
 #
 #   docker build --build-arg FEDORA_VERSION=43 -f ci/fedora-rpm.Dockerfile -t punktfunk-fedora-rpm ci
 #   docker build --build-arg FEDORA_VERSION=44 -f ci/fedora-rpm.Dockerfile -t punktfunk-fedora44-rpm ci
+#   docker build --build-arg FEDORA_VERSION=45 -f ci/fedora-rpm.Dockerfile -t punktfunk-fedora45-rpm ci
 #
 # Mirrors ci/rust-ci.Dockerfile (the Ubuntu workspace builder) for the rpmbuild side.
 ARG FEDORA_VERSION=43

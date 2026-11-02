@@ -36,6 +36,10 @@ ExecStart=/usr/bin/punktfunk-scripting
 ExecStartPre=+/bin/mkdir -p -m 0700 %h/.config/punktfunk/plugin-run %h/.config/punktfunk/plugin-state
 Restart=on-failure
 RestartSec=2
+# 78 is the runner refusing to run a plugin without the sandbox this box can't build
+# (SANDBOX_REFUSED_EXIT, sdk/src/runner.ts). A restart would probe the same box again, so the unit
+# stays failed until the operator repairs the sandbox and starts the runner.
+RestartPreventExitStatus=78
 # Deliver the stop signal to the runner process itself (it orchestrates the structural shutdown of
 # its unit fibers), and give it room to run their finalizers before the cgroup is reaped.
 KillMode=mixed
@@ -57,8 +61,8 @@ TimeoutStopSec=30
 # NOTE: these all need unprivileged user namespaces for a *user* unit, as does bwrap itself. Where
 # AppArmor restricts them (Ubuntu), the punktfunk-scripting-apparmor user generator swaps these
 # directives for the AppArmor profile of that name; a loose script's extra paths then go in
-# /etc/apparmor.d/local/punktfunk-scripting. On any other restricting kernel the runner starts no
-# plugin and the console's Troubleshooting page says so.
+# /etc/apparmor.d/local/punktfunk-scripting. On any other restricting kernel the runner stops at
+# start once a plugin is installed, and the console's Troubleshooting page says so.
 #
 # PrivateTmp is deliberately OFF (field report 2026-08-03, the VirtualHere plugin). A plugin's
 # whole job is integrating with things already running on this box, and on Linux those talk over

@@ -54,8 +54,11 @@ from pathlib import Path
 
 import decky
 
-# Flatpak application id of the GTK client (packaging/flatpak/io.unom.Punktfunk.yml).
-APP_ID = "io.unom.Punktfunk"
+# Flatpak application id of the GTK client (packaging/flatpak/io.unom.punktfunk.yml).
+APP_ID = "io.unom.punktfunk"
+# The id before the lowercase rename. A Deck still on it is driven under it until its next client
+# update, which the remote's end-of-life marker turns into a rebase onto APP_ID.
+LEGACY_APP_ID = "io.unom.Punktfunk"
 
 def _runner_path() -> str:
     """Absolute path to the launch wrapper shipped with the plugin (bin/punktfunkrun.sh)."""
@@ -359,12 +362,10 @@ def _flatpak() -> str | None:
 
 # --- which client is installed -------------------------------------------------------------
 #
-# The flatpak is the Deck's usual client, but it is not the only one: a sysext, a .deb/.rpm, an
-# AUR build, a nix profile and a hand-built binary all install a NATIVE `punktfunk-client`, and
-# on those the plugin used to be dead in the water — every headless call went through
-# `flatpak run io.unom.Punktfunk` and simply failed. Both kinds keep identity, known-hosts and
-# settings in the same ~/.config/punktfunk (the flatpak's sandbox HOME resolves to the real
-# home), so nothing else in this file has to care which one answered.
+# The flatpak is the Deck's usual client, but a sysext, a .deb/.rpm, an AUR build, a nix profile
+# and a hand-built binary all install a NATIVE `punktfunk-client` instead. Every call goes
+# through the one client found, which owns its identity, known-hosts and settings (the
+# flatpak's under ~/.var/app), so nothing else in this file cares which one answered.
 NATIVE_BIN = "punktfunk-client"
 # The headless CLI — the door this backend does almost everything through (discover, hosts,
 # pair, trust). Shipped beside the GTK client in every package since v0.22.0: /app/bin in the
@@ -393,19 +394,20 @@ def _native_client() -> str | None:
     return None
 
 
-# The client flatpak ships x86_64 and aarch64; flatpak names arches the way uname does.
-_FLATPAK_ARCH = os.uname().machine
-
-
 def _flatpak_ref() -> dict | None:
     """The INSTALLED client flatpak resolved to a SCOPE and a BRANCH, or None when there is none.
 
-    ``{"scope": "--user"|"--system", "branch": "canary", "ref": "io.unom.Punktfunk//canary"}``.
+    ``{"scope": "--user"|"--system", "branch": "canary", "arch": "aarch64", "app_id": APP_ID,
+    "ref": "io.unom.punktfunk//canary"}``. ``app_id`` is :data:`LEGACY_APP_ID` only when that is
+    all the box has.
+
+    The arch is read off the installed tree, not `os.uname()`: Decky's Python can be an x86_64
+    process on an aarch64 SteamOS (Steam Frame).
 
     ⭐⭐ **Naming no branch is not a shorthand for "the only one".** flatpak refuses an ambiguous
     ref rather than guessing at one, and the ambiguity does not need two branches *installed*:
     the punktfunk remote publishes `stable` AND `canary`, so an unqualified
-    ``flatpak remote-info <origin> io.unom.Punktfunk`` errors with "Multiple branches available"
+    ``flatpak remote-info <origin> io.unom.punktfunk`` errors with "Multiple branches available"
     on a Deck that has exactly one. That error is why the client update check silently answered
     "up to date" on every Deck — so every query downstream now names the ref in full.
 
@@ -421,27 +423,35 @@ def _flatpak_ref() -> dict | None:
     """
     if not _flatpak():
         return None
-    for root, scope in (
+    scopes = (
         (Path(decky.DECKY_USER_HOME) / ".local" / "share" / "flatpak", "--user"),
         (Path("/var/lib/flatpak"), "--system"),
-    ):
-        try:
-            branches = sorted(
-                p.name for p in (root / "app" / APP_ID / _FLATPAK_ARCH).iterdir()
-                if (p / "active").exists()
-            )
-        except OSError:
-            continue  # not installed in this scope
-        if not branches:
-            continue
-        branch = "stable" if "stable" in branches else branches[0]
-        if len(branches) > 1:
-            decky.logger.warning(
-                "%s is installed on %d branches (%s) — using %s, the one `flatpak run` resolves "
-                "to; uninstall the others so the client you launch is the client we update",
-                APP_ID, len(branches), ", ".join(branches), branch,
-            )
-        return {"scope": scope, "branch": branch, "ref": f"{APP_ID}//{branch}"}
+    )
+    for app_id in (APP_ID, LEGACY_APP_ID):
+        for root, scope in scopes:
+            try:
+                found = sorted(
+                    (p.parent.name, p.name) for p in (root / "app" / app_id).glob("*/*")
+                    if (p / "active").exists()
+                )
+            except OSError:
+                continue  # not installed in this scope
+            if not found:
+                continue
+            arch = found[0][0]
+            branches = [b for a, b in found if a == arch]
+            branch = "stable" if "stable" in branches else branches[0]
+            if len(branches) > 1:
+                decky.logger.warning(
+                    "%s is installed on %d branches (%s) — using %s, the one `flatpak run` "
+                    "resolves to; uninstall the others so the client you launch is the client "
+                    "we update",
+                    app_id, len(branches), ", ".join(branches), branch,
+                )
+            return {
+                "scope": scope, "branch": branch, "arch": arch, "app_id": app_id,
+                "ref": f"{app_id}//{branch}",
+            }
     return None
 
 
@@ -476,7 +486,9 @@ def _client_argv() -> list[str] | None:
     if forced != "flatpak" and not ref and native:
         return [native]
     if ref:
-        return [_flatpak(), "run", f"--arch={_FLATPAK_ARCH}", f"--branch={ref['branch']}", APP_ID]
+        return [
+            _flatpak(), "run", f"--arch={ref['arch']}", f"--branch={ref['branch']}", ref["app_id"],
+        ]
     return [native] if native else None
 
 
@@ -801,6 +813,7 @@ def _ctl_sockets() -> list[Path]:
     run = Path(f"/run/user/{uid}")
     return [
         run / "app" / APP_ID / "punktfunk-session-ctl.sock",
+        run / "app" / LEGACY_APP_ID / "punktfunk-session-ctl.sock",
         run / "punktfunk-session-ctl.sock",
     ]
 
@@ -867,6 +880,36 @@ class Plugin:
         decky.logger.warning("pairing failed (rc=%s): %s", rc, detail)
         return {"ok": False, "error": _cli_error(rc, err), "detail": detail}
 
+    async def request_access(
+        self, addr: str, port: int, name: str = "Steam Deck", fp: str = ""
+    ) -> dict:
+        """No-PIN pairing (``punktfunk pair <addr:port> --request-access --name LABEL --fp HEX``).
+
+        Waits up to ~185 s for the host's operator to approve this Deck, pinned to ``fp``, the
+        fingerprint the host advertised and ``trust_host`` saved. Without it the CLI takes the
+        newest record at the address, which at a dual-boot box can be the other OS. Never
+        streams. Same result shape as ``pair``; on failure ``detail`` is the CLI's sentence for
+        the user. A client too old for the flag asks for a PIN instead, which comes back
+        ``client-outdated``."""
+        fp = str(fp).strip()
+        if fp and not re.fullmatch(r"[0-9a-fA-F]{64}", fp):
+            return {"ok": False, "error": "unresolved", "detail": "bad host fingerprint"}
+        args = ["pair", f"{addr}:{int(port)}", "--request-access", "--name", name]
+        if fp:
+            args += ["--fp", fp]
+        rc, out, err = await _run_cli(args, timeout=200.0)
+        if rc == 0:
+            fp = ""
+            for token in out.split():
+                if token.startswith("fp="):
+                    fp = token[3:]
+            decky.logger.info("access granted by %s:%s", addr, port)
+            return {"ok": True, "fp": fp}
+        detail = (err.strip().splitlines() or ["the request failed"])[-1]
+        decky.logger.warning("request access failed (rc=%s): %s", rc, detail)
+        error = "client-outdated" if rc == 6 and "--pin" in err else _cli_error(rc, err)
+        return {"ok": False, "error": error, "detail": detail}
+
     async def trust_host(self, addr: str, port: int, fp: str, name: str = "") -> dict:
         """Step 1 of request access: save the host with the fingerprint it ADVERTISED
         (``punktfunk hosts add <addr:port> --fp <hex> --name <label>``).
@@ -904,6 +947,17 @@ class Plugin:
         if not ref or ref.startswith("-"):
             return {"ok": False, "error": "unresolved", "detail": "bad host reference"}
         return await _cli_json(["library", ref, "--json"], timeout=20.0)
+
+    async def profiles(self, ref: str) -> dict:
+        """Who plays on the host (``punktfunk profiles <host-ref> --json``).
+
+        ``{ok: True, profiles: [{id, display_name, accent, owner, note, picture}], picked}``,
+        a picture being a data URL or null. A host without profiles answers ``unresolved``,
+        which the panel reads as "no chips"."""
+        ref = str(ref).strip()
+        if not ref or ref.startswith("-"):
+            return {"ok": False, "error": "unresolved", "detail": "bad host reference"}
+        return await _cli_json(["profiles", ref, "--json"], timeout=20.0)
 
     async def shortcut_art(self) -> dict:
         """The Steam-shortcut artwork shipped with the plugin (committed under ``assets/``):
@@ -1053,7 +1107,7 @@ class Plugin:
         native = bool(prefix) and prefix[0] != _flatpak()
         return {
             "runner": path,
-            "app_id": APP_ID,
+            "app_id": (_flatpak_ref() or {}).get("app_id", APP_ID),
             "exists": Path(path).exists(),
             "client_kind": "native" if native else ("flatpak" if prefix else "none"),
             "client_bin": prefix[0] if native else "",
@@ -1068,7 +1122,7 @@ class Plugin:
         if not prefix:
             return {"ok": False, "error": "client-not-found"}
         if prefix[0] == _flatpak():
-            argv = [prefix[0], "kill", APP_ID]
+            argv = [prefix[0], "kill", prefix[-1]]  # the app id is last, see _client_argv
         else:
             # -x: whole-name match, so this can only ever hit the client itself.
             killer = shutil.which("pkill") or "/usr/bin/pkill"
@@ -1218,6 +1272,12 @@ class Plugin:
         if rc != 0:
             decky.logger.warning("flatpak client update failed (rc=%s): %s", rc, out[-400:])
             return {"ok": False, "updated": False, "error": "update-failed"}
+        # An end-of-life rebase leaves the old ref uninstalled, so its commit cannot be compared.
+        moved = _flatpak_ref()
+        if moved and moved["app_id"] != ref["app_id"]:
+            decky.logger.info("flatpak client rebased: %s -> %s", ref["ref"], moved["ref"])
+            _update_cache["data"] = None
+            return {"ok": True, "updated": True}
         _, after = await _flatpak_capture(["info", scope, full], timeout=10.0)
         after_commit = _field_from(after, "Commit")
         updated = bool(before_commit and after_commit and before_commit != after_commit)

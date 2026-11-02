@@ -226,11 +226,12 @@ public func dpadBits(dx: Float, dy: Float, dead: Float) -> UInt32 {
 }
 
 /// A stick's wire pair for a travel of `dx`, `dy` points from where the finger landed: i16 with
-/// +y up, nothing inside `dead`, full deflection at `radius` and beyond.
+/// +y up, nothing inside `dead`, the travel itself past it, full deflection at `radius` and beyond.
+/// `dead` only gates: subtracting it would stack on the game's own dead zone.
 public func stickWire(dx: Float, dy: Float, radius: Float, dead: Float) -> (x: Int32, y: Int32) {
     let mag = hypot(dx, dy)
     if mag <= dead { return (0, 0) }
-    let v = min(max((mag - dead) / (radius - dead), 0), 1) * 32767 / mag
+    let v = min(mag / radius, 1) * 32767 / mag
     return (Int32((dx * v).rounded()), Int32((-dy * v).rounded()))
 }
 

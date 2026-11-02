@@ -19,7 +19,7 @@
 //
 // Package-op flags: --exact pins the resolved version instead of a caret range, and
 // --registry @scope=https://… maps a scope to its registry in bunfig.toml. Both exist for the
-// plugin store (crates/punktfunk-host/src/plugin_host/store), which installs one reviewed version
+// plugin store (crates/host/punktfunk-host/src/plugin_host/store), which installs one reviewed version
 // of a package that may live on somebody else's registry — but they are ordinary CLI flags too.
 import { Effect, Fiber } from "effect";
 import { publishedMgmtUrl } from "./config.js";
@@ -31,8 +31,8 @@ import {
 	removePlugins,
 } from "./plugins.js";
 import { discoverUnits } from "./discover.js";
-import { runner, runOneUnit } from "./runner.js";
-import { redirectUiServe } from "./ui-forward.js";
+import { runner, runnerExitStatus, runOneUnit } from "./runner.js";
+import { redirectUiServe, redirectUiServeToChannel } from "./ui-forward.js";
 
 const arg = (flag: string): string | undefined => {
 	const i = process.argv.indexOf(flag);
@@ -154,9 +154,9 @@ switch (process.argv[2]) {
 
 // ---- one unit, inside its sandbox (spawned by the supervisor; never run by hand) --------------
 //
-// The other half of `runner.ts`'s sandbox: `bwrap` re-execs this bundle with one unit to run, so a
-// plugin's code gets a process — and a token — of its own. Everything it can see was decided by
-// the argv on the outside; there is nothing left to enforce in here. The exit code is how the
+// The other half of runner-linux.ts's sandbox: `bwrap` re-execs this bundle with one unit to run,
+// so a plugin's code gets a process — and a token — of its own. Everything it can see was decided
+// by the argv on the outside; there is nothing left to enforce in here. The exit code is how the
 // supervisor learns the plugin failed, and what makes it restart on the usual backoff.
 const runUnit = arg("--run-unit");
 if (runUnit) {
@@ -164,6 +164,10 @@ if (runUnit) {
 	// Set only for a plugin without network, whose UI the supervisor forwards.
 	const uiPort = Number(process.env.PUNKTFUNK_UI_PORT);
 	if (uiPort > 0) redirectUiServe(uiPort);
+	// Set only for a Windows container, whose page goes over the host's channel on its pipe.
+	const channel = process.env.PUNKTFUNK_UI_CHANNEL;
+	const pipe = process.env.PUNKTFUNK_MGMT_UNIX;
+	if (channel && pipe) redirectUiServeToChannel(pipe, channel);
 	const unitShipper = installLogShipper();
 	const unitFiber = Effect.runFork(runOneUnit(unit));
 	const stopUnit = (): void => {
@@ -233,7 +237,9 @@ const shutdown = (signal: string) => {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-await Effect.runPromise(Fiber.await(fiber));
+const ended = await Effect.runPromise(Fiber.await(fiber));
 await shipper.flush(); // every unit ended on its own — don't leave their last lines unsent
 shipper.stop();
 clearInterval(keepAlive); // …then let the process exit
+// A sandbox refusal leaves with its own status: a supervisor stops on it and does not restart.
+process.exitCode = runnerExitStatus(ended);

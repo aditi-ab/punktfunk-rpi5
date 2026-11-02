@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- The devices whose USB grant we want persisted: matching this filter is what makes the
      grant stick on Android TV, where the in-app dialog often never appears. Ids are decimal.
-     The SC2 pids mirror Sc2Device.USB_PIDS and the Sony ones DsDevice.USB_PIDS; the SC2's
+     The Valve pids mirror Sc2Device / Sc1Device USB_PIDS and the Sony ones DsDevice.USB_PIDS; the SC2's
      BLE identity (28DE:1303) is deliberately absent, since it never enumerates over USB. -->
 <resources>
     <!-- Valve Steam Controller 2, wired 28DE:1302 -->
@@ -10,6 +10,9 @@
     <usb-device vendor-id="10462" product-id="4868" />
     <!-- Puck Nereid 28DE:1305 -->
     <usb-device vendor-id="10462" product-id="4869" />
+    <!-- Steam Controller (2015), wired 28DE:1102 and its dongle 1142 -->
+    <usb-device vendor-id="10462" product-id="4354" />
+    <usb-device vendor-id="10462" product-id="4418" />
     <!-- Sony DualSense 054C:0CE6, Edge 0DF2, DualShock 4 05C4 / 09CC -->
     <usb-device vendor-id="1356" product-id="3302" />
     <usb-device vendor-id="1356" product-id="3570" />

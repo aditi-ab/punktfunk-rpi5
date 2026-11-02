@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Link profiles, named after the simulator's scenarios and carrying its numbers
-# (crates/punktfunk-core/src/abr/sim/scenarios.rs). Sourced by rig.sh.
+# (crates/core/punktfunk-core/src/abr/sim/scenarios.rs). Sourced by rig.sh.
 #
 # Unmeasured in both tiers, and worth knowing before you read a row: a keyframe
 # here is IDR_PCT (10x) of an ordinary frame and the simulator's is 4x. Nobody
@@ -11,6 +11,9 @@
 # TRACE is "<at_s>:<kbit> …" applied while the run goes on; WANDER_PCT/WANDER_S
 # re-draw the rate around it. MODE and ACHIEVABLE_KBPS are what the client asks
 # for and what the summary scores against.
+#
+# `lost` counts frames the client saw a shard of; a frame lost whole shows only
+# in `unrec`.
 
 profile() {
   # Defaults; a profile overrides what it cares about.
@@ -55,6 +58,10 @@ profile() {
   BRINGUP_MS=${PF_RIG_BRINGUP_MS:-2500}
   # 1 = do not offer the ramp, so the client takes the legacy in-session burst.
   NO_RAMP=${PF_RIG_NO_RAMP:-0}
+  # Seconds into the stream when the client's address moves (0 = never), and the MTU both
+  # ends of the link take then (0 = unchanged): a roam onto a new subnet, or onto a tunnel.
+  REBIND_AT=0
+  REBIND_MTU=0
 
   case "$1" in
     lan_1g)
@@ -62,8 +69,8 @@ profile() {
       MODE=3840x2160x120; ACHIEVABLE_KBPS=150000
       ;;
     # The 2.5 G host → 1 G client hop: a 1 Gbit/s link whose queue is one switch's SRAM
-    # (1 ms ≈ 125 KB). A line-rate burst overruns it on IDRs; `PUNKTFUNK_DELIVERY=capped`
-    # does not.
+    # (1 ms ≈ 125 KB). A line-rate burst (`PUNKTFUNK_DELIVERY=burst`) overruns it on IDRs;
+    # a frame paced at the link rate does not.
     lan_1g_switch)
       RATE_KBIT=1000000; DELAY_MS=1; BUFFER_MS=1
       MODE=3840x2160x120; ACHIEVABLE_KBPS=150000
@@ -188,10 +195,30 @@ profile() {
       MODE=1920x1080x30; ACHIEVABLE_KBPS=12000
       PROBES=2
       ;;
+    # The client's address moves 15 s in. `roam_wifi` keeps the path's MTU; `roam_tunnel`
+    # lands on a 1280-byte path, where full-size video shards no longer fit.
+    roam_wifi)
+      RATE_KBIT=100000; DELAY_MS=5; BUFFER_MS=60
+      MODE=1920x1080x60; ACHIEVABLE_KBPS=60000
+      REBIND_AT=15
+      ;;
+    roam_tunnel)
+      RATE_KBIT=100000; DELAY_MS=5; BUFFER_MS=60
+      MODE=1920x1080x60; ACHIEVABLE_KBPS=60000
+      REBIND_AT=15; REBIND_MTU=1280
+      ;;
+    # A fixed rate over a 100 Mbit/s hop with a switch's queue. Nothing measures the session,
+    # so it starts at the floor's pace and only its dead frames bring that down.
+    fixed_100m)
+      RATE_KBIT=93000; DELAY_MS=1; BUFFER_MS=10
+      MODE=1920x1080x60; ACHIEVABLE_KBPS=80000
+      PROBE_BITRATE="${PF_RIG_FIXED_KBPS:-80000}"
+      ;;
     *)
       echo "unknown profile '$1' (lan_1g lan_1g_switch lan_1g_smallbuf wifi_tv wifi_tv_probe_damage wan_wg_12 \
 lte_variable wan_still ramp_loss nowall_720p policer_20 shared_two_auto shared_both shared_newcomer \
-shared_fixed_plus_auto shared_fixed_survivor shared_leaver shared_lone shared_fixed_lone)" >&2
+shared_fixed_plus_auto shared_fixed_survivor shared_leaver shared_lone shared_fixed_lone roam_wifi \
+roam_tunnel fixed_100m)" >&2
       return 1
       ;;
   esac

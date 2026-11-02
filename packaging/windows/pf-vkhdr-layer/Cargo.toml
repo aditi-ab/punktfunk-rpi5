@@ -20,6 +20,10 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
+ptr_cast_constness = "deny"
+unnecessary_safety_doc = "deny"
+unnecessary_safety_comment = "deny"
+cast_ptr_alignment = "warn"
 
 [profile.release]
 opt-level = 2

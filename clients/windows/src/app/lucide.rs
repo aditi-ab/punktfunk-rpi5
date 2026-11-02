@@ -1,34 +1,22 @@
 //! The shell's icons: [Lucide](https://lucide.dev), the same marks the console (gamepad UI) and
 //! the GTK shell draw, from the same masters in `assets/lucide`.
 //!
-//! Those two shells stroke the path data. This one cannot — windows-reactor has no vector
-//! element — so it draws Lucide's own icon FONT instead, one glyph per mark, from the
-//! codepoints in [`pf_client_core::lucide`]. A `FontIcon` is sized by the control and tinted
-//! from the foreground brush, exactly as the `SymbolIcon` it replaced was: an icon on an accent
-//! button comes out white, one in the sidebar takes the theme's own colour, and every one of
-//! them is a vector at any DPI.
+//! Inside a control a mark is a glyph of Lucide's own icon FONT, from the codepoints in
+//! [`pf_client_core::lucide`]: a text block in that font takes the control's foreground, so a
+//! mark on an accent button comes out white and one on a plain button in the theme's text
+//! colour, a vector at any DPI. Where WinUI wants an `Icon` (a navigation item), the mark is the
+//! master's path stroked as SVG in the theme's text colour: reactor's icon font is fixed, and
+//! it holds other glyphs at Lucide's codepoints. No PNGs: a bitmap keeps one colour on every
+//! theme.
 //!
-//! 🛑 The obvious alternative — baking PNGs, the way [`super::os_icons`] and
-//! [`super::launcher_icons`] carry their brand marks — was tried and is WRONG for UI icons.
-//! Reactor's `.icon()` builds a `BitmapIcon` with no size set and with `ShowAsMonochrome(false)`,
-//! so a bitmap is stuck at one baked colour on every theme AND renders at its source pixel count
-//! read as DIPs. It looked right in the settings sidebar (a `NavigationViewItem`'s template
-//! clamps its icon) and was enormous on every button (an ordinary `Button` does not). The brand
-//! marks can live with a baked colour because they ARE a fixed colour; a UI icon cannot.
-//!
-//! ## Where the font comes from
-//!
-//! `ms-appx:///` resolves to the app's install folder, which for this unpackaged-or-packaged
-//! shell means "next to the exe". The font gets there twice over:
-//!
-//! * a dev `cargo build` — `build.rs` stages it into `target/<profile>/Assets/`, beside the
-//!   App SDK bootstrap that `windows-reactor-setup` puts there;
-//! * a shipped build — it is checked in under `clients/windows/packaging/assets/`, which
-//!   `pack-msix.ps1` copies wholesale into the layout's `Assets\`, and the installer and the
-//!   portable zip are packed from that same layout.
+//! The font: `ms-appx:///` resolves to the folder of the exe. A dev `cargo build` stages it
+//! into `target/<profile>/Assets/` (`build.rs`); a shipped build carries it from
+//! `clients/windows/packaging/assets/`, which `pack-msix.ps1` copies into the layout's
+//! `Assets\`, and the installer and the portable zip pack that same layout.
 
 use pf_client_core::lucide as set;
-use windows_reactor::Icon;
+use pf_fluent::Palette;
+use windows_reactor::{ColorScheme, EncodedImage, FontWeight, Icon, TextBlock};
 
 /// The font as XAML names it: the file, then `#` and the family inside it. Both halves matter —
 /// a family name alone would only find a font installed system-wide, which this one is not.
@@ -41,10 +29,30 @@ pub(super) fn glyph(name: &str) -> String {
     set::glyph(name).map(String::from).unwrap_or_default()
 }
 
-/// A mark for any control that takes an icon — a button, a list row, a navigation item. The
-/// control sizes it and the theme colours it; there is nothing per-site to pass.
-pub(super) fn icon(name: &str) -> Icon {
-    Icon::font_family(glyph(name), FAMILY)
+/// A mark for a control's content, at the 20 px of WinUI's `FontIcon`. It takes the
+/// control's foreground.
+pub(super) fn mark(name: &str) -> TextBlock {
+    TextBlock::new()
+        .text(glyph(name))
+        .font_family(FAMILY)
+        .font_size(20.0)
+        .font_weight(FontWeight::NORMAL)
+}
+
+/// A mark as an `Icon`: the master's path at Lucide's stroke width, in the theme's primary
+/// text colour (`TextFillColorPrimary`).
+pub(super) fn icon(name: &str, pal: &Palette) -> Icon {
+    let ink = match pal.scheme {
+        ColorScheme::Dark => "#FFFFFF",
+        ColorScheme::Light => "#000000\" stroke-opacity=\"0.894",
+    };
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" \
+         stroke=\"{ink}\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">\
+         <path d=\"{}\"/></svg>",
+        set::path(name).unwrap_or_default()
+    );
+    Icon::image_svg(EncodedImage::new(svg.into_bytes()))
 }
 
 #[cfg(test)]
@@ -58,6 +66,7 @@ mod tests {
         let named = [
             "arrow-left",
             "arrow-right",
+            "arrow-up-down",
             "chart-column",
             "check",
             "circle-help",

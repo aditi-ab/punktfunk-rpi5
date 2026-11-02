@@ -26,14 +26,13 @@
 import CryptoKit
 import Foundation
 import Network
+import PunktfunkCore
 import Security
 
 enum MgmtTransportError: Error, Sendable {
     /// The host's certificate did not hash to the pinned fingerprint — an impostor, or a host
     /// that was reinstalled/re-keyed since pairing.
     case pinMismatch
-    /// No fingerprint to pin: the host is unpaired, so nothing it presents can be verified.
-    case unpinned
     case connection(String)
     case timedOut
     case tooLarge
@@ -45,59 +44,13 @@ enum MgmtTransport {
     /// a few MB; anything past this is not a poster and not a library payload.
     static let maxResponseBytes = 16 * 1024 * 1024
 
-    /// `GET https://host:port/path`, authenticated by mTLS (`identity`) and pinned by
-    /// `pinnedHostFingerprint`. A nil pin throws `unpinned` before any socket opens.
+    /// One request to `https://host:port/path`, authenticated by mTLS (`identity`) and pinned by
+    /// `pin`. A `body` goes out with `contentType` and a length.
     ///
     /// Runs over a pooled keep-alive connection. A connection the host has since dropped is
     /// indistinguishable from a live one until we write to it, so a REUSED connection that fails
     /// is retried, up to once per pooled socket; a fresh connection that fails is a real error.
-    static func get(
-        host: String,
-        port: UInt16,
-        path: String,
-        identity: SecIdentity,
-        pinnedHostFingerprint: Data?,
-        timeout: TimeInterval = 15
-    ) async throws -> HTTPResponse {
-        try await request(
-            host: host, port: port, method: "GET", path: path, body: nil, contentType: nil,
-            identity: identity, pinnedHostFingerprint: pinnedHostFingerprint, timeout: timeout)
-    }
-
-    /// `POST https://host:port/path` with a body — same transport, trust and retry rule as `get`.
-    /// The one write a paired device may make is the client-log upload, which is idempotent in
-    /// the only sense that matters (a retried bundle is a second bundle, not a corrupted one).
-    static func post(
-        host: String,
-        port: UInt16,
-        path: String,
-        body: Data,
-        contentType: String,
-        identity: SecIdentity,
-        pinnedHostFingerprint: Data?,
-        timeout: TimeInterval = 15
-    ) async throws -> HTTPResponse {
-        try await request(
-            host: host, port: port, method: "POST", path: path, body: body,
-            contentType: contentType, identity: identity,
-            pinnedHostFingerprint: pinnedHostFingerprint, timeout: timeout)
-    }
-
-    /// `DELETE https://host:port/path` — same transport, trust and retry rule as `get`.
-    static func delete(
-        host: String,
-        port: UInt16,
-        path: String,
-        identity: SecIdentity,
-        pinnedHostFingerprint: Data?,
-        timeout: TimeInterval = 15
-    ) async throws -> HTTPResponse {
-        try await request(
-            host: host, port: port, method: "DELETE", path: path, body: nil, contentType: nil,
-            identity: identity, pinnedHostFingerprint: pinnedHostFingerprint, timeout: timeout)
-    }
-
-    private static func request(
+    static func request(
         host: String,
         port: UInt16,
         method: String,
@@ -105,13 +58,12 @@ enum MgmtTransport {
         body: Data?,
         contentType: String?,
         identity: SecIdentity,
-        pinnedHostFingerprint: Data?,
-        timeout: TimeInterval
+        pin: Data,
+        timeout: TimeInterval = 15
     ) async throws -> HTTPResponse {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw MgmtTransportError.invalidPort(port)
         }
-        guard let pin = pinnedHostFingerprint else { throw MgmtTransportError.unpinned }
         let key = "\(unbracketed(host)):\(port):\(hex(pin))"
         var lastError: Error = MgmtTransportError.connection("no attempt made")
 
@@ -149,6 +101,60 @@ enum MgmtTransport {
     static func unbracketed(_ host: String) -> String {
         guard host.hasPrefix("["), host.hasSuffix("]"), host.count > 2 else { return host }
         return String(host.dropFirst().dropLast())
+    }
+}
+
+extension MgmtTransport {
+    /// How long a dial over the stream port waits before HTTPS takes over.
+    static let tunnelWaitMs: UInt32 = 3000
+
+    /// `method path` over the host's stream port, which needs no TCP 47990. A `body` goes out
+    /// with `contentType`. One connection per host serves every call. Throws `pinMismatch` for a
+    /// host that is not the pinned one, `connection` when the port carried nothing.
+    static func tunnel(
+        _ method: String, _ path: String, body: Data?, contentType: String?,
+        to target: MgmtTarget
+    ) async throws -> HTTPResponse {
+        try await withCheckedThrowingContinuation { done in
+            // The call blocks for a dial; it must not hold a cooperative thread.
+            DispatchQueue.global(qos: .userInitiated).async {
+                done.resume(with: Result {
+                    try tunnelBlocking(method, path, body: body ?? Data(), contentType, to: target)
+                })
+            }
+        }
+    }
+
+    private static func tunnelBlocking(
+        _ method: String, _ path: String, body: Data, _ contentType: String?,
+        to target: MgmtTarget
+    ) throws -> HTTPResponse {
+        guard target.pin.count == 32 else { throw MgmtTransportError.pinMismatch }
+        var status: UInt16 = 0
+        var reply: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let call = { (contentType: UnsafePointer<CChar>?) in
+            target.pin.withUnsafeBytes { pin in
+                body.withUnsafeBytes { sent in
+                    punktfunk_mgmt_request(
+                        unbracketed(target.address), target.streamPort, target.certPEM,
+                        target.keyPEM, pin.bindMemory(to: UInt8.self).baseAddress, method, path,
+                        contentType, sent.bindMemory(to: UInt8.self).baseAddress,
+                        UInt(sent.count), tunnelWaitMs, &status, &reply, &len)
+                }
+            }
+        }
+        let rc = contentType.map { $0.withCString(call) } ?? call(nil)
+        defer { punktfunk_mgmt_body_free(reply, len) }
+        switch rc {
+        case PUNKTFUNK_STATUS_OK.rawValue:
+            let data = reply.map { Data(bytes: $0, count: Int(len)) } ?? Data()
+            return HTTPResponse(status: Int(status), headers: [:], body: data)
+        case PUNKTFUNK_STATUS_CRYPTO.rawValue:
+            throw MgmtTransportError.pinMismatch
+        default:
+            throw MgmtTransportError.connection("stream port status \(rc)")
+        }
     }
 }
 
@@ -276,7 +282,7 @@ final class MgmtConnection: @unchecked Sendable {
     /// False once the connection has failed; the pool discards these instead of handing them out.
     private(set) var isHealthy = true
     /// Has this connection completed at least one request? Drives the retry-once rule in
-    /// `MgmtTransport.get` — only a connection the host may have dropped since is worth retrying.
+    /// `MgmtTransport.request` — only a connection the host may have dropped since is worth retrying.
     var hasServedRequest: Bool { servedRequest }
 
     /// A nil `identity` presents no client certificate. Only the pool's tests pass one: they

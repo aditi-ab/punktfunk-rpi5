@@ -32,6 +32,9 @@ public enum DefaultsKey {
     /// How a frame whose shape differs from the view fills it: a `VideoFit` raw value, `"fit"`
     /// (default, bars), `"crop"` or `"stretch"`. The cross-client `video_fit` key.
     public static let videoFit = "punktfunk.videoFit"
+    /// `"this"` (default) or `"all"`: a host screen on each of this Mac's displays. The
+    /// cross-client `screens` key.
+    public static let screens = "punktfunk.screens"
     public static let compositor = "punktfunk.compositor"
     public static let gamepadType = "punktfunk.gamepadType"
     public static let gamepadID = "punktfunk.gamepadID"
@@ -99,7 +102,15 @@ public enum DefaultsKey {
     /// and forces the session SDR). A soft preference — the host emits it when it can, else
     /// falls back. Drives the decoder via `Welcome.codec`.
     public static let codec = "punktfunk.codec"
+    /// PyroWave quality, bits per pixel from 0.5 to 2 (default 1.6): the most a PyroWave session
+    /// sends. The row shows it as the rate it needs, never as bits per pixel.
+    public static let pyrowaveBpp = "punktfunk.pyrowaveBpp"
     public static let micEnabled = "punktfunk.micEnabled"
+    /// visionOS: the room places the stream's audio at its window (on, the platform's own
+    /// default); off plays the game's mix straight to the ears. This device's, never a preset's.
+    public static let spatialAudio = "punktfunk.spatialAudio"
+    /// visionOS: how the screen bends (`ScreenCurve`). This device's, never a preset's.
+    public static let screen = "punktfunk.screen"
     /// Echo cancellation for the mic uplink (on by default): playback + capture share ONE
     /// audio engine so the system voice processor can subtract what this device is playing
     /// from what its mic hears — without it a loudspeaker client feeds the game audio straight
@@ -283,6 +294,8 @@ public enum DefaultsKey {
     /// Show how to leave for a few seconds when a stream starts (cross-client `exit_hint`).
     /// Default on.
     public static let exitHint = "punktfunk.exitHint"
+    /// The player answered the macOS 26 variable-refresh stutter notice with "Don't warn again".
+    public static let vrrWarningMuted = "punktfunk.vrrWarningMuted"
     /// Settings show their advanced rows (cross-client `show_advanced`). Default off; hiding a
     /// row keeps its value.
     public static let showAdvanced = "punktfunk.showAdvanced"
@@ -309,6 +322,11 @@ public enum DefaultsKey {
     /// `GamepadFeedback` reads it per command, so a change lands mid-stream. A device
     /// preference, never part of a stream preset.
     public static let padRumble = "punktfunk.padRumble"
+    /// The cross-client `keep_awake` key. On (default), a stream holds the screen awake for as
+    /// long as it runs. Off, only while the player's input is recent
+    /// (`PunktfunkConnection.holdsScreenAwake`), so the device's own sleep timer runs over a
+    /// game left alone. Read each second mid-stream; never part of a stream preset.
+    public static let keepAwake = "punktfunk.keepAwake"
     /// iPhone: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
     /// device's own Taptic Engine — for phone-clip pads that ship without rumble motors, where
     /// the phone body is the only actuator in the player's hands. Off by default (opt-in); read
@@ -341,6 +359,77 @@ public enum DefaultsKey {
     public static let backgroundTimeoutMinutes = "punktfunk.backgroundTimeoutMinutes"
 }
 
+/// What a `DefaultsKey` reads as before anything wrote it. The app's `@AppStorage`, the console's
+/// settings document and `EffectiveSettings` all start here, so a default lives once.
+public enum SettingDefault {
+    // Session settings (`EffectiveSettings`). A size or rate of 0 is Native.
+    public static let streamWidth = 0
+    public static let streamHeight = 0
+    public static let streamHz = 0
+    public static let matchWindow = false
+    public static let bitrateKbps = 0
+    /// PyroWave quality, bits per pixel; the host's own default.
+    public static let pyrowaveBpp = 1.6
+    public static let renderScale = 1.0
+    public static let videoFit = VideoFit.fit.rawValue
+    public static let screens = "this"
+    public static let codec = "auto"
+    public static let hdrEnabled = true
+    public static let compositor = 0
+    public static let audioChannels = 2
+    public static let audioFormat = AudioFormatChoice.opus.rawValue
+    public static let micEnabled = false
+    public static let spatialAudio = true
+    public static let screen = ScreenCurve.flat.rawValue
+    public static let echoCancel = true
+    public static let keepHostAudio = false
+    public static let touchMode = "trackpad"
+    public static let mouseMode = "capture"
+    public static let invertScroll = false
+    public static let overlayActions = ""
+    public static let inhibitShortcuts = true
+    public static let gamepadType = 0
+    public static let gamepadForwarding = true
+    public static let sc2Capture = false
+    public static let systemButtons = "auto"
+    public static let guideGesture = "auto"
+    public static let statsVerbosity = "normal"
+    public static let fullscreenWhileStreaming = true
+    public static let enable444 = false
+    public static let tenBitSdr = false
+    public static let presentPriority = "latency"
+    public static let smoothBuffer = 0
+    public static let vsync = false
+    public static let allowVRR = true
+    public static let modifierLayout = ModifierLayout.mac.rawValue
+    public static let speakerUID = ""
+    public static let micUID = ""
+    public static let micChannel = 0
+    public static let pointerCapture = true
+    // App preferences, read where they are used.
+    public static let padRumble = true
+    public static let keepAwake = true
+    public static let advancedStats = false
+    public static let fullscreenAlways = false
+    public static let uiPalette = "violet"
+    public static let librarySort = ""
+    public static let librarySections = ""
+    public static let startIn = StartIn.hosts.stored
+    public static let autoWake = true
+    public static let gamepadUIEnabled = true
+    public static let backgroundKeepAlive = false
+    public static let backgroundTimeoutMinutes = 10
+    public static let hudPlacement = "topTrailing"
+    public static let statsScalePct = 100
+    public static let exitHint = true
+    public static let vrrWarningMuted = false
+    public static let showAdvanced = false
+    public static let hostSort = HostSort.added.rawValue
+    public static let hostGrouping = HostGrouping.none.rawValue
+    public static let rumbleOnDevice = false
+    public static let gyroFromDevice = false
+}
+
 extension Notification.Name {
     /// Posted by the app's Stream menu ("Release Mouse", ⌃⌥⇧Q): the key window's stream view
     /// releases input capture if it holds it. Only reachable while NOT captured (a captured
@@ -354,10 +443,11 @@ extension Notification.Name {
     /// Posted by `StatsVerbosity.requestCycle`. The stored default does not move.
     public static let punktfunkStatsCycled = Notification.Name("io.unom.punktfunk.stats-cycled")
 
-    /// Posted by the session view when the quick-action ring opens (`object` is a Bool `NSNumber`).
-    /// The Mac's stream layer releases a captured mouse for as long as it is up and takes capture
-    /// back on close: the ring's buttons are SwiftUI above the video, and a grabbed pointer can
-    /// never reach one. macOS only — the touch clients' fingers reach the ring either way.
+    /// Posted by the session view when the quick-action ring opens or closes (`object` is a Bool
+    /// `NSNumber`). The ring's buttons are SwiftUI above the video, and a grabbed pointer can
+    /// never reach one. So the Mac's stream layer releases a captured mouse for as long as the
+    /// ring is up, and the iPad's drops its pointer lock; both take it back on close. macOS and
+    /// iOS only: a finger reaches the ring either way.
     public static let punktfunkRingOpen = Notification.Name("io.unom.punktfunk.ring-open")
 
     /// Posted by InputCapture on ⌃⌥⇧O (`object` is the session's connection): on macOS while input
@@ -376,6 +466,11 @@ extension Notification.Name {
     /// live session's owner (ContentView) flips the session's mic mute. Released, the menu item
     /// handles the same combo directly; both end at `SessionModel.toggleMicMute`.
     public static let punktfunkToggleMicMute = Notification.Name("io.unom.punktfunk.toggle-mic-mute")
+
+    /// Posted by InputCapture's chord path (⌃⌥⇧C) while input is CAPTURED (`object` is the
+    /// session's connection). ContentView flips that session's clipboard sharing; released, the
+    /// Stream menu item handles the same combo.
+    public static let punktfunkToggleClipboard = Notification.Name("io.unom.punktfunk.toggle-clipboard")
 
     /// Posted by the Live Activity's / Shortcuts' End-stream intent (`EndStreamIntent.perform`,
     /// which runs in the app's process): the app tears the active session down deliberately

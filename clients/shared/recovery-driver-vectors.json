@@ -1,0 +1,192 @@
+{
+  "$comment": "Loss recovery, scripted: what RecoveryDriver::step (crates/core/punktfunk-core/src/client/recovery.rs) answers to each event. Core replays every case with the clock injected (`at_ms` from the case's start). A case marked `abi` holds embedder events only and nothing that depends on the clock: punktfunk-ffi and the Swift client replay it over a live connection, one C export per event (arrived = recovery_on_frame, decoded = recovery_on_decoded, no_output = recovery_on_no_output, lost = recovery_lost, reset = recovery_reset, need_keyframe = request_keyframe), and check what each call returns (admit and gap, hold and forgive_chain). `want` defaults: admit true, gap 0, hold false, forgive_chain false, ask \"none\"; `ask` is \"keyframe\", \"starved_keyframe\" (a freeze the client raised with nothing lost) or the RFI range [first, last]. `arrived` defaults: complete true, decode_order 0. `decoded` defaults: no flags, keyframe false, evidence \"unavailable\", sei false, recovery_point false, no decode_order. `noted` is note_frame_index, the lane that keeps no freeze. `tick` carries the drop count and `reset` answers nothing.",
+  "cases": [
+    {
+      "name": "a fast anchor is not refrozen by the same loss's drop climb",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 102, "want": {"gap": 1, "hold": true, "ask": [101, 101]}},
+        {"at_ms": 60, "ev": "decoded", "flags": ["anchor"], "want": {}},
+        {"at_ms": 120, "ev": "tick", "frames_dropped": 1, "want": {}}
+      ]
+    },
+    {
+      "name": "an anchor the decoder refutes holds until the original backstop",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 102, "want": {"gap": 1, "hold": true, "ask": [101, 101]}},
+        {"at_ms": 60, "ev": "decoded", "flags": ["anchor"], "evidence": "damaged", "want": {"hold": true}},
+        {"at_ms": 120, "ev": "tick", "frames_dropped": 1, "want": {"hold": true}},
+        {"at_ms": 499, "ev": "tick", "frames_dropped": 1, "want": {"hold": true}},
+        {"at_ms": 500, "ev": "tick", "frames_dropped": 1, "want": {"hold": true, "ask": "keyframe"}}
+      ]
+    },
+    {
+      "name": "a damaged chain on an open gate holds and asks at once",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "decoded", "evidence": "damaged", "want": {"hold": true, "ask": "keyframe"}}
+      ]
+    },
+    {
+      "name": "a damaged chain inside the window waits for the backstop",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 102, "want": {"gap": 1, "hold": true, "ask": [101, 101]}},
+        {"at_ms": 60, "ev": "decoded", "flags": ["anchor"], "want": {}},
+        {"at_ms": 70, "ev": "decoded", "evidence": "damaged", "want": {"hold": true}},
+        {"at_ms": 569, "ev": "tick", "frames_dropped": 1, "want": {"hold": true}},
+        {"at_ms": 570, "ev": "tick", "frames_dropped": 1, "want": {"hold": true, "ask": "keyframe"}}
+      ]
+    },
+    {
+      "name": "a wave lift forgives the chain and suspends damage for one frame",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 102, "want": {"gap": 1, "hold": true, "ask": [101, 101]}},
+        {"at_ms": 50, "ev": "decoded", "flags": ["point"], "want": {"hold": true}},
+        {"at_ms": 80, "ev": "decoded", "flags": ["point"], "want": {"forgive_chain": true}},
+        {"at_ms": 90, "ev": "decoded", "flags": ["anchor"], "evidence": "damaged", "want": {}},
+        {"at_ms": 100, "ev": "decoded", "evidence": "damaged", "want": {"hold": true, "ask": "keyframe"}}
+      ]
+    },
+    {
+      "name": "a straggler is dropped and a swallowed gap goes when the window opens",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 102, "want": {"gap": 1, "hold": true, "ask": [101, 101]}},
+        {"at_ms": 10, "ev": "arrived", "index": 101, "want": {"admit": false, "hold": true}},
+        {"at_ms": 30, "ev": "arrived", "index": 104, "want": {"gap": 1, "hold": true}},
+        {"at_ms": 100, "ev": "arrived", "index": 105, "want": {"hold": true, "ask": [103, 103]}}
+      ]
+    },
+    {
+      "name": "a keyframe on the tick drops the pending range",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 102, "want": {"gap": 1, "hold": true, "ask": [101, 101]}},
+        {"at_ms": 30, "ev": "arrived", "index": 104, "want": {"gap": 1, "hold": true}},
+        {"at_ms": 100, "ev": "tick", "frames_dropped": 5, "want": {"hold": true, "ask": "keyframe"}},
+        {"at_ms": 101, "ev": "tick", "frames_dropped": 5, "want": {"hold": true}}
+      ]
+    },
+    {
+      "name": "a no-output streak inside the window is re-asked by its own backstop",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 102, "want": {"gap": 1, "hold": true, "ask": [101, 101]}},
+        {"at_ms": 10, "ev": "no_output", "want": {"hold": true}},
+        {"at_ms": 20, "ev": "no_output", "want": {"hold": true}},
+        {"at_ms": 30, "ev": "no_output", "want": {"hold": true}},
+        {"at_ms": 120, "ev": "tick", "frames_dropped": 1, "want": {"hold": true}},
+        {"at_ms": 529, "ev": "tick", "frames_dropped": 1, "want": {"hold": true}},
+        {"at_ms": 530, "ev": "tick", "frames_dropped": 1, "want": {"hold": true, "ask": "keyframe"}}
+      ]
+    },
+    {
+      "name": "an engaged keyframe ask shuts the window for the next gap",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "need_keyframe", "want": {"hold": true, "ask": "starved_keyframe"}},
+        {"at_ms": 1, "ev": "arrived", "index": 102, "want": {"gap": 1, "hold": true}},
+        {"at_ms": 100, "ev": "tick", "frames_dropped": 0, "want": {"hold": true, "ask": [101, 101]}}
+      ]
+    },
+    {
+      "name": "a lost AU arms and asks and the IDR lifts",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "lost", "want": {"hold": true, "ask": "keyframe"}},
+        {"at_ms": 50, "ev": "decoded", "flags": ["sof"], "want": {}}
+      ]
+    },
+    {
+      "name": "a lane that keeps no freeze asks at once and never holds",
+      "steps": [
+        {"at_ms": 0, "ev": "noted", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "need_keyframe", "want": {"ask": "keyframe"}},
+        {"at_ms": 1, "ev": "noted", "index": 102, "want": {"gap": 1, "ask": [101, 101]}},
+        {"at_ms": 1000, "ev": "tick", "frames_dropped": 3, "want": {}}
+      ]
+    },
+    {
+      "name": "a stale partial is dropped and a PyroWave straggler is kept",
+      "all_intra": true,
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 101, "complete": false, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 101, "complete": false, "want": {"admit": false}},
+        {"at_ms": 0, "ev": "arrived", "index": 101, "want": {}}
+      ]
+    },
+    {
+      "name": "a recovery point decoded before the arm cannot lift",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 102, "decode_order": 5, "want": {"gap": 1, "hold": true, "ask": [101, 101]}},
+        {"at_ms": 0, "ev": "decoded", "sei": true, "recovery_point": true, "decode_order": 5, "want": {"hold": true}},
+        {"at_ms": 0, "ev": "decoded", "sei": true, "recovery_point": true, "decode_order": 6, "want": {"forgive_chain": true}}
+      ]
+    },
+    {
+      "name": "a gap reports its width and a straggler none",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 103, "want": {"gap": 2, "hold": true, "ask": [101, 102]}},
+        {"at_ms": 0, "ev": "arrived", "index": 101, "want": {"admit": false, "hold": true}}
+      ]
+    },
+    {
+      "name": "a duplicate and a frame from before the index wrap are stragglers",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 4294967294, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 2, "want": {"gap": 3, "hold": true, "ask": [4294967295, 1]}},
+        {"at_ms": 0, "ev": "arrived", "index": 4294967295, "want": {"admit": false, "hold": true}},
+        {"at_ms": 0, "ev": "arrived", "index": 2, "want": {"admit": false, "hold": true}}
+      ]
+    },
+    {
+      "name": "a codec error holds without asking until the backstop",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "codec_error", "want": {"hold": true}},
+        {"at_ms": 499, "ev": "tick", "frames_dropped": 0, "want": {"hold": true}},
+        {"at_ms": 500, "ev": "tick", "frames_dropped": 0, "want": {"hold": true, "ask": "keyframe"}}
+      ]
+    },
+    {
+      "name": "a parked decoder asks nothing and the next report starts fresh",
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "lost", "want": {"hold": true, "ask": "keyframe"}},
+        {"at_ms": 0, "ev": "reset"},
+        {"at_ms": 600, "ev": "tick", "frames_dropped": 5, "want": {}},
+        {"at_ms": 700, "ev": "arrived", "index": 101, "want": {}},
+        {"at_ms": 701, "ev": "tick", "frames_dropped": 5, "want": {}}
+      ]
+    },
+    {
+      "name": "an embedder's calls reach the driver one for one",
+      "abi": true,
+      "steps": [
+        {"at_ms": 0, "ev": "arrived", "index": 100, "want": {}},
+        {"at_ms": 0, "ev": "arrived", "index": 102, "want": {"gap": 1, "hold": true, "ask": [101, 101]}},
+        {"at_ms": 0, "ev": "arrived", "index": 101, "want": {"admit": false, "hold": true}},
+        {"at_ms": 0, "ev": "decoded", "want": {"hold": true}},
+        {"at_ms": 0, "ev": "decoded", "flags": ["anchor"], "want": {}},
+        {"at_ms": 0, "ev": "lost", "want": {"hold": true}},
+        {"at_ms": 0, "ev": "decoded", "want": {"hold": true}},
+        {"at_ms": 0, "ev": "decoded", "flags": ["sof"], "want": {}},
+        {"at_ms": 0, "ev": "no_output", "want": {}},
+        {"at_ms": 0, "ev": "no_output", "want": {}},
+        {"at_ms": 0, "ev": "no_output", "want": {"hold": true}},
+        {"at_ms": 0, "ev": "decoded", "want": {"hold": true}},
+        {"at_ms": 0, "ev": "reset"},
+        {"at_ms": 0, "ev": "decoded", "want": {}},
+        {"at_ms": 0, "ev": "need_keyframe", "want": {"hold": true}},
+        {"at_ms": 0, "ev": "decoded", "flags": ["point"], "want": {"hold": true}},
+        {"at_ms": 0, "ev": "decoded", "flags": ["point"], "want": {"forgive_chain": true}}
+      ]
+    }
+  ]
+}

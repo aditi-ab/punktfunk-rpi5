@@ -5,7 +5,7 @@ import org.json.JSONObject
 
 /**
  * The one list of [Settings] fields. Every place that walks the fields — the prefs store, the
- * preset overlay's apply/absorb/clear/JSON, the console document both ways — loops over this,
+ * preset overlay's apply/pin/clear/JSON, the console document both ways — loops over this,
  * so a new field is one row here plus its two data-class properties. `SettingsFieldsTest`
  * checks by reflection that no property is missing from the table.
  */
@@ -13,9 +13,9 @@ internal object SettingsFields {
     /** The width/height pair, which one control drives — the reset alias, as on every client. */
     const val FIELD_RESOLUTION = "resolution"
 
-    /** The console's stored spellings, by wire byte; `xboxelite` is a console-only row. */
-    val GAMEPAD_NAMES = io.unom.punktfunk.kit.Gamepad.PREFS.map { it.name } + "xboxelite"
-    val COMPOSITOR_NAMES = listOf("auto", "kwin", "wlroots", "mutter", "gamescope", "hyprland")
+    /** The console's stored spellings, by wire byte. */
+    val GAMEPAD_NAMES = io.unom.punktfunk.kit.Gamepad.PREFS.map { it.name }
+    val COMPOSITOR_NAMES = listOf("auto", "kwin", "wlroots", "mutter", "gamescope", "hyprland", "windows", "niri", "umbriel")
 
     val ALL: List<Field<*>> = listOf(
         field("width", "width", IntKind, { it.width }, { s, v -> s.copy(width = v) },
@@ -28,6 +28,10 @@ internal object SettingsFields {
         // document's `Settings::extra` rather than needing a row in the shared shell.
         field("bitrateKbps", "bitrate_kbps", IntKind, { it.bitrateKbps }, { s, v -> s.copy(bitrateKbps = v) },
             overlay({ it.bitrateKbps }, { o, v -> o.copy(bitrateKbps = v) })),
+        // Prefs keep a float; reading back in hundredths, the dial's unit, returns what was saved.
+        field("pyrowaveBpp", "pyrowave_bpp", DoubleKind, { it.pyrowaveBpp },
+            { s, v -> s.copy(pyrowaveBpp = Math.round(v * 100) / 100.0) },
+            overlay({ it.pyrowaveBpp }, { o, v -> o.copy(pyrowaveBpp = v) })),
         field("renderScale", "render_scale", DoubleKind, { it.renderScale }, { s, v -> s.copy(renderScale = v) },
             overlay({ it.renderScale }, { o, v -> o.copy(renderScale = v) })),
         field("videoFit", "video_fit", StrKind, { it.videoFit }, { s, v -> s.copy(videoFit = v) },
@@ -99,12 +103,11 @@ internal object SettingsFields {
         field("backgroundTimeoutMinutes", "background_timeout_minutes", IntKind,
             { it.backgroundTimeoutMinutes }, { s, v -> s.copy(backgroundTimeoutMinutes = v) }),
         field("padRumble", "pad_rumble", BoolKind, { it.padRumble }, { s, v -> s.copy(padRumble = v) }),
+        field("keepAwake", "keep_awake", BoolKind, { it.keepAwake }, { s, v -> s.copy(keepAwake = v) }),
         field("rumbleOnPhone", "android.rumble_on_phone", BoolKind, { it.rumbleOnPhone }, { s, v -> s.copy(rumbleOnPhone = v) },
             prefsKey = "rumble_on_phone"),
         field("gyroOnPhone", "android.gyro_on_phone", BoolKind, { it.gyroOnPhone }, { s, v -> s.copy(gyroOnPhone = v) },
             prefsKey = "gyro_on_phone"),
-        field("sc2Capture", "android.sc2_capture", BoolKind, { it.sc2Capture }, { s, v -> s.copy(sc2Capture = v) },
-            prefsKey = "sc2_capture"),
         field("dsCapture", "android.ds_capture", BoolKind, { it.dsCapture }, { s, v -> s.copy(dsCapture = v) },
             prefsKey = "ds_capture"),
         field("padHaptics", "pad_haptics", BoolKind, { it.padHaptics }, { s, v -> s.copy(padHaptics = v) }),
@@ -128,6 +131,11 @@ internal object SettingsFields {
 
     /** The overlay's JSON keys — everything else in a stored overlay is carried through. */
     val PRESET_KEYS: Set<String> = PRESET.map { it.key }.toSet()
+
+    /** The tier-P rows one control drives: [FIELD_RESOLUTION] is the width/height pair. */
+    fun controlRows(field: String): List<Field<*>> = PRESET.filter {
+        if (field == FIELD_RESOLUTION) it.key == "width" || it.key == "height" else it.key == field
+    }
 
     /** Legacy prefs keys, read once as a migration default and never written. */
     private const val K_HUD = "stats_hud_enabled"
@@ -156,9 +164,8 @@ internal object SettingsFields {
         fun applyOverlay(o: SettingsOverlay, base: Settings): Settings =
             overlay?.get?.invoke(o)?.let { set(base, it) } ?: base
 
-        /** Record an override when the field moved between [before] and [after]. */
-        fun absorb(o: SettingsOverlay, before: Settings, after: Settings): SettingsOverlay =
-            if (overlay != null && get(after) != get(before)) overlay.set(o, get(after)) else o
+        /** [from]'s value as this field's override. */
+        fun pin(o: SettingsOverlay, from: Settings): SettingsOverlay = overlay?.set?.invoke(o, get(from)) ?: o
 
         fun clear(o: SettingsOverlay): SettingsOverlay = overlay?.set?.invoke(o, null) ?: o
         fun isOverridden(o: SettingsOverlay): Boolean = overlay?.get?.invoke(o) != null

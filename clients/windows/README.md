@@ -6,6 +6,9 @@ The WinUI 3 shell: discover, pair, configure, launch. Pure Rust — the UI is Wi
 Decode, present and input are **not** here. They live in the spawned
 [`punktfunk-session`](../session/) binary; this crate is the shell around it. What a user can do
 with the app is [the docs site](https://docs.punktfunk.unom.io/docs/install-client)'s job.
+The session presents through Vulkan, or through Direct3D 11 where the GPU's Vulkan driver can't
+import D3D11VA pictures (Snapdragon X). It picks once at start; `PUNKTFUNK_PRESENT_BACKEND=vulkan`
+or `d3d11` forces one, and `punktfunk-session --probe-decode` prints the pick.
 
 Ships x64 and ARM64, three ways from one layout: a signed installer (the default — a per-user
 setup.exe whose stable install path Steam can launch, so the overlay and Big Picture work), a
@@ -16,8 +19,7 @@ portable zip, and a signed MSIX kept for Microsoft Store compatibility. All thre
 
 Windows-only; the crate builds as a stub elsewhere so the workspace stays green. You need the MSVC
 toolchain and CMake (SDL3 builds from source) and nothing else — decode is native, so there is no
-`FFMPEG_DIR`, and the Windows App SDK runtime bootstrap is staged next to the exe by
-`windows-reactor-setup` from this crate's `build.rs`.
+`FFMPEG_DIR`. At start the client resolves the installed Windows App Runtime 2.6.4 or newer.
 
 ```sh
 cargo build -p punktfunk-client-windows --target x86_64-pc-windows-msvc

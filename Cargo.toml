@@ -1,50 +1,63 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/punktfunk-core",
-    "crates/punktfunk-ffi",
-    "crates/punktfunk-host",
+    # crates/<group>: core and codec serve both sides; client and host never depend on each
+    # other; install sits on core and host. scripts/ci/check-crate-groups.py holds the rule.
+    "crates/core/punktfunk-core",
+    "crates/core/pf-dmabuf",
+    "crates/core/pf-update-check",
+    "crates/core/pf-fluent",
+    "crates/codec/pf-bitstream",
+    "crates/codec/pf-bitstream/vendor/cros-codecs",
+    "crates/codec/pf-vkdecode",
+    "crates/codec/pf-vaapi",
+    "crates/codec/pf-libva",
+    "crates/codec/pf-v4l2",
+    "crates/codec/pf-v4l2dec",
+    "crates/codec/pf-dxvadec",
+    "crates/codec/pyrowave-sys",
+    "crates/codec/libvpl-sys",
+    "crates/client/punktfunk-ffi",
+    "crates/client/pf-client-core",
+    "crates/client/pf-client-video",
+    "crates/client/pf-presenter",
+    "crates/client/pf-console-ui",
+    "crates/host/punktfunk-host",
     # The capability-carrying PyroWave encode worker. A SEPARATE binary by design — never a
     # hardlink of, or a subcommand of, punktfunk-host (design/gpu-priority-capability-worker.md).
-    "crates/punktfunk-encode-worker",
-    "crates/punktfunk-tray",
-    "crates/punktfunk-setup",
+    "crates/host/punktfunk-encode-worker",
+    # The Windows capture worker: Windows Graphics Capture and the encoder, as the signed-in
+    # user. A separate binary by design (design/windows-wgc-capture.md §4.2).
+    "crates/host/punktfunk-capture-worker",
+    "crates/host/pf-capture",
+    "crates/host/pf-encode",
+    "crates/host/pf-encode-core",
+    "crates/host/pf-encode-win",
+    "crates/host/pf-encode-session",
+    "crates/host/pf-vdisplay",
+    "crates/host/pf-inject",
+    "crates/host/pf-inject/vendor/usbip-sim",
+    "crates/host/pf-audio",
+    "crates/host/pf-clipboard",
+    "crates/host/pf-frame",
+    "crates/host/pf-gpu",
+    "crates/host/pf-zerocopy",
+    "crates/host/pf-portal",
+    "crates/host/pf-win-display",
+    "crates/host/pf-driver-proto",
+    "crates/host/pf-host-config",
+    "crates/host/pf-paths",
+    "crates/host/pf-paths-win",
+    "crates/host/pf-seats",
+    "crates/host/pf-seat-audio",
+    # The seat supervisor's binary, apart from its library: it links pf-inject for the pads it
+    # builds, which the Windows seat keeper's own workspace cannot resolve beside IronRDP.
+    "crates/host/punktfunk-seats",
+    "crates/install/punktfunk-setup",
     # The Windows installer wizard (WinUI 3 over the same engine). Stub bin off-Windows.
-    "crates/punktfunk-setup-win",
-    "crates/pf-bitstream",
-    "crates/pf-bitstream/vendor/cros-codecs",
-    "crates/pf-client-core",
-    "crates/pf-clipboard",
-    "crates/pf-presenter",
-    "crates/pf-console-ui",
-    "crates/pf-driver-proto",
-    "crates/pf-paths",
-    "crates/pf-paths-win",
-    "crates/pf-update",
-    "crates/pf-update-check",
-    "crates/pf-host-config",
-    "crates/pf-gpu",
-    "crates/pf-zerocopy",
-    "crates/pf-dmabuf",
-    "crates/pf-portal",
-    "crates/pf-frame",
-    "crates/pf-win-display",
-    "crates/pf-encode",
-    "crates/pf-encode-core",
-    "crates/pf-encode-win",
-    "crates/pf-capture",
-    "crates/pf-inject",
-    "crates/pf-audio",
-    "crates/pf-inject/vendor/usbip-sim",
-    "crates/pf-vdisplay",
-    "crates/pf-vkdecode",
-    "crates/pf-dxvadec",
-    "crates/pf-libva",
-    "crates/pf-vaapi",
-    "crates/pf-v4l2dec",
-    "crates/pf-v4l2",
-    "crates/pyrowave-sys",
-    "crates/libvpl-sys",
+    "crates/install/punktfunk-setup-win",
+    "crates/install/punktfunk-tray",
+    "crates/install/pf-update",
     "clients/probe",
     "clients/cli",
     "clients/linux",
@@ -57,6 +70,7 @@ members = [
     "tools/gen-headers",
     "tools/loss-harness",
     "tools/scroll-probe",
+    "tools/wgc-probe",
     "tools/wl-scanout-probe",
 ]
 # Standalone PoC (built on its own; pulls usbip/tokio/libusb we don't want in the workspace).
@@ -73,6 +87,8 @@ exclude = [
     # A Windows-only design spike: its ring states are the design it tested, not the shipped au
     # ring's, so it builds on its own and no CI leg compiles it.
     "tools/fence-ring-spike",
+    # libFuzzer targets: nightly and `cargo fuzz` only, run weekly by audit.yml.
+    "fuzz",
 ]
 
 # ndk 0.9.0 with a small maintained patch set: public `MediaCodec::as_ptr` for the missing
@@ -83,7 +99,7 @@ exclude = [
 ndk = { path = "clients/android/native/vendor/ndk" }
 
 [workspace.package]
-version = "0.43.1"
+version = "0.46.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -112,19 +128,18 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 
 # microsoft/windows-rs at one verified commit: windows-reactor is unpublished (0.0.0), and
 # `windows` comes from the same rev so its `windows-core` unifies with reactor's. Re-run
-# clients/windows' tests/reactor_semantics.rs on every bump. Host crates declare crates.io
+# punktfunk-setup-win's tests/wizard_flow.rs on every bump. Host crates declare crates.io
 # `windows = "0.62"` inline: cargo can't rename a workspace entry per member.
-windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
-windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
-windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
-test_reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "58217a690" }
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "58217a690" }
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "58217a690" }
 
 windows-sys = "0.61"
 
 # One generation owns every Vulkan handle, including the ones sdl3's `ash` feature types.
 ash = "0.38"
 # The vendored parser snapshot the decode crates share.
-cros-codecs = { path = "crates/pf-bitstream/vendor/cros-codecs" }
+cros-codecs = { path = "crates/codec/pf-bitstream/vendor/cros-codecs" }
 
 # The `unsafe` discipline the `packaging/windows/drivers/*` crates already run, extended to the
 # workspace. `unsafe fn` marks a CONTRACT the caller must uphold; it is not a licence for the whole
@@ -154,6 +169,9 @@ cros-codecs = { path = "crates/pf-bitstream/vendor/cros-codecs" }
 # something (a raw pointer, a borrowed HANDLE, a GPU object that must not be in flight).
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# The PS5 homebrew target (punktfunk/client-ps5) is a custom target JSON whose vendor rustc does
+# not list: `all(target_os = "freebsd", target_vendor = "sie")` gates it.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("sie"))'] }
 
 # The companion lint: every `unsafe {}` / `unsafe impl` carries a `// SAFETY:` proof. Hoisted here
 # from ~85 per-file `#![deny(...)]` attributes so a NEW crate (or a new module in an old one) is
@@ -165,6 +183,19 @@ unsafe_op_in_unsafe_fn = "deny"
 # pf-inject/vendor/usbip-sim) stay out, deliberately — upstream code stays pristine.
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
+# `*const T as *mut T` reads like any other cast. `cast_mut()` names the one that can turn a
+# shared borrow into a write, so a grep finds every site.
+ptr_cast_constness = "deny"
+# `SAFETY:` on safe code reads as a proof and proves nothing.
+unnecessary_safety_doc = "deny"
+unnecessary_safety_comment = "deny"
+# Warn, which CI's `-D warnings` denies: a mapped view or an OS buffer is aligned by a rule the
+# compiler cannot see, and each such cast says which in an `#[expect(.., reason)]`.
+cast_ptr_alignment = "warn"
+
+# PROVENANCE has no lint and no sanitizer, so the rule lives here. A pointer into a C flexible
+# array is taken from the whole struct with `&raw const (*detail).DevicePath`, never from the
+# `[T; 1]` field's `as_ptr()`: that pointer may reach one element, and the callee reads the rest.
 
 [profile.release]
 opt-level = 3

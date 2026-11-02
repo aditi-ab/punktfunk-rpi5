@@ -1,6 +1,6 @@
 ---
 title: Connection & discovery
-description: Fixes for a client that can't find or reach the host — other streaming hosts, discovery, the video port, wake, pairing and plugin pages.
+description: Fixes for a client that can't find or reach the host — other streaming hosts, discovery, wake, pairing and plugin pages.
 ---
 
 Fixes for a client that can't find or reach the host. A Windows host on a **Public** network is
@@ -28,7 +28,7 @@ Discovery uses mDNS on the local network, and anything that blocks it hides the 
 - Both devices are on the same subnet. mDNS doesn't cross routers or most VPNs; add the host by
   its IP address instead.
 - The host firewall lets discovery in: [Ports → Enable the profiles](/docs/ports#enable-the-profiles).
-- **Local discovery** is on under **Host → Settings** (an advanced setting).
+- **Local discovery** is on under **Host** (an advanced setting).
 
 ### The host is asleep and won't wake
 
@@ -42,17 +42,12 @@ The host admits only paired devices. Approve the device in the web console, or p
 [Pairing](/docs/pairing). A host that lost its identity (config deleted, OS reinstalled) needs
 pairing again.
 
+Over a VPN other than Tailscale or NetBird, the host can count the device as coming from the
+internet: there is no **Approve**, and a PIN from **Pair a device** fails with "Pairing isn't armed".
+Click **Arm PIN** on the device's row under **Waiting for approval**, and set its access yourself:
+the default is for a friend.
+
 ## After connecting
-
-### Video is slow to start, or fails across subnets
-
-A host firewall drops the client's first packet to the video port, which is random per session.
-Each start then waits about 2.5 s, and the host log warns
-`no hole-punch reached this host's data port`.
-
-[Pin the video port](/docs/friends-over-the-internet#pin-the-video-port), then open it on a Linux
-host, for example `sudo ufw allow 9779/udp`. A pinned port carries one session at a time; a second
-one falls back to a random port.
 
 ### A plugin's interface doesn't load
 

@@ -109,6 +109,24 @@ export interface LibraryResult extends CliResult {
   games?: LibraryGame[];
 }
 
+/** One profile on a host, from `punktfunk profiles <ref> --json`. */
+export interface HostProfile {
+  id: string;
+  display_name: string;
+  accent?: string | null;
+  owner: boolean;
+  /** The one line under it: `Steam sign-in once`, `In use by Ben's Apple TV`. */
+  note?: string | null;
+  /** Its picture as a data URL. A client older than this field sends none. */
+  picture?: string | null;
+}
+
+export interface ProfilesResult extends CliResult {
+  profiles?: HostProfile[];
+  /** The profile this Deck plays as on that host, if it picked one. */
+  picked?: string | null;
+}
+
 export interface RunnerInfo {
   runner: string; // absolute path to bin/punktfunkrun.sh
   app_id: string; // flatpak app id
@@ -169,6 +187,15 @@ export const pair = callable<
   PairResult
 >("pair");
 /**
+ * No-PIN pairing: wait (up to ~185 s) for the host's operator to approve this Deck, pinned to
+ * `fp`, the advertised fingerprint `trustHost` saved. The address alone names both OS installs of
+ * a dual-boot box. Never streams. On failure `detail` is a sentence for the user.
+ */
+export const requestAccess = callable<
+  [addr: string, port: number, name: string, fp: string],
+  PairResult
+>("request_access");
+/**
  * Step 1 of request access: save the host with its ADVERTISED fingerprint, pinned but unpaired.
  * The launch that follows pins the same fingerprint, which is the only thing standing between a
  * 185 s wait for approval and an impostor answering for the host. Idempotent; a host already
@@ -183,6 +210,8 @@ export const trustHost = callable<
  * over mTLS, so a host that merely has a pinned fingerprint answers `needs-pairing`.
  */
 export const library = callable<[ref: string], LibraryResult>("library");
+
+export const profiles = callable<[ref: string], ProfilesResult>("profiles");
 
 // ---- Steam / plugin business (only a Decky plugin can do these) ------------------------
 

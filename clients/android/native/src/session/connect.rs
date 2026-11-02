@@ -7,6 +7,7 @@ use jni::sys::{jboolean, jint, jlong};
 use jni::EnvUnowned;
 use punktfunk_core::client::{ConnectParams, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,20 +19,47 @@ use super::{hex, jni_guard, lock_recover, parse_hex32, SessionHandle, SESSIONS};
 /// — the moko0878-class support threads). The app runs one attempt at a time, so one slot
 /// suffices; a stale token is harmless (it is taken immediately after the failed call).
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+/// What the host said with that failure's refusal, beside its token; empty when it said nothing.
+static LAST_SAID: Mutex<String> = Mutex::new(String::new());
+/// The dial `nativeConnect` is blocked on was parked by the host for its operator.
+static DIAL_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Stable token for a failed pair/connect cause, matched by Kotlin (`ConnectErrors.kt`):
 /// a typed host rejection yields its `RejectReason::as_str()` token ("not-armed", "denied",
 /// "approval-timeout", …); transport-level causes map to "crypto" / "timeout" / "io" / "error".
 fn note_error(e: &punktfunk_core::error::PunktfunkError) {
     use punktfunk_core::error::PunktfunkError as E;
-    let token = match e {
-        E::Rejected(r) => r.as_str(),
-        E::Crypto => "crypto",
-        E::Timeout => "timeout",
-        E::Io(_) => "io",
-        _ => "error",
+    let (token, said) = match e {
+        E::Rejected(r, said) => (r.as_str(), said.as_str()),
+        E::Crypto => ("crypto", ""),
+        E::Timeout => ("timeout", ""),
+        E::Io(_) => ("io", ""),
+        _ => ("error", ""),
     };
     *lock_recover(&LAST_ERROR) = token.to_string();
+    *lock_recover(&LAST_SAID) = said.to_string();
+}
+
+/// `NativeBridge.nativeTakeLastSaid(): String` — the host's own sentence with the most recent
+/// refusal, cleared on read (`""` when it said none). Read beside `nativeTakeLastError`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTakeLastSaid<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> JString<'local> {
+    let said = std::mem::take(&mut *lock_recover(&LAST_SAID));
+    env.with_env(|env| env.new_string(said))
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeDialPending(): Boolean` — the dial `nativeConnect` is blocked on was
+/// parked by the host for its operator's approval; it now waits for that verdict.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDialPending(
+    _env: EnvUnowned,
+    _this: JObject,
+) -> jboolean {
+    DIAL_PENDING.load(Ordering::Relaxed)
 }
 
 /// `NativeBridge.nativeTakeLastError(): String` — the machine token of the most recent failed
@@ -327,6 +355,9 @@ struct ConnectRequest {
     /// 0 = host default.
     #[serde(default)]
     bitrate_kbps: u32,
+    /// PyroWave quality in hundredths of a bit per pixel; 0 = the host's own.
+    #[serde(default)]
+    pyrowave_bpp_x100: u16,
     /// `CompositorPref` / `GamepadPref` wire bytes (unknown ⇒ Auto).
     #[serde(default)]
     compositor_pref: u8,
@@ -357,10 +388,7 @@ struct ConnectRequest {
     /// Soft codec preference wire byte (0 = Auto).
     #[serde(default)]
     preferred_codec: u8,
-    /// The delivery ask (`EXT_TAG_DELIVERY`): the profile on the host's record, and the flags
-    /// a network check sets (facts, probes only). `0`/`0` asks nothing.
-    #[serde(default)]
-    delivery_profile: u8,
+    /// `2` dials a network check's probes-only session (`EXT_DELIVERY_PROBE_ONLY`).
     #[serde(default)]
     delivery_flags: u8,
     /// Handshake budget: short for a normal connect, long (≥ the host's approval-park window) for
@@ -376,6 +404,9 @@ struct ConnectRequest {
     pad_audio_ok: bool,
     #[serde(default)]
     keep_host_audio: bool,
+    /// Ask for the host's cursor out of band (`CLIENT_CAP_CURSOR`): Desktop mouse mode.
+    #[serde(default)]
+    client_cursor: bool,
     /// The `video_fit` setting (`"fit"`/`"crop"`/`"stretch"`); absent reads as fit.
     #[serde(default)]
     video_fit: String,
@@ -388,6 +419,13 @@ struct ConnectRequest {
     /// That preset's name.
     #[serde(default)]
     preset_name: Option<String>,
+    /// The host profile to play as; rides the Hello as `profile`.
+    #[serde(default)]
+    profile: Option<String>,
+    /// This display shows full-range video as studio (Kotlin's Qualcomm decoder probe): the
+    /// `FEATURE_STUDIO_RANGE` ask.
+    #[serde(default)]
+    studio_range: bool,
 }
 
 /// `NativeBridge.nativeConnect(requestJson): Long` — see [`ConnectRequest`]. Returns an opaque
@@ -430,6 +468,7 @@ fn connect(req: ConnectRequest) -> jlong {
         key_pem: key,
         pin_hex,
         bitrate_kbps,
+        pyrowave_bpp_x100,
         compositor_pref,
         gamepad_pref,
         hdr_enabled,
@@ -441,17 +480,19 @@ fn connect(req: ConnectRequest) -> jlong {
         audio_bits,
         video_codecs,
         preferred_codec,
-        delivery_profile,
         delivery_flags,
         timeout_ms,
         launch,
         device_name,
         pad_audio_ok,
         keep_host_audio,
+        client_cursor,
         video_fit,
         dialer,
         preset_id,
         preset_name,
+        profile,
+        studio_range,
     } = req;
     // Which shell asked, for the host's `handshake complete` line. Set before the dial: core reads
     // it once the host says it parses the block.
@@ -460,6 +501,7 @@ fn connect(req: ConnectRequest) -> jlong {
         punktfunk_core::quic::SessionPreset::new(id, preset_name.as_deref().unwrap_or(""))
     });
     let launch = launch.filter(|s| !s.is_empty());
+    let profile = profile.filter(|s| !s.is_empty());
     let device_name = device_name
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -479,12 +521,14 @@ fn connect(req: ConnectRequest) -> jlong {
     // inert client-side unless BOTH probes pass — this line is the one place that says which.
     log::info!(
         target: "pf.caps",
-        "decoder caps: multi_slice={} partial_frame={}{} hdr={} ten_bit_sdr={} codec_bits={:#x}",
+        "decoder caps: multi_slice={} partial_frame={}{} hdr={} ten_bit_sdr={} studio_range={} \
+         codec_bits={:#x}",
         multi_slice_ok,
         frame_parts_ok,
         if force_parts { " (FORCED by sysprop)" } else { "" },
         hdr_enabled,
         ten_bit_sdr,
+        studio_range,
         video_codecs,
     );
     let pin: Option<[u8; 32]> = if pin_hex.is_empty() {
@@ -513,15 +557,13 @@ fn connect(req: ConnectRequest) -> jlong {
     let (audio_rate_hz, audio_bits) =
         resolve_requested_audio_format(audio_rate_hz, audio_bits, audio_channels);
     let params = ConnectParams {
-        delivery: (delivery_profile != 0 || delivery_flags != 0).then_some(
-            punktfunk_core::quic::DeliveryAsk {
-                profile: delivery_profile,
-                flags: delivery_flags,
-            },
-        ),
+        probe_only: delivery_flags & punktfunk_core::quic::EXT_DELIVERY_PROBE_ONLY != 0,
         compositor: CompositorPref::from_u8(compositor_pref),
         gamepad: GamepadPref::from_u8(gamepad_pref),
         bitrate_kbps, // 0 = host default
+        pyrowave_bpp_x100,
+        // The audio supervisor reopens its device on a packet in a new format.
+        reopens_audio: true,
         video_caps: video_caps(hdr_enabled, ten_bit_sdr, multi_slice_ok),
         audio_channels,
         // The audio format this session ASKS for (resolved above). A non-default pair is what
@@ -556,17 +598,11 @@ fn connect(req: ConnectRequest) -> jlong {
         // No display-volume forwarding from Android yet (the panel tone-maps PQ itself via the
         // Surface dataspace + static metadata) — the host keeps its virtual-display EDID defaults.
         display_hdr: None,
-        // No CLIENT_CAP_CURSOR: this client does not render the host cursor locally (no
-        // shape/state planes in the jni surface) — advertising it would stream cursor-less.
-        // CLIENT_CAP_PHASE_LOCK is honest: the async decode loop's presenter feeds
-        // report_phase (advisory in v1 — the host arms on report receipt — but the Hello
-        // should say what the client does).
         // CLIENT_CAP_PAD_AUDIO is the SESSION-level negotiation, separate from the per-pad
         // arrival bits: without it the host never sets HOST_CAP_PAD_AUDIO and never emits 0xD1,
         // so declaring a pad's render caps later would have nothing to gate. Gated on the
         // settings so a user with pad audio off does not make the host provision endpoints.
-        client_caps: punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
-            | if pad_audio_ok {
+        client_caps: if pad_audio_ok {
                 punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO
             } else {
                 0
@@ -580,26 +616,48 @@ fn connect(req: ConnectRequest) -> jlong {
                 punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
             } else {
                 0
+            }
+            // Desktop mouse mode with a mouse: Kotlin's HostCursor wears the host's pointer and
+            // tells the host when to composite it instead.
+            | if client_cursor {
+                punktfunk_core::quic::CLIENT_CAP_CURSOR
+            } else {
+                0
             },
         // Slice-progressive delivery, by decoder truth (Kotlin probes FEATURE_PartialFrame on
         // every decoder this device would use; `debug.punktfunk.force_parts` overrides for the
         // on-glass experiment): AU prefixes then arrive as `Frame::part` pieces and the decode
         // loop feeds them with BUFFER_FLAG_PARTIAL_FRAME.
         frame_parts,
+        // The decode loop rebuilds its codec on a frame in a new format (`RunEnd::Reformat`).
+        rebuilds_decoder: true,
         launch, // a store-qualified library id to boot into a game, or None for the desktop
         name: device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
         pin,    // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)
         preset,
+        profile,
+        // An older Qualcomm display shows full-range BT.709 as studio, so ask for studio SDR. The
+        // decode path takes the range from the Welcome either way.
+        studio_range,
         // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
         // (the host parks the connection until the operator approves the device — see ConnectScreen).
         // No `cancel`: Kotlin drops the result (`Dial.cancelled`) rather than abort the dial — its
         // connect runs on a pool thread, so a parked one costs a thread, not a stuck UI.
+        on_pending: Some(Arc::new(|| DIAL_PENDING.store(true, Ordering::Relaxed))),
         ..ConnectParams::new(&host, port, mode, Duration::from_millis(timeout_ms))
     };
-    match NativeClient::connect(params) {
+    DIAL_PENDING.store(false, Ordering::Relaxed);
+    let dialed = NativeClient::connect(params);
+    DIAL_PENDING.store(false, Ordering::Relaxed);
+    match dialed {
         Ok(client) => {
             let client = Arc::new(client);
+            // A forwarded cursor starts out of the picture: the host composites it until the
+            // mouse takes it (Kotlin's HostCursor), so no session starts without a pointer.
+            if client.host_caps() & punktfunk_core::quic::HOST_CAP_CURSOR != 0 {
+                let _ = client.set_cursor_render(false);
+            }
             let handle = SessionHandle {
                 stats: Arc::new(crate::stats::VideoStats::new(client.hud_shared())),
                 client,
@@ -752,6 +810,78 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
     })
 }
 
+/// `NativeBridge.nativeRedialDelayMs(endReason, attempt)` — milliseconds before redial `attempt`
+/// (0-based) of a session that ended with `endReason`, on the schedule every client shares; `-1`
+/// means stay ended. Only a lost connection redials.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRedialDelayMs(
+    _env: EnvUnowned,
+    _this: JObject,
+    end_reason: jint,
+    attempt: jint,
+) -> jlong {
+    jni_guard(-1, || {
+        punktfunk_core::client::PunktfunkEndReason::from_u8(end_reason as u8)
+            .redial_delay(attempt.max(0) as u32)
+            .map_or(-1, |d| d.as_millis() as jlong)
+    })
+}
+
+/// `sinceFirstMs` as the core reads it: negative is no refusal yet.
+fn since_first(since_first_ms: jlong) -> Option<Duration> {
+    u64::try_from(since_first_ms)
+        .ok()
+        .map(Duration::from_millis)
+}
+
+/// `NativeBridge.nativeWakeRedialDelayMs(autoWake, token, sinceFirstMs)` — milliseconds before
+/// dialing again a host that refused a connect with `token` (`nativeTakeLastError`),
+/// `sinceFirstMs` after its first such refusal (`-1`: the first); `-1` means show the refusal.
+/// The rule every client shares (`punktfunk_core::reject::wake_redial_delay`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeWakeRedialDelayMs<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    auto_wake: jboolean,
+    token: JString<'local>,
+    since_first_ms: jlong,
+) -> jlong {
+    let token = env
+        .with_env(|env| token.try_to_string(env))
+        .resolve::<LogErrorAndDefault>();
+    jni_guard(-1, || {
+        let refused = punktfunk_core::reject::RejectReason::from_token(&token);
+        punktfunk_core::reject::wake_redial_delay(
+            auto_wake,
+            refused,
+            false,
+            since_first(since_first_ms),
+        )
+        .map_or(-1, |d| d.as_millis() as jlong)
+    })
+}
+
+/// `NativeBridge.nativeSessionWakeRedialDelayMs(handle, autoWake, sinceFirstMs)` — the same for
+/// a session that ended: its typed close counts only before any frame. `-1` for a missing key.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionWakeRedialDelayMs(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    auto_wake: jboolean,
+    since_first_ms: jlong,
+) -> jlong {
+    jni_guard(-1, || {
+        SESSIONS
+            .get(handle)
+            .and_then(|s| {
+                s.client
+                    .wake_redial_delay(auto_wake, since_first(since_first_ms))
+            })
+            .map_or(-1, |d| d.as_millis() as jlong)
+    })
+}
+
 /// `NativeBridge.nativePair(host, port, certPem, keyPem, pin, name): String` — run the SPAKE2 PIN
 /// ceremony, presenting our persistent identity. On success returns the host's verified fingerprint
 /// (64-hex) to persist + pin; on any failure (wrong PIN / MITM / host reject / unreachable) returns
@@ -795,6 +925,58 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePair<'local
                     // Crypto error == wrong PIN / MITM; anything else == transport/host reject.
                     // The token lets Kotlin say WHICH (`nativeTakeLastError`).
                     log::error!("nativePair to {host}:{port} failed: {e}");
+                    note_error(&e);
+                    String::new()
+                }
+            }
+        };
+        env.new_string(out)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeRequestAccess(host, port, certPem, keyPem, pinHex, name): String` — ask
+/// for access with no PIN and wait for the host's operator. `pinHex` is the advertised
+/// fingerprint, `""` to trust on first use. Returns the host fingerprint (64-hex) to persist as
+/// paired, or `""` with the cause in `nativeTakeLastError`. Never streams. Blocking.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRequestAccess<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    host: JString<'local>,
+    port: jint,
+    cert_pem: JString<'local>,
+    key_pem: JString<'local>,
+    pin_hex: JString<'local>,
+    name: JString<'local>,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        let g = |e: &jni::Env<'local>, j: &JString<'local>| -> String {
+            j.try_to_string(e).unwrap_or_default()
+        };
+        let host = g(env, &host);
+        let cert = g(env, &cert_pem);
+        let key = g(env, &key_pem);
+        let pin = punktfunk_core::fp::parse_hex32(&g(env, &pin_hex));
+        let name = g(env, &name);
+
+        let out = if host.is_empty() || cert.is_empty() || key.is_empty() {
+            log::error!("nativeRequestAccess: missing host/identity");
+            String::new()
+        } else {
+            match NativeClient::request_access(
+                &host,
+                port as u16,
+                (&cert, &key),
+                pin,
+                &name,
+                pf_client_core::trust::REQUEST_ACCESS_TIMEOUT,
+                None,
+            ) {
+                Ok(host_fp) => hex(&host_fp),
+                Err(e) => {
+                    log::error!("nativeRequestAccess to {host}:{port} failed: {e}");
                     note_error(&e);
                     String::new()
                 }
@@ -965,5 +1147,87 @@ mod tests {
         assert_eq!(rate_fallback_ladder(96_000), &[96_000, SAMPLE_RATE_HZ]);
         // A default session's ladder is one rung, so it opens no probe stream at all.
         assert_eq!(rate_fallback_ladder(SAMPLE_RATE_HZ), &[SAMPLE_RATE_HZ]);
+    }
+}
+
+/// `clients/shared/connect-request-vectors.json`: the JSON Kotlin writes. The struct reads every
+/// key through `#[serde(default)]` and ignores unknown ones, so a key renamed on either side
+/// reads as its default; these tests fail instead.
+#[cfg(test)]
+mod request_vectors {
+    use super::ConnectRequest;
+    use serde::de::{self, Deserialize, Deserializer, Visitor};
+    use std::collections::BTreeSet;
+
+    /// The key names serde derived for [`ConnectRequest`], read from the `fields` the derive
+    /// hands `deserialize_struct`.
+    fn field_names() -> BTreeSet<String> {
+        struct Fields;
+        impl<'de> Deserializer<'de> for Fields {
+            type Error = de::value::Error;
+            fn deserialize_struct<V: Visitor<'de>>(
+                self,
+                _name: &'static str,
+                fields: &'static [&'static str],
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(de::Error::custom(fields.join(",")))
+            }
+            fn deserialize_any<V: Visitor<'de>>(
+                self,
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(de::Error::custom("not a struct"))
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+                identifier ignored_any
+            }
+        }
+        let err = ConnectRequest::deserialize(Fields)
+            .err()
+            .expect("a struct reads fields");
+        err.to_string().split(',').map(str::to_owned).collect()
+    }
+
+    fn cases() -> Vec<serde_json::Value> {
+        let file: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../shared/connect-request-vectors.json"
+        ))
+        .unwrap();
+        file["cases"].as_array().expect("cases").clone()
+    }
+
+    #[test]
+    fn every_vector_key_is_a_field_and_every_field_is_in_a_vector() {
+        let known = field_names();
+        assert!(
+            known.contains("host") && known.contains("timeout_ms"),
+            "{known:?}"
+        );
+        let mut seen = BTreeSet::new();
+        for case in cases() {
+            let name = &case["name"];
+            for key in case["json"].as_object().expect("json").keys() {
+                assert!(
+                    known.contains(key),
+                    "{name}: ConnectRequest has no field `{key}`, so serde drops it"
+                );
+                seen.insert(key.clone());
+            }
+        }
+        let unwritten: Vec<_> = known.difference(&seen).collect();
+        assert!(unwritten.is_empty(), "no vector writes {unwritten:?}");
+    }
+
+    #[test]
+    fn every_vector_parses() {
+        for case in cases() {
+            let text = case["json"].to_string();
+            if let Err(e) = serde_json::from_str::<ConnectRequest>(&text) {
+                panic!("{}: {e}", case["name"]);
+            }
+        }
     }
 }

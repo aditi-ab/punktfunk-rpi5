@@ -232,19 +232,11 @@ extension SettingsView {
         guard let panel = SettingsOptions.macDisplayModes().first else { return }
         applyDisplayMode(panel)
         customMode = false
-        #elseif os(visionOS)
+        #else
         let native = NativeDisplay.mode
         setResolution(width: native.width, height: native.height)
         scoped(SettingsFields.refreshHz).wrappedValue = native.hz
-        customMode = false
-        #else
-        // nativeBounds is portrait-oriented pixels — streams are landscape.
-        let bounds = UIScreen.main.nativeBounds
-        setResolution(
-            width: Int(max(bounds.width, bounds.height)),
-            height: Int(min(bounds.width, bounds.height)))
-        scoped(SettingsFields.refreshHz).wrappedValue = UIScreen.main.maximumFramesPerSecond
-        #if os(iOS)
+        #if !os(tvOS)
         // The native mode is the "This device" wheel row, so leave Custom mode if it was on.
         customMode = false
         #endif

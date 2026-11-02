@@ -25,6 +25,7 @@ final class ConsoleJSONTests: XCTestCase {
     func testHostRowsCarryTheModelsKeys() throws {
         var saved = host(name: "Desk")
         saved.pinnedPresetIDs = ["p1"]
+        saved.gamePresets = ["halo": "p1"]
         let preset = StreamPreset(name: "Couch", id: "p1")
         let json = ConsoleJSON.hostRows(
             saved: [saved], discovered: [], online: [saved.id], presets: [preset])
@@ -42,6 +43,9 @@ final class ConsoleJSONTests: XCTestCase {
         XCTAssertEqual(row["os"] as? String, "linux/fedora")
         XCTAssertEqual(row["last_used"] as? Int, 1_700_000_000)
         XCTAssertTrue(row["pin"] is NSNull, "the primary tile carries no pin")
+        XCTAssertEqual(
+            row["game_presets"] as? [String: String], ["halo": "p1"],
+            "the bind screen marks a title's preset from this map")
 
         let card = rows[1]
         XCTAssertEqual(
@@ -53,14 +57,7 @@ final class ConsoleJSONTests: XCTestCase {
     /// `clients/shared/host-row-vectors.json`: the rows the Kotlin and desktop producers send
     /// too, so a player moving between devices finds one carousel.
     func testHostRowsMatchTheSharedVectors() throws {
-        let url = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // PunktfunkKitTests
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // apple
-            .deletingLastPathComponent() // clients
-            .appendingPathComponent("shared/host-row-vectors.json")
-        let doc = try XCTUnwrap(
-            try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let doc = try sharedVectors("host-row-vectors.json")
         for c in try XCTUnwrap(doc["cases"] as? [[String: Any]]) {
             let name = c["name"] as? String ?? "?"
             var ids: [String: UUID] = [:]
@@ -149,7 +146,9 @@ final class ConsoleJSONTests: XCTestCase {
              {"id": "steam:2", "store": "steam", "title": "Never", "art": {}}]
             """#
         let games = try JSONDecoder().decode([GameEntry].self, from: Data(wire.utf8))
-        let out = try rows(ConsoleJSON.libraryGames(games))
+        let push = ConsoleJSON.libraryGames(ConsoleJSON.unasked, games)
+        let doc = try JSONSerialization.jsonObject(with: Data(push.utf8)) as? [String: Any]
+        let out = try XCTUnwrap(doc?["games"] as? [[String: Any]])
         let stats = try XCTUnwrap(out.first?["stats"] as? [String: Any])
         XCTAssertEqual(stats["last_played_unix_ms"] as? UInt64, 1_757_160_000_000)
         XCTAssertEqual(stats["play_time_ms"] as? UInt64, 5_400_000)
@@ -209,6 +208,102 @@ final class ConsoleJSONTests: XCTestCase {
         XCTAssertEqual(merged.hdrEnabled, false)
         XCTAssertNil(merged.codec, "the console cleared it")
         XCTAssertEqual(merged.modifierLayout, "pc", "only this app edits it")
+    }
+
+    /// `clients/shared/console-bridge-vectors.json`: the models this client writes match its
+    /// samples, each answer under its command sample's `req`, and the menu and phase codes
+    /// match its table. `Phase` stops at reconnecting: this client never reports a profile the
+    /// host refused.
+    func testBridgeShapesMatchTheSharedVectors() throws {
+        let doc = try sharedVectors("console-bridge-vectors.json")
+        let models = try XCTUnwrap(doc["models"] as? [String: [Any]])
+        let commands = try XCTUnwrap(doc["commands"] as? [Any])
+        func req(_ command: String) throws -> Any {
+            let body = commands.lazy.compactMap { ($0 as? [String: Any])?[command] }.first
+            return try XCTUnwrap((body as? [String: Any])?["req"], "\(command) carries a req")
+        }
+        // Every key written is in the sample with its value; one left out is one Rust defaults.
+        func within(_ got: Any, _ want: Any) -> Bool {
+            if let g = got as? [String: Any], let w = want as? [String: Any] {
+                return g.allSatisfy { k, v in w[k].map { within(v, $0) } ?? false }
+            }
+            if let g = got as? [Any], let w = want as? [Any] {
+                return g.count == w.count && zip(g, w).allSatisfy { within($0, $1) }
+            }
+            return (got as AnyObject).isEqual(want)
+        }
+        func check(_ model: String, _ i: Int, _ written: String, exact: Bool = true) throws {
+            let got = try JSONSerialization.jsonObject(
+                with: Data(written.utf8), options: .fragmentsAllowed)
+            let want = try XCTUnwrap(models[model]?[i], "\(model)[\(i)]")
+            let same = exact ? (got as AnyObject).isEqual(want) : within(got, want)
+            XCTAssertTrue(same, "\(model)[\(i)] wrote \(written)")
+        }
+
+        let pair = try req("Pair")
+        try check("PairStatus", 1, ConsoleJSON.pairBusy(pair))
+        try check("PairStatus", 2, ConsoleJSON.pairFailed(pair, "Wrong PIN."))
+        try check("PairStatus", 3, ConsoleJSON.pairPaired(pair, key: "ab12"))
+        try check(
+            "WakeStatus", 0,
+            ConsoleJSON.wake(
+                req: try req("Wake"), key: "ab12", name: "Desk", seconds: 12, timedOut: false,
+                online: true, thenConnect: true))
+        let fetch = try req("FetchLibrary")
+        try check("PhasePush", 2, ConsoleJSON.libraryPhase(fetch, "Ready"))
+        try check(
+            "PhasePush", 3,
+            ConsoleJSON.libraryError(
+                fetch, title: "Not paired", body: "Pair this device first.", canRetry: false))
+        let wire = #"{"id": "steam:570", "store": "steam", "title": "Dota 2", "art": {}}"#
+        let dota = try JSONDecoder().decode(GameEntry.self, from: Data(wire.utf8))
+        try check("GamesPush", 0, ConsoleJSON.libraryGames(fetch, [dota]))
+        let downloads = [
+            HostDownload(
+                appID: "steam:570", state: "downloading", doneBytes: 1_048_576,
+                totalBytes: 4_194_304, rateBps: 524_288, etaS: 6, phase: "File 2 of 3"),
+            HostDownload(appID: "steam:620", state: "failed", error: "The disk is full."),
+        ]
+        try check("DownloadsPush", 0, ConsoleJSON.downloads(downloads, grants: 255))
+        let sc2 = ConsoleJSON.Pad(
+            name: "Steam Controller", key: "sc2:1", pref: 0, detail: "28DE:1302 · gamepad",
+            forwarded: true, rumble: true, battery: nil, charging: false)
+        try check("PadsJson", 0, ConsoleJSON.pads([sc2], active: sc2), exact: false)
+        let ds = ConsoleJSON.Pad(
+            name: "DualSense", key: "054C:0CE6:DualSense", pref: 2, detail: "054C:0CE6 · gamepad",
+            forwarded: true, rumble: true, battery: 0.42, charging: false)
+        try check(
+            "PadsJson", 1,
+            ConsoleJSON.pads([ds], active: ds, others: [(name: "Keyboard", kind: "keyboard")]),
+            exact: false)
+
+        let codes = try XCTUnwrap(doc["codes"] as? [String: [String]])
+        func camel(_ name: String) -> String {
+            let words = name.split(separator: "_")
+            return words.prefix(1).joined() + words.dropFirst().map(\.capitalized).joined()
+        }
+        for (code, name) in try XCTUnwrap(codes["menu"]).enumerated() {
+            let menu = ConsoleBridge.Menu(rawValue: UInt8(code))
+            XCTAssertEqual(menu.map { "\($0)" }, camel(name), "menu \(code)")
+        }
+        XCTAssertNil(ConsoleBridge.Menu(rawValue: UInt8(codes["menu"]?.count ?? 0)))
+        for (code, name) in try XCTUnwrap(codes["phase"]).enumerated() {
+            let phase = ConsoleBridge.Phase(rawValue: UInt8(code))
+            XCTAssertEqual(
+                phase.map { "\($0)" }, name == "profile_gone" ? nil : camel(name), "phase \(code)")
+        }
+    }
+
+    /// One of the `clients/shared` vector files.
+    private func sharedVectors(_ file: String) throws -> [String: Any] {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // PunktfunkKitTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // apple
+            .deletingLastPathComponent() // clients
+            .appendingPathComponent("shared/\(file)")
+        return try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
     }
 }
 

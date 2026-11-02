@@ -95,6 +95,14 @@ final class LibraryClientTests: XCTestCase {
         }
     }
 
+    func testAPictureMustBeAPathOnTheHost() {
+        let base = "https://10.0.0.2:47990"
+        XCTAssertEqual(
+            LibraryClient.pictureURL("/kid?v=1", base: base)?.absoluteString, base + "/kid?v=1")
+        XCTAssertNil(LibraryClient.pictureURL("https://elsewhere.example/x.png", base: base))
+        XCTAssertNil(LibraryClient.pictureURL(nil, base: base))
+    }
+
     func testACursorIsEncodedIntoThePagePath() {
         XCTAssertEqual(LibraryClient.pagePath(cursor: nil), "/api/v1/library/page?limit=200")
         XCTAssertEqual(
@@ -427,5 +435,68 @@ final class LibraryClientTests: XCTestCase {
         // An address the user pasted already bracketed must not end up double-bracketed.
         XCTAssertEqual(LibraryClient.baseURL(address: "[fd7a:115c::1]", port: 47990),
                        "https://[fd7a:115c::1]:47990")
+    }
+
+    // MARK: - Management call preamble
+
+    func testMgmtTargetNamesWhatIsMissing() {
+        let unpaired = StoredHost(name: "Desk", address: "192.168.1.70")
+        let identity = ClientIdentity(certPEM: "", keyPEM: "")
+        XCTAssertEqual(MgmtTarget.make(host: unpaired, identity: nil).failure, .identity)
+        XCTAssertEqual(MgmtTarget.make(host: unpaired, identity: identity).failure, .pairing("Desk"))
+        var paired = unpaired
+        paired.pinnedSHA256 = Data(repeating: 1, count: 32)
+        XCTAssertEqual(MgmtTarget.make(host: paired, identity: identity).failure, .keychain)
+    }
+
+    func testARefusedWakeReadsAsTheHostsSentence() {
+        func woken(_ code: Int) -> String {
+            do {
+                try LibraryClient.expectWoken(HTTPResponse(status: code, headers: [:], body: Data()))
+                return "ok"
+            } catch {
+                return LibraryClient.wakeFailedLine("Kid", error)
+            }
+        }
+        XCTAssertEqual(woken(200), "ok")
+        XCTAssertEqual(woken(202), "ok")
+        XCTAssertEqual(woken(403), "This device isn't allowed to start another profile's seat.")
+        XCTAssertEqual(woken(401), "Couldn't wake Kid's desk. Try again in a moment.")
+        XCTAssertEqual(woken(500), "Couldn't wake Kid's desk. Try again in a moment.")
+    }
+
+    func testExpectOKFoldsTheCertificateRefusals() {
+        func status(_ code: Int, _ ok: Set<Int> = [200]) -> String {
+            let response = HTTPResponse(status: code, headers: [:], body: Data())
+            do {
+                try LibraryClient.expectOK(response, ok)
+                return "ok"
+            } catch {
+                return "\(error)"
+            }
+        }
+        XCTAssertEqual(status(200), "ok")
+        XCTAssertEqual(status(202, [200, 202]), "ok")
+        XCTAssertEqual(status(202), "http(202)")
+        XCTAssertEqual(status(401), "unauthorized")
+        XCTAssertEqual(status(403), "unauthorized")
+        XCTAssertEqual(status(500), "http(500)")
+    }
+
+    /// The host refuses an install in its `ApiError` envelope; the player reads its sentence.
+    func testInstallRefusalCarriesTheHostSentence() {
+        let body = Data(#"{"error":"Not enough space on the host."}"#.utf8)
+        XCTAssertEqual(
+            InstallOutcome.from(status: 409, message: LibraryClient.hostReason(body)),
+            .refused("Not enough space on the host."))
+        XCTAssertNil(LibraryClient.hostReason(Data(#"{"error":""}"#.utf8)))
+        XCTAssertNil(LibraryClient.hostReason(Data()))
+    }
+}
+
+private extension Result {
+    var failure: Failure? {
+        if case .failure(let error) = self { return error }
+        return nil
     }
 }

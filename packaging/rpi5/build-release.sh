@@ -102,7 +102,7 @@ git -C "${ffmpeg_source}" checkout --detach "${ffmpeg_ref}"
         -p punktfunk-client-session \
         --no-default-features \
         --features ui,rpi5-v4l2-request
-    cargo_release test --locked --release -p pf-client-core -p pf-console-ui -p pf-presenter \
+    cargo_release test --locked --release -p pf-client-core -p pf-client-video -p pf-console-ui -p pf-presenter \
         --no-default-features \
         --features pf-presenter/rpi5-v4l2-request,pf-console-ui/vulkan-overlay --lib
 )

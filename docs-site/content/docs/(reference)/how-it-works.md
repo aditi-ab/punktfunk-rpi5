@@ -18,6 +18,8 @@ own mode.
 | **KDE Plasma** | A virtual output from KWin |
 | **gamescope** (SteamOS, Bazzite) | A gamescope session at the client's mode |
 | **[Hyprland](/docs/hyprland)** | A headless output added with `hyprctl` |
+| **[niri](/docs/niri)** | A virtual output created over niri's IPC; needs the biri fork |
+| **[Umbriel](/docs/umbriel)** | A virtual output created over Umbriel's IPC |
 | **[sway, scroll](/docs/sway)** | A headless output added over the compositor's IPC |
 | **Windows** | Punktfunk's own display driver, which also shows the secure desktop (UAC, lock screen) |
 
@@ -42,11 +44,11 @@ your client all support it. The full breakdown is in the [Support matrix](/docs/
 
 ## Two protocols
 
-- **punktfunk/1** — Punktfunk's own protocol: a QUIC control channel and an encrypted UDP media
-  channel with forward error correction. The [native clients](/docs/clients) (Apple, Android, Linux,
+- **punktfunk/2** — Punktfunk's own protocol: control, video and audio over one encrypted QUIC
+  port, with forward error correction on the video. The [native clients](/docs/clients) (Apple, Android, Linux,
   Windows) use it. It is always on.
 - **GameStream** — the protocol [Moonlight](/docs/moonlight) speaks, so any Moonlight client
-  connects. It is off until you turn on **GameStream** in **Host → Settings**, and it pairs over
+  connects. It is off until you turn on **GameStream** in **Host**, and it pairs over
   plain HTTP, so use it on a [trusted network](/docs/security#gamestream--moonlight-compatibility-is-the-weak-crypto-path)
   only.
 

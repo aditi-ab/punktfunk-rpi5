@@ -1,6 +1,7 @@
 package io.unom.punktfunk
 
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Handler
@@ -18,9 +19,10 @@ import io.unom.punktfunk.kit.NativeBridge
  *    without a content-provider round-trip that isn't worth it here).
  *
  * Loop guard: text set from a host fetch is remembered ([lastFromHost]) so the resulting
- * primary-clip-changed callback doesn't bounce it straight back as a new offer. Clipboard reads
- * happen while the stream is foreground (Android only allows focused-app reads). The native
- * events are drained on a dedicated thread and applied on the main thread; [stop] joins it.
+ * primary-clip-changed callback doesn't bounce it straight back as a new offer. A clip a password
+ * manager marks secret ([isSecretClip]) is never offered or served. Clipboard reads happen while
+ * the stream is foreground (Android only allows focused-app reads). The native events are drained
+ * on a dedicated thread and applied on the main thread; [stop] joins it.
  */
 class ClipboardSync(
     private val context: Context,
@@ -62,7 +64,9 @@ class ClipboardSync(
         NativeBridge.nativeClipOfferText(handle, seq)
     }
 
+    /** The clip's text, or null when there is none or it is marked secret. */
     private fun currentClipText(): String? = runCatching {
+        if (isSecretClip(cm.primaryClipDescription)) return@runCatching null
         cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
             ?.coerceToText(context)?.toString()?.takeIf { it.isNotEmpty() }
     }.getOrNull()
@@ -109,3 +113,10 @@ class ClipboardSync(
         }
     }
 }
+
+/** `ClipDescription.EXTRA_IS_SENSITIVE`, spelled out: the constant is API 33, the key is not. */
+private const val EXTRA_IS_SENSITIVE = "android.content.extra.IS_SENSITIVE"
+
+/** A password manager marked this clip secret. */
+internal fun isSecretClip(description: ClipDescription?): Boolean =
+    description?.extras?.getBoolean(EXTRA_IS_SENSITIVE) == true

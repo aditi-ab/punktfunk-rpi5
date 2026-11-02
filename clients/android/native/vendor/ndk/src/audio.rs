@@ -545,7 +545,10 @@ impl AudioStreamBuilder {
         }
     }
 
-    fn as_ptr(&self) -> *mut ffi::AAudioStreamBuilder {
+    /// [punktfunk vendored patch] Public so callers can bind `AAudioStreamBuilder_*` entry points
+    /// the wrapper doesn't expose yet (here: `AAudioStreamBuilder_setChannelMask`, API 32). The
+    /// pointer is valid for `&self`'s lifetime; callers must not delete the builder through it.
+    pub fn as_ptr(&self) -> *mut ffi::AAudioStreamBuilder {
         self.inner.as_ptr()
     }
 

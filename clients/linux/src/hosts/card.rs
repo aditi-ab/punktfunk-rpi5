@@ -14,13 +14,14 @@ use std::collections::HashSet;
 pub fn build(
     m: &CardModel,
     presets: &[Preset],
+    identity: &(String, String),
     sender: &relm4::Sender<HostsMsg>,
 ) -> gtk::FlowBoxChild {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("card");
     row.add_css_class("pf-host-card");
     row.set_size_request(280, -1);
-    row.append(&tile(m));
+    row.append(&tile(m, identity));
 
     let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
     text.set_valign(gtk::Align::Center);
@@ -91,14 +92,14 @@ fn saved_ref(m: &CardModel) -> Option<HostRef> {
     };
     Some(HostRef {
         id: id.clone(),
-        addr: m.request.addr.clone(),
-        port: m.request.port,
+        addr: m.request.host.addr.clone(),
+        port: m.request.host.port,
     })
 }
 
 /// The OS mark in a circle — which machine this is, not the letter it starts with — dimmed
 /// while it cannot answer, a spinner while connecting, a star on the default host's own card.
-fn tile(m: &CardModel) -> gtk::Widget {
+fn tile(m: &CardModel, identity: &(String, String)) -> gtk::Widget {
     if m.status == Status::Connecting {
         let spinner = adw::Spinner::new();
         spinner.set_size_request(48, 48);
@@ -130,6 +131,21 @@ fn tile(m: &CardModel) -> gtk::Widget {
         star.set_valign(gtk::Align::Start);
         star.set_tooltip_text(Some("Default host"));
         overlay.add_overlay(&star);
+    }
+    if let CardKind::Saved {
+        profile: Some(pick),
+        pinned: None,
+        ..
+    } = &m.kind
+    {
+        let badge = adw::Avatar::new(20, Some(&pick.display_name), true);
+        badge.set_halign(gtk::Align::End);
+        badge.set_valign(gtk::Align::End);
+        badge.set_tooltip_text(Some(&pick.display_name));
+        if let Some(url) = &pick.avatar {
+            super::picture::show(&badge, url, m.request.host.api(identity));
+        }
+        overlay.add_overlay(&badge);
     }
     overlay.upcast()
 }
@@ -183,7 +199,13 @@ fn menu(
     presets: &[Preset],
     sender: &relm4::Sender<HostsMsg>,
 ) -> (gio::Menu, gio::SimpleActionGroup) {
-    let CardKind::Saved { paired, pinned, .. } = &m.kind else {
+    let CardKind::Saved {
+        paired,
+        pinned,
+        profile,
+        ..
+    } = &m.kind
+    else {
         unreachable!("only saved cards carry a menu");
     };
     let actions = gio::SimpleActionGroup::new();
@@ -209,11 +231,22 @@ fn menu(
         );
     }
     {
+        let req = m.request.clone();
+        add(
+            "switch-profile",
+            Box::new(move || Act::SwitchProfile(req.clone())),
+        );
+    }
+    {
         let host = host.clone();
         add("details", Box::new(move || Act::Details(host.clone())));
     }
     {
-        let (mac, addr) = (m.request.mac.clone(), m.request.addr.clone());
+        let key = m.request.card_key();
+        add("disconnect", Box::new(move || Act::Disconnect(key.clone())));
+    }
+    {
+        let (mac, addr) = (m.request.host.mac.clone(), m.request.host.addr.clone());
         add(
             "wake",
             Box::new(move || Act::Wake {
@@ -258,6 +291,9 @@ fn menu(
         menu.append(Some("Unpin Card"), Some("card.unpin"));
         return (menu, actions);
     }
+    if m.status == Status::Streaming {
+        menu.append(Some("Disconnect"), Some("card.disconnect"));
+    }
     if !presets.is_empty() {
         let with = gio::Menu::new();
         for (label, id) in std::iter::once(("Default settings", ""))
@@ -273,8 +309,11 @@ fn menu(
     if *paired {
         menu.append(Some("Browse Library"), Some("card.library"));
     }
-    if !m.status.live() && !m.request.mac.is_empty() {
+    if !m.status.live() && !m.request.host.mac.is_empty() {
         menu.append(Some("Wake Host"), Some("card.wake"));
+    }
+    if profile.is_some() {
+        menu.append(Some("Switch Profile\u{2026}"), Some("card.switch-profile"));
     }
     menu.append(Some("Copy Link"), Some("card.copy-link"));
     menu.append(Some("Host Details\u{2026}"), Some("card.details"));

@@ -9,14 +9,16 @@ It encodes and decodes in a fraction of a millisecond, and pays for that with fa
 than HEVC or AV1.
 
 Punktfunk never picks it for you. It runs when you choose it on the client and the host supports
-it; otherwise the session uses the normal codecs.
+it; otherwise the session uses the normal codecs. Setting the host's **Encoder** to **PyroWave**
+chooses it for every client whose **Video codec** is on automatic and that can decode it.
 
 ## Why use it
 
 - **Codec latency almost disappears.** Encode takes ~0.15 ms and decode ~0.07 ms at 1080p on an
   RTX 5070 Ti. Hardware HEVC takes one to several milliseconds on each side.
-- **Packet loss costs one frame.** No frame depends on another, so there is no keyframe request
-  and no stutter while the stream recovers.
+- **A lost packet blurs a small patch of one frame.** No frame depends on another, so there is no
+  keyframe request and no stutter while the stream recovers. Only each frame's coarsest layer,
+  whose loss would show, carries recovery data.
 - **Every frame is the same size.** The network sees a steady load instead of keyframe bursts.
 
 ## Setting it up
@@ -37,15 +39,29 @@ The Apple and Android apps and the controller UI list it only when the device ca
 A session whose host or device can't run it falls back to HEVC. The
 [stats overlay](/docs/stats) names `PyroWave` as the codec while it runs.
 
+## From a Moonlight client
+
+A host that supports PyroWave also offers it to Moonlight forks that support it: pick it in the
+fork's codec setting.
+
+- The fork's bitrate sets the rate, up to the largest frame a Moonlight stream can carry. That
+  limit binds at 60 fps and high bitrates.
+- 4:4:4 needs **Full color 4:4:4** on in the
+  [host settings](/docs/configuration#settings-in-the-web-console). The host refuses a 4:4:4
+  request it can't serve, 8K-class modes included, because the fork can't decode 4:2:0 instead.
+
 ## Bits per pixel
 
 PyroWave has no quality setting of its own: its encoder fills each frame's byte budget exactly.
 Punktfunk sets that budget in **bits per pixel**, so one number means the same picture at every
 resolution and frame rate.
 
-Set it in the web console under **Host → Settings → Video → PyroWave quality**, or with
-`PUNKTFUNK_PYROWAVE_BPP` in `host.env`: 0.25 to 4, from the next session. One value covers every
-client, each at its own bitrate. The client's bitrate setting doesn't apply.
+Set it on the client under **PyroWave quality**, 0.5 to 2, shown as the rate it needs at your
+stream's mode ([Client settings](/docs/client-settings)). For a client without that row, set the
+host's value in the web console under **Host → Video → PyroWave quality**, or
+with `PUNKTFUNK_PYROWAVE_BPP` in `host.env`: 0.25 to 4, from the next session. The client's
+**Bitrate** then offers **Automatic** or **Fixed**: Fixed streams at the quality, and with
+**Automatic** the quality is the most a session uses ([Fitting the link](#fitting-the-link)).
 
 The default is **1.6**, the codec author's clean point: at 200 Mbps for 1080p60 he
 [could not spot compression artifacts](https://themaister.net/blog/2025/06/16/i-designed-my-own-ridiculously-fast-game-streaming-video-codec-pyrowave/)
@@ -59,6 +75,8 @@ without comparing side by side and zooming in.
 | 2560×1440 @ 120 | ≈ 710 Mbps |
 | 3840×2160 @ 60 | ≈ 800 Mbps |
 | 3840×2160 @ 120 | ≈ 1.6 Gbps |
+
+These are what the link carries, recovery data and packet headers included.
 
 Lower values work and look softer: fewer bits never break the stream. PyroWave sends every frame
 whole and keeps its coding simple for speed, which
@@ -81,11 +99,19 @@ Together, 4:4:4 HDR at the default is ~3.0 bits per pixel.
 
 ## Fitting the link
 
-Before the first frame the client tests the link. If it can't carry the rate with room to spare,
-the session drops to 70 % of what the link delivered, so 4K120 on Gigabit still streams at fewer
-bits per pixel. The rate never rises afterwards and adaptive bitrate stays off; under sustained
-loss, switch to HEVC. The Android app runs this test only with its bitrate on **Automatic**, the
-default.
+Before the first frame the client tests the link. With the client's bitrate on **Automatic**, the
+default, a link that can't carry the rate with room to spare starts the session at 70 % of what
+the link delivered, so 4K120 on Gigabit still streams at fewer bits per pixel.
+
+PyroWave then adapts like the other codecs: bits per pixel follow the link between 0.5 and
+**PyroWave quality**, dropping under loss and climbing back when the link recovers. Held at 0.5
+for three seconds, the [stats overlay](/docs/stats) says the network is weak and that HEVC would
+look better on this link.
+
+With **Bitrate** on **Fixed** the session streams at **PyroWave quality** whatever the test finds.
+A link that can't carry it drops frames; lower the quality, or pick **Automatic**. A bitrate you
+set for another codec counts as **Fixed** here, so a player who kept one streams at full quality
+until **Bitrate** goes back to **Automatic**.
 
 To hold every session under a fixed rate, set **PyroWave bitrate cap** (under **Show advanced**,
 `PUNKTFUNK_PYROWAVE_MAX_MBPS`, 0 for no cap).

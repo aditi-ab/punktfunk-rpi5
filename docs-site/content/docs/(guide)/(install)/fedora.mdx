@@ -1,9 +1,9 @@
 ---
 title: Fedora
-description: Install the Punktfunk host on Fedora 43 or 44 from the RPM repo, in four steps.
+description: Install the Punktfunk host on Fedora 43, 44 or 45 from the RPM repo, in four steps.
 ---
 
-Install the host on **Fedora 43 or 44**, Workstation or KDE. Bazzite and other Fedora Atomic spins
+Install the host on **Fedora 43, 44 or 45**, Workstation or KDE. Bazzite and other Fedora Atomic spins
 have [their own page](/docs/bazzite).
 
 **One command instead?** The [guided installer](/docs/install#guided-install-preview) (preview)
@@ -30,7 +30,8 @@ does steps 2 to 4 and warns when step 1 is missing:
 ## 2. Install the host
 
 Add the repo and install the host, the console and the plugin runner. On **Fedora 43**, change
-`fedora-44` to `bazzite` in `baseurl` first (`rpm -E %fedora` prints your release):
+`fedora-44` to `bazzite` in `baseurl` first. On **Fedora 45**, change it to `fedora-45`.
+`rpm -E %fedora` prints your release:
 
 <Install platform="fedora" />
 

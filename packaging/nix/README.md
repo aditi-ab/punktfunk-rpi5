@@ -18,9 +18,11 @@ can hold: how the packages are built, and the traps.
 | `packages.…punktfunk-client` | `punktfunk-client` (GTK4 shell) + `punktfunk-session` (without the Skia OSD — see below) |
 | `packages.…punktfunk-web` | the management console (bun-built Nitro SSR bundle) |
 | `packages.…punktfunk-scripting` | the plugin/script runner (bun-bundled Effect SDK) |
-| `nixosModules.default` | `services.punktfunk.host` / `.client` / `.web` / `.scripting` |
+| `packages.…punktfunk-seats` | the seat supervisor, the door's helper, their units, tmpfiles rules and polkit rule, rewritten to the store path. The module points the door's host and console units at its own packages |
+| `nixosModules.default` | `services.punktfunk.host` / `.client` / `.web` / `.scripting` / `.seats` |
 | `devShells.…default` | pinned Rust from `rust-toolchain.toml` + every system library |
 | `checks.…nixos-module` | evaluates the module against real nixpkgs and asserts on the rendered units |
+| `checks.…nixos-vm` | boots the module with the real packages in a VM: the user units run, the runner keeps its sandbox. Builds the host; CI runs it under the `ci:nix-rust` label |
 
 One binary covers every GPU vendor: NVENC/CUDA entry points are `dlopen`'d at runtime, so the same
 host runs on NVIDIA, AMD/Intel or software.
@@ -124,8 +126,10 @@ GPU driver. `nix fmt` formats the `.nix` files.
   `// FIXME: if we have a 'nixpkgs' input, use it to check the module.`). Measured: a module setting
   a nonexistent option, referencing a nonexistent `pkgs` attribute **and** calling a nonexistent
   `lib` function passes clean, printing *all checks passed!*. So that line means nothing.
-  [`module-check.nix`](module-check.nix) closes the gap by evaluating against real nixpkgs in four
-  scenarios and asserting on the rendered systemd units. Two rules if you edit it: **keep every
+  [`module-check.nix`](module-check.nix) closes the gap by evaluating against real nixpkgs in a set
+  of scenarios and asserting on what the module renders: the drop-ins over the packaged user units,
+  and the system wiring. What the shipped unit itself declares is
+  [`vm-test.nix`](vm-test.nix)'s to check. Two rules if you edit it: **keep every
   assertion pure Nix** (instantiating the derivation is what runs them, which is what lets the cheap
   `--no-build` CI leg cover it), and **assert list-valued unit fields on the evaluated lists**, not
   the rendered text — systemd renders `After=` as one space-separated line, so an `hasInfix` on it
@@ -137,7 +141,7 @@ GPU driver. `nix fmt` formats the `.nix` files.
   session `--no-default-features --features pyrowave`. Everything streams; only the optional
   on-glass stats overlay and the console are absent. The GTK shell builds without its `console`
   feature too, so it shows no Console button, and this build does **not** install
-  `io.unom.Punktfunk.Console.desktop`.
+  `io.unom.punktfunk.console.desktop`.
 
 - **Commit `flake.lock`.** It pins nixpkgs, crane, rust-overlay and bun2nix.
 

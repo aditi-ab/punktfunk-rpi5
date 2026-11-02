@@ -31,7 +31,7 @@ Face buttons by position: `A` south, `B` east, `X` west, `Y` north. A label carr
 engraving, so a Switch's south button is `id="A"` with the label `B`.
 
 `Up` `Down` `Left` `Right` `LB` `RB` `LT` `RT` `LS` `RS` `Back` `Start` `Guide` `Misc`
-`Touchpad`, and the rear buttons by the Deck's names: `L4` `R4` upper, `L5` `R5` lower.
+`Touchpad` `C`, and the rear buttons by the Deck's names: `L4` `R4` upper, `L5` `R5` lower.
 
 ## References
 
@@ -41,7 +41,7 @@ Drawn here. Proportions were measured from these; no image or model data ships.
 | --- | --- |
 | `xboxone` | Commons "Xbox Series Controller Carbon Black.jpg"; controls from Microsoft's Elite Series 2 render |
 | `xboxelite` | Microsoft's xbox.com front render |
-| `xbox360` | Commons "Xbox 360 controller top (3455250267).jpg", dimensions.com drawing |
+| `xbox360` | Commons "Xbox360 gamepad.svg" — the shell, lower panel, bumpers and every control's centre re-traced from it at 155 mm wide |
 | `dualsense` | Commons "Playstation 5 DualSense controller in Midnight Black, 2026-02-07 (front).jpg" |
 | `dualsenseedge` | Commons "DualSense Edge Controller.jpg", Sony's part-name diagrams |
 | `dualshock4` | Commons "Dualshock 4 Layout.svg" |

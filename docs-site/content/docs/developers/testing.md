@@ -33,7 +33,7 @@ Two traps:
 | Area | Command |
 |---|---|
 | FEC under loss, no network | `cargo run -p loss-harness` |
-| C ABI links from C | `bash crates/punktfunk-ffi/tests/c/run.sh` |
+| C ABI links from C | `bash crates/client/punktfunk-ffi/tests/c/run.sh` |
 | Scroll, wire and compatibility | `cargo test -p punktfunk-core --features quic scroll` |
 | Scroll, host mapping (any OS) | `cargo test -p pf-inject --lib scroll` |
 | Touch and scroll in the presenter (macOS too) | `cargo test -p pf-presenter --no-default-features` |
@@ -104,7 +104,7 @@ From `packaging/windows/drivers`, as in
 
 ## Run a host from source against a client
 
-**Without a desktop.** The synthetic host speaks `punktfunk/1` with generated frames and runs
+**Without a desktop.** The synthetic host speaks `punktfunk/2` with generated frames and runs
 anywhere the host compiles, macOS included. In two terminals, start it and connect the probe,
 which byte-checks the frames:
 

@@ -74,6 +74,7 @@ final class MicUplinkTests: XCTestCase {
     /// The whole uplink through a real session, on the split path: the voice processor is a
     /// second topology, and a test process that starts it can wedge the audio server.
     /// Driven by clients/apple/test-loopback.sh.
+    @MainActor
     func testSessionCaptureStartsOnTheSplitPath() throws {
         guard let portStr = ProcessInfo.processInfo.environment["PUNKTFUNK_LOOPBACK_PORT"],
               let port = UInt16(portStr)

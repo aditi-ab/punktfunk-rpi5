@@ -502,6 +502,111 @@ mod imp {
         }
     }
 
+    /// A visible window that asks GameInput for the gamepad reading once a second and logs
+    /// whether it still advances. Run it in two sessions and change the foreground in one: the
+    /// other's log shows whether GameInput's one focus per box took its pad away.
+    fn focus_window(seconds: u64, log: &std::path::Path) {
+        use std::io::Write as _;
+        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow, PeekMessageW,
+            PostQuitMessage, RegisterClassW, SetForegroundWindow, ShowWindow, TranslateMessage,
+            MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WM_DESTROY, WM_QUIT, WNDCLASSW,
+            WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        };
+        unsafe extern "system" fn wnd_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            if m == WM_DESTROY {
+                // SAFETY: plain Win32 call with no pointer arguments.
+                unsafe { PostQuitMessage(0) };
+                return LRESULT(0);
+            }
+            // SAFETY: forwarding the message the system handed us, unchanged.
+            unsafe { DefWindowProcW(h, m, w, l) }
+        }
+        let mut file = std::fs::File::create(log).expect("open the focus log");
+        let mut line = |s: String| {
+            let _ = writeln!(file, "{s}");
+            let _ = file.flush();
+            println!("{s}");
+        };
+        let class = windows::core::w!("pf-gi-focus");
+        // SAFETY: Win32 window bring-up on this thread; `class` is a static literal and `wc` is a
+        // fully initialised local that RegisterClassW reads synchronously.
+        let hwnd = unsafe {
+            let hinst = GetModuleHandleW(None).expect("module handle");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(wnd_proc),
+                hInstance: hinst.into(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+            let h = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class,
+                class,
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                420,
+                160,
+                None,
+                None,
+                Some(hinst.into()),
+                None,
+            )
+            .expect("create the focus window");
+            let _ = ShowWindow(h, SW_SHOW);
+            let _ = SetForegroundWindow(h);
+            h
+        };
+        let gi = match crate::gameinput::GameInput::create() {
+            Ok(gi) => gi,
+            Err(e) => {
+                line(format!("gameinput unavailable: {e}"));
+                return;
+            }
+        };
+        let start = std::time::Instant::now();
+        let mut next = start;
+        let mut last: Option<(u64, u64)> = None;
+        while start.elapsed().as_secs() < seconds {
+            // SAFETY: the standard message pump on the window's own thread.
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_QUIT {
+                        return;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            if std::time::Instant::now() >= next {
+                next += Duration::from_secs(1);
+                let now = gi.gamepad_stamp();
+                // SAFETY: plain Win32 query with no arguments.
+                let fg = unsafe { GetForegroundWindow() } == hwnd;
+                let advanced = matches!((last, now), (Some(a), Some(b)) if a != b);
+                let epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                line(format!(
+                    "t={:>5.1}s epoch_ms={epoch} pid={} fg={fg} reading={} ts={} seq={} advanced={advanced}",
+                    start.elapsed().as_secs_f32(),
+                    std::process::id(),
+                    now.is_some(),
+                    now.map_or(0, |x| x.0),
+                    now.map_or(0, |x| x.1),
+                ));
+                last = now;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     pub fn run() {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut rounds = 0usize;
@@ -509,6 +614,7 @@ mod imp {
         let mut gameinput_report = false;
         let mut gi_rumble: Option<String> = None;
         let mut gi_pid: Option<u16> = None;
+        let mut gi_focus: Option<(u64, String)> = None;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -517,6 +623,15 @@ mod imp {
                     i += 1;
                 }
                 "--gameinput" => gameinput_report = true,
+                "--gi-focus" => {
+                    let secs = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(60);
+                    let log = args
+                        .get(i + 2)
+                        .cloned()
+                        .unwrap_or_else(|| "gi-focus.log".into());
+                    gi_focus = Some((secs, log));
+                    i += 2;
+                }
                 "--gi-pid" => {
                     gi_pid = args
                         .get(i + 1)
@@ -533,10 +648,12 @@ mod imp {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "win-input-matrix [--watch N] [--rumble SLOT]\n\n  \
+                        "win-input-matrix [--watch N] [--rumble SLOT] [--gameinput] [--gi-focus SECS LOG]\n\n  \
                          --watch N     sample WGI N times and report LIVE vs MUTE per device\n  \
                          --rumble SLOT drive XInputSetState into that slot for 3 s (WP0 probe:\n                \
-                         does anything write an output report back to our pad?)\n\n\
+                         does anything write an output report back to our pad?)\n  \
+                         --gi-focus SECS LOG  open a window and log once a second whether GameInput\n                \
+                         still hands this process gamepad readings (its focus is one per box)\n\n\
                          ALWAYS take a baseline with your virtual pad STOPPED and diff it: a real\n\
                          pad on the box owns XInput slot 0 and shows up in WGI."
                     );
@@ -545,6 +662,10 @@ mod imp {
                 other => eprintln!("(ignoring unknown argument {other})"),
             }
             i += 1;
+        }
+        if let Some((secs, log)) = gi_focus {
+            focus_window(secs, std::path::Path::new(&log));
+            return;
         }
 
         // WinRT needs an initialised apartment. CoIncrementMTAUsage keeps an MTA alive for the

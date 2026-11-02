@@ -1,0 +1,708 @@
+//! Physical-monitor enumeration: heads the compositor already has.
+//!
+//! Read-only. Everything else in this crate creates and owns virtual outputs;
+//! this module only reports existing heads so an operator can pin capture
+//! (`PUNKTFUNK_CAPTURE_MONITOR`) and the console can render a picker.
+//! See `design/per-monitor-portal-capture.md`.
+//!
+//! Lives here because enumeration is per-compositor and this crate already
+//! speaks those dialects. Each backend implements listing beside its other
+//! IPC; this module is the shared type and the dispatch.
+//!
+//! `x`/`y` identify a head: two monitors can share a size, never an origin
+//! in the compositor's global space. Size-keyed matching is a trap — see
+//! `pf-inject`'s absolute-coordinate region selection.
+
+use crate::Compositor;
+use anyhow::Result;
+// Only the non-Linux fallback arm of `list` bails; on Linux every backend has its own arm, so an
+// unconditional import is an unused one under `-D warnings`.
+#[cfg(not(target_os = "linux"))]
+use anyhow::bail;
+
+/// One head as the compositor currently reports it.
+///
+/// `x`/`y` are logical — compositor global layout, the same space libei
+/// regions use. `width`/`height` are the current mode in pixels, which is
+/// what every backend reports and what a capturer opens against. `scale`
+/// is the factor between them; [`Self::logical_size`] is the only correct
+/// way to compare a size against `x`/`y`. Mixing the two spaces is a trap.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhysicalMonitor {
+    /// Connector name (`DP-1`, `HDMI-A-2`). The id `PUNKTFUNK_CAPTURE_MONITOR` names.
+    pub connector: String,
+    /// Human label for a picker (`make model`, else the connector). Never used for matching.
+    pub description: String,
+    /// Current mode in pixels, not logical size. See [`Self::logical_size`].
+    pub width: u32,
+    pub height: u32,
+    /// Refresh in mHz (60000 = 60 Hz). 0 when the backend doesn't report it.
+    pub refresh_mhz: u32,
+    /// Top-left in the compositor's global logical space — the identity key (see the module doc).
+    pub x: i32,
+    pub y: i32,
+    /// Logical scale factor (1.0 when unreported).
+    pub scale: f64,
+    /// The compositor's primary/focused head, when it says.
+    pub primary: bool,
+    /// Enabled (driven). A disabled head is still listed, so "why can't I pick it?" has an answer.
+    pub enabled: bool,
+    /// Best-effort: we created this output. Only KWin names them distinctly;
+    /// other backends leave this `false` rather than guess. Grey out, never filter.
+    pub managed: bool,
+}
+
+/// Picker label from make/model, else the connector.
+///
+/// Compositors write the literal `"Unknown"` rather than leaving fields empty;
+/// treat that as absent so a row does not read "Unknown Unknown".
+pub(crate) fn describe(make: &str, model: &str, connector: &str) -> String {
+    let known = |s: &str| {
+        let s = s.trim();
+        !s.is_empty() && !s.eq_ignore_ascii_case("unknown")
+    };
+    let label = [make, model]
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| known(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.is_empty() {
+        connector.to_string()
+    } else {
+        label
+    }
+}
+
+impl PhysicalMonitor {
+    /// Extent in the same space as `x`/`y`: mode pixels divided by `scale`.
+    ///
+    /// The only correct way to ask whether a layout coordinate is inside this
+    /// head. Comparing `width`/`height` to `x`/`y` is right only at scale 1.0
+    /// (a 3840-px panel at 150% occupies 2560 logical units). A non-positive
+    /// scale is treated as 1.0 rather than dividing by zero.
+    pub fn logical_size(&self) -> (f64, f64) {
+        let scale = if self.scale > 0.0 { self.scale } else { 1.0 };
+        (
+            f64::from(self.width) / scale,
+            f64::from(self.height) / scale,
+        )
+    }
+
+    /// `1920x1080@60` — for logs and pickers.
+    pub fn mode_label(&self) -> String {
+        if self.refresh_mhz == 0 {
+            format!("{}x{}", self.width, self.height)
+        } else {
+            format!(
+                "{}x{}@{}",
+                self.width,
+                self.height,
+                (self.refresh_mhz as f64 / 1000.0).round() as u32
+            )
+        }
+    }
+}
+
+/// Every head `compositor` reports, in compositor order.
+///
+/// Backend unreachable is an error; `Ok(vec![])` means reached it, no heads.
+/// A picker can treat both as empty; a pin resolver must not (see [`resolve`]).
+pub fn list(compositor: Compositor) -> Result<Vec<PhysicalMonitor>> {
+    match compositor {
+        // The KWin seam: in-process, then `kscreen-doctor` once, as every KWin output op.
+        // A miss of both is an error, never "no monitors" (`resolve` keys on it).
+        #[cfg(target_os = "linux")]
+        Compositor::Kwin => crate::kwin::outputs::list(),
+        #[cfg(target_os = "linux")]
+        Compositor::Mutter => crate::mutter::list_monitors(),
+        #[cfg(target_os = "linux")]
+        Compositor::Wlroots => crate::wlroots::list_monitors(),
+        #[cfg(target_os = "linux")]
+        Compositor::Hyprland => crate::hyprland::list_monitors(),
+        #[cfg(target_os = "linux")]
+        Compositor::Niri => crate::niri::list_monitors(),
+        #[cfg(target_os = "linux")]
+        Compositor::Umbriel => crate::umbriel::list_monitors(),
+        // Game Mode gamescope is DRM master and has a real connector; nested
+        // ones this crate spawns are headless. Empty list, not an error, for those.
+        #[cfg(target_os = "linux")]
+        Compositor::Gamescope => crate::gamescope::list_monitors(),
+        #[cfg(target_os = "linux")]
+        Compositor::Windows => {
+            anyhow::bail!("physical-monitor enumeration needs a Linux backend")
+        }
+        #[cfg(not(target_os = "linux"))]
+        _ => bail!("physical-monitor enumeration is implemented for the Linux backends only"),
+    }
+}
+
+/// Every head Windows reports — the non-compositor counterpart to [`list`].
+///
+/// Reads the CCD database the Windows backend already drives. Inactive heads
+/// are listed with zeroed geometry and `enabled: false`, matching [`list`].
+///
+/// Two fields cannot mean here what they mean on Linux:
+/// * `scale` is always `1.0`. Windows scaling is per-monitor DPI per application,
+///   not a compositor-global logical scale, so the geometry is pixels.
+/// * `refresh_mhz` comes from the path's own rational rate (59.94 stays distinct from 60).
+#[cfg(windows)]
+pub fn list_windows() -> Result<Vec<PhysicalMonitor>> {
+    // `Ok` on an empty inventory, matching [`list`]: every panel off is a real state. The display
+    // actor's cached snapshot (immunity plan WP9) — a direct read only before its first publish.
+    Ok(from_inventory(
+        pf_win_display::display_events::snapshot_or_query()
+            .targets
+            .to_vec(),
+    ))
+}
+
+/// CCD inventory → [`PhysicalMonitor`]. Split from the OS call so tests can
+/// cover the pin mapping without touching the display database.
+#[cfg(windows)]
+pub(crate) fn from_inventory(
+    inv: Vec<pf_win_display::win_display::TargetInventory>,
+) -> Vec<PhysicalMonitor> {
+    inv.into_iter()
+        .map(|t| {
+            // GDI name is what capture pins on; inactive paths have none, so
+            // fall back to `target-{id}` — `resolve` matches this, a blank cannot.
+            let connector = if t.gdi_name.is_empty() {
+                format!("target-{}", t.target_id)
+            } else {
+                t.gdi_name
+            };
+            PhysicalMonitor {
+                description: describe("", &t.friendly, &connector),
+                connector,
+                width: t.width,
+                height: t.height,
+                refresh_mhz: t.refresh_mhz,
+                x: t.x,
+                y: t.y,
+                scale: 1.0,
+                primary: t.primary,
+                enabled: t.active,
+                // IddCx monitors carry our EDID manufacturer id in the device path.
+                managed: t.ours,
+            }
+        })
+        .collect()
+}
+
+/// Resolve a configured monitor name against `monitors`, exact then case-insensitive.
+///
+/// A miss is a hard error listing available names, never a silent fallback:
+/// pinning `DP-2` and streaming `DP-1` is worse than refusing to start.
+/// See `design/per-monitor-portal-capture.md`.
+pub fn resolve<'a>(monitors: &'a [PhysicalMonitor], want: &str) -> Result<&'a PhysicalMonitor> {
+    if let Some(m) = monitors.iter().find(|m| m.connector == want) {
+        return Ok(m);
+    }
+    if let Some(m) = monitors
+        .iter()
+        .find(|m| m.connector.eq_ignore_ascii_case(want))
+    {
+        return Ok(m);
+    }
+    Err(MonitorNotFound {
+        want: want.to_string(),
+        available: monitors.iter().map(|m| m.connector.clone()).collect(),
+    }
+    .into())
+}
+
+/// Does `exclusive` turn this head off? Enabled, not ours, not a managed sibling's
+/// output, and not on the operator's `keep_monitors` list (§5.5). The list matches
+/// case-insensitively: it arrives from the console, a config file and the compositor,
+/// and `DP-1` / `dp-1` are the same screen to the person who typed it.
+pub(crate) fn darkens(
+    name: &str,
+    enabled: bool,
+    managed: bool,
+    ours: bool,
+    keep: &[String],
+) -> bool {
+    enabled && !managed && !ours && !keep.iter().any(|k| k.eq_ignore_ascii_case(name))
+}
+
+/// The connectors [`darkens`] turns off, in list order. `ours` is matched by name.
+pub(crate) fn heads_to_darken(
+    heads: &[PhysicalMonitor],
+    ours: &str,
+    keep: &[String],
+) -> Vec<String> {
+    heads
+        .iter()
+        .filter(|h| {
+            darkens(
+                &h.connector,
+                h.enabled,
+                h.managed,
+                h.connector == ours,
+                keep,
+            )
+        })
+        .map(|h| h.connector.clone())
+        .collect()
+}
+
+/// How long a head's disable, or the call that undoes it, has to show in the compositor's
+/// listing. A miss is reported, never assumed.
+pub(crate) const DISABLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Disable every head [`heads_to_darken`] names for an `exclusive` session; the ones that went
+/// dark are the restore's input. A listing error or a refused head leaves that screen lit, never
+/// the session down. `tag` prefixes the log lines.
+///
+/// `journal(plan)` runs before the first head goes dark, with every head about to: the
+/// write-ahead record of what to re-enable. `refocus(ours)` runs once anything went dark: the
+/// compositor re-homes workspaces and picks a new focus, and launches must still land on the
+/// stream.
+pub(crate) fn disable_for_exclusive(
+    tag: &str,
+    heads: Result<Vec<PhysicalMonitor>>,
+    ours: &str,
+    keep: &[String],
+    disable: impl Fn(&str) -> Result<()>,
+    refocus: impl FnOnce(&str),
+    journal: impl FnOnce(&[String]),
+) -> Vec<String> {
+    let heads = match heads {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "{tag}: heads not listed for `topology: exclusive` — they stay lit and the session \
+                 streams as `extend`"
+            );
+            return Vec::new();
+        }
+    };
+    let targets = heads_to_darken(&heads, ours, keep);
+    if targets.is_empty() {
+        tracing::info!(
+            "{tag}: `topology: exclusive` had nothing to disable — no enabled head besides the \
+             managed and kept ones (a headless box, or a sibling session already took the desk)"
+        );
+        return Vec::new();
+    }
+    journal(&targets);
+    let disabled: Vec<String> = targets
+        .into_iter()
+        .filter(|name| match disable(name) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    output = %name, error = %format!("{e:#}"),
+                    "{tag}: head not disabled for `topology: exclusive` — it stays lit"
+                );
+                false
+            }
+        })
+        .collect();
+    if !disabled.is_empty() {
+        tracing::info!(
+            ?disabled,
+            "{tag}: `topology: exclusive` — the streamed output is now the desk"
+        );
+        refocus(ours);
+    }
+    disabled
+}
+
+/// Blank every head but a managed sibling's for a gamescope `exclusive` stream
+/// ([`crate::panel_dpms`]); the result is what [`relight`] wakes. Only heads `set` reports it
+/// changed are recorded, so a toggling dispatcher never wakes a head this call left alone.
+///
+/// No `ours` and no keep list: gamescope owns no head on this compositor, and its darken
+/// ignores `keep_monitors` on every compositor.
+pub(crate) fn dpms_others(
+    tag: &str,
+    heads: Result<Vec<PhysicalMonitor>>,
+    set: impl Fn(&str) -> Result<bool>,
+) -> Vec<String> {
+    let Ok(heads) = heads else {
+        return Vec::new();
+    };
+    heads_to_darken(&heads, "", &[])
+        .into_iter()
+        .filter(|name| match set(name) {
+            Ok(changed) => changed,
+            Err(e) => {
+                tracing::warn!(
+                    output = %name, error = %format!("{e:#}"),
+                    "{tag}: head not blanked for `topology: exclusive`"
+                );
+                false
+            }
+        })
+        .collect()
+}
+
+/// Wake exactly `names`, the heads [`dpms_others`] blanked, with `set`. The ones now on, an
+/// already-lit head included.
+pub(crate) fn relight(
+    tag: &str,
+    names: &[String],
+    set: impl Fn(&str) -> Result<bool>,
+) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| match set(name) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(output = %name, error = %format!("{e:#}"), "{tag}: head not re-lit");
+                false
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// A [`resolve`] miss, typed so the host can hand the client a sentence naming the
+/// pin rather than the operator chain. `available` empty = the compositor reports
+/// no monitors at all.
+#[derive(Debug, Clone)]
+pub struct MonitorNotFound {
+    pub want: String,
+    pub available: Vec<String>,
+}
+
+/// The operator line. The session pipeline matches its `no monitor named` prefix to
+/// refuse a retry, so the opening is a contract, not a wording choice.
+impl std::fmt::Display for MonitorNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let want = &self.want;
+        if self.available.is_empty() {
+            return write!(
+                f,
+                "no monitor named {want:?} — this compositor reports no monitors at all"
+            );
+        }
+        write!(
+            f,
+            "no monitor named {want:?} — this host has: {}",
+            self.available.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for MonitorNotFound {}
+
+/// Names beyond this go unlisted: the sentence rides a 256-byte close frame, and
+/// losing the next move to a truncation costs more than losing the fifth name.
+const NAMED_IN_SENTENCE: usize = 4;
+
+impl MonitorNotFound {
+    /// The user's sentence — what did not happen, then the move that fixes it.
+    /// Naming the heads the host does have is that move: the pin is a setting.
+    pub fn user_message(&self) -> String {
+        let want = &self.want;
+        if self.available.is_empty() {
+            return format!(
+                "The host is set to capture a monitor called \"{want}\", and reports no \
+                 monitors at all. Clear that in the host's display settings to stream a \
+                 virtual display instead."
+            );
+        }
+        let mut names = self
+            .available
+            .iter()
+            .take(NAMED_IN_SENTENCE)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.available.len() > NAMED_IN_SENTENCE {
+            names.push_str(", …");
+        }
+        format!(
+            "The host is set to capture a monitor called \"{want}\", which isn't connected to \
+             it. Change it to one the host has ({names}) in the host's display settings, or \
+             clear it to stream a virtual display instead."
+        )
+    }
+}
+
+/// No head the compositor would show a mirrored stream on: none at all, or only the virtual
+/// outputs this host manages.
+pub(crate) fn only_managed(heads: &[PhysicalMonitor]) -> bool {
+    heads.iter().all(|h| h.managed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mon(connector: &str) -> PhysicalMonitor {
+        PhysicalMonitor {
+            connector: connector.into(),
+            description: String::new(),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60000,
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            primary: false,
+            enabled: true,
+            managed: false,
+        }
+    }
+
+    /// A desk is a head the compositor shows: our own virtual outputs are not one, so a
+    /// pinned monitor on a box that has only those degrades to a virtual display.
+    #[test]
+    fn our_own_virtual_heads_do_not_make_a_desk() {
+        assert!(only_managed(&[]));
+        let mut ours = mon("HEADLESS-1");
+        ours.managed = true;
+        assert!(only_managed(&[ours.clone()]));
+        assert!(!only_managed(&[ours, mon("DP-1")]));
+    }
+
+    /// Kept heads stay lit, matched case-insensitively; ours, managed siblings and
+    /// already-dark heads are never in the list.
+    #[test]
+    fn exclusive_spares_kept_heads_ours_and_managed_siblings() {
+        let mut dark = mon("DP-3");
+        dark.enabled = false;
+        let mut sibling = mon("PF-1-2");
+        sibling.managed = true;
+        let heads = [mon("DP-1"), mon("HDMI-A-1"), mon("PF-1-1"), sibling, dark];
+        assert_eq!(heads_to_darken(&heads, "PF-1-1", &[]), ["DP-1", "HDMI-A-1"]);
+        assert_eq!(
+            heads_to_darken(&heads, "PF-1-1", &["hdmi-a-1".into()]),
+            ["DP-1"]
+        );
+    }
+
+    /// Only heads the primitive accepted come back; the whole plan is journaled before the
+    /// first disable, refused head included; refocus runs once, only after a disable.
+    #[test]
+    fn exclusive_returns_the_heads_that_went_dark_and_refocuses_once() {
+        let heads = vec![mon("DP-1"), mon("HDMI-A-1"), mon("PF-1-1")];
+        let refocused = std::cell::RefCell::new(Vec::new());
+        let journaled = std::cell::RefCell::new(Vec::new());
+        let refuse_hdmi = |n: &str| match n {
+            "HDMI-A-1" => Err(anyhow::anyhow!("refused")),
+            _ => Ok(()),
+        };
+        let got = disable_for_exclusive(
+            "t",
+            Ok(heads),
+            "PF-1-1",
+            &[],
+            refuse_hdmi,
+            |o| refocused.borrow_mut().push(o.to_string()),
+            |plan| journaled.borrow_mut().extend_from_slice(plan),
+        );
+        assert_eq!(got, ["DP-1"]);
+        assert_eq!(*journaled.borrow(), ["DP-1", "HDMI-A-1"]);
+        assert_eq!(*refocused.borrow(), ["PF-1-1"]);
+
+        let unlisted = Err(anyhow::anyhow!("gone"));
+        let none = disable_for_exclusive(
+            "t",
+            unlisted,
+            "x",
+            &[],
+            refuse_hdmi,
+            |_| panic!("nothing went dark, so nothing refocuses"),
+            |_| panic!("nothing listed, so nothing to journal"),
+        );
+        assert!(none.is_empty());
+    }
+
+    /// DPMS records only heads `set` changed; relight counts every head that took the call.
+    #[test]
+    fn dpms_records_only_changed_heads_and_relight_counts_every_accepted_one() {
+        let set = |n: &str| match n {
+            "DP-1" => Ok(true),
+            "DP-2" => Ok(false),
+            _ => Err(anyhow::anyhow!("refused")),
+        };
+        let heads = vec![mon("DP-1"), mon("DP-2"), mon("DP-3")];
+        assert_eq!(dpms_others("t", Ok(heads), set), ["DP-1"]);
+        let names = ["DP-1".to_string(), "DP-2".into(), "DP-3".into()];
+        assert_eq!(relight("t", &names, set), ["DP-1", "DP-2"]);
+    }
+
+    #[test]
+    fn resolve_matches_exactly_then_case_insensitively() {
+        let ms = [mon("DP-1"), mon("HDMI-A-2")];
+        assert_eq!(resolve(&ms, "DP-1").unwrap().connector, "DP-1");
+        assert_eq!(resolve(&ms, "hdmi-a-2").unwrap().connector, "HDMI-A-2");
+    }
+
+    #[test]
+    fn resolve_prefers_the_exact_match_over_a_case_fold() {
+        // Connector names are case-sensitive to the compositor; exact wins over a fold.
+        let ms = [mon("dp-1"), mon("DP-1")];
+        assert_eq!(resolve(&ms, "DP-1").unwrap().connector, "DP-1");
+    }
+
+    #[test]
+    fn a_miss_lists_what_is_available() {
+        let ms = [mon("DP-1"), mon("HDMI-A-2")];
+        let err = resolve(&ms, "DP-9").unwrap_err().to_string();
+        assert!(err.contains("DP-1") && err.contains("HDMI-A-2"), "{err}");
+    }
+
+    #[test]
+    fn a_miss_with_no_monitors_says_so() {
+        let err = resolve(&[], "DP-1").unwrap_err().to_string();
+        assert!(err.contains("no monitors at all"), "{err}");
+    }
+
+    /// Reads the sentence off the error `resolve` really produces, so a reworded
+    /// miss cannot leave the client's half behind.
+    #[test]
+    fn a_miss_words_the_pin_and_the_heads_for_the_user() {
+        let ms = [mon("HDMI-A-1"), mon("DP-1")];
+        let err = resolve(&ms, "HDMI-A-3").unwrap_err();
+        let said = err
+            .downcast_ref::<MonitorNotFound>()
+            .expect("a miss stays typed through anyhow")
+            .user_message();
+        assert!(said.contains("HDMI-A-3"), "names the pin: {said}");
+        assert!(said.contains("HDMI-A-1"), "names a head it has: {said}");
+        assert!(
+            !said.contains("no monitor named"),
+            "not the operator line: {said}"
+        );
+        assert!(
+            said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX,
+            "fits one close frame uncut: {} bytes",
+            said.len()
+        );
+    }
+
+    /// Sixteen connectors is the policy ceiling; the sentence still has to arrive
+    /// whole, so the list is what gets cut, never the next move.
+    #[test]
+    fn a_miss_on_a_crowded_host_still_fits_the_close_frame() {
+        let ms = (0..16).map(|i| mon(&format!("DP-{i}"))).collect::<Vec<_>>();
+        let said = resolve(&ms, "HDMI-A-3")
+            .unwrap_err()
+            .downcast_ref::<MonitorNotFound>()
+            .unwrap()
+            .user_message();
+        assert!(
+            said.ends_with("virtual display instead."),
+            "keeps the move: {said}"
+        );
+        assert!(
+            said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX,
+            "fits one close frame uncut: {} bytes",
+            said.len()
+        );
+    }
+
+    #[test]
+    fn describe_falls_back_to_the_connector_for_empty_or_unknown_fields() {
+        assert_eq!(describe("ACME", "U2720Q", "DP-1"), "ACME U2720Q");
+        assert_eq!(describe("Unknown", "Unknown", "HEADLESS-1"), "HEADLESS-1");
+        assert_eq!(describe("", "", "DP-1"), "DP-1");
+        assert_eq!(describe("Unknown", "U2720Q", "DP-1"), "U2720Q");
+        assert_eq!(describe("  ", "unknown", "DP-2"), "DP-2");
+    }
+
+    #[test]
+    fn logical_size_divides_the_mode_by_the_scale() {
+        let mut m = mon("DP-1");
+        m.width = 3840;
+        m.height = 2160;
+        m.scale = 1.5;
+        assert_eq!(m.logical_size(), (2560.0, 1440.0));
+        m.scale = 1.0;
+        assert_eq!(m.logical_size(), (3840.0, 2160.0));
+        // Non-positive scale must not produce infinity or NaN.
+        m.scale = 0.0;
+        assert_eq!(m.logical_size(), (3840.0, 2160.0));
+    }
+
+    #[test]
+    fn mode_label_drops_an_unknown_refresh() {
+        let mut m = mon("DP-1");
+        assert_eq!(m.mode_label(), "1920x1080@60");
+        m.refresh_mhz = 0;
+        assert_eq!(m.mode_label(), "1920x1080");
+    }
+}
+
+/// Windows inventory mapping — exercises [`from_inventory`] without an OS call.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use pf_win_display::win_display::TargetInventory;
+
+    /// One inventory row. The foreign struct has no `Default`.
+    fn target(target_id: u32, gdi_name: &str, active: bool) -> TargetInventory {
+        TargetInventory {
+            key: pf_win_display::win_display::CcdTargetKey::new(0, target_id),
+            target_id,
+            active,
+            external_physical: true,
+            internal_panel: false,
+            tech: "HDMI",
+            friendly: "ACME TV".into(),
+            monitor_device_path: r"\\?\DISPLAY#ACM1234#".into(),
+            ours: false,
+            gdi_name: gdi_name.into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 59940,
+            primary: active,
+            hdr: active.then_some(false),
+            wcg: active.then_some(false),
+            sdr_white_level: None,
+            source_id: target_id,
+            source_adapter_luid: 0,
+        }
+    }
+
+    /// Inactive paths have no GDI name; list them under a pinnable `target-{id}`.
+    #[test]
+    fn an_inactive_path_gets_a_target_id_connector_and_enabled_false() {
+        let mons = from_inventory(vec![target(4352, "", false)]);
+        assert_eq!(mons.len(), 1);
+        assert_eq!(mons[0].connector, "target-4352");
+        assert!(!mons[0].enabled);
+        assert_eq!(mons[0].scale, 1.0);
+    }
+
+    /// Whatever connector this mapping synthesizes, [`resolve`] must find it.
+    #[test]
+    fn resolve_can_find_a_synthesized_target_name() {
+        let mons = from_inventory(vec![
+            target(4352, "", false),
+            target(1, r"\\.\DISPLAY1", true),
+        ]);
+        assert_eq!(
+            resolve(&mons, "target-4352")
+                .expect("synthesized name")
+                .width,
+            1920
+        );
+        assert_eq!(
+            resolve(&mons, r"\\.\DISPLAY1").expect("gdi name").connector,
+            r"\\.\DISPLAY1"
+        );
+        assert!(
+            resolve(&mons, r"\\.\display1").is_ok(),
+            "and case-insensitively, as `resolve` promises"
+        );
+    }
+
+    #[test]
+    fn our_own_idd_is_marked_managed() {
+        let mut ours = target(257, r"\\.\DISPLAY2", true);
+        ours.ours = true;
+        let mons = from_inventory(vec![ours]);
+        assert!(mons[0].managed);
+        assert!(!from_inventory(vec![target(1, r"\\.\DISPLAY1", true)])[0].managed);
+    }
+}

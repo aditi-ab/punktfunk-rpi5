@@ -70,8 +70,13 @@ pub fn is_seat_role() -> bool {
 /// `device` must be a live `WDFDEVICE`.
 pub unsafe fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     // A D0 entry that lands while the first async init is in flight must not issue a second
-    // adapter; last-write-wins on `set_adapter` would leak the first.
-    if adapter().is_some() || INIT_PENDING.load(Ordering::Acquire) {
+    // adapter; last-write-wins on `set_adapter` would leak the first. One compare-exchange is
+    // the gate: an ADD's retry and the PnP thread can arrive together.
+    if adapter().is_some()
+        || INIT_PENDING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
         return STATUS_SUCCESS;
     }
     dbglog!("[pf-vd] init_adapter");
@@ -185,7 +190,6 @@ pub unsafe fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
         ObjectAttributes: &raw mut attr,
     };
     let mut out = iddcx::IDARG_OUT_ADAPTER_INIT::default();
-    INIT_PENDING.store(true, Ordering::Release);
     // SAFETY: `device` is live per this function's contract; `init`/`out` are valid local storage
     // IddCxAdapterInitAsync reads synchronously (the adapter object itself is delivered later via
     // adapter_init_finished). `INIT_PENDING` keeps a second init from racing this one.
@@ -224,35 +228,37 @@ pub(crate) fn adapter() -> Option<iddcx::IDDCX_ADAPTER> {
         .map(|a| a.0)
 }
 
-/// The pin in force and the owner that set it. IddCx has one render adapter per IddCx adapter,
-/// so this cannot be scoped: another owner may repeat it, not move it ([`set_render_adapter`]).
-static RENDER_PIN: Mutex<Option<(i64, u32)>> = Mutex::new(None);
+/// The pin in force. IddCx has one render adapter per IddCx adapter, so this cannot be
+/// scoped: another owner may repeat it, not move it ([`set_render_adapter`]).
+static RENDER_PIN: Mutex<Option<i64>> = Mutex::new(None);
 
 /// Honor `owner`'s `IOCTL_SET_RENDER_ADAPTER`: pin the GPU the IddCx swap-chain renders on. On a
 /// hybrid iGPU+dGPU box the OS may otherwise pick the iGPU to render the virtual monitor, and the
 /// encode pool then opens on an adapter whose encoder the host never selected. The pin is
 /// adapter-wide and moving it flaps every live swap-chain, so a different GPU is refused with
-/// `STATUS_ACCESS_DENIED` while the owner that pinned the current one still holds a monitor; the
-/// host tolerates that and streams on the GPU in force. `STATUS_NOT_FOUND` before the adapter
-/// exists.
+/// `STATUS_ACCESS_DENIED` while any other host holds a monitor (the seat placeholder is
+/// nobody's); the host tolerates that and streams on the GPU in force. `STATUS_NOT_FOUND`
+/// before the adapter exists.
 pub fn set_render_adapter(owner: u32, luid_low: u32, luid_high: i32) -> NTSTATUS {
     let Some(adapter) = adapter() else {
         return crate::STATUS_NOT_FOUND;
     };
     let packed = (i64::from(luid_high) << 32) | i64::from(luid_low);
     let pin = *crate::registry::lock(&RENDER_PIN);
-    if let Some((held, by)) = pin
-        && held != packed
-        && by != owner
-        && crate::registry::find(|m| m.owner == by).is_some()
+    // Repeating the pinned GPU is free; moving it is refused while anyone else streams on it.
+    if pin.is_some_and(|held| held != packed)
+        && let Some(other) = crate::registry::find(|m| {
+            m.owner != owner && m.owner != crate::monitor::SEAT_PLACEHOLDER_OWNER
+        })
     {
         dbglog!(
             "[pf-vd] set_render_adapter: owner {owner} asked for {luid_high:08x}:{luid_low:08x} \
-             while owner {by} holds monitors on the pinned GPU — refused"
+             while owner {} holds monitors on the pinned GPU — refused",
+            other.owner
         );
         return crate::STATUS_ACCESS_DENIED;
     }
-    *crate::registry::lock(&RENDER_PIN) = Some((packed, owner));
+    *crate::registry::lock(&RENDER_PIN) = Some(packed);
     let in_args = iddcx::IDARG_IN_ADAPTERSETRENDERADAPTER {
         PreferredRenderAdapter: wdk_sys::LUID {
             LowPart: luid_low,

@@ -40,13 +40,21 @@ object Gamepad {
 
     // Extended bits (Moonlight `buttonFlags2 << 16` namespace — `input.rs::gamepad`): the four
     // back grips (Steam L4/L5/R4/R5 ≙ Elite P1–P4), touchpad click, and the misc/QAM button.
-    // Android's standard InputDevice path never produces these; the SC2 capture link does.
+    // The SC2 capture link sends all six; [buttonBit] finds the upper grip pair on a plain pad.
     const val BTN_PADDLE1 = 0x10000
     const val BTN_PADDLE2 = 0x20000
     const val BTN_PADDLE3 = 0x40000
     const val BTN_PADDLE4 = 0x80000
     const val BTN_TOUCHPAD = 0x100000
     const val BTN_MISC1 = 0x200000
+
+    /**
+     * What a synthetic Quick Access tap presses, in order (punktfunk-core's
+     * `quick_access_presses`). A pad with the button takes [BTN_MISC1]. Every other pad takes
+     * the chord Steam reads there: Guide held, then A.
+     */
+    fun quickAccessPresses(hasButton: Boolean): List<Int> =
+        if (hasButton) listOf(BTN_MISC1) else listOf(BTN_GUIDE, BTN_A)
 
     // Axis ids — must equal `input.rs::gamepad::AXIS_*`.
     const val AXIS_LS_X = 0
@@ -93,6 +101,14 @@ object Gamepad {
     const val PREF_SWITCHPRO = 8
     const val PREF_STEAMCONTROLLER2 = 9
     const val PREF_STEAMCONTROLLER2_PUCK = 10
+    const val PREF_XBOXELITE = 11
+    const val PREF_EIGHTBITDOULTIMATE2 = 12
+    const val PREF_EIGHTBITDOPRO2 = 13
+    const val PREF_EIGHTBITDOPRO3 = 14
+    const val PREF_HORIPADSTEAM = 15
+    const val PREF_JOYCONPAIR = 16
+    const val PREF_SWITCH2PRO = 17
+    const val PREF_SWITCH2GAMECUBE = 18
 
     /** One pad type: its wire byte, the console's stored spelling, and the label people see. */
     class Pref(val wire: Int, val name: String, val label: String)
@@ -110,6 +126,14 @@ object Gamepad {
         Pref(PREF_SWITCHPRO, "switchpro", "Switch Pro"),
         Pref(PREF_STEAMCONTROLLER2, "steamcontroller2", "Steam Controller 2"),
         Pref(PREF_STEAMCONTROLLER2_PUCK, "steamcontroller2puck", "Steam Controller 2 Puck"),
+        Pref(PREF_XBOXELITE, "xboxelite", "Xbox Elite Series 2"),
+        Pref(PREF_EIGHTBITDOULTIMATE2, "8bitdoultimate2", "8BitDo Ultimate 2"),
+        Pref(PREF_EIGHTBITDOPRO2, "8bitdopro2", "8BitDo Pro 2"),
+        Pref(PREF_EIGHTBITDOPRO3, "8bitdopro3", "8BitDo Pro 3"),
+        Pref(PREF_HORIPADSTEAM, "horipadsteam", "HORIPAD for Steam"),
+        Pref(PREF_JOYCONPAIR, "joyconpair", "Joy-Con pair"),
+        Pref(PREF_SWITCH2PRO, "switch2pro", "Switch 2 Pro"),
+        Pref(PREF_SWITCH2GAMECUBE, "switch2gamecube", "GameCube (Switch 2)"),
     )
 
     /** The label for a wire byte; an unknown one reads as Automatic. */
@@ -129,10 +153,21 @@ object Gamepad {
     private val PID_DUALSHOCK4 = setOf(0x05C4, 0x09CC)
 
     // Nintendo: Switch Pro Controller — the host builds the virtual hid-nintendo pad (correct
-    // glyphs + positional layout). The Switch 2 Pro Controller (0x2069) and a Joy-Con 2 pair
-    // (0x2068) are the same full pad surface and ride the same virtual pad (SDL folds them to
-    // its NINTENDO_SWITCH_PRO type too).
-    private val PID_SWITCHPRO = setOf(0x2009, 0x2069, 0x2068)
+    // glyphs + positional layout).
+    private val PID_SWITCHPRO = setOf(0x2009)
+
+    // Switch 2 Pro Controller and GameCube pad. A host that cannot build them folds both to the
+    // Switch Pro.
+    private val PID_SWITCH2PRO = setOf(0x2069)
+    private val PID_SWITCH2GAMECUBE = setOf(0x2073)
+
+    // A combined pair: joycond's 0x2008 (Switchroot) and SDL's Joy-Con 2 pair 0x2068. A single
+    // half stays on the Xbox 360 fallback, as on the SDL clients.
+    private val PID_JOYCONPAIR = setOf(0x2008, 0x2068)
+
+    // Pads whose face buttons hid-nintendo reports by position (BTN_SOUTH is the engraved B):
+    // Joy-Con L/R, the combined pair, the Pro Controller, the charging grip.
+    private val PID_HID_NINTENDO = setOf(0x2006, 0x2007, 0x2008, 0x2009, 0x200E)
 
     // Valve: Steam Deck built-in controller (0x1205); classic Steam Controller wired (0x1102) /
     // dongle (0x1142). The host builds the virtual hid-steam pad; rich-input capture (paddles /
@@ -158,31 +193,30 @@ object Gamepad {
     )
 
     /**
-     * Resolve a connected controller's [GamepadPref] wire byte from its USB VID/PID, mirroring the
-     * Linux client's `pref_for_type` (SDL3 `GamepadType`) and the Apple client's GameController type
-     * auto-resolution. Android exposes no controller-type enum, so we match `getVendorId()` /
-     * `getProductId()`. Used only when the user picked "Automatic" — an explicit choice is honored as
-     * is. An unrecognized pad (or none) falls back to [PREF_XBOX360], the safe XInput default the
-     * host always supports. Never returns [PREF_AUTO] (the host would then decide) — once we have a
-     * physical pad we resolve it concretely, matching the other native clients.
+     * A connected controller's [GamepadPref] wire byte from its USB VID/PID — the answer the SDL
+     * clients' `pref_for_type` and `pref_for_ids` give. Android exposes no controller-type enum.
+     * Used only under "Automatic"; an explicit choice is honored as is. An unrecognized pad (or none)
+     * falls back to [PREF_XBOX360], which every host builds. Never [PREF_AUTO]: a physical pad
+     * always resolves concretely.
      */
-    fun prefFor(dev: InputDevice?): Int {
-        if (dev == null) return PREF_XBOX360
-        val vid = dev.vendorId
-        val pid = dev.productId
-        return when {
-            vid == VID_SONY && pid in PID_DUALSENSE -> PREF_DUALSENSE
-            vid == VID_SONY && pid in PID_DUALSENSEEDGE -> PREF_DUALSENSEEDGE
-            vid == VID_SONY && pid in PID_DUALSHOCK4 -> PREF_DUALSHOCK4
-            vid == VID_MICROSOFT && pid in PID_XBOXONE -> PREF_XBOXONE
-            vid == VID_VALVE && pid in PID_STEAMDECK -> PREF_STEAMDECK
-            vid == VID_VALVE && pid in PID_STEAMCONTROLLER -> PREF_STEAMCONTROLLER
-            vid == VID_VALVE && pid in PID_STEAMCONTROLLER2_PUCK ->
-                PREF_STEAMCONTROLLER2_PUCK
-            vid == VID_VALVE && pid in PID_STEAMCONTROLLER2 -> PREF_STEAMCONTROLLER2
-            vid == VID_NINTENDO && pid in PID_SWITCHPRO -> PREF_SWITCHPRO
-            else -> PREF_XBOX360
-        }
+    fun prefFor(dev: InputDevice?): Int =
+        if (dev == null) PREF_XBOX360 else prefFor(dev.vendorId, dev.productId)
+
+    /** [prefFor]'s table over plain ids — the seam it is tested at. */
+    fun prefFor(vid: Int, pid: Int): Int = when {
+        vid == VID_SONY && pid in PID_DUALSENSE -> PREF_DUALSENSE
+        vid == VID_SONY && pid in PID_DUALSENSEEDGE -> PREF_DUALSENSEEDGE
+        vid == VID_SONY && pid in PID_DUALSHOCK4 -> PREF_DUALSHOCK4
+        vid == VID_MICROSOFT && pid in PID_XBOXONE -> PREF_XBOXONE
+        vid == VID_VALVE && pid in PID_STEAMDECK -> PREF_STEAMDECK
+        vid == VID_VALVE && pid in PID_STEAMCONTROLLER -> PREF_STEAMCONTROLLER
+        vid == VID_VALVE && pid in PID_STEAMCONTROLLER2_PUCK -> PREF_STEAMCONTROLLER2_PUCK
+        vid == VID_VALVE && pid in PID_STEAMCONTROLLER2 -> PREF_STEAMCONTROLLER2
+        vid == VID_NINTENDO && pid in PID_SWITCHPRO -> PREF_SWITCHPRO
+        vid == VID_NINTENDO && pid in PID_SWITCH2PRO -> PREF_SWITCH2PRO
+        vid == VID_NINTENDO && pid in PID_SWITCH2GAMECUBE -> PREF_SWITCH2GAMECUBE
+        vid == VID_NINTENDO && pid in PID_JOYCONPAIR -> PREF_JOYCONPAIR
+        else -> PREF_XBOX360
     }
 
     /** True when [dev]'s source classes include gamepad or joystick. */
@@ -194,43 +228,32 @@ object Gamepad {
 
     /**
      * True when [dev] is a controller someone can actually hold: a pad source ([isPad]) that is a
-     * REAL device carrying real pad hardware — a stick, a HAT, or the A/B face buttons.
+     * REAL device with a stick or a HAT on the joystick source.
      *
      * [isPad] alone answers "did this event come from a pad source", which is the right question
-     * for ROUTING an event and the wrong one for "is a controller attached". Devices publish
-     * inputs that claim `SOURCE_GAMEPAD`/`SOURCE_JOYSTICK` while being no such thing — OEM
-     * game-mode overlays and the gaming-phone shoulder triggers among them — and one of those is
-     * enough to pin the console UI on forever: a pad that was never there cannot disconnect, so
-     * "With a controller" has no way back to the touch UI.
+     * for ROUTING an event and the wrong one for "is a controller attached". OEM game-mode
+     * overlays, gaming-phone shoulder triggers and TV remotes claim `SOURCE_GAMEPAD`, and a
+     * generic key layout grants a remote the A/B keys too, so face buttons prove nothing. One
+     * such device pins the console UI on and lists itself as a controller.
      *
-     * The capability probe is what separates them: a source class is a claim, a stick or a face
-     * button is hardware. It is not a complete defence — an OEM device that declares `BTN_GAMEPAD`
-     * and a pair of axes is indistinguishable from a pad at this layer — so the master switch stays
-     * the guaranteed way out. `isVirtual` only means "device id < 0" (the platform's own synthetic
-     * device), which is worth excluding but catches none of the above.
+     * A stick or HAT is hardware a remote does not report. `isVirtual` only means "device id < 0".
      */
+    // ponytail: a pad with no stick and no HAT is not listed; the router still forwards it on its
+    // first button. Track first presses here if such a pad turns up.
     fun looksLikeController(dev: InputDevice?): Boolean {
         val d = dev ?: return false
-        return looksLikeController(
-            padSource = isPad(d),
-            virtual = d.isVirtual,
-            hasStick = d.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null ||
-                d.getMotionRange(MotionEvent.AXIS_HAT_X, InputDevice.SOURCE_JOYSTICK) != null,
-            // `hasKeys` answers for the DEVICE, so a pad with no sticks at all (an arcade stick,
-            // a d-pad-only pad) still counts.
-            hasFaceButtons = d.hasKeys(KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B)
-                .any { it },
-        )
+        return looksLikeController(padSource = isPad(d), virtual = d.isVirtual, hasStick = hasStick(d))
     }
+
+    /** Whether [dev] reports a stick or a HAT on the joystick source. */
+    fun hasStick(dev: InputDevice): Boolean =
+        dev.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null ||
+            dev.getMotionRange(MotionEvent.AXIS_HAT_X, InputDevice.SOURCE_JOYSTICK) != null
 
     /** [looksLikeController]'s decision, over plain facts — the seam its truth table is tested at
      * (an [InputDevice] cannot be built off a device). */
-    fun looksLikeController(
-        padSource: Boolean,
-        virtual: Boolean,
-        hasStick: Boolean,
-        hasFaceButtons: Boolean,
-    ): Boolean = padSource && !virtual && (hasStick || hasFaceButtons)
+    fun looksLikeController(padSource: Boolean, virtual: Boolean, hasStick: Boolean): Boolean =
+        padSource && !virtual && hasStick
 
     /** A Steam Controller 2 by identity: wired, BLE, or on one of the Puck dongles. */
     fun isSc2VidPid(vid: Int, pid: Int): Boolean =
@@ -344,28 +367,28 @@ object Gamepad {
         if (setting == PREF_AUTO) prefFor(firstPad()) else setting
 
     /**
-     * Gamepad `KEYCODE_*` → BTN_* bit, or 0 if not a gamepad button we forward. A/B/X/Y are
-     * positional (Xbox layout; Nintendo relabeling needs device-type detection, deferred).
-     * `KEYCODE_DPAD_*` are included but must only be routed here when the event is from a gamepad
-     * (a keyboard's arrow keys share these keycodes and belong to the VK path) — see MainActivity.
-     * L2/R2 are forwarded as the analog trigger axes, never as buttons.
+     * Gamepad `KEYCODE_*` → BTN_* bit, or 0 for a key this client doesn't forward. A/B/X/Y are
+     * positional (Xbox layout). `KEYCODE_DPAD_*` belong here only when the event is from a
+     * gamepad: a keyboard's arrows share them and take the VK path (see MainActivity). L2/R2 are
+     * forwarded as the analog trigger axes, never as buttons.
      *
-     * [BTN_TOUCHPAD] and [BTN_MISC1] have no Android keycode at all, so
-     * [PadButtons.GENERIC_SONY] BORROWS the last two rows of `Generic.kl`'s joystick block for
-     * them ([KEYCODE_BUTTON_15][KeyEvent.KEYCODE_BUTTON_15] / `_16`, evdev `BTN_BASE5`/`BTN_BASE6`)
-     * — see there. This table is global, so a device that genuinely presses one of those two
-     * emits the bit as well. That is the cost of the borrow, and it is why the borrow is at the
-     * TOP of the block rather than at `BUTTON_1`/`BUTTON_2`: those are a flight stick's trigger
-     * and thumb button, which any joystick-usage HID device reports, whereas reaching `BUTTON_15`
-     * takes a pad that declares fifteen. The residual case — a fifteen-button HOTAS whose button
-     * 16 also toggles the client's mic — is the one this leaves on the table; narrowing it
-     * further needs per-device knowledge the router does not have (see `GamepadRouter`).
+     * `BUTTON_C` and `BUTTON_Z` are the two slots the Android gamepad layout leaves empty, and
+     * where a handheld puts its back buttons (AYN: M1 on C, M2 on Z). They are the upper back
+     * grips, L4 and R4. A six-button pad's own C and Z land there too. Only a host pad with
+     * grips shows them: Steam Deck, DualSense Edge.
+     *
+     * [BTN_TOUCHPAD] and [BTN_MISC1] have no Android keycode, so [PadButtons.GENERIC_SONY]
+     * borrows `BUTTON_15`/`BUTTON_16` for them. This table is global: any device that presses
+     * one of those two emits the bit as well. They sit at the top of the joystick block because
+     * `BUTTON_1`/`BUTTON_2` are a flight stick's trigger and thumb button.
      */
     fun buttonBit(keyCode: Int): Int = when (keyCode) {
         KeyEvent.KEYCODE_BUTTON_A -> BTN_A
         KeyEvent.KEYCODE_BUTTON_B -> BTN_B
         KeyEvent.KEYCODE_BUTTON_X -> BTN_X
         KeyEvent.KEYCODE_BUTTON_Y -> BTN_Y
+        KeyEvent.KEYCODE_BUTTON_C -> BTN_PADDLE2 // L4
+        KeyEvent.KEYCODE_BUTTON_Z -> BTN_PADDLE1 // R4
         KeyEvent.KEYCODE_BUTTON_L1 -> BTN_LB
         KeyEvent.KEYCODE_BUTTON_R1 -> BTN_RB
         KeyEvent.KEYCODE_BUTTON_THUMBL -> BTN_LS_CLICK
@@ -763,7 +786,8 @@ object Gamepad {
     /**
      * The keycode [event] should have carried, given the controller it came from — [event]'s own
      * keycode for every pad Android has a key layout for, and the scancode's true button for one
-     * it does not (see the block comment above [PadButtons]).
+     * it does not (see the block comment above [PadButtons]). A hid-nintendo pad's face buttons
+     * always come from the scancode ([nintendoFace]).
      *
      * A drop-in for `event.keyCode` at every gamepad reader: the console UI's navigation, the
      * Controllers screen's tester, and the streaming branch all route through it, so a mis-mapped
@@ -774,7 +798,26 @@ object Gamepad {
     fun padKeyCode(event: KeyEvent): Int {
         val dev = event.device ?: return event.keyCode
         if (event.scanCode == 0 || !isPad(dev)) return event.keyCode
+        nintendoFace(dev.vendorId, dev.productId, event.scanCode)?.let { return it }
         return padMap(dev).buttons.correct(event.scanCode, event.keyCode)
+    }
+
+    /**
+     * The positional keycode for a face scancode on a hid-nintendo pad, or null for any other
+     * key or pad. The kernel reports faces by position, and AOSP's own
+     * `Vendor_057e_Product_2009.kl` reads them that way. A ROM layout that names them by the
+     * engraved letter instead (Switchroot's `057e:2008`) is overruled here, unlike
+     * [PadButtons.correct], which defers to any device-specific layout.
+     */
+    fun nintendoFace(vid: Int, pid: Int, scan: Int): Int? {
+        if (vid != VID_NINTENDO || pid !in PID_HID_NINTENDO) return null
+        return when (scan) {
+            0x130 -> KeyEvent.KEYCODE_BUTTON_A // BTN_SOUTH, engraved B
+            0x131 -> KeyEvent.KEYCODE_BUTTON_B // BTN_EAST, engraved A
+            0x133 -> KeyEvent.KEYCODE_BUTTON_Y // BTN_NORTH, engraved X
+            0x134 -> KeyEvent.KEYCODE_BUTTON_X // BTN_WEST, engraved Y
+            else -> null
+        }
     }
 
     /**

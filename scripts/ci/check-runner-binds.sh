@@ -9,7 +9,6 @@ set -eu
 cd "$(dirname "$0")/../.."
 
 UNIT=scripts/punktfunk-scripting.service
-NIX=packaging/nix/nixos-module.nix
 AA=packaging/linux/apparmor/punktfunk-scripting
 
 names=$(grep -rhoE 'path\.join\((configDir\(\)|configDir|config), "[^"]+"' sdk/src |
@@ -17,13 +16,11 @@ names=$(grep -rhoE 'path\.join\((configDir\(\)|configDir|config), "[^"]+"' sdk/s
 
 rc=0
 for n in $names; do
-	for f in "$UNIT" "$NIX"; do
-		grep -q "punktfunk/$n" "$f" || {
-			echo "$f: the runner reads \$config/$n and this unit never binds it"
-			rc=1
-		}
-	done
-	grep '^ *priority=1 ' "$AA" | grep -qE "[/{,]$n[,}/ ]" || {
+	grep -q "punktfunk/$n" "$UNIT" || {
+		echo "$UNIT: the runner reads \$config/$n and this unit never binds it"
+		rc=1
+	}
+	grep '^ *priority=1 ' "$AA" | grep -qE "[/{,]${n}[,}/ ]" || {
 		echo "$AA: the runner reads \$config/$n and this profile never allows it"
 		rc=1
 	}

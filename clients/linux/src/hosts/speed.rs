@@ -39,7 +39,7 @@ pub fn push(
         .css_classes(["title-1"])
         .build();
     let caption = gtk::Label::builder()
-        .label(format!("The host sends a short burst to {}", req.name))
+        .label(format!("The host sends a short burst to {}", req.host.name))
         .css_classes(["dim-label"])
         .wrap(true)
         .build();
@@ -97,8 +97,6 @@ pub fn push(
         Done(Result<Box<HealthReport>, String>),
     }
     let (tx, rx) = async_channel::unbounded::<Probe>();
-    // The host's record and name, for the offer: `req` moves into the worker below.
-    let (offer_fp, host_name) = (req.fp_hex.clone(), req.name.clone());
     std::thread::Builder::new()
         .name("punktfunk-speed".into())
         .spawn(move || {
@@ -108,9 +106,13 @@ pub fn push(
             let result = if crate::shots::shot_scene().is_some() {
                 canned(progress)
             } else {
-                let fp = req.fp_hex.as_deref();
+                let fp = req.host.fp_hex.as_deref();
                 pf_client_core::speed::run_network_check_with(
-                    &req.addr, req.port, fp, identity, progress,
+                    &req.host.addr,
+                    req.host.port,
+                    fp,
+                    identity,
+                    progress,
                 )
             };
             let _ = tx.send_blocking(Probe::Done(result.map(Box::new)));
@@ -154,36 +156,6 @@ pub fn push(
                         findings.add(&row);
                     }
                     findings.set_visible(!report.findings.is_empty());
-                    // The profile a finding offered goes on this host's record; the next
-                    // connect asks for it. Only a saved host has a record.
-                    let offered = report.findings.iter().find_map(|f| f.profile);
-                    if let (Some(profile), Some(fp)) = (offered, offer_fp.clone()) {
-                        let b = gtk::Button::builder()
-                            .label(format!(
-                                "Use paced delivery ({})",
-                                pf_client_core::findings::profile_name(profile)
-                            ))
-                            .css_classes(["pill"])
-                            .build();
-                        let (store, toasts, name) =
-                            (store.clone(), toasts.clone(), host_name.clone());
-                        b.connect_clicked(move |_| {
-                            let written = store.update_hosts(|k| {
-                                k.hosts.iter_mut().find(|h| h.fp_hex == fp).map(|h| {
-                                    h.delivery = Some(profile);
-                                })
-                            });
-                            let text = match written {
-                                Ok(Some(())) => format!(
-                                    "Paced delivery set for {name} \u{2014} it applies from the \
-                                     next connect"
-                                ),
-                                _ => "Couldn't save the host's record".to_string(),
-                            };
-                            toasts.add_toast(adw::Toast::new(&text));
-                        });
-                        buttons.append(&b);
-                    }
                     // The loss figure is the clean round's, at a rate the link holds. A host
                     // without a ramp only ever measured the blast, which says nothing.
                     match r.clean {
@@ -438,7 +410,7 @@ impl Target {
     fn resolve(req: &ConnectRequest, store: &Store) -> Target {
         let bound = store
             .hosts()
-            .resolve(req.fp_hex.as_deref(), &req.addr, req.port)
+            .resolve(req.host.fp_hex.as_deref(), &req.host.addr, req.host.port)
             .and_then(|h| h.preset_id.clone());
         let reference = match req.preset.as_deref() {
             Some("") => return Target::Global,

@@ -70,7 +70,7 @@ import kotlinx.coroutines.delay
  * device itself.
  *
  * The TOUCH presentation, and since 2026-08 the only one: the console reaches the same answer
- * through its own Skia screen (`crates/pf-console-ui/src/screens/controllers.rs`), which keeps the
+ * through its own Skia screen (`crates/client/pf-console-ui/src/screens/controllers.rs`), which keeps the
  * console's input on the page instead of suspending it behind a Compose takeover. What this screen
  * still owns alone is the live input test - the console receives only the aggregated navigation
  * sample, which is nowhere near a per-device axis/trigger readout. Everything the console DOES
@@ -441,8 +441,6 @@ private fun Sc2BluetoothRow(
     activity: MainActivity?,
     onGranted: () -> Unit,
 ) {
-    val context = LocalContext.current
-    val settingOn = remember { SettingsStore(context).load().sc2Capture }
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
@@ -463,9 +461,6 @@ private fun Sc2BluetoothRow(
             )
             Text(
                 when {
-                    !settingOn ->
-                        "Passthrough is disabled in Settings — enable \"Steam Controller 2 " +
-                            "passthrough\" to capture it."
                     attached ->
                         "Paired over Bluetooth. Punktfunk needs Bluetooth access to capture it — " +
                             "until then it stays in its built-in keyboard/mouse mode and no game " +
@@ -478,10 +473,8 @@ private fun Sc2BluetoothRow(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            if (settingOn) {
-                OutlinedButton(onClick = { launcher.launch(permission) }) {
-                    Text("Grant Bluetooth access")
-                }
+            OutlinedButton(onClick = { launcher.launch(permission) }) {
+                Text("Grant Bluetooth access")
             }
         }
     }
@@ -496,10 +489,11 @@ private fun Sc2BluetoothRow(
 @Composable
 private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivity?) {
     val context = LocalContext.current
-    val settingOn = remember { SettingsStore(context).load().sc2Capture }
     val active = activity?.sc2MenuActive == true
     val usbManager = context.getSystemService(Context.USB_SERVICE) as android.hardware.usb.UsbManager
     val permitted = usbDev != null && usbManager.hasPermission(usbDev)
+    val classic = usbDev != null && usbDev.productId in io.unom.punktfunk.kit.Sc1Device.USB_PIDS
+    val name = if (classic) "Steam Controller" else "Steam Controller 2"
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -507,7 +501,7 @@ private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivi
         ) {
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    "Steam Controller 2",
+                    name,
                     style = MaterialTheme.typography.bodyLarge,
                     modifier = Modifier.weight(1f),
                 )
@@ -523,21 +517,17 @@ private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivi
                 when {
                     usbDev == null -> "Paired via Bluetooth"
                     usbDev.productId == io.unom.punktfunk.kit.Sc2Device.PID_WIRED -> "Wired (USB)"
+                    usbDev.productId == io.unom.punktfunk.kit.Sc1Device.PID_WIRED -> "Wired (USB)"
+                    classic -> "Wireless dongle (USB)"
                     else -> "Puck dongle (USB)"
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             when {
-                !settingOn -> Text(
-                    "Passthrough is disabled in Settings — enable \"Steam Controller 2 " +
-                        "passthrough\" to capture it.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
                 active -> {
                     Text(
-                        "Captured — streams as-is: the host presents a real Steam Controller 2 " +
+                        "Captured — streams as-is: the host presents a real $name " +
                             "that its Steam drives directly (trackpads, gyro, haptics).",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -967,6 +957,9 @@ private val TEST_BUTTONS = listOf(
     "Select" to KeyEvent.KEYCODE_BUTTON_SELECT,
     "Start" to KeyEvent.KEYCODE_BUTTON_START,
     "Guide" to KeyEvent.KEYCODE_BUTTON_MODE,
+    // A handheld's back buttons, as the grips [Gamepad.buttonBit] sends them.
+    "L4" to KeyEvent.KEYCODE_BUTTON_C,
+    "R4" to KeyEvent.KEYCODE_BUTTON_Z,
     // The two buttons Android has no keycode for, on the keycodes [Gamepad.buttonBit] borrows for
     // them. Only a driverless Sony pad reaches these; every other controller leaves them dark.
     "Touch" to KeyEvent.KEYCODE_BUTTON_15,

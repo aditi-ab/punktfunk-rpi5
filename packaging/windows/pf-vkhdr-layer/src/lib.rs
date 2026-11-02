@@ -77,6 +77,30 @@ pub struct NegotiateLayerInterface {
     pfn_gdpa: Option<PfnGdpa>,
     pfn_gpdpa: Option<PfnGpdpa>,
 }
+// Layout proofs for the vk_layer.h mirrors: the loader allocates them, the layer reads and writes
+// them by field, so each field must sit where the header puts it. The two create-info mirrors
+// stop at the first union member, so they are prefixes the layer never allocates.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    let word = size_of::<usize>();
+    assert!(size_of::<BaseIn>() == 2 * word);
+    assert!(offset_of!(BaseIn, p_next) == word);
+    assert!(size_of::<LayerInstanceLink>() == 3 * word);
+    assert!(offset_of!(LayerInstanceLink, next_gipa) == word);
+    assert!(offset_of!(LayerInstanceLink, next_gpdpa) == 2 * word);
+    assert!(offset_of!(LayerInstanceCreateInfo, function) == 2 * word);
+    assert!(offset_of!(LayerInstanceCreateInfo, u) == 3 * word);
+    assert!(size_of::<LayerDeviceLink>() == 3 * word);
+    assert!(offset_of!(LayerDeviceLink, next_gipa) == word);
+    assert!(offset_of!(LayerDeviceLink, next_gdpa) == 2 * word);
+    assert!(offset_of!(LayerDeviceCreateInfo, function) == 2 * word);
+    assert!(offset_of!(LayerDeviceCreateInfo, u) == 3 * word);
+    assert!(size_of::<NegotiateLayerInterface>() == 6 * word);
+    assert!(offset_of!(NegotiateLayerInterface, loader_layer_interface_version) == 2 * word);
+    assert!(offset_of!(NegotiateLayerInterface, pfn_gipa) == 3 * word);
+    assert!(offset_of!(NegotiateLayerInterface, pfn_gdpa) == 4 * word);
+    assert!(offset_of!(NegotiateLayerInterface, pfn_gpdpa) == 5 * word);
+};
 
 // raw mirror of VkSurfaceFormat2KHR (avoid ash lifetime generics in fn-pointer types)
 #[repr(C)]
@@ -94,6 +118,23 @@ struct PhysicalDeviceSurfaceInfo2Raw {
     _p_next: *const c_void,
     surface: vk::SurfaceKHR,
 }
+// Both read one field out of the caller's struct; ash's generated types are the layout oracle.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<Win32SurfaceCreateInfoRaw>() == size_of::<vk::Win32SurfaceCreateInfoKHR>());
+    assert!(
+        offset_of!(Win32SurfaceCreateInfoRaw, hwnd)
+            == offset_of!(vk::Win32SurfaceCreateInfoKHR, hwnd)
+    );
+    assert!(
+        size_of::<PhysicalDeviceSurfaceInfo2Raw>()
+            == size_of::<vk::PhysicalDeviceSurfaceInfo2KHR>()
+    );
+    assert!(
+        offset_of!(PhysicalDeviceSurfaceInfo2Raw, surface)
+            == offset_of!(vk::PhysicalDeviceSurfaceInfo2KHR, surface)
+    );
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -399,6 +440,22 @@ mod hdr {
         pub friendly: [u16; 64],
         pub path: [u16; 128],
     }
+    // The documented sizes of the Win32 records: a request carries its own in `header.size`,
+    // which DisplayConfigGetDeviceInfo refuses unless exact, and the query arrays are stepped
+    // by the kernel at the real stride.
+    const _: () = {
+        use std::mem::{offset_of, size_of};
+        assert!(size_of::<Luid>() == 8);
+        assert!(size_of::<Header>() == 20 && offset_of!(Header, id) == 16);
+        assert!(size_of::<Source>() == 20 && offset_of!(Source, id) == 8);
+        assert!(size_of::<Target>() == 48 && offset_of!(Target, id) == 8);
+        assert!(size_of::<PathInfo>() == 72 && offset_of!(PathInfo, tgt) == 20);
+        assert!(size_of::<ModeInfo>() == 64);
+        assert!(size_of::<MonitorInfoExW>() == 104 && offset_of!(MonitorInfoExW, sz_device) == 40);
+        assert!(size_of::<AdvInfo>() == 32 && offset_of!(AdvInfo, value) == 20);
+        assert!(size_of::<SourceName>() == 84 && offset_of!(SourceName, gdi) == 20);
+        assert!(size_of::<TargetName>() == 420 && offset_of!(TargetName, path) == 164);
+    };
 
     #[link(name = "user32")]
     unsafe extern "system" {

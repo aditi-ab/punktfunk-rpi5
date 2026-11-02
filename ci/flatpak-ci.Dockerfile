@@ -48,7 +48,7 @@ RUN dnf -y install \
 # HOME=/root in the job container) — the same path flatpak.yml used to restore from
 # actions/cache, so `flatpak-builder --user` finds these with no further wiring.
 #
-# ⚠ KEEP IN SYNC with packaging/flatpak/io.unom.Punktfunk.yml: GNOME_VERSION is the
+# ⚠ KEEP IN SYNC with packaging/flatpak/io.unom.punktfunk.yml: GNOME_VERSION is the
 # manifest's `runtime-version`, FREEDESKTOP_VERSION is what flatpak-builder resolves the
 # two `sdk-extensions` to (it prints them as "Dependency Extension: … 25.08"). A drift
 # here is not fatal — flatpak.yml's prefetch step downloads whatever is missing from

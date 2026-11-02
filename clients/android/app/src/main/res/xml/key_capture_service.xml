@@ -1,10 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Key filtering only: no accessibility events, no window content. Inert until the user turns
-     it on under Accessibility. -->
+<!-- Key filtering only: no accessibility events, no window content. The service requests the
+     filter at runtime, while a stream holds the window (KeyCaptureService.filterKeys). -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/key_capture_service_description"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagRequestFilterKeyEvents"
     android:canRequestFilterKeyEvents="true"
     android:isAccessibilityTool="false"
     android:notificationTimeout="100" />

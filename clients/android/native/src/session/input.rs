@@ -4,14 +4,14 @@
 //! from the Kotlin UI thread. NOT android-gated — send_input exists on the host build too, so these
 //! compile everywhere (parity with nativeConnect/nativeClose). The wire codes are the GameStream
 //! conventions: buttons 1=left/2=middle/3=right/4=X1/5=X2; scroll axis 0=vertical/1=horizontal,
-//! signed 120-unit delta, +=up/right; keys are Windows VK (mapped from KEYCODE_* on the Kotlin side).
+//! +=up/right; keys are Windows VK (mapped from KEYCODE_* on the Kotlin side).
 
 use jni::errors::LogErrorAndDefault;
-use jni::objects::{JByteBuffer, JFloatArray, JObject, JString};
+use jni::objects::{JByteArray, JByteBuffer, JFloatArray, JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
 use jni::EnvUnowned;
 use punktfunk_core::input::scroll::ScrollEvent;
-use punktfunk_core::input::{InputEvent, InputKind, SCROLL_FLAG_PRECISE};
+use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::quic::{
     PenSample, PenTool, RichInput, HID_REPORT_MAX, HOST_CAP2_TOUCH, HOST_CAP_PEN,
     HOST_CAP_TEXT_INPUT, PEN_ANGLE_UNKNOWN, PEN_BATCH_MAX, PEN_DISTANCE_UNKNOWN, PEN_TILT_UNKNOWN,
@@ -90,25 +90,6 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointer
     })
 }
 
-/// `NativeBridge.nativeSendScroll(handle, axis, delta, precise)` — one scroll step. `axis`:
-/// 0=vertical, 1=horizontal. `delta`: signed, WHEEL_DELTA(120)-scaled, +=up/right. `precise`:
-/// the delta was MEASURED off a trackpad, so the host travels that distance instead of pricing
-/// each detent as a wheel click ([`SCROLL_FLAG_PRECISE`]).
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendScroll(
-    _env: EnvUnowned,
-    _this: JObject,
-    handle: jlong,
-    axis: jint,
-    delta: jint,
-    precise: jboolean,
-) {
-    jni_guard((), || {
-        let flags = if precise { SCROLL_FLAG_PRECISE } else { 0 };
-        send_event(handle, InputKind::MouseScroll, axis as u32, delta, 0, flags);
-    })
-}
-
 /// `NativeBridge.nativeSendNormalizedScroll(handle, axis, delta, source, phase)` — one normalized
 /// scroll event (`InputKind::Scroll`). `delta` is signed Q24.8 in the source's unit (v120 for
 /// Wheel/Unknown, DIP for the rest); `source`/`phase` are the wire bytes packed into `flags`.
@@ -159,6 +140,23 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetInvertSc
     jni_guard(false, || {
         SESSIONS.get(handle).is_some_and(|h| {
             h.client.set_invert_scroll(invert);
+            true
+        })
+    })
+}
+
+/// `NativeBridge.nativePathChanged(handle)` — the default network or its addresses changed. The
+/// core shows the host where this device is now, so a roam heals within a round trip. `false`
+/// when the session is gone.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePathChanged(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(false, || {
+        SESSIONS.get(handle).is_some_and(|h| {
+            h.client.path_changed();
             true
         })
     })
@@ -529,6 +527,37 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMotionRe
     })
 }
 
+/// `NativeBridge.nativePadHasQuickAccess(handle, declaredPref)` — whether the host's device for a
+/// pad that declared `declaredPref` has a Quick Access button, so a synthetic Quick Access tap
+/// presses `MISC1` there and Steam's chord everywhere else. A negative `declaredPref` is a pad
+/// that never declared: the session default answers for it.
+///
+/// Answered here for the reason `nativePadMotionReaches` is:
+/// [`punktfunk_core::config::pad_has_quick_access`] carries the rule and its tests. A `0`
+/// handle answers `false`, which sends the chord: every pad Steam reads takes it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadHasQuickAccess(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    declared_pref: jint,
+) -> jboolean {
+    jni_guard(false, || {
+        let Some(h) = SESSIONS.get(handle) else {
+            return false;
+        };
+        let declared = u8::try_from(declared_pref).map_or(
+            h.client.requested_gamepad,
+            punktfunk_core::config::GamepadPref::from_u8,
+        );
+        punktfunk_core::config::pad_has_quick_access(
+            declared,
+            h.client.requested_gamepad,
+            h.client.resolved_gamepad,
+        )
+    })
+}
+
 /// `NativeBridge.nativeSendGamepadRemove(handle, pad)` — signal that wire pad index `pad` was
 /// unplugged so the host tears its virtual device down. `pad` (rides `flags`) is the only field; the
 /// core stamps the per-pad seq (in the snapshot seq space, so a reordered snapshot can't resurrect the
@@ -585,6 +614,173 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadHidR
             len: n as u8,
             data,
         });
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSetSc2Gate(handle, pad, gate)` — what core holds back of a Steam
+/// Controller 2's raw reports on wire pad `pad`: `PUNKTFUNK_SC2_GATE_*` bits, latest wins.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetSc2Gate(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    pad: jint,
+    gate: jint,
+) {
+    jni_guard((), || {
+        if let Some(h) = SESSIONS.get(handle) {
+            let gate = punktfunk_core::client::Sc2Gate::from_bits(gate as u32);
+            h.client.set_sc2_gate((pad as u32 & 0xF) as u8, gate);
+        }
+    })
+}
+
+/// `NativeBridge.nativeSc2IdentityRequest(puck, index): ByteArray?` — the `index`th feature
+/// query a Steam Controller 2's identity is read with; null past the last.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc2IdentityRequest<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    puck: jboolean,
+    index: jint,
+) -> JByteArray<'local> {
+    env.with_env(|env| -> jni::errors::Result<JByteArray<'local>> {
+        let nth = usize::try_from(index).ok();
+        match nth.and_then(|i| punktfunk_core::client::sc2::identity_requests(puck).nth(i)) {
+            Some(request) => env.byte_array_from_slice(request),
+            None => Ok(JByteArray::default()),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSc1IdentityRequest(index): ByteArray?` — the `index`th feature query a
+/// 2015 Steam Controller's identity is read with; null past the last.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1IdentityRequest<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    index: jint,
+) -> JByteArray<'local> {
+    env.with_env(|env| -> jni::errors::Result<JByteArray<'local>> {
+        let nth = usize::try_from(index).ok();
+        match nth.and_then(|i| punktfunk_core::client::sc2::classic_identity_requests().nth(i)) {
+            Some(request) => env.byte_array_from_slice(request),
+            None => Ok(JByteArray::default()),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSc1BleState(): ByteArray` — a fresh state for one 2015 Steam Controller's
+/// Bluetooth input, for [`nativeSc1BleInput`].
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1BleState<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> JByteArray<'local> {
+    use punktfunk_core::client::sc1_ble::CLASSIC_BLE_STATE;
+    env.with_env(|env| env.byte_array_from_slice(&[0u8; CLASSIC_BLE_STATE]))
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSc1BleInput(state, segment): ByteArray?` — one segment of a 2015 Steam
+/// Controller's Bluetooth input, `[0x03, header, 18 bytes]`; the 64-byte wired frame when it
+/// completed a state message, else null. `state` is updated in place.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1BleInput<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    state: JByteArray<'local>,
+    segment: JByteArray<'local>,
+) -> JByteArray<'local> {
+    use punktfunk_core::client::sc1_ble::{classic_ble_input, CLASSIC_BLE_STATE};
+    env.with_env(|env| -> jni::errors::Result<JByteArray<'local>> {
+        let mut held = [0i8; CLASSIC_BLE_STATE];
+        state.get_region(env, 0, &mut held)?;
+        let mut st = held.map(|b| b as u8);
+        let seg = env.convert_byte_array(&segment)?;
+        let mut out = [0u8; 64];
+        let done = classic_ble_input(&mut st, &seg, &mut out);
+        state.set_region(env, 0, &st.map(|b| b as i8))?;
+        if done {
+            env.byte_array_from_slice(&out)
+        } else {
+            Ok(JByteArray::default())
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSc1BleSegments(frame): ByteArray` — a wired feature frame for a 2015
+/// Steam Controller, report id 0 first, as its Bluetooth segments back to back.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1BleSegments<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    frame: JByteArray<'local>,
+) -> JByteArray<'local> {
+    env.with_env(|env| -> jni::errors::Result<JByteArray<'local>> {
+        let frame = env.convert_byte_array(&frame)?;
+        let segs: Vec<u8> = punktfunk_core::client::sc1_ble::classic_ble_segments(&frame)
+            .flatten()
+            .collect();
+        env.byte_array_from_slice(&segs)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSc1BleReply(segments): ByteArray?` — the segments read back for one 2015
+/// Steam Controller feature query, in order; the reply, report id 0 first, once the last is in.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1BleReply<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    segments: JByteArray<'local>,
+) -> JByteArray<'local> {
+    env.with_env(|env| -> jni::errors::Result<JByteArray<'local>> {
+        let segments = env.convert_byte_array(&segments)?;
+        let mut reply = [0u8; 73];
+        match punktfunk_core::client::sc1_ble::classic_ble_reply(&segments, &mut reply) {
+            Some(n) => env.byte_array_from_slice(&reply[..n]),
+            None => Ok(JByteArray::default()),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSendPadIdentity(handle, pad, slot, serial, replies)` — a captured Steam
+/// Controller 2's identity for wire pad `pad`: its Puck slot (0 off a Puck), its USB serial (empty
+/// when unknown) and its replies to the identity queries, packed `[len][request][len][reply]…`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadIdentity(
+    mut env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    pad: jint,
+    slot: jint,
+    serial: JString,
+    replies: JByteArray,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let Some(h) = SESSIONS.get(handle) else {
+            return Ok(());
+        };
+        let serial = serial.try_to_string(env).unwrap_or_default();
+        let replies = env.convert_byte_array(&replies)?;
+        let pad = (pad as u32 & 0xF) as u8;
+        let slot = u8::try_from(slot).unwrap_or(0);
+        let id = punktfunk_core::quic::PadIdentity {
+            pad,
+            serial,
+            replies,
+            slot,
+        };
+        if let Err(e) = h.client.send_pad_identity(id) {
+            log::warn!("pad identity not sent: {e:#}");
+        }
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -650,5 +846,28 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadMoti
             gyro: [c(gyro_pitch), c(gyro_yaw), c(gyro_roll)],
             accel: [c(accel_x), c(accel_y), c(accel_z)],
         });
+    })
+}
+
+/// `NativeBridge.nativeHoldsScreenAwake(handle, keepAwake)` — whether this stream holds the
+/// screen awake right now: always with the "Keep screen awake" setting on, else only while the
+/// player's input is recent.
+///
+/// Answered here because every input this client forwards goes through the session's
+/// `send_input`, which is the one clock for "recent"; the rule is
+/// [`punktfunk_core::client::holds_screen_awake`]. A `0` handle answers `true`: a screen that
+/// stays on is the safe answer when the session cannot be asked.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHoldsScreenAwake(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    keep_awake: jboolean,
+) -> jboolean {
+    jni_guard(true, || {
+        let Some(h) = SESSIONS.get(handle) else {
+            return true;
+        };
+        punktfunk_core::client::holds_screen_awake(keep_awake, h.client.input_idle())
     })
 }

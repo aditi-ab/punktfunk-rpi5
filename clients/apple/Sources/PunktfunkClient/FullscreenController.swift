@@ -23,6 +23,9 @@ struct FullscreenController: NSViewRepresentable {
     let stream: CGSize?
     /// Input is captured, so the traffic lights hide with the pointer.
     let captured: Bool
+    /// The session opens a window on each display. Without separate Spaces a native fullscreen
+    /// blanks every other display, so the stream takes the panel instead.
+    let spansDisplays: Bool
     @Binding var isFullscreen: Bool
     /// True only while the window is in a fullscreen THIS controller drove it into. A window the
     /// user fullscreened themselves is not ours to leave, and an alert deferred on "fullscreen"
@@ -66,6 +69,8 @@ struct FullscreenController: NSViewRepresentable {
         let want = active
         let stream = stream
         let captured = captured
+        let sharesSpace = spansDisplays && NSScreen.screens.count > 1
+            && !NSScreen.screensHaveSeparateSpaces
         let isFullscreen = $isFullscreen
         let appDriven = $appDriven
         let edge = edge
@@ -79,6 +84,7 @@ struct FullscreenController: NSViewRepresentable {
             if edge.stream != stream {
                 edge.stream = stream
                 edge.wantsPanel = Self.coversHousing(window.screen, stream)
+                    || (stream != nil && sharesSpace)
                 if edge.panel != nil, !edge.wantsPanel {
                     // The home screens never live in the panel; "Always" falls back to native.
                     Self.exitPanel(window, edge)

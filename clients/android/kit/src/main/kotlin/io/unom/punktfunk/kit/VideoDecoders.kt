@@ -1,5 +1,6 @@
 package io.unom.punktfunk.kit
 
+import android.media.MediaCodec
 import android.media.MediaCodecInfo.CodecCapabilities
 import android.media.MediaCodecList
 import android.os.Build
@@ -102,6 +103,25 @@ object VideoDecoders {
     }
 
     /**
+     * Whether this device's display shows full-range BT.709 video as studio range — the
+     * `FEATURE_STUDIO_RANGE` ask, so the host sends studio SDR. See [limitedOnlyBt709Hal].
+     */
+    fun showsFullRangeAsStudio(): Boolean {
+        val vendorApi = vendorApiLevel()
+        return advertisedMimes().any { mime ->
+            val name = pickDecoder(mime)?.name ?: return@any false
+            limitedOnlyBt709Hal(name, vendorApi)
+        }
+    }
+
+    /** `ro.vendor.api_level`, 0 when unreadable. Android 15+ vendors report YYYYMM (202404). */
+    private fun vendorApiLevel(): Int = runCatching {
+        Class.forName("android.os.SystemProperties")
+            .getMethod("getInt", String::class.java, Int::class.javaPrimitiveType)
+            .invoke(null, "ro.vendor.api_level", 0) as Int
+    }.getOrDefault(0)
+
+    /**
      * True when EVERY decoder this device would stream with supports partial-frame input
      * (MediaCodec `FEATURE_PartialFrame`): the client may then opt into slice-progressive
      * delivery and feed slices with `BUFFER_FLAG_PARTIAL_FRAME` ahead of the AU's tail.
@@ -124,8 +144,9 @@ object VideoDecoders {
 
     /**
      * One-line per-mime probe readout for the connect log (`adb logcat -s pf.caps`): which
-     * decoder each advertised mime resolves to and whether it declares `FEATURE_PartialFrame` —
-     * the P2 slice-pipeline gate that is otherwise invisible until a stream behaves differently.
+     * decoder each advertised mime resolves to, whether it declares `FEATURE_PartialFrame` (the
+     * P2 slice-pipeline gate) and which latency-named vendor parameters it declares — whether a
+     * `low_latency_key` profile's keys exist on this device, otherwise invisible from a report.
      */
     fun capsReport(): String {
         val mimes = advertisedMimes()
@@ -142,7 +163,34 @@ object VideoDecoders {
                 }
             }
             "${mime.removePrefix("video/")}=${pick ?: "platform-default"}" +
-                " partialFrame=${partial ?: "?"}"
+                " partialFrame=${partial ?: "?"} vendor=[${vendorKeys(pick)}]"
+        }
+    }
+
+    /** Substrings of the vendor parameter names worth a line in the connect log. */
+    private val VENDOR_KEY_HINTS = listOf(
+        "fence", "slice", "early", "picture-order", "low-latency", "lowlatency", "boost",
+        "display-delay", "dpb",
+    )
+    private val vendorKeyCache = HashMap<String, String>()
+
+    /**
+     * The vendor parameters of [name] that match [VENDOR_KEY_HINTS], comma-joined; `?` below
+     * API 31 or when the codec can't be opened. Opens the codec once per name and releases it.
+     */
+    private fun vendorKeys(name: String?): String {
+        if (name == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return "?"
+        return vendorKeyCache.getOrPut(name) {
+            runCatching {
+                val codec = MediaCodec.createByCodecName(name)
+                try {
+                    codec.supportedVendorParameters
+                        .filter { key -> VENDOR_KEY_HINTS.any { it in key } }
+                        .joinToString(",")
+                } finally {
+                    codec.release()
+                }
+            }.getOrDefault("?")
         }
     }
 
@@ -194,4 +242,16 @@ object VideoDecoders {
         }
         return bestName?.let { DecoderChoice(it, bestLowLatency) }
     }
+}
+
+/**
+ * A Qualcomm display HAL from before the Android 13 vendor release (kalama, SM8550) converts every
+ * BT.709 YUV layer with the limited matrix whatever its range tag (`SelectCscType`): full-range
+ * video shows crushed blacks and clipped highlights. Later HALs check the range. A Qualcomm
+ * decoder marks the HAL's vendor; an unreadable vendor level (0) counts as old.
+ */
+internal fun limitedOnlyBt709Hal(decoder: String, vendorApi: Int): Boolean {
+    val name = decoder.lowercase()
+    val qualcomm = name.startsWith("c2.qti") || name.startsWith("omx.qcom")
+    return qualcomm && vendorApi < Build.VERSION_CODES.TIRAMISU
 }

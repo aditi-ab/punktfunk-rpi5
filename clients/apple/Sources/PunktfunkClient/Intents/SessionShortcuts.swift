@@ -76,7 +76,7 @@ struct WakeHostIntent: AppIntent {
     @Parameter(title: "Host") var host: HostEntity
 
     func perform() async throws -> some IntentResult {
-        guard let stored = loadStoredHost(host.id), !stored.wakeMacs.isEmpty else {
+        guard let stored = loadStoredHost(host.id), WakePolicy.canWake(stored.wakeMacs) else {
             throw IntentError.noWakeAddress
         }
         PunktfunkConnection.wakeOnLAN(macs: stored.wakeMacs, lastKnownIP: stored.address)

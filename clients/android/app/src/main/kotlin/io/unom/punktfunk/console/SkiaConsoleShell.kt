@@ -53,7 +53,7 @@ import io.unom.punktfunk.testRumble
 import kotlin.math.roundToInt
 
 /**
- * The console UI drawn by the Skia shell (`crates/pf-console-ui`), hosted on a `SurfaceView` this
+ * The console UI drawn by the Skia shell (`crates/client/pf-console-ui`), hosted on a `SurfaceView` this
  * composable owns and driven through [SkiaConsole]. `App.kt` shows it when [SkiaConsole.wanted].
  *
  * What lives here is only what needs a composition: the surface lifecycle, the safe-area insets,
@@ -102,6 +102,9 @@ fun SkiaConsoleShell(
                 // cannot have. Still the only way to speak a Skia-drawn focus.
                 @Suppress("DEPRECATION")
                 consoleView?.announceForAccessibility(text)
+            },
+            onSaveLauncherFile = { title, url ->
+                activity?.saveLauncherFile(title, url) { SkiaConsole.notice(it) }
             },
         )
         onDispose { SkiaConsole.detach() }
@@ -216,7 +219,7 @@ fun SkiaConsoleShell(
         // The input test takes the pad; the menu forgets what was held when it starts or ends.
         var testing = false
         fun followTest() {
-            if ((SkiaConsole.padTest != null) == testing) return
+            if (SkiaConsole.padTesting() == testing) return
             testing = !testing
             padState.reset()
             padState.push(handle)
@@ -229,11 +232,7 @@ fun SkiaConsoleShell(
             val fromPad = Gamepad.eventFromPad(ev)
             if (fromPad) {
                 followTest()
-                SkiaConsole.padTest?.let { test ->
-                    test.key(Gamepad.padKeyCode(ev), down)
-                    SkiaConsole.pushPadTest()
-                    return@probe true
-                }
+                if (SkiaConsole.padTestKey(Gamepad.padKeyCode(ev), down)) return@probe true
                 // The CORRECTED keycode: a pad Android has no key layout for delivers its buttons
                 // under other buttons' names, so read raw this console answered ✕ with whatever
                 // sat in BUTTON_A's scancode slot. Same resolution the stream uses — the console
@@ -331,11 +330,7 @@ fun SkiaConsoleShell(
                 return@probe false
             }
             followTest()
-            SkiaConsole.padTest?.let { test ->
-                test.motion(ev)
-                SkiaConsole.pushPadTest()
-                return@probe true
-            }
+            if (SkiaConsole.padTestMotion(ev)) return@probe true
             val lx = ev.getAxisValue(MotionEvent.AXIS_X)
             val ly = ev.getAxisValue(MotionEvent.AXIS_Y)
             val hx = ev.getAxisValue(MotionEvent.AXIS_HAT_X)
@@ -388,6 +383,7 @@ fun SkiaConsoleShell(
                         }
                         override fun surfaceChanged(h: SurfaceHolder, format: Int, width: Int, height: Int) {
                             if (handle != 0L) NativeBridge.nativeConsoleSurfaceChanged(handle)
+                            activity?.voteConsoleFrameRate(h.surface)
                         }
                         override fun surfaceDestroyed(h: SurfaceHolder) {
                             if (handle != 0L) NativeBridge.nativeConsoleSurfaceDestroyed(handle)
@@ -497,8 +493,6 @@ private fun padAction(activity: MainActivity?, action: String, padKey: String) {
             if (!pulsed) SkiaConsole.notice("No motor answered.")
         }
         "sc2_bluetooth" -> when {
-            !settings.sc2Capture ->
-                SkiaConsole.notice("Enable \"Steam Controller 2 passthrough\" in Settings first.")
             Sc2BleLink.permissionGranted(activity) ->
                 SkiaConsole.notice("Bluetooth access is already granted.")
             // The system dialog pauses the activity; onResume re-probes and engages the capture,
@@ -507,13 +501,8 @@ private fun padAction(activity: MainActivity?, action: String, padKey: String) {
                 ActivityCompat.requestPermissions(activity, arrayOf(it), 5)
             }
         }
-        "sc2_usb" ->
-            if (!settings.sc2Capture) {
-                SkiaConsole.notice("Enable \"Steam Controller 2 passthrough\" in Settings first.")
-            } else {
-                // Asks for the USB grant when one is missing and engages the capture on it.
-                activity.startSc2MenuNav(forceAsk = true)
-            }
+        // Asks for the USB grant when one is missing and engages the capture on it.
+        "sc2_usb" -> activity.startSc2MenuNav(forceAsk = true)
         "ds_usb" -> {
             val dev = usb.deviceList.values.firstOrNull {
                 it.vendorId == DsDevice.VID_SONY && it.productId in DsDevice.USB_PIDS
@@ -586,12 +575,21 @@ private fun sc2Extras(activity: MainActivity?): List<ConsoleJson.ExtraPad> {
     val onBle = dev == null && probe.pairedBleAddress() != null
     val captured = activity.sc2MenuActive
     if (dev == null && !onBle && !captured) return emptyList()
-    val puck = dev != null && dev.productId != Sc2Device.PID_WIRED
+    val classic = dev != null && dev.productId in io.unom.punktfunk.kit.Sc1Device.USB_PIDS
+    val puck = !classic && dev != null && dev.productId != Sc2Device.PID_WIRED
     return listOf(
         ConsoleJson.ExtraPad(
-            name = if (puck) "Steam Controller 2 Puck" else "Steam Controller 2",
+            name = when {
+                classic -> "Steam Controller"
+                puck -> "Steam Controller 2 Puck"
+                else -> "Steam Controller 2"
+            },
             key = "$SC2_PAD_KEY${dev?.vendorId ?: 0}:${dev?.productId ?: 0}",
-            pref = if (puck) Gamepad.PREF_STEAMCONTROLLER2_PUCK else Gamepad.PREF_STEAMCONTROLLER2,
+            pref = when {
+                classic -> Gamepad.PREF_STEAMCONTROLLER
+                puck -> Gamepad.PREF_STEAMCONTROLLER2_PUCK
+                else -> Gamepad.PREF_STEAMCONTROLLER2
+            },
             detail = dev?.let { "%04X:%04X · usb".format(it.vendorId, it.productId) }
                 ?: if (onBle) "bluetooth" else "captured",
             forwarded = captured,

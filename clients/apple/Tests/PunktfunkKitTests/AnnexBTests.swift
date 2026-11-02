@@ -125,6 +125,78 @@ final class AnnexBTests: XCTestCase {
         XCTAssertEqual(packed, expected)
     }
 
+    /// `au` as the core would leave it: written into a slot the pool lent.
+    private func placed(_ au: Data, in pool: AccessUnitSlotPool) throws
+        -> (unit: AccessUnit, base: UnsafeMutableRawPointer, token: UInt64)
+    {
+        let slot = try XCTUnwrap(pool.take(au.count))
+        au.withUnsafeBytes { slot.base.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+        let at = try XCTUnwrap(pool.locate(UnsafeRawPointer(slot.base)))
+        let unit = AccessUnit(
+            data: Data(bytesNoCopy: slot.base, count: au.count, deallocator: .none),
+            ptsNs: 0, frameIndex: 0, flags: 0, receivedNs: 0,
+            inPlace: AccessUnit.InPlace(token: at.token, offset: at.offset, count: au.count))
+        return (unit, slot.base, slot.token)
+    }
+
+    /// The sample's block: its bytes and where it lies.
+    private func blockBytes(_ sample: CMSampleBuffer) throws -> (bytes: Data, base: UnsafeMutableRawPointer) {
+        let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+        var length = 0
+        var ptr: UnsafeMutablePointer<CChar>?
+        XCTAssertEqual(CMBlockBufferGetDataPointer(
+            block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length,
+            dataPointerOut: &ptr), noErr)
+        let base = try XCTUnwrap(ptr)
+        return (Data(bytes: base, count: length), UnsafeMutableRawPointer(base))
+    }
+
+    /// An AU the core assembled in a pool slot becomes the sample without a copy: the block is
+    /// the slot, each start code now its NAL's length. The slot stays the sample's until the
+    /// sample is gone, whatever the core released.
+    func testSampleBufferOverTheSlotRewritesStartCodes() throws {
+        let format = try XCTUnwrap(Self.anyFormat())
+        let first = nal(type: 1, payload: [0x10, 0x11, 0x12])
+        let second = nal(type: 1, payload: [0x20, 0x21])
+        var au = Data()
+        for n in [first, second] {
+            au.append(contentsOf: start4)
+            au.append(n)
+        }
+        let pool = AccessUnitSlotPool(capacity: 4096)
+        let slot = try placed(au, in: pool)
+        var expected = Data([0, 0, 0, UInt8(first.count)]) + first
+        expected.append(Data([0, 0, 0, UInt8(second.count)]) + second)
+        try autoreleasepool {
+            let sample = try XCTUnwrap(
+                AnnexB.sampleBuffer(au: slot.unit, format: format, codec: .hevc, in: pool))
+            let block = try blockBytes(sample)
+            XCTAssertEqual(block.base, slot.base, "the block is the slot")
+            XCTAssertEqual(block.bytes, expected)
+            pool.release(slot.token)
+            let other = try XCTUnwrap(pool.take(16))
+            XCTAssertNotEqual(other.token, slot.token, "held by the sample")
+            pool.release(other.token)
+        }
+        // The sample is gone: the slot is free again (the pool hands out the last freed first).
+        XCTAssertEqual(pool.take(16)?.token, slot.token)
+    }
+
+    /// A parameter set or a 3-byte start code leaves the AU to the repack: a fresh block.
+    func testSampleBufferRepacksWhatCannotBeRewritten() throws {
+        let format = try XCTUnwrap(Self.anyFormat())
+        let pool = AccessUnitSlotPool(capacity: 4096)
+        let withSps = Data(start4) + nal(type: 33, payload: [0xBB]) + Data(start4) + nal(type: 1, payload: [0x10])
+        let threeByte = Data(start4) + nal(type: 1, payload: [0x10]) + Data(start3) + nal(type: 1, payload: [0x20])
+        for au in [withSps, threeByte] {
+            let slot = try placed(au, in: pool)
+            let sample = try XCTUnwrap(
+                AnnexB.sampleBuffer(au: slot.unit, format: format, codec: .hevc, in: pool))
+            XCTAssertNotEqual(try blockBytes(sample).base, slot.base)
+            pool.release(slot.token)
+        }
+    }
+
     /// Any video format description: the pack only carries it along.
     private static func anyFormat() -> CMVideoFormatDescription? {
         var format: CMVideoFormatDescription?

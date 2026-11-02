@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""Every packaging channel states the same capabilities and groups, before anything is built.
+
+packaging/linux/capabilities.txt is the capability matrix. Each channel grants capabilities in
+its own recipe (a deb postinst, an rpm `%caps`, a pacman scriptlet, a NixOS wrapper, the Steam
+Deck installer, the sysext builders). This reads each recipe and fails when a channel grants what
+the matrix does not, or omits what it does. A grant it cannot attribute to a known binary fails
+too. scripts/ci/assert-cap-matrix.sh checks the host and worker rows on the built package.
+
+packaging/linux/punktfunk.sysusers is the group matrix. The deb, rpm, Arch and Steam Deck
+recipes must install it, NixOS must declare the same groups, and no script or rule may create,
+join or name a group it lacks.
+
+packaging/linux/payload.txt's seats rows are the seat supervisor's files. The Nix and Steam Deck
+recipes build nothing CI can read, so each must name every one of those files.
+
+Usage: python3 scripts/ci/check-packaging-policy.py [--self-test]
+"""
+import glob
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+MATRIX = "packaging/linux/capabilities.txt"
+GATE = "scripts/ci/assert-cap-matrix.sh"
+SYSUSERS = "packaging/linux/punktfunk.sysusers"
+NIX_MODULE = "packaging/nix/nixos-module.nix"
+# Recipes that install the sysusers file, by the text they must hold.
+GROUP_RECIPES = ["packaging/debian/build-deb.sh", "packaging/debian/build-client-deb.sh",
+                 "packaging/rpm/punktfunk.spec", "packaging/arch/PKGBUILD",
+                 "scripts/steamdeck/lib.sh"]
+PAYLOAD = "packaging/linux/payload.txt"
+# The seats recipes CI can't build, and the payload files each may leave out.
+SEATS_RECIPES = {
+    # The module orders user@ after the supervisor itself.
+    "packaging/nix/packages.nix": {"50-punktfunk-seats.conf"},
+    "scripts/steamdeck/door.sh": set(),
+}
+# Created on first use by door-helper and the seat supervisor, so no package ships them.
+RUNTIME_GROUPS = {"punktfunk-games"}
+# Groups the distribution provides.
+DISTRO_GROUPS = {"input", "root"}
+HOST = "punktfunk-host"
+WORKER = "punktfunk-encode-worker"
+GAMESCOPE = "punktfunk-gamescope"
+
+
+def strip_comments(text):
+    """Drop `#` comments (shell, spec, nix); `$#` and `${#x}` have no space before the `#`."""
+    return "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in text.splitlines())
+
+
+def caps_norm(caps):
+    """`CAP_SYS_NICE+ep` and `cap_sys_nice=ep` are one capability; none is `-`."""
+    caps = caps.strip().lower().replace("+", "=")
+    return "-" if caps in ("", "-", "(none)", "<none>") else caps
+
+
+def binary_of(target, variables):
+    """The punktfunk binary a setcap target names, by literal path or by shell variable."""
+    target = target.strip("'\"")
+    for var, binary in variables.items():
+        if re.search(r"\$\{?%s\b" % var, target):
+            return binary
+    return os.path.basename(target)
+
+
+# `setcap` in command position: after a line start, `sudo`, `;`, `&&`, `then`, not inside prose.
+SETCAP = re.compile(r"""(?:^|[;&|({]|\bsudo|\bthen|\bdo|\belse)\s*setcap\s+(?!-)"""
+                    r"""(?:'([^']*)'|"([^"]*)"|(\S+))\s+(\S+)""", re.M)
+
+
+def read_setcap(text, variables):
+    """[(binary, caps)] for each `setcap <caps> <path>`; `setcap -r` grants nothing."""
+    return [(binary_of(m.group(4), variables), caps_norm(m.group(1) or m.group(2) or m.group(3)))
+            for m in SETCAP.finditer(strip_comments(text))]
+
+
+def read_rpm(text, variables):
+    """[(binary, caps)] for each `%caps(<caps>) <path>` line of a spec."""
+    return [(binary_of(m.group(2), variables), caps_norm(m.group(1)))
+            for m in re.finditer(r"^%caps\(([^)]*)\)\s+(\S+)", strip_comments(text), re.M)]
+
+
+def read_nix(text, variables):
+    """[(binary, caps)] for each `security.wrappers.<name> = { capabilities = "…"; }`."""
+    out = []
+    for m in re.finditer(r"security\.wrappers\.([\w-]+)\s*=\s*\{(.*?)\n\s*\};",
+                         strip_comments(text), re.S):
+        caps = re.search(r'capabilities\s*=\s*"([^"]*)"', m.group(2))
+        out.append((m.group(1), caps_norm(caps.group(1) if caps else "")))
+    return out
+
+
+def read_seal(text, variables):
+    """The sysext builders grant the worker through `pf_seal_caps`, which reads the gate."""
+    if re.search(r"^\s*pf_seal_caps\s", strip_comments(text), re.M):
+        return [(WORKER, variables["WANT_WORKER_CAPS"])]
+    return []
+
+
+# channel -> (binaries it ships or None for all, [(files, reader, shell variables naming a binary)]).
+# A glob reads every recipe of the channel, so a setcap added to a sibling script is seen.
+CHANNELS = {
+    "deb": (None, [(["packaging/debian/*.sh"], read_setcap, {})]),
+    "rpm": (None, [(["packaging/rpm/*.spec", "packaging/gamescope/*.spec"], read_rpm, {})]),
+    "arch": (None, [(["packaging/arch/PKGBUILD", "packaging/arch/*.install",
+                      "packaging/gamescope/PKGBUILD", "packaging/gamescope/*.install"],
+                     read_setcap, {})]),
+    "nix": (None, [(["packaging/nix/*.nix"], read_nix, {})]),
+    "steamdeck": (None, [(["scripts/steamdeck/*.sh"], read_setcap,
+                          {"BIN": HOST, "WORKER": WORKER, "GS_BIN": GAMESCOPE})]),
+    "source": ([GAMESCOPE], [(["packaging/gamescope/build-punktfunk-gamescope.sh"], read_setcap,
+                              {"DEST": GAMESCOPE})]),
+    "sysext-arch": (None, [(["packaging/arch/build-sysext.sh"], read_seal, {})]),
+    "sysext-bazzite": (None, [(["packaging/bazzite/build-sysext.sh"], read_seal, {})]),
+}
+
+
+def read_matrix(text):
+    """{binary: (caps, channels or None)}"""
+    rows = {}
+    for line in text.splitlines():
+        fields = line.split("#")[0].split()
+        if fields:
+            rows[fields[0]] = (caps_norm(fields[1]), fields[2:] or None)
+    return rows
+
+
+def expected(matrix, binary, channel):
+    caps, channels = matrix[binary]
+    return caps if channels is None or channel in channels else "-"
+
+
+def compare(matrix, channel, grants, covers=None):
+    """[(binary, error)] for one channel's [(binary, caps)] against the matrix rows it covers."""
+    errors = [(binary, f"{channel} grants {caps} to {binary}, which {MATRIX} has no row for")
+              for binary, caps in grants if binary not in matrix]
+    for binary in covers or matrix:
+        got = {caps for b, caps in grants if b == binary} or {"-"}
+        want = expected(matrix, binary, channel)
+        if got != {want}:
+            errors.append((binary, f"{channel} grants {binary} {' and '.join(sorted(got))}; "
+                                   f"{MATRIX} says {want}"))
+    return errors
+
+
+# The gate's constants: the host and worker rows the matrix must hold.
+GATE_CONST = re.compile(r"^(HOST_REL|WORKER_REL|WANT_WORKER_CAPS)='([^']*)'", re.M)
+
+
+def gate_errors(matrix, const):
+    errors = []
+    for key, binary in (("HOST_REL", HOST), ("WORKER_REL", WORKER)):
+        if os.path.basename(const.get(key, "")) != binary:
+            errors.append(f"{GATE} {key} is {const.get(key)!r}, not .../{binary}")
+    want = caps_norm(const.get("WANT_WORKER_CAPS", ""))
+    if want != matrix[WORKER][0]:
+        errors.append(f"{GATE} WANT_WORKER_CAPS is {want}; {MATRIX} says {matrix[WORKER][0]}")
+    if matrix[HOST][0] != "-":
+        errors.append(f"{MATRIX} gives {HOST} {matrix[HOST][0]}; {GATE} fails any host capability")
+    return errors
+
+
+def read(path):
+    with open(os.path.join(ROOT, path), encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+SYSUSERS_GROUP = re.compile(r"^g\s+(\S+)", re.M)
+NIX_GROUP = re.compile(r"\busers\.groups\.([\w-]+)")
+
+
+# The commands that name a group, and whether a runtime group may be named there. A rule or a
+# polkit test needs the group to exist already; a script that creates or joins one may be first.
+GROUP_NAMES = [
+    (re.compile(r"\bgroupadd(?:\s+-{1,2}[\w-]+)*\s+([A-Za-z_][\w-]*)"), True),
+    (re.compile(r"\busermod\s+-aG\s+([A-Za-z_][\w-]*)"), True),
+    (re.compile(r"^\s*(?:if\s+)?ensure_group\s+([\w-]+)", re.M), False),
+    (re.compile(r'\bGROUP:?="([^"]+)"'), False),
+    (re.compile(r"\bchgrp\s+([A-Za-z_][\w-]*)"), False),
+    (re.compile(r'isInGroup\("([^"]+)"\)'), False),
+]
+
+
+def group_errors(sysusers, nix_groups, texts):
+    """[(path, error)] for the groups the sysusers file declares against what the channels create
+    and name. `texts` is {path: recipe, script or rule text}."""
+    declared = set(SYSUSERS_GROUP.findall(sysusers))
+    nix = nix_groups - DISTRO_GROUPS
+    errors = [(NIX_MODULE, f"{SYSUSERS} declares group {g}; the NixOS module does not")
+              for g in sorted(declared - nix)]
+    errors += [(NIX_MODULE, f"the NixOS module declares group {g}; {SYSUSERS} does not")
+               for g in sorted(nix - declared)]
+    for path, text in texts.items():
+        text = strip_comments(text)
+        for pattern, runtime_ok in GROUP_NAMES:
+            allowed = declared | DISTRO_GROUPS | (RUNTIME_GROUPS if runtime_ok else set())
+            errors += [(path, f"names group {g}, which no channel creates ({SYSUSERS})")
+                       for g in pattern.findall(text) if g not in allowed]
+    return errors
+
+
+def tracked(*dirs):
+    """{path: text} of the tracked files under `dirs`, less Markdown and Python."""
+    names = subprocess.check_output(["git", "ls-files", "--", *dirs], cwd=ROOT, text=True)
+    return {p: read(p) for p in names.split("\n") if p and not p.endswith((".md", ".py"))}
+
+
+def tree_group_errors():
+    installs = os.path.basename(SYSUSERS)
+    errors = [(path, f"does not install {installs}")
+              for path in GROUP_RECIPES if installs not in strip_comments(read(path))]
+    nix = set(NIX_GROUP.findall(strip_comments(read(NIX_MODULE))))
+    return errors + group_errors(read(SYSUSERS), nix, tracked("packaging", "scripts"))
+
+
+def seats_errors(payload, texts):
+    """[(path, error)] for each seats file in `payload` a recipe in `texts` never names."""
+    rows = (line.split() for line in payload.splitlines() if line[:1].isalpha())
+    names = sorted({os.path.basename(row[1]) for row in rows if row[0] == "seats"})
+    return [(path, f"ships no {name}, which {PAYLOAD} lists for seats")
+            for path, text in texts.items() for name in names
+            if name not in SEATS_RECIPES.get(path, set()) and name not in strip_comments(text)]
+
+
+def tree_errors():
+    matrix = read_matrix(read(MATRIX))
+    const = dict(GATE_CONST.findall(read(GATE)))
+    variables = {"WANT_WORKER_CAPS": caps_norm(const.get("WANT_WORKER_CAPS", ""))}
+    errors = [(GATE, e) for e in gate_errors(matrix, const)]
+    channels = {c for _, chans in matrix.values() if chans for c in chans}
+    errors += [(MATRIX, f"channel {c} is not one of {sorted(CHANNELS)}")
+               for c in sorted(channels - CHANNELS.keys())]
+    for channel, (covers, sources) in CHANNELS.items():
+        grants, where, listed = [], {}, []
+        for patterns, reader, names in sources:
+            # Pattern order: the channel's own recipe comes first and takes a missing grant.
+            files = [os.path.relpath(f, ROOT) for p in patterns
+                     for f in sorted(glob.glob(os.path.join(ROOT, p)))]
+            if not files:
+                errors.append((patterns[0], f"{channel} has no recipe to read"))
+            listed += files
+            for f in files:
+                found = reader(read(f), {**variables, **names})
+                grants += found
+                where.update({binary: f for binary, _ in found})
+        first = listed[0] if listed else sources[0][0][0]
+        errors += [(where.get(binary, first), e)
+                   for binary, e in compare(matrix, channel, grants, covers)]
+    seats = {path: read(path) for path in SEATS_RECIPES}
+    return errors + tree_group_errors() + seats_errors(read(PAYLOAD), seats)
+
+
+def check():
+    errors = tree_errors()
+    for path, message in errors:
+        print(f"::error file={path}::{message}")
+    if errors:
+        print(f"{len(errors)} packaging policy mismatch(es): make the channel and its matrix agree.",
+              file=sys.stderr)
+        return 1
+    print(f"check-packaging-policy: {len(CHANNELS)} channels match {MATRIX} and {SYSUSERS}")
+    return 0
+
+
+def self_test():
+    fails = 0
+
+    def expect(name, got, want):
+        nonlocal fails
+        if got != want:
+            print(f"self-test {name}: got {got!r}, want {want!r}", file=sys.stderr)
+            fails += 1
+
+    ep, eip = "cap_sys_nice=ep", "cap_sys_nice=eip"
+    expect("caps spellings", [caps_norm(c) for c in ("CAP_SYS_NICE+ep", ep, "(none)", "")],
+           [ep, ep, "-", "-"])
+    sh = """\
+# setcap 'cap_sys_nice=ep' /usr/bin/punktfunk-host   <- a comment
+setcap -r /usr/bin/punktfunk-host 2>/dev/null || true
+  setcap 'cap_sys_nice=ep' usr/bin/punktfunk-encode-worker 2>/dev/null || true
+sudo setcap "CAP_SYS_NICE=eip" "$GS_BIN" || warn x
+sudo setcap cap_sys_nice=ep ${WORKER}
+"""
+    expect("setcap", read_setcap(sh, {"GS_BIN": GAMESCOPE, "WORKER": WORKER}),
+           [(WORKER, ep), (GAMESCOPE, eip), (WORKER, ep)])
+    spec = """\
+# %caps(cap_sys_nice=ep) %{_bindir}/punktfunk-host
+# Declared with %%caps rather than a %%post setcap
+%{_bindir}/punktfunk-host
+%caps(cap_sys_nice=ep) %{_bindir}/punktfunk-encode-worker
+"""
+    expect("rpm", read_rpm(spec, {}), [(WORKER, ep)])
+    nix = """\
+      # security.wrappers.punktfunk-host = { capabilities = "cap_sys_nice=ep"; };
+      security.wrappers.punktfunk-encode-worker = {
+        source = "${cfg.host.package}/bin/punktfunk-encode-worker";
+        capabilities = "cap_sys_nice=ep";
+        owner = "root";
+      };
+"""
+    expect("nix", read_nix(nix, {}), [(WORKER, ep)])
+    expect("seal", read_seal("# pf_seal_caps x\npf_seal_caps \"$STAGE\" why\n", {"WANT_WORKER_CAPS": ep}),
+           [(WORKER, ep)])
+    expect("seal absent", read_seal("# pf_seal_caps x\n", {"WANT_WORKER_CAPS": ep}), [])
+
+    matrix = read_matrix(f"{HOST} -\n{WORKER} {ep}\n{GAMESCOPE} {eip} arch\n")
+    ok = [(WORKER, ep)]
+    expect("clean", compare(matrix, "deb", ok), [])
+    expect("scoped row", compare(matrix, "arch", ok + [(GAMESCOPE, eip)]), [])
+    expect("scoped row elsewhere", len(compare(matrix, "deb", ok + [(GAMESCOPE, eip)])), 1)
+    expect("scoped row missing", len(compare(matrix, "arch", ok)), 1)
+    expect("channel covering one binary", compare(matrix, "source", [(GAMESCOPE, "-")], [GAMESCOPE]), [])
+    expect("host granted", len(compare(matrix, "rpm", ok + [(HOST, ep)])), 1)
+    expect("worker changed in one channel", len(compare(matrix, "deb", [(WORKER, eip)])), 1)
+    expect("worker grant removed", len(compare(matrix, "nix", [])), 1)
+    expect("unknown binary", len(compare(matrix, "deb", ok + [("punktfunk-tray", ep)])), 1)
+    expect("worker twice, two ways", len(compare(matrix, "deb", ok + [(WORKER, eip)])), 1)
+
+    const = {"HOST_REL": "usr/bin/punktfunk-host", "WORKER_REL": "usr/bin/punktfunk-encode-worker",
+             "WANT_WORKER_CAPS": ep}
+    expect("gate agrees", gate_errors(matrix, const), [])
+    expect("gate caps drift", len(gate_errors(matrix, {**const, "WANT_WORKER_CAPS": eip})), 1)
+    expect("gate path drift", len(gate_errors(matrix, {**const, "HOST_REL": "usr/bin/x"})), 1)
+    expect("matrix host capped", len(gate_errors(read_matrix(f"{HOST} {ep}\n{WORKER} {ep}\n"), const)), 1)
+    expect("gate reader", GATE_CONST.findall("HOST_REL='usr/bin/punktfunk-host'\nWANT_WORKER_CAPS='x'\n"),
+           [("HOST_REL", "usr/bin/punktfunk-host"), ("WANT_WORKER_CAPS", "x")])
+
+    users = "# c\ng punktfunk -\ng punktfunk-update -\n"
+    expect("sysusers", SYSUSERS_GROUP.findall(users), ["punktfunk", "punktfunk-update"])
+    expect("nix groups", NIX_GROUP.findall("users.groups.input = { };\nusers.groups.punktfunk = { };\n"),
+           ["input", "punktfunk"])
+    nix_ok = {"input", "punktfunk", "punktfunk-update"}
+    texts = {"a.sh": "getent group x || groupadd --system punktfunk\n# groupadd old\n"
+                     "groupadd punktfunk-games\nif ensure_group punktfunk; then\n"
+                     'usermod -aG input "$USER"\nusermod -aG punktfunk-games u\n',
+             "a.rules": 'GROUP="input"\nRUN+="chgrp punktfunk /x"\n# GROUP="old"\n'}
+    expect("groups agree", group_errors(users, nix_ok, texts), [])
+    expect("nix lacks a group", len(group_errors(users, nix_ok - {"punktfunk-update"}, {})), 1)
+    expect("nix adds a group", len(group_errors(users, nix_ok | {"extra"}, {})), 1)
+    for name, text in (("groupadd", "groupadd --system x\n"), ("ensure_group", "ensure_group x\n"),
+                       ("usermod", 'sudo usermod -aG x "$USER"\n'), ("udev GROUP", 'GROUP="plugdev"\n'),
+                       ("chgrp", "chgrp x /sys/a\n"), ("polkit", 'subject.isInGroup("x")\n'),
+                       ("a rule needs the group to exist", 'GROUP="punktfunk-games"\n')):
+        expect(f"unlisted group: {name}", len(group_errors(users, nix_ok, {"b": text})), 1)
+
+    payload = "# c\nhost usr/bin/punktfunk-host\nseats usr/libexec/punktfunk/door-helper\n" \
+              "seats usr/lib/systemd/system/user@.service.d/50-punktfunk-seats.conf\n"
+    nix = "packaging/nix/packages.nix"
+    expect("seats named", seats_errors(payload, {nix: "install door-helper\n"}), [])
+    expect("seats file missing", len(seats_errors(payload, {nix: "# door-helper\n"})), 1)
+    expect("seats exemption is per recipe",
+           len(seats_errors(payload, {"scripts/steamdeck/door.sh": "door-helper\n"})), 1)
+    if fails:
+        return 1
+    print("check-packaging-policy self-test ok")
+    return 0
+
+
+def main(argv):
+    if argv[1:] == ["--self-test"]:
+        return self_test()
+    if argv[1:]:
+        print("usage: check-packaging-policy.py [--self-test]", file=sys.stderr)
+        return 2
+    return check()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

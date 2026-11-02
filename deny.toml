@@ -1,0 +1,22 @@
+# cargo-deny, `bans` and `sources` only. Advisories belong to cargo-audit (.cargo/audit.toml)
+# and licenses to cargo-about (about.toml), so run `cargo deny check bans sources`, never a bare
+# `check`. One config for every workspace: .gitea/workflows/audit.yml passes it to each manifest.
+
+[bans]
+# Informational. ring, curve25519-dalek, spake2 and rsa hold the old rand, rand_core and
+# getrandom, so a ban on those duplicates can't pass.
+multiple-versions = "warn"
+# `wildcards` stays off: cargo-deny counts a versionless `path` dependency as one, and exempts
+# it only in a crate marked `publish = false`.
+deny = []
+
+# The control: a crate from a registry or repository not listed here fails the audit run.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/microsoft/windows-rs",
+    "https://github.com/unom-io/hermir",
+    "https://github.com/unom-io/omur",
+    "https://github.com/unom-io/usbfs-iso",
+]

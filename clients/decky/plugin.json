@@ -1,7 +1,7 @@
 {
   "name": "Punktfunk",
   "author": "enrico",
-  "flags": ["debug"],
+  "flags": [],
   "api_version": 1,
   "publish": {
     "tags": ["streaming", "game-streaming", "remote-play"],

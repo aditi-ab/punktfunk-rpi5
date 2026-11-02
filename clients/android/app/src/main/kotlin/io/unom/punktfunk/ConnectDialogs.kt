@@ -33,7 +33,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
@@ -124,13 +123,14 @@ internal fun AddHostSheet(
 }
 
 /**
- * The SPAKE2 PIN ceremony dialog. Runs [NativeBridge.nativePair] off the UI thread itself (the
+ * The SPAKE2 PIN ceremony dialog. Runs [HostServices.pair] off the UI thread itself (the
  * pin/name/error state is dialog-local); on success hands the host's verified fingerprint to
- * [onPaired], which saves + connects. Dismissal is blocked while a pair attempt is in flight.
+ * [onPaired], which saves it. Dismissal is blocked while a pair attempt is in flight.
  */
 @Composable
 internal fun PairPinDialog(
     pt: PendingTrust,
+    services: HostServices,
     identity: ClientIdentity?,
     onPaired: (fpHex: String) -> Unit,
     onDismiss: () -> Unit,
@@ -172,17 +172,15 @@ internal fun PairPinDialog(
                         pairing = true
                         err = null
                         scope.launch {
-                            val fp = withContext(Dispatchers.IO) {
-                                NativeBridge.nativePair(
-                                    pt.host, pt.port, id.certPem, id.privateKeyPem, pin, name,
-                                )
+                            val paired = withContext(Dispatchers.IO) {
+                                services.pair(pt.host, pt.port, id, pin, name)
                             }
                             pairing = false
-                            if (fp.isNotEmpty()) {
-                                onPaired(fp) // verified host fp — caller saves + connects
-                            } else {
+                            when (paired) {
+                                // Verified host fp — the caller saves it.
+                                is HostServices.Paired.Ok -> onPaired(paired.fp)
                                 // Cause-specific: wrong PIN vs not-armed vs unreachable.
-                                err = ConnectErrors.pairMessage(NativeBridge.nativeTakeLastError())
+                                is HostServices.Paired.Failed -> err = ConnectErrors.pairMessage(paired.token)
                             }
                         }
                     }

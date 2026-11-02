@@ -9,7 +9,7 @@ exists, use it instead: it has lower latency and more features.
 
 ## 1. Turn on GameStream
 
-GameStream is off by default. In the [web console](/docs/web-console), open **Host → Settings**,
+GameStream is off by default. In the [web console](/docs/web-console), open **Host**,
 turn on **GameStream**, then click **Restart Punktfunk**. Or:
 
 | Where | How |
@@ -53,8 +53,8 @@ More in [Troubleshooting](/docs/troubleshooting-connect#another-streaming-host-s
 
 1. In the web console, open **Devices**.
 2. In Moonlight, select the host. It shows a 4-digit PIN.
-3. In the console's **Moonlight (GameStream) pairing** card, type the PIN, name the device, enter
-   your console password and click **Submit PIN**.
+3. The console lists **A Moonlight client is waiting for its PIN**. Click **Enter PIN**, type the
+   PIN, name the device, enter your console password and click **Submit PIN**.
 
 The device appears under **Paired devices**. See [Pairing & Trust](/docs/pairing).
 
@@ -68,7 +68,8 @@ An `apps.json` in the host's config directory replaces that list, **Desktop** in
 
 ## Tips
 
-- **Codec:** HEVC is a good default; AV1 works if your client decodes it.
+- **Codec:** HEVC is a good default; AV1 works if your client decodes it. A Moonlight fork with
+  [PyroWave](/docs/pyrowave#from-a-moonlight-client) can use it on a wired link.
 - **HDR:** Moonlight offers HDR only when the host can [capture and encode it](/docs/hdr#the-chain).
   Pick HEVC or AV1; H.264 stays SDR.
 - **Bitrate:** the number covers video and error correction together. Start moderate and raise it.

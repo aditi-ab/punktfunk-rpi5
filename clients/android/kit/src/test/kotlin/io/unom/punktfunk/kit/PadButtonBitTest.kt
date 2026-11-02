@@ -67,6 +67,17 @@ class PadButtonBitTest {
         )
     }
 
+    /** A handheld's back buttons arrive as C and Z; a pad numbering straight through never does. */
+    @Test
+    fun `C and Z are the upper back grips`() {
+        assertEquals(Gamepad.BTN_PADDLE2, Gamepad.padButtonBit(KeyEvent.KEYCODE_BUTTON_C, 0))
+        assertEquals(Gamepad.BTN_PADDLE1, Gamepad.padButtonBit(KeyEvent.KEYCODE_BUTTON_Z, 0))
+        val x = Gamepad.PadButtons.GENERIC_XBOX.correct(0x132, KeyEvent.KEYCODE_BUTTON_C)
+        val rb = Gamepad.PadButtons.GENERIC_XBOX.correct(0x135, KeyEvent.KEYCODE_BUTTON_Z)
+        assertEquals(Gamepad.BTN_X, Gamepad.padButtonBit(x, 0))
+        assertEquals(Gamepad.BTN_RB, Gamepad.padButtonBit(rb, 0))
+    }
+
     /** Everything else is [Gamepad.buttonBit] verbatim — BACK is the only row this adds. */
     @Test
     fun `every other keycode is unchanged`() {

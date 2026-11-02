@@ -7,7 +7,7 @@ Copy on your device and paste on the host, or the other way round, once three sw
 
 ## Turn it on
 
-1. **On the host:** in the web console, open **Host → Settings → Streaming** and set **Shared
+1. **On the host:** in the web console, open **Host → Streaming** and set **Shared
    clipboard** to **Text** or **Text and files**. It applies from the next stream.
 2. **For your device:** its [access level](/docs/access-levels) must include **Clipboard**.
    **Full control** does.
@@ -24,7 +24,7 @@ Copy on your device and paste on the host, or the other way round, once three sw
 
 The client reads its switch when a stream starts, so reconnect after changing it. On a Mac,
 **Stream → Share Clipboard** (⌃⌥⇧C) turns it on mid-stream and **Stop Sharing Clipboard** turns
-it off. The same keys work on an iPad with a keyboard while input is released.
+it off. The same keys work on an iPad with a keyboard.
 
 A `PUNKTFUNK_CLIPBOARD` line in `host.env` overrides step 1 and locks it in the console: see
 [Configuration](/docs/configuration).
@@ -36,24 +36,27 @@ A `PUNKTFUNK_CLIPBOARD` line in `host.env` overrides step 1 and locks it in the 
 | Mac, iPhone, iPad | Text, rich text (RTF), HTML, PNG, JPEG, GIF |
 | Windows | Text, PNG |
 | Android | Text |
-| Linux, Steam Deck | Nothing yet: the switch exists, but no clipboard is read or written |
+| Linux, Steam Deck | Text, PNG; to the host also HTML, RTF, JPEG, GIF |
 | Apple TV | No clipboard |
 
 - **Your copies cross when something pastes.** A copy sends only the list of formats; the bytes
   follow when an app on the other side pastes.
-- **Host copies land on Windows and Android at once.** Windows skips a host copy over 4 MiB.
-  Mac, iPhone and iPad fetch only when you paste.
+- **Host copies land on Windows, Linux and Android at once.** Windows and Linux skip a host copy
+  over 4 MiB. Mac, iPhone and iPad fetch only when you paste.
+- **On Linux, a copy from another app crosses when you switch back to the stream window.** A
+  host copy stays on your clipboard while the stream runs; after it ends, only a clipboard
+  manager keeps it.
 - **Leaving the app on iPhone or iPad** ends the stream. A host copy you haven't pasted, up to
   8 MiB, is brought over first so you can paste it in another app.
 - **One transfer is at most 64 MiB.**
-- **Passwords stay put on Mac, iPhone, iPad and Windows.** A copy a password manager marks as
-  secret is never sent. Android and the host don't filter, so a password copied on the host
-  reaches your client.
+- **Passwords stay put on every client.** A copy a password manager marks as secret is never
+  sent. On Linux that takes a manager that marks copies the KDE way, such as KeePassXC. The host
+  doesn't filter, so a password copied on the host reaches your client.
 - **No client sends files yet**, so **Text** and **Text and files** behave the same.
 - **Moonlight has no clipboard.** It exists only in Punktfunk sessions.
 
 A Linux host needs a desktop that offers a clipboard to it: `ext-data-control-v1` (KWin, Sway,
-Hyprland and other wlroots compositors) or GNOME's remote-desktop clipboard. A
+Hyprland, niri, Umbriel and other wlroots compositors) or GNOME's remote-desktop clipboard. A
 [gamescope](/docs/gamescope) session keeps one plain-text clipboard, so only text crosses there.
 A Windows host always has one.
 
@@ -69,7 +72,7 @@ Work down this list:
 | The console shows **Set by PUNKTFUNK_CLIPBOARD in host.env.** | Change or remove that line, then restart the host ([Configuration](/docs/configuration)). |
 | Your client's switch is off for this host, or you changed it while streaming | Step 3, then reconnect. |
 | Your device's access level lacks **Clipboard** | Step 2. |
-| You're on Linux, a Steam Deck or an Apple TV | These clients don't move the clipboard yet. |
+| You're on an Apple TV | tvOS gives apps no clipboard. |
 | The host's desktop has no clipboard (none of the protocols above) | The host log says `clipboard backend unavailable`. Stream another desktop session instead. |
 | A picture doesn't cross in a gamescope session | gamescope's clipboard holds text only. |
 
@@ -83,8 +86,7 @@ lacks **Clipboard**.
 
 ### A copied password doesn't arrive
 
-Intended: the Mac, iPhone, iPad and Windows clients never send a copy a password manager marks as
-secret.
+Intended: no client sends a copy a password manager marks as secret.
 
 ### An image copied on Windows doesn't arrive on the host
 

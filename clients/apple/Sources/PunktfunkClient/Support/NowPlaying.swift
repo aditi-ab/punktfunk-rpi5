@@ -1,6 +1,6 @@
 // What each paired host has UP right now (`GET /api/v1/status`), so a host card can say so
 // before anybody connects — the Apple port of the console's `HostRow::running`
-// (crates/pf-console-ui/src/model.rs), fed by the same route on the same mTLS lane.
+// (crates/client/pf-console-ui/src/model.rs), fed by the same route on the same mTLS lane.
 //
 // A sibling of `HostPowerStore` with a far shorter fuse: what a host may be asked to do changes
 // when an operator edits access, but what it is PLAYING changes while somebody is looking at the
@@ -36,14 +36,11 @@ final class NowPlayingStore: ObservableObject {
         // Stamp BEFORE the request, so a slow or hanging host cannot make every pass ask again.
         if let at = askedAt[key], Date().timeIntervalSince(at) < Self.ttl { return }
         // The demo host serves no management API.
-        guard !DemoMode.isDemo(host), let pin = host.pinnedSHA256,
-              let identity = (try? ClientIdentityStore.shared.load())?.identity
+        guard !DemoMode.isDemo(host), case .success(let target) = MgmtTarget.make(host: host)
         else { return }
         askedAt[key] = Date()
         Task { @MainActor in
-            let games = await LibraryClient.running(
-                address: host.address, port: host.effectiveMgmtPort,
-                certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
+            let games = await LibraryClient.running(target)
             adopt(games, for: host)
         }
     }

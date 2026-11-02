@@ -5,24 +5,27 @@ import Foundation
 import PunktfunkCore
 
 public extension PunktfunkInputEvent {
+    /// `screen` rides the first pad byte: an absolute event names the screen it lands on, 0 the
+    /// first.
     private static func make(
-        _ kind: UInt32, code: UInt32, x: Int32, y: Int32, flags: UInt32 = 0
+        _ kind: UInt32, code: UInt32, x: Int32, y: Int32, flags: UInt32 = 0, screen: UInt8 = 0
     ) -> PunktfunkInputEvent {
-        PunktfunkInputEvent(kind: UInt8(kind), _pad: (0, 0, 0), code: code, x: x, y: y, flags: flags)
+        PunktfunkInputEvent(
+            kind: UInt8(kind), _pad: (screen, 0, 0), code: code, x: x, y: y, flags: flags)
     }
     static func mouseMove(dx: Int32, dy: Int32) -> PunktfunkInputEvent {
         make(PUNKTFUNK_INPUT_KIND_MOUSE_MOVE.rawValue, code: 0, x: dx, y: dy)
     }
-    /// Absolute cursor position in client-surface pixels — the host places its cursor
-    /// there (same letterbox mapping and `flags` surface-dims packing as the touch events).
-    /// Used by the iPad pointer fallback when the scene can't pointer-lock and GCMouse's
-    /// relative deltas aren't available; the surface dimensions must each fit in 16 bits.
+    /// Absolute cursor position in client-surface pixels of screen `screen`'s picture — the host
+    /// places its cursor there (same letterbox mapping and `flags` surface-dims packing as the
+    /// touch events). The desktop mouse model and the iPad pointer fallback send it; the surface
+    /// dimensions must each fit in 16 bits.
     static func mouseMoveAbs(
-        x: Int32, y: Int32, surfaceWidth: UInt32, surfaceHeight: UInt32
+        x: Int32, y: Int32, surfaceWidth: UInt32, surfaceHeight: UInt32, screen: UInt8 = 0
     ) -> PunktfunkInputEvent {
         make(
             PUNKTFUNK_INPUT_KIND_MOUSE_MOVE_ABS.rawValue, code: 0, x: x, y: y,
-            flags: ((surfaceWidth & 0xFFFF) << 16) | (surfaceHeight & 0xFFFF))
+            flags: ((surfaceWidth & 0xFFFF) << 16) | (surfaceHeight & 0xFFFF), screen: screen)
     }
     /// GameStream button ids: 1=left 2=middle 3=right 4=X1 5=X2 (host maps to evdev BTN_*).
     static func mouseButton(_ button: UInt32, down: Bool) -> PunktfunkInputEvent {

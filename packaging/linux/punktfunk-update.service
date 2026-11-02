@@ -3,7 +3,8 @@
 # `systemctl start punktfunk-update.service`, authorized by the polkit rule
 # (49-punktfunk-update.rules) for members of the `punktfunk-update` group. systemd gives us
 # single-flight (a second start while active fails) and journal capture for free; the helper
-# writes its machine-readable outcome to /var/lib/punktfunk/update-result.json.
+# writes its machine-readable outcome to /var/lib/punktfunk-update/update-result.json: a directory
+# only root writes, unlike /var/lib/punktfunk, which is the door's.
 [Unit]
 Description=punktfunk host update (root helper)
 # Network is a hard prerequisite for every leg (package manager / sysext feed).
@@ -13,5 +14,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/libexec/punktfunk/pf-update apply
+# /var/lib/punktfunk-update, root's, 0755 so the host reads the result.
+StateDirectory=punktfunk-update
 # The helper drives the distro package manager, which needs the real system — no sandboxing
 # directives here on purpose; the constraint is the FIXED ExecStart (no parameters exist).

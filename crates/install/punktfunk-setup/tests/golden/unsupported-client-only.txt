@@ -1,0 +1,11 @@
+==> Detected voidlinux → flatpak (guide: https://docs.punktfunk.unom.io/docs/install)
+==> Choices (nothing below has run yet)
+  Channel: stable
+==> Installing: client (stable channel)
+  + flatpak install --user -y https://flatpak.unom.io/io.unom.punktfunk.flatpakref
+==> Checking
+
+  Done. Next: let a device in.
+  Open punktfunk here and pick the PC you stream from — then approve this device in that host's console.
+  https://docs.punktfunk.unom.io/docs/install-client · https://docs.punktfunk.unom.io/docs/pairing
+

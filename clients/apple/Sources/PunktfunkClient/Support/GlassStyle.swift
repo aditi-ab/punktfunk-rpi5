@@ -22,9 +22,19 @@ private struct GlassBackground<S: Shape>: ViewModifier {
     let shape: S
     var interactive = false
 
+    #if os(visionOS)
+    @Environment(\.inAttachment) private var inAttachment
+    #endif
+
     func body(content: Content) -> some View {
         #if os(visionOS)
-        content.background(.regularMaterial, in: shape) // visionOS materials are its glass
+        // visionOS materials are its glass; a RealityView attachment draws none, so a dark
+        // card keeps the text off the picture there.
+        if inAttachment {
+            content.background(.black.opacity(0.8), in: shape)
+        } else {
+            content.background(.regularMaterial, in: shape)
+        }
         #else
         if #available(iOS 26, macOS 26, tvOS 26, *) {
             content.glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
@@ -34,6 +44,13 @@ private struct GlassBackground<S: Shape>: ViewModifier {
         #endif
     }
 }
+
+#if os(visionOS)
+extension EnvironmentValues {
+    /// The view floats in a RealityView attachment, where materials do not draw.
+    @Entry var inAttachment = false
+}
+#endif
 
 extension View {
     /// Liquid Glass (26+) or the existing `.regularMaterial` (pre-26) behind a floating

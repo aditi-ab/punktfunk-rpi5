@@ -12,7 +12,7 @@
 //! the whole struct + callback surface, so an allowlist regression fails CI instead of the box.
 #![no_std]
 #![allow(non_snake_case, clippy::missing_safety_doc)]
-// P0 lint (audit §8): require explicit `unsafe {}` blocks inside `unsafe fn`s + a `// SAFETY:` proof on
+// P0 lint (audit §8): require explicit `unsafe {}` blocks inside `unsafe fn`s + a proof on
 // each (this crate is the IddCx DDI dispatch layer — inherently unsafe, so audited, not unsafe-free).
 
 pub use wdk_sys::iddcx;

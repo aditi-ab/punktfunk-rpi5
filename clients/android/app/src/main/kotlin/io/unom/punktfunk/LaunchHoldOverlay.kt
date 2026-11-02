@@ -51,9 +51,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.ImageLoader
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
+import coil3.ImageLoader
+import coil3.compose.AsyncImage
+import coil3.request.ImageRequest
 import io.unom.punktfunk.kit.library.Download
 import io.unom.punktfunk.kit.library.GameEnd
 import io.unom.punktfunk.kit.library.GameEntry
@@ -153,7 +153,7 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
     LaunchedEffect(hold) {
         val (id, art) = withContext(Dispatchers.IO) {
             IdentityHolder.shared(context).await()?.let { me ->
-                runCatching { me to posterLoader(context, me, hold.address, hold.fpHex) }.getOrNull()
+                runCatching { me to posterLoader(context, me, hold.address, hold.fpHex, hold.streamPort) }.getOrNull()
             }
         } ?: run {
             onShow()
@@ -164,7 +164,7 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
         while (isActive) {
             val status = withContext(Dispatchers.IO) {
                 LibraryClient.fetchStatus(
-                    hold.address, hold.mgmtPort, id.certPem, id.privateKeyPem, hold.fpHex,
+                    hold.address, hold.mgmtPort, id.certPem, id.privateKeyPem, hold.fpHex, hold.streamPort,
                 )
             }
             val game = status.games.firstOrNull { it.appId == hold.game.id }
@@ -431,8 +431,7 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
                             } else {
                                 withContext(Dispatchers.IO) {
                                     LibraryClient.endGame(
-                                        hold.address, hold.mgmtPort, id.certPem, id.privateKeyPem,
-                                        hold.fpHex, hold.game.id,
+                                        id, hold.address, hold.mgmtPort, hold.fpHex, hold.game.id, hold.streamPort,
                                     )
                                 }
                             }

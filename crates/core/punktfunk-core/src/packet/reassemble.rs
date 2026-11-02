@@ -1,0 +1,1566 @@
+//! Client reassembly: buffer incoming shards, FEC-recover lost ones, emit access units.
+//!
+//! [`Reassembler::push`] is the hot path: a pure header firewall, then placement over
+//! disjoint field borrows. A malformed header or exhausted in-flight budget drops the
+//! packet; it never aborts the session. Geometry is per-frame: the first packet pins
+//! `shard_bytes`, later packets must match.
+//!
+//! Two index spaces (`video`, `probe`) so a speed-test burst cannot move the video
+//! loss window. Incomplete frames age out after [`LOSS_WINDOW_NS`] of capture time
+//! (or [`HARD_LOSS_WINDOW`] indices). Opt-in paths emit chunk-aligned partials and
+//! slice-progressive prefixes.
+//!
+//! In-flight memory is capped at [`IN_FLIGHT_BUF_FACTOR`] × `max_frame_bytes`.
+//! Pinning: `design/shard-payload-reneg.md`. Late-shard netting:
+//! [`crate::stats::Stats::fec_late_shards`].
+
+use super::*;
+use crate::au::{AuBuf, AuMemory};
+use crate::config::Config;
+use crate::error::Result;
+use crate::fec::ErasureCoder;
+use crate::session::{Frame, FramePart};
+use crate::stats::StatsCounters;
+use std::collections::HashMap;
+
+/// Incomplete-frame fuse: capture time behind the newest pts. Time, not index count —
+/// 4 frames is 66 ms at 60 fps and 33 ms at 120 fps, inside Wi-Fi retry/reorder.
+/// 120 ms sits above radio jitter; a real loss still trips ~2× faster than a
+/// 16-frame window at 60 fps. A false trip requests a recovery IDR.
+pub(super) const LOSS_WINDOW_NS: u64 = 120_000_000;
+
+/// Index cap beside [`LOSS_WINDOW_NS`]. A hostile pts would otherwise grow the
+/// window without bound. 120 ms at 120 fps ≈ 14 indices; 64 covers ~500 fps.
+const HARD_LOSS_WINDOW: u32 = 64;
+
+/// Fuse for opted-in chunk-aligned partials. The full 120 ms would inject
+/// independently-decodable ancient frames into a live stream. 30 ms ≈ 2 periods at 60 fps.
+const PARTIAL_WINDOW_NS: u64 = 30_000_000;
+
+/// How far `completed` remembers emitted/abandoned indices, so a straggler cannot
+/// resurrect them. Must be ≥ [`HARD_LOSS_WINDOW`]: shards can arrive after the verdict.
+const REORDER_WINDOW: u32 = 64;
+
+/// Presence map and held recovery shards. Data bytes live in [`FrameBuf::buf`] at
+/// their final AU offset — this struct never copies them.
+struct BlockState {
+    data_shards: usize,
+    recovery_shards: usize,
+    /// Data-shard origin in the frame buffer: a sentinel's wire base, the final block's
+    /// `total_data − K`.
+    base_shard: usize,
+    /// Present data-shard slots; also the FEC reconstruct input map.
+    have_data: Vec<bool>,
+    data_received: usize,
+    recovery: Vec<Option<Vec<u8>>>,
+    recovery_received: usize,
+    /// Reconstructed or unrecoverable. Later shards for this block are ignored.
+    done: bool,
+    /// `true` iff reconstruct consumed parity (`missing > 0`). Only then a late data
+    /// shard was counted in `fec_recovered_shards` and must net into `fec_late_shards`.
+    reconstructed: bool,
+}
+
+struct FrameBuf {
+    /// Pinned by the first packet; later packets must match. Per-frame so a mid-session
+    /// `shard_payload` change cannot splice two geometries into one buffer.
+    /// See `design/shard-payload-reneg.md`.
+    shard_bytes: usize,
+    /// Exact AU size. `0` = opened by a sentinel; cannot complete until the final block
+    /// pins the totals.
+    frame_bytes: usize,
+    /// `0` until the final block pins the totals.
+    block_count: usize,
+    pts_ns: u64,
+    user_flags: u32,
+    /// Config generation (`punktfunk/2`); every packet of the frame carries the same.
+    epoch: u8,
+    /// Leading blocks already handed up as slice-progressive prefix parts.
+    next_part_block: u16,
+    /// AU shard offset of the next prefix part (`next_part_block`'s start).
+    delivered_shards: usize,
+    /// Whole data region. Shards copy to their final offset; FEC writes only the holes;
+    /// a partial zeroes what never arrived. On completion it is [`Frame::data`].
+    buf: AuBuf,
+    blocks: HashMap<u16, BlockState>,
+    /// Blocks reconstructed into `buf`. A failed block never counts; the frame ages out.
+    blocks_ok: usize,
+    /// A block's last shard arrived and parity could not close it. Reported once.
+    short_tail: bool,
+}
+
+/// Per-session header bounds, applied before any allocation. Derived from [`Config`].
+///
+/// Geometry is per-frame, not per-session (`design/shard-payload-reneg.md`): the first
+/// packet pins `shard_bytes` in `[min_shard_bytes, max_shard_bytes]`; later packets
+/// must match; the block ceiling derives from the pin (a smaller shard needs more
+/// blocks). Ordered control-stream changes cannot splice unordered datagrams.
+#[derive(Clone, Copy, Debug)]
+pub struct ReassemblerLimits {
+    /// Floor of the per-frame pin. Production is [`crate::config::MIN_SHARD_PAYLOAD`];
+    /// a hand-configured session may start below it.
+    pub min_shard_bytes: usize,
+    /// Ceiling of the pin, advertised in `Hello::max_shard_payload`. Recv buffers are
+    /// sized for a sealed datagram of this shard size.
+    pub max_shard_bytes: usize,
+    pub max_data_shards: usize,
+    pub max_total_shards: usize,
+    pub max_frame_bytes: usize,
+}
+
+impl ReassemblerLimits {
+    pub fn from_config(c: &Config) -> Self {
+        let max_data = c.fec.max_data_per_block as usize;
+        // Ceiling from the 90% live FEC range, not the session-start percent. The
+        // sender ramps `fec_percent` without renegotiating; a stale snapshot then
+        // fails `total > max_total_shards` and wedges large frames at 100% loss.
+        let max_total =
+            (max_data + (max_data * 90).div_ceil(100)).min(c.fec.scheme.max_total_shards());
+        ReassemblerLimits {
+            // Never reject the session's own `shard_payload`. Only the client takes
+            // that from `Welcome`, and `Config::validate` already refuses a sub-floor.
+            min_shard_bytes: crate::config::MIN_SHARD_PAYLOAD.min(c.shard_payload),
+            max_shard_bytes: crate::config::max_shard_payload(),
+            max_data_shards: max_data,
+            max_total_shards: max_total,
+            max_frame_bytes: c.max_frame_bytes,
+        }
+    }
+}
+
+/// One index space: in-flight frames, recently-emitted memory, loss-window anchor.
+/// [`Reassembler`] keeps two — video and probe — because they use separate counters
+/// ([`VIDEO_CAP_PROBE_SEQ`]): a probe burst must not move the video loss window.
+/// [`VIDEO_CAP_PROBE_SEQ`]: crate::quic::VIDEO_CAP_PROBE_SEQ
+#[derive(Default)]
+struct ReassemblyWindow {
+    frames: HashMap<u32, FrameBuf>,
+    /// Terminated frame indices (emitted or abandoned) so a straggler cannot resurrect
+    /// them, each with what it still lacked ([`Done`]). Pruned with `frames` to
+    /// [`REORDER_WINDOW`].
+    completed: HashMap<u32, Done>,
+    /// Loss-window anchor `(frame_index, capture pts)`. Incomplete frames die once they
+    /// sit [`LOSS_WINDOW_NS`] behind this pts or [`HARD_LOSS_WINDOW`] indices.
+    newest_frame: Option<(u32, u64)>,
+    /// What terminated frames never got, by position, since the last drain.
+    positions: LossPositions,
+}
+
+/// Shards that never arrived, by where in their frame they fell: the first twelve data
+/// shards, the middle, and the last twelve with all parity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LossPositions {
+    pub head: u32,
+    pub mid: u32,
+    pub tail: u32,
+}
+
+/// Cap on in-flight `FrameBuf::buf` bytes (both index spaces): factor × `max_frame_bytes`.
+/// Buffers are allocated whole at the first shard; without this, [`HARD_LOSS_WINDOW`]
+/// max-sized frames opened by one header each could commit gigabytes.
+pub(super) const IN_FLIGHT_BUF_FACTOR: usize = 4;
+
+/// Recovery-shard pool cap. Several max-recovery blocks; ~720 KB at a 1408-byte shard.
+/// Jumbo sessions keep larger entries but need ~6× fewer buffers per block.
+const RECOVERY_POOL_MAX: usize = 512;
+
+/// First-shard delay samples held between drains ([`Reassembler::take_shard_delays`]).
+/// One per video frame and the pump drains every iteration, so this bounds only a
+/// consumer that stopped reading: at the cap a frame costs one comparison and no
+/// clock read.
+const SHARD_DELAY_SAMPLES: usize = 256;
+
+/// Short tails held between drains ([`Reassembler::take_short_tails`]). The pump drains
+/// every iteration, so this bounds only a consumer that stopped reading.
+const SHORT_TAIL_SAMPLES: usize = 64;
+
+/// Bytes a [`BlockState`] charges the in-flight budget. Vectors size from header
+/// fields, so a slice-streamed frame can mint thousands of blocks while `buf` stays
+/// near zero — they must meter like the buffer. `pub(super)` so budget tests read
+/// the cost model instead of a baked-in frame count.
+pub(super) fn block_state_bytes(data_shards: usize, recovery_shards: usize) -> usize {
+    std::mem::size_of::<BlockState>()
+        + data_shards // have_data: Vec<bool>
+        + recovery_shards * std::mem::size_of::<Option<Vec<u8>>>() // recovery slot table
+}
+
+/// Call before any `buf` truncate so release nets the increments made at
+/// allocation and block insert.
+fn frame_cost(f: &FrameBuf) -> usize {
+    f.buf.len()
+        + f.blocks
+            .values()
+            .map(|b| block_state_bytes(b.data_shards, b.recovery_shards))
+            .sum::<usize>()
+}
+
+/// Return held parity buffers to the pool and credit their bytes. Every take-out of
+/// `BlockState::recovery` must go through here or the in-flight budget drifts.
+fn reclaim_parity(
+    block: &mut BlockState,
+    recovery_pool: &mut Vec<Vec<u8>>,
+    in_flight_bytes: &mut usize,
+) {
+    for slot in block.recovery.iter_mut() {
+        if let Some(rb) = slot.take() {
+            *in_flight_bytes -= rb.len();
+            if recovery_pool.len() < RECOVERY_POOL_MAX {
+                recovery_pool.push(rb);
+            }
+        }
+    }
+}
+
+pub struct Reassembler {
+    limits: ReassemblerLimits,
+    /// The host instant the session's capture times count from.
+    clock_origin_ns: u64,
+    /// The newest capture time seen, which unwraps the 32-bit field; `None` until the first
+    /// packet seeds it.
+    pts_ref_us: Option<i64>,
+    /// Opt-in: emit [`USER_FLAG_CHUNK_ALIGNED`] frames that cannot complete instead of
+    /// dropping them: aged out, overtaken by a newer frame, or released. One that went up
+    /// without its head block is still a dropped frame.
+    deliver_partial: bool,
+    /// Newest parked partial (newest-wins; partials are lossy).
+    pending_partial: Option<Frame>,
+    /// The frame a NACK is out for ([`Self::set_partial_hold`]).
+    partial_hold: Option<u32>,
+    /// Opt-in: emit each newly-contiguous AU prefix as a [`Frame`] with `part = Some`
+    /// while the rest is still in flight. Any multi-block frame tiles via `base_shard`.
+    deliver_parts: bool,
+    /// Video index space. Aged-out frames count as `frames_dropped` (recovery trigger).
+    video: ReassemblyWindow,
+    /// Probe filler ([`FLAG_PROBE`]), including old hosts that still use video indexes.
+    /// Aged-out probes are not `frames_dropped` — that would fire video recovery.
+    probe: ReassemblyWindow,
+    /// Each further screen's stream, opened by its first packet while `screens_on`. Whole
+    /// frames only, and like the probe's its drops are not `frames_dropped`: the client's lane
+    /// for that screen asks for its own keyframe.
+    screens: Vec<(u8, ReassemblyWindow)>,
+    screens_on: bool,
+    /// Pooled recovery-shard buffers. Data shards land in the frame buffer; these do not.
+    recovery_pool: Vec<Vec<u8>>,
+    /// In-flight `buf` bytes plus per-block [`block_state_bytes`], both windows.
+    in_flight_bytes: usize,
+    /// `(pts_ns, first shard arrival − pts_ns)`, ns, one per video frame that opened,
+    /// oldest first. Raw: the reader adds the clock offset. A frame parity never
+    /// recovers is timed here and nowhere else, which is what keeps the delay signal
+    /// alive while the queue is deepest.
+    shard_delay_ns: Vec<(u64, i64)>,
+    /// Video frames whose tail arrived short, oldest first ([`Self::take_short_tails`]).
+    short_tails: Vec<u32>,
+    /// Where frame buffers come from ([`Self::set_memory`]).
+    memory: std::sync::Arc<dyn AuMemory>,
+    /// Frame buffers no decoder reads in place: further screens' and probe filler's. The lent
+    /// memory is the first screen's decoder's few slots, which a stray probe would pin.
+    heap: crate::au::HeapPool,
+}
+
+impl Reassembler {
+    /// Reads [`decode_v2`] packets whose capture times count from `clock_origin_ns`.
+    pub fn new(limits: ReassemblerLimits, clock_origin_ns: u64) -> Self {
+        Reassembler {
+            limits,
+            clock_origin_ns,
+            pts_ref_us: None,
+            deliver_partial: false,
+            pending_partial: None,
+            partial_hold: None,
+            deliver_parts: false,
+            video: ReassemblyWindow::default(),
+            probe: ReassemblyWindow::default(),
+            screens: Vec::new(),
+            screens_on: false,
+            recovery_pool: Vec::new(),
+            in_flight_bytes: 0,
+            shard_delay_ns: Vec::with_capacity(SHARD_DELAY_SAMPLES),
+            short_tails: Vec::new(),
+            memory: std::sync::Arc::new(crate::au::HeapPool::default()),
+            heap: crate::au::HeapPool::default(),
+        }
+    }
+
+    /// The first-shard delays since the last call, oldest first, each beside its
+    /// frame's pts. Raw `arrival − pts_ns`: the caller applies the clock offset, as
+    /// it does for a completed AU.
+    pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, (u64, i64)> {
+        self.shard_delay_ns.drain(..)
+    }
+
+    /// Video frames whose block tail arrived short of what parity can rebuild, since the
+    /// last call. A block sends its parity last, so its last shard closes it: without a
+    /// reordered shard still on the way, the frame is lost now, a frame interval before
+    /// the next frame's arrival shows the gap.
+    pub fn take_short_tails(&mut self) -> std::vec::Drain<'_, u32> {
+        self.short_tails.drain(..)
+    }
+
+    /// Video loss by position since the last call. A frame counts once it leaves the
+    /// reorder window, so a shard that only came late is not loss.
+    pub fn take_loss_positions(&mut self) -> LossPositions {
+        std::mem::take(&mut self.video.positions)
+    }
+
+    pub fn set_deliver_partial(&mut self, on: bool) {
+        self.deliver_partial = on;
+        if !on {
+            self.pending_partial = None;
+        }
+    }
+
+    pub fn set_deliver_parts(&mut self, on: bool) {
+        self.deliver_parts = on;
+    }
+
+    /// Take the streams of screens past the first; off drops them and what they hold.
+    pub fn set_screens(&mut self, on: bool) {
+        self.screens_on = on;
+        if !on {
+            for (_, mut w) in self.screens.drain(..) {
+                for f in w.frames.values_mut() {
+                    self.in_flight_bytes -= frame_cost(f);
+                    for block in f.blocks.values_mut() {
+                        reclaim_parity(block, &mut self.recovery_pool, &mut self.in_flight_bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn take_partial(&mut self) -> Option<Frame> {
+        self.pending_partial.take()
+    }
+
+    /// The frame a NACK is out for: a newer frame does not hand it up, since its resend may
+    /// still land.
+    pub fn set_partial_hold(&mut self, frame: Option<u32>) {
+        self.partial_hold = frame;
+    }
+
+    /// Hand chunk-aligned video frame `frame_index` up as a partial now, ahead of its loss
+    /// window; with `need_head`, only once its head block is whole. `true` when handed up.
+    pub fn release_partial(
+        &mut self,
+        frame_index: u32,
+        need_head: bool,
+        stats: &StatsCounters,
+    ) -> bool {
+        let Reassembler {
+            deliver_partial,
+            video,
+            pending_partial,
+            recovery_pool,
+            in_flight_bytes,
+            ..
+        } = self;
+        let ready = video.frames.get(&frame_index).is_some_and(|f| {
+            f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0
+                && f.frame_bytes > 0
+                && (!need_head || head_whole(f))
+        });
+        if !*deliver_partial || !ready {
+            return false;
+        }
+        let mut f = video.frames.remove(&frame_index).expect("checked above");
+        video.completed.insert(frame_index, Done::of(&f));
+        *in_flight_bytes -= frame_cost(&f);
+        if hand_up_partial(frame_index, &mut f, pending_partial, stats) != Some(true) {
+            StatsCounters::add(&stats.frames_dropped, 1);
+        }
+        for block in f.blocks.values_mut() {
+            reclaim_parity(block, recovery_pool, in_flight_bytes);
+        }
+        true
+    }
+
+    /// Assemble frames in `memory` from the next frame on.
+    pub fn set_memory(&mut self, memory: std::sync::Arc<dyn AuMemory>) {
+        self.memory = memory;
+    }
+
+    /// Ingest one already-decrypted packet. The AU when its last block completes, else `None`.
+    ///
+    /// Malformed or non-video: drop, never fatal — must not abort `poll_frame`. A
+    /// reconstruct failure drops the block; the stream recovers at the next keyframe.
+    pub fn push(
+        &mut self,
+        pkt: &[u8],
+        coder: &dyn ErasureCoder,
+        stats: &StatsCounters,
+    ) -> Result<Option<Frame>> {
+        let pushed = decode_v2(pkt, self.clock_origin_ns, &mut self.pts_ref_us)
+            .ok_or(Dropped)
+            .and_then(|(hdr, epoch, stream, body)| {
+                self.push_inner(hdr, epoch, stream, body.len(), Some(body), coder, stats)
+            });
+        Ok(pushed.unwrap_or_else(|Dropped| {
+            StatsCounters::add(&stats.packets_dropped, 1);
+            None
+        }))
+    }
+
+    /// The empty slot a data shard with this clear `header` opens into, or `None` when it must
+    /// take [`Self::push`]: its frame or block is not in flight yet, the geometry differs, or
+    /// the shard is parity or already here. Reads only, because the header is not yet
+    /// authenticated; a failed open leaves the slot unmarked.
+    pub fn data_slot(&mut self, header: &[u8], body_len: usize) -> Option<&mut [u8]> {
+        let mut pts_ref = self.pts_ref_us;
+        let (hdr, epoch, stream) =
+            decode_v2_header(header, body_len, self.clock_origin_ns, &mut pts_ref)?;
+        let g = firewall(&hdr, body_len, &self.limits)?;
+        if g.shard_index >= g.data_shards {
+            return None;
+        }
+        let win = match stream {
+            V2_STREAM_VIDEO => &mut self.video,
+            V2_STREAM_PROBE => &mut self.probe,
+            s => self
+                .screens
+                .iter_mut()
+                .find(|(id, _)| *id == s)
+                .map(|(_, w)| w)?,
+        };
+        let f = win.frames.get_mut(&hdr.frame_index)?;
+        let b = f.blocks.get(&hdr.block_index)?;
+        if f.shard_bytes != g.shard_bytes
+            || f.epoch != epoch
+            || b.done
+            || b.data_shards != g.data_shards
+            || b.recovery_shards != g.recovery_shards
+            || b.base_shard != g.base_shard
+            || b.have_data[g.shard_index]
+        {
+            return None;
+        }
+        let off = (b.base_shard + g.shard_index) * g.shard_bytes;
+        f.buf.get_mut(off..off + g.shard_bytes)
+    }
+
+    /// [`Self::push`] for a shard opened into its [`Self::data_slot`] and authenticated:
+    /// `header` is the packet's clear header and the shard is already in place.
+    pub fn push_placed(
+        &mut self,
+        header: &[u8],
+        body_len: usize,
+        coder: &dyn ErasureCoder,
+        stats: &StatsCounters,
+    ) -> Result<Option<Frame>> {
+        let pushed = decode_v2_header(header, body_len, self.clock_origin_ns, &mut self.pts_ref_us)
+            .ok_or(Dropped)
+            .and_then(|(hdr, epoch, stream)| {
+                self.push_inner(hdr, epoch, stream, body_len, None, coder, stats)
+            });
+        Ok(pushed.unwrap_or_else(|Dropped| {
+            StatsCounters::add(&stats.packets_dropped, 1);
+            None
+        }))
+    }
+
+    /// [`Self::push`] past the header decode, with every counted drop as `Err(Dropped)`.
+    /// `body` is `None` for a shard already opened into its slot.
+    #[allow(clippy::too_many_arguments)]
+    fn push_inner(
+        &mut self,
+        hdr: PacketHeader,
+        epoch: u8,
+        stream: u8,
+        body_len: usize,
+        body: Option<&[u8]>,
+        coder: &dyn ErasureCoder,
+        stats: &StatsCounters,
+    ) -> std::result::Result<Option<Frame>, Dropped> {
+        let lim = self.limits;
+        let g = firewall(&hdr, body_len, &lim).ok_or(Dropped)?;
+        let body = body.map(|b| &b[..g.shard_bytes]);
+        // Another screen's stream: whole frames, in a window of its own.
+        let screen = stream > V2_STREAM_PROBE;
+        if screen && !self.screens_on {
+            return Err(Dropped);
+        }
+
+        // Split so the window, pool, and in-flight budget can be touched while a
+        // frame entry is mutably borrowed.
+        let Reassembler {
+            limits: _,
+            clock_origin_ns: _,
+            pts_ref_us: _,
+            deliver_partial,
+            pending_partial,
+            partial_hold,
+            deliver_parts,
+            video,
+            probe,
+            screens,
+            screens_on: _,
+            recovery_pool,
+            in_flight_bytes,
+            shard_delay_ns,
+            short_tails,
+            memory,
+            heap,
+        } = self;
+        let parts = *deliver_parts && !screen;
+
+        // Probe filler reassembles in its own window so its indexes never move the
+        // video loss window or count as `frames_dropped`.
+        let is_probe = hdr.user_flags & (FLAG_PROBE as u32) != 0;
+        let memory: &dyn AuMemory = if screen || is_probe { heap } else { &**memory };
+        if is_probe {
+            // Probe receive accounting, stamped at the routing decision so video in
+            // flight around the burst cannot contaminate it. Bytes = the whole plaintext packet,
+            // header included. First packet since the pump zeroed the slot claims first-arrival.
+            let now_ns = crate::stats::now_monotonic_ns();
+            StatsCounters::add(&stats.probe_packets_received, 1);
+            StatsCounters::add(
+                &stats.probe_bytes_received,
+                (super::V2_HEADER_LEN + g.shard_bytes) as u64,
+            );
+            let _ = stats.probe_first_arrival_ns.compare_exchange(
+                0,
+                now_ns,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            stats
+                .probe_last_arrival_ns
+                .store(now_ns, std::sync::atomic::Ordering::Relaxed);
+            // The gap to the previous probe packet, and a key that must not go backwards.
+            let prev = stats
+                .probe_prev_arrival_ns
+                .swap(now_ns, std::sync::atomic::Ordering::Relaxed);
+            if prev != 0 {
+                let i = crate::stats::probe_gap_bucket(now_ns.saturating_sub(prev) / 1_000);
+                stats.probe_gap_buckets[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let key = (u64::from(hdr.frame_index) << 16 | u64::from(hdr.shard_index)) + 1;
+            let last = stats
+                .probe_last_key
+                .swap(key, std::sync::atomic::Ordering::Relaxed);
+            if last != 0 && key < last {
+                StatsCounters::add(&stats.probe_reorders, 1);
+            }
+        } else if hdr.shard_index < hdr.data_shards {
+            // DATA payload only. ABR compares delivered throughput to an encoder
+            // target, so parity, headers, and probe filler stay out of the numerator.
+            StatsCounters::add(&stats.media_bytes_received, g.shard_bytes as u64);
+        }
+        // Only the first screen's video counts drops, delivers partials and is timed.
+        let primary = !is_probe && !screen;
+        let win = if is_probe {
+            probe
+        } else if !screen {
+            video
+        } else if let Some(i) = screens.iter().position(|(id, _)| *id == stream) {
+            &mut screens[i].1
+        } else if screens.len() + 1 < crate::quic::v2::msg::SCREENS_MAX {
+            screens.push((stream, ReassemblyWindow::default()));
+            &mut screens.last_mut().expect("just pushed").1
+        } else {
+            return Err(Dropped);
+        };
+        win.advance_window(
+            hdr.frame_index,
+            hdr.pts_ns,
+            stats,
+            primary,
+            recovery_pool,
+            in_flight_bytes,
+            (*deliver_partial && primary).then_some(pending_partial),
+            partial_hold.filter(|_| primary),
+        );
+
+        // Terminated (emitted or abandoned): drop. Recovery shards of an early-complete
+        // frame land here; a late original nets `fec_late_shards`.
+        if let Some(done) = win.completed.get_mut(&hdr.frame_index) {
+            done.straggler(&g, stats);
+            return Err(Dropped);
+        }
+        if win.is_stale(hdr.frame_index, hdr.pts_ns) {
+            return Err(Dropped);
+        }
+
+        let buf_len = g.need_shards * g.shard_bytes;
+        let frame = match win.frames.entry(hdr.frame_index) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // A shard opened in place needs the frame it was opened into.
+                if body.is_none() {
+                    return Err(Dropped);
+                }
+                // Several max-size frames already in flight. Dropping this packet
+                // is milder than the loss window killing the frame moments later.
+                charge(in_flight_bytes, buf_len, &lim)?;
+                // This packet is the frame's first: timed before the frame's own
+                // pacing spread, and before FEC knows whether it will ever complete.
+                if primary && shard_delay_ns.len() < SHARD_DELAY_SAMPLES {
+                    let delay_ns = crate::quic::wall_clock_ns() as i64 - hdr.pts_ns as i64;
+                    shard_delay_ns.push((hdr.pts_ns, delay_ns));
+                }
+                e.insert(FrameBuf {
+                    shard_bytes: g.shard_bytes,
+                    // Slice sentinel `frame_bytes` is the block base, not AU size.
+                    // Stay 0 until the final block pins the totals.
+                    frame_bytes: if g.sentinel { 0 } else { g.frame_bytes },
+                    block_count: g.block_count,
+                    pts_ns: hdr.pts_ns,
+                    user_flags: hdr.user_flags,
+                    epoch,
+                    next_part_block: 0,
+                    delivered_shards: 0,
+                    buf: AuBuf::take(memory, buf_len),
+                    blocks: HashMap::new(),
+                    blocks_ok: 0,
+                    short_tail: false,
+                })
+            }
+        };
+        // First packet pinned shard size; a later in-bounds but different size would
+        // compute different offsets into one buffer. Also keeps a mid-session
+        // `shard_payload` change from landing a straggler in the wrong geometry.
+        if frame.shard_bytes != g.shard_bytes || frame.epoch != epoch {
+            return Err(Dropped);
+        }
+        match pin_totals(frame, &g) {
+            Pin::Keep => {}
+            Pin::Drop => return Err(Dropped),
+            Pin::KillFrame => {
+                let mut f = win
+                    .frames
+                    .remove(&hdr.frame_index)
+                    .expect("frame entry exists");
+                *in_flight_bytes -= frame_cost(&f);
+                // Remember the index (late-shard memory, like an aged-out frame) so
+                // stragglers cannot resurrect it. Count the drop: recovery-keyframe
+                // is the right outcome for a frame destroyed by a bad header.
+                win.completed.insert(hdr.frame_index, Done::of(&f));
+                for block in f.blocks.values_mut() {
+                    reclaim_parity(block, recovery_pool, in_flight_bytes);
+                }
+                if primary {
+                    StatsCounters::add(&stats.frames_dropped, 1);
+                }
+                return Err(Dropped);
+            }
+        }
+        // Grow to this packet's proven extent. A streamed frame opens on whichever
+        // block arrived first; the buffer never shrinks (completion truncates).
+        // Re-check the budget: growth commits memory too.
+        if buf_len > frame.buf.len() {
+            charge(in_flight_bytes, buf_len - frame.buf.len(), &lim)?;
+            frame.buf.resize(buf_len, memory);
+        }
+
+        {
+            let FrameBuf {
+                buf,
+                blocks,
+                blocks_ok,
+                short_tail,
+                ..
+            } = &mut *frame;
+            // First packet sizes the block. `data_shards` is already pinned;
+            // `recovery_shards` varies per frame (adaptive FEC) — later packets must match.
+            let block = match blocks.entry(hdr.block_index) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    if body.is_none() {
+                        return Err(Dropped);
+                    }
+                    // Block state is sized from header shard counts — same in-flight budget
+                    // as the frame buffer, or a slice-streamed frame mints unmetered state.
+                    let cost = block_state_bytes(g.data_shards, g.recovery_shards);
+                    charge(in_flight_bytes, cost, &lim)?;
+                    e.insert(BlockState {
+                        data_shards: g.data_shards,
+                        recovery_shards: g.recovery_shards,
+                        base_shard: g.base_shard,
+                        have_data: vec![false; g.data_shards],
+                        data_received: 0,
+                        recovery: vec![None; g.recovery_shards],
+                        recovery_received: 0,
+                        done: false,
+                        reconstructed: false,
+                    })
+                }
+            };
+            // Slice-stream base is per-block wire input, like `recovery_shards`: two
+            // packets of "one" block must not place shards at different offsets. The
+            // explicit K check keeps a later firewall change from turning `have_data`
+            // and recovery-slot math into an OOB panic.
+            if block.recovery_shards != g.recovery_shards
+                || block.base_shard != g.base_shard
+                || block.data_shards != g.data_shards
+            {
+                return Err(Dropped);
+            }
+            if block.done {
+                if body.is_none() {
+                    return Err(Dropped);
+                }
+                // Late original after reconstruct (`!have_data`): net out of
+                // `fec_recovered_shards`. Covers multi-block frames still in flight.
+                // `have_data` = duplicate; a failed reconstruct never counted missing.
+                if block.reconstructed
+                    && g.shard_index < block.data_shards
+                    && !block.have_data[g.shard_index]
+                {
+                    block.have_data[g.shard_index] = true; // arrived — dedup a later re-dup
+                    StatsCounters::add(&stats.fec_late_shards, 1);
+                } else if g.shard_index >= block.data_shards {
+                    // Parity the block no longer needs still arrived: not tail loss.
+                    block.recovery_received += 1;
+                }
+                return Ok(None);
+            }
+
+            let shard_bytes = g.shard_bytes;
+            if g.shard_index < g.data_shards {
+                // Lands at its final AU offset — the only copy past decrypt.
+                if !block.have_data[g.shard_index] {
+                    let off = (block.base_shard + g.shard_index) * shard_bytes;
+                    // Firewall + pin keep accepted bases in range; same refactor
+                    // insurance as the `data_shards` check above.
+                    if off + shard_bytes > buf.len() {
+                        return Err(Dropped);
+                    }
+                    // `None`: opened straight into this slot already.
+                    if let Some(body) = body {
+                        buf[off..off + shard_bytes].copy_from_slice(body);
+                    }
+                    block.have_data[g.shard_index] = true;
+                    block.data_received += 1;
+                }
+            } else {
+                let Some(body) = body else {
+                    return Err(Dropped);
+                };
+                let slot = g.shard_index - g.data_shards;
+                if block.recovery[slot].is_none() {
+                    // Parity is a heap buffer sized from the wire. Meter it or a
+                    // max-recovery frame exceeds `4 × max_frame_bytes`. Soft refuse:
+                    // the block cannot reconstruct and the frame ages out.
+                    charge(in_flight_bytes, body.len(), &lim)?;
+                    let mut rb = recovery_pool.pop().unwrap_or_default();
+                    rb.clear();
+                    rb.extend_from_slice(body);
+                    block.recovery[slot] = Some(rb);
+                    block.recovery_received += 1;
+                }
+            }
+
+            if block.data_received + block.recovery_received >= block.data_shards {
+                let missing = block.data_shards - block.data_received;
+                let outcome = if missing == 0 {
+                    Ok(()) // originals already in place
+                } else {
+                    let base = block.base_shard * shard_bytes;
+                    let region = &mut buf[base..base + block.data_shards * shard_bytes];
+                    let mut slots: Vec<&mut [u8]> = region.chunks_mut(shard_bytes).collect();
+                    let parity: Vec<(usize, &[u8])> = block
+                        .recovery
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(j, s)| s.as_deref().map(|b| (j, b)))
+                        .collect();
+                    coder.reconstruct_into(
+                        block.recovery_shards,
+                        &mut slots,
+                        &block.have_data,
+                        &parity,
+                    )
+                };
+                // Parity is spent either way — reclaim for the next block.
+                reclaim_parity(block, recovery_pool, in_flight_bytes);
+                block.done = true;
+                // In-order, `missing` is true loss. Under reorder the early trigger
+                // also "recovers" shards still in flight; their arrival counts
+                // `fec_late_shards` so estimators can net the two. Corrupt shards
+                // that passed the header checks discard the block, never `blocks_ok`.
+                outcome.map_err(|_| Dropped)?;
+                block.reconstructed = missing > 0;
+                StatsCounters::add(&stats.fec_recovered_shards, missing as u64);
+                *blocks_ok += 1;
+            } else if g.shard_index + 1 == g.data_shards + g.recovery_shards
+                && primary
+                && !*short_tail
+            {
+                *short_tail = true;
+                if short_tails.len() < SHORT_TAIL_SAMPLES {
+                    short_tails.push(hdr.frame_index);
+                }
+            }
+        }
+
+        // Use the FRAME's pinned block count, not this header. A streamed frame
+        // can complete on a reordered sentinel (`block_count == 0` in the header)
+        // after the final block pinned; it cannot complete before (`0 != blocks_ok`).
+        if frame.block_count != 0 && frame.blocks_ok == frame.block_count {
+            let done = win.frames.remove(&hdr.frame_index).unwrap();
+            win.completed.insert(hdr.frame_index, Done::of(&done));
+            *in_flight_bytes -= frame_cost(&done); // before `into_frame` truncates
+
+            // The index is already in `completed`, so an untiled frame counts its drop.
+            if !tiles(&done) {
+                if primary {
+                    StatsCounters::add(&stats.frames_dropped, 1);
+                }
+                return Err(Dropped);
+            }
+            // Probe filler stays whole: the speed test accounts AUs, not slices.
+            let mut frame = done.into_frame(hdr.frame_index, parts && !is_probe);
+            frame.stream = stream;
+            return Ok(Some(frame));
+        }
+        Ok(if parts && !is_probe {
+            frame.next_prefix_part(hdr.frame_index)
+        } else {
+            None
+        })
+    }
+
+    /// Drop all in-flight state in both index spaces. After
+    /// [`Session::flush_backlog`](crate::session::Session::flush_backlog) the remaining
+    /// shards are gone and `newest_frame` points into the discarded past. The video
+    /// indices in flight or recently terminated stay remembered, with nothing owed: a
+    /// shard still on the wire for a frame the flush tore, or the parity of one it had
+    /// just finished, is a straggler, not a frame lost on the link.
+    pub fn reset(&mut self) {
+        let video = &self.video;
+        let completed = video.frames.keys().chain(video.completed.keys());
+        self.video = ReassemblyWindow {
+            completed: completed.map(|&idx| (idx, Done::default())).collect(),
+            ..ReassemblyWindow::default()
+        };
+        self.probe = ReassemblyWindow::default();
+        self.screens.clear();
+        // Dropped buffers return to the allocator, not the pool — flush is rare.
+        self.in_flight_bytes = 0;
+        // A parked partial is from the discarded past too; leaving it would hand it
+        // up as the first frame after jump-to-live.
+        self.pending_partial = None;
+        // Samples of the backlog that was just thrown away describe a queue the
+        // session no longer has.
+        self.shard_delay_ns.clear();
+        self.short_tails.clear();
+    }
+
+    /// Test-only in-flight byte commitment. Mixed-geometry tests assert it returns
+    /// to zero once every frame has terminated — drift here wedges the budget.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight_bytes
+    }
+
+    /// `(missing, recovery)` for an in-flight video frame: shards it still needs past
+    /// what its parity can rebuild, and the parity shards it carries. A block with no
+    /// shard in yet counts all its data as missing. `None` when no shard of the frame
+    /// is in flight, or a streamed frame has not pinned its size.
+    /// Video frame `frame_index` is still being reassembled: neither emitted nor abandoned.
+    pub fn frame_in_flight(&self, frame_index: u32) -> bool {
+        self.video.frames.contains_key(&frame_index)
+    }
+
+    /// The shards an in-flight video frame still lacks, at most `max`: its missing data
+    /// shards by AU index, then its missing parity, numbered after all the data in block
+    /// order. `None` for a frame not in flight, or when a block never showed a shard (its
+    /// geometry is unknown).
+    pub fn missing_shards(&self, frame_index: u32, max: usize) -> Option<Vec<u16>> {
+        let f = self.video.frames.get(&frame_index)?;
+        if f.frame_bytes == 0 || f.blocks.len() != f.block_count {
+            return None;
+        }
+        let mut blocks: Vec<&BlockState> = f.blocks.values().collect();
+        blocks.sort_by_key(|b| b.base_shard);
+        let total_data = f.frame_bytes.div_ceil(f.shard_bytes);
+        let (mut data, mut parity, mut parity_at) = (Vec::new(), Vec::new(), total_data);
+        for b in blocks {
+            if !b.done {
+                let lacks = |have: bool, i: usize| (!have).then_some(i);
+                let d = b.have_data.iter().enumerate();
+                data.extend(d.filter_map(|(i, &h)| lacks(h, b.base_shard + i)));
+                let p = b.recovery.iter().enumerate();
+                parity.extend(p.filter_map(|(j, r)| lacks(r.is_some(), parity_at + j)));
+            }
+            parity_at += b.recovery_shards;
+        }
+        data.extend(parity);
+        data.truncate(max);
+        data.into_iter().map(|i| u16::try_from(i).ok()).collect()
+    }
+
+    pub fn missing_beyond_parity(&self, frame_index: u32) -> Option<(u32, u32)> {
+        let f = self.video.frames.get(&frame_index)?;
+        if f.frame_bytes == 0 {
+            return None;
+        }
+        let total_data = f.frame_bytes.div_ceil(f.shard_bytes).max(1);
+        let (mut seen, mut missing, mut recovery) = (0, 0, 0);
+        for b in f.blocks.values() {
+            seen += b.data_shards;
+            recovery += b.recovery_shards;
+            if !b.done {
+                missing += b
+                    .data_shards
+                    .saturating_sub(b.data_received + b.recovery_received);
+            }
+        }
+        missing += total_data.saturating_sub(seen);
+        Some((missing as u32, recovery as u32))
+    }
+}
+
+/// Data shards at each end of an AU that count as its head and its tail: about 16 KiB,
+/// the first group a paced sender puts on the wire.
+pub(crate) const LOSS_EDGE_SHARDS: u32 = 12;
+
+/// Where a missing data shard `i` of an AU with `total` data shards fell: `0` head, `1`
+/// middle, `2` tail. An AU too small to have a middle has no head or tail either: there
+/// random loss would read as a place.
+pub(crate) fn loss_position(i: u32, total: u32) -> usize {
+    if total <= 2 * LOSS_EDGE_SHARDS {
+        1
+    } else if i < LOSS_EDGE_SHARDS {
+        0
+    } else if i + LOSS_EDGE_SHARDS >= total {
+        2
+    } else {
+        1
+    }
+}
+
+/// A terminated frame: what it lacked when it terminated, settled as stragglers land, and
+/// counted by position once it leaves the reorder window ([`Self::settle`]).
+#[derive(Default)]
+struct Done {
+    /// AU data indexes parity restored. A later arrival was late, not lost: it nets
+    /// `fec_recovered_shards` into `fec_late_shards`, once.
+    restored: Vec<u32>,
+    total_data: u32,
+    /// Missing data shards by [`loss_position`].
+    missing: [u32; 3],
+    /// Parity not yet seen. Parity leaves last, so most of it lands after the frame is done.
+    parity_owed: u32,
+}
+
+impl Done {
+    /// What `f` lacked when it terminated.
+    fn of(f: &FrameBuf) -> Done {
+        let mut d = Done::default();
+        let covered = f
+            .blocks
+            .values()
+            .map(|b| b.base_shard + b.data_shards)
+            .max();
+        d.total_data = match f.frame_bytes {
+            0 => covered.unwrap_or(0),
+            n => n.div_ceil(f.shard_bytes),
+        } as u32;
+        for b in f.blocks.values() {
+            d.parity_owed += b.recovery_shards.saturating_sub(b.recovery_received) as u32;
+            for (i, _) in b.have_data.iter().enumerate().filter(|(_, have)| !**have) {
+                let idx = (b.base_shard + i) as u32;
+                d.missing[loss_position(idx, d.total_data)] += 1;
+                if b.reconstructed {
+                    d.restored.push(idx);
+                }
+            }
+        }
+        d
+    }
+
+    /// A shard of this frame arrived after it terminated.
+    fn straggler(&mut self, g: &Geom, stats: &StatsCounters) {
+        if g.shard_index >= g.data_shards {
+            self.parity_owed = self.parity_owed.saturating_sub(1);
+            return;
+        }
+        // Remove the match so wire duplicates count nothing. No probe/video split.
+        let idx = (g.base_shard + g.shard_index) as u32;
+        if let Some(pos) = self.restored.iter().position(|&s| s == idx) {
+            self.restored.swap_remove(pos);
+            StatsCounters::add(&stats.fec_late_shards, 1);
+            let slot = &mut self.missing[loss_position(idx, self.total_data)];
+            *slot = slot.saturating_sub(1);
+        }
+    }
+
+    /// Out of the reorder window: what never arrived, by position. All parity is the tail.
+    fn settle(&self, p: &mut LossPositions) {
+        let [head, mid, tail] = self.missing;
+        p.head = p.head.saturating_add(head);
+        p.mid = p.mid.saturating_add(mid);
+        p.tail = p.tail.saturating_add(tail + self.parity_owed);
+    }
+}
+
+/// A packet [`Reassembler::push`] counts in `packets_dropped`.
+struct Dropped;
+
+/// Header geometry [`firewall`] passed: every size `push` allocates or indexes on.
+#[derive(Clone, Copy, Debug)]
+struct Geom {
+    shard_bytes: usize,
+    data_shards: usize,
+    recovery_shards: usize,
+    shard_index: usize,
+    block_idx: usize,
+    block_count: usize,
+    frame_bytes: usize,
+    /// Sentinel (`block_count == 0`): a non-final block of an AU whose total is still
+    /// unknown.
+    sentinel: bool,
+    /// Buffer extent this packet proves, in shards.
+    need_shards: usize,
+    /// Where this block's data shards start in the AU.
+    base_shard: usize,
+}
+
+/// Bound every attacker-controlled header field before anything allocates on it.
+/// `None` = drop the packet.
+///
+/// Reads [`decode_v2`]'s slice form: a sentinel carries its block's base in `frame_bytes`,
+/// the final block the frame's totals. `shard_bytes` is a range, not equality: geometry is
+/// per-frame, and `push` rejects a mid-frame change. Even size matches `Config::validate`.
+/// Reads only the header, the length of the bytes after it and the limits, so it is tested
+/// directly.
+fn firewall(hdr: &PacketHeader, body_len: usize, lim: &ReassemblerLimits) -> Option<Geom> {
+    let shard_bytes = hdr.shard_bytes as usize;
+    let data_shards = hdr.data_shards as usize;
+    let recovery_shards = hdr.recovery_shards as usize;
+    let total = data_shards + recovery_shards;
+    let shard_index = hdr.shard_index as usize;
+    let block_count = hdr.block_count as usize;
+    let frame_bytes = hdr.frame_bytes as usize;
+    if shard_bytes < lim.min_shard_bytes
+        || shard_bytes > lim.max_shard_bytes
+        || shard_bytes % 2 != 0
+        || body_len < shard_bytes
+        || data_shards == 0
+        || data_shards > lim.max_data_shards
+        || total == 0
+        || total > lim.max_total_shards
+        || shard_index >= total
+        || frame_bytes > lim.max_frame_bytes
+    {
+        return None;
+    }
+    let sentinel = block_count == 0;
+    let block_idx = hdr.block_index as usize;
+    // Per-packet shard-size ceiling for the block cap and buffer extent. Allocation
+    // uses only what this packet proves (`need_shards`); the in-flight budget
+    // bounds the rest — one datagram must not commit `max_frame_bytes`.
+    let total_data_max = lim.max_frame_bytes.div_ceil(shard_bytes).max(1);
+    // Every non-final block is at least `min(MIN_STREAM_BLOCK_SHARDS, max_data_per_block)`
+    // data shards, so a max-size frame bounds the count (+ final + rounding). Matches the
+    // sender.
+    let block_cap = total_data_max
+        / super::packetize::MIN_STREAM_BLOCK_SHARDS.min(lim.max_data_shards.max(1))
+        + 2;
+    let total_data = frame_bytes.div_ceil(shard_bytes).max(1);
+    if sentinel {
+        // Shard-aligned base; the block's range must fit the negotiated frame budget.
+        if frame_bytes % shard_bytes != 0
+            || frame_bytes + data_shards * shard_bytes > lim.max_frame_bytes
+            || block_idx + 1 >= block_cap
+        {
+            return None;
+        }
+    } else if block_count > block_cap || block_idx + 1 != block_count || data_shards > total_data {
+        // The final block must be last and its shards must sit in the frame
+        // (`base = total_data − data_shards`).
+        return None;
+    }
+    // A sentinel has no total but pins its own block at its wire base. Never
+    // `total_data_max` (8–64 MiB): every AU would open at the ceiling and exhaust the
+    // in-flight budget after ~3 frames.
+    let (base_shard, need_shards) = if sentinel {
+        let base = frame_bytes / shard_bytes;
+        (base, base + data_shards)
+    } else {
+        (total_data - data_shards, total_data)
+    };
+    Some(Geom {
+        shard_bytes,
+        data_shards,
+        recovery_shards,
+        shard_index,
+        block_idx,
+        block_count,
+        frame_bytes,
+        sentinel,
+        need_shards: need_shards.min(total_data_max),
+        base_shard,
+    })
+}
+
+/// Commit `n` more bytes to the in-flight budget, or drop the packet if that would
+/// cross [`IN_FLIGHT_BUF_FACTOR`] × `max_frame_bytes`.
+fn charge(
+    in_flight_bytes: &mut usize,
+    n: usize,
+    lim: &ReassemblerLimits,
+) -> std::result::Result<(), Dropped> {
+    if *in_flight_bytes + n > IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes {
+        return Err(Dropped);
+    }
+    *in_flight_bytes += n;
+    Ok(())
+}
+
+/// What a packet's totals do to its frame, from [`pin_totals`].
+enum Pin {
+    Keep,
+    Drop,
+    /// The totals contradict blocks already placed: the whole frame goes.
+    KillFrame,
+}
+
+/// Check `g` against `frame`'s pinned totals, pinning them on the first final block.
+///
+/// A sentinel has no totals: unpinned it matches by construction; pinned (either
+/// order — reorder is normal) it must still be non-final and sit below the final block.
+/// Final-block totals retro-validate every sentinel-created block. Totals that put a
+/// landed block out of range kill the frame: landed offsets can't be trusted, so
+/// delivering would splice the decoder.
+fn pin_totals(frame: &mut FrameBuf, g: &Geom) -> Pin {
+    if g.sentinel {
+        if frame.block_count != 0 {
+            // The pinning packet created the final block. A later sentinel must sit
+            // strictly below its base or it overwrites landed shards.
+            let final_k = frame
+                .blocks
+                .get(&((frame.block_count - 1) as u16))
+                .map(|b| b.data_shards)
+                .unwrap_or(0);
+            let pinned_total = frame.frame_bytes.div_ceil(g.shard_bytes).max(1);
+            if g.block_idx + 1 >= frame.block_count
+                || g.base_shard + g.data_shards > pinned_total - final_k
+            {
+                return Pin::Drop;
+            }
+        }
+        return Pin::Keep;
+    }
+    if frame.block_count != 0 {
+        return if frame.block_count != g.block_count || frame.frame_bytes != g.frame_bytes {
+            Pin::Drop
+        } else {
+            Pin::Keep
+        };
+    }
+    // Every landed sentinel must be a non-final index and sit strictly below the final
+    // base. Sentinel overlap is not policed here: placement stays in bounds and the
+    // tiling check refuses to deliver gaps.
+    let lied = frame.blocks.iter().any(|(&bi, b)| {
+        bi as usize + 1 >= g.block_count || b.base_shard + b.data_shards > g.base_shard
+    });
+    if lied {
+        return Pin::KillFrame;
+    }
+    frame.frame_bytes = g.frame_bytes;
+    frame.block_count = g.block_count;
+    Pin::Keep
+}
+
+/// Hand `f` up through `sink` (newest-wins) when it is chunk-aligned and its size is known:
+/// received shards at their offsets, holes zeroed and counted in `partial_shards_lost`.
+/// `Some(true)` when it went up with its head block, the one at base 0, whole: a picture with
+/// patches missing, not a lost frame. `None` when it did not go up: its holes are uncounted.
+fn hand_up_partial(
+    idx: u32,
+    f: &mut FrameBuf,
+    sink: &mut Option<Frame>,
+    stats: &StatsCounters,
+) -> Option<bool> {
+    // `frame_bytes > 0` also excludes an unpinned streamed frame (total still the 0 sentinel):
+    // truncate-to-0 would emit empty.
+    if f.user_flags & USER_FLAG_CHUNK_ALIGNED == 0 || f.frame_bytes == 0 {
+        return None;
+    }
+    StatsCounters::add(&stats.partial_shards_lost, unrepaired(f));
+    zero_holes(f);
+    let mut buf = std::mem::replace(&mut f.buf, Vec::new().into());
+    buf.truncate(f.frame_bytes);
+    let newer = sink
+        .as_ref()
+        .is_none_or(|p| idx.wrapping_sub(p.frame_index) <= u32::MAX / 2);
+    if newer {
+        *sink = Some(Frame {
+            data: buf,
+            frame_index: idx,
+            pts_ns: f.pts_ns,
+            flags: f.user_flags,
+            epoch: f.epoch,
+            stream: 0,
+            complete: false,
+            part: None,
+            received_ns: 0, // stamped by Session::poll_frame at the session boundary
+            new_format: None,
+        });
+    }
+    Some(head_whole(f))
+}
+
+/// Retire an aged-out `f`, handing it up through `sink` when it can go as a partial (whose
+/// holes [`hand_up_partial`] counts). `(dead, holes)`: `dead` is 1 unless it went up as a
+/// picture; `holes` is what it adds to `dead_shards_lost`, nonzero only if it did not go up.
+fn retire(
+    idx: u32,
+    f: &mut FrameBuf,
+    sink: Option<&mut Option<Frame>>,
+    stats: &StatsCounters,
+) -> (u64, u64) {
+    match sink.and_then(|sink| hand_up_partial(idx, f, sink, stats)) {
+        Some(pictured) => (u64::from(!pictured), 0),
+        None => (1, unrepaired(f)),
+    }
+}
+
+/// Data shards `f` never got in blocks no parity rebuilt, with its never-seen blocks once its
+/// size is known. A shard parity rebuilt counts in `fec_recovered_shards` instead.
+fn unrepaired(f: &FrameBuf) -> u64 {
+    let seen: usize = f.blocks.values().map(|b| b.data_shards).sum();
+    let total = match f.frame_bytes {
+        0 => seen,
+        n => n.div_ceil(f.shard_bytes),
+    };
+    let missing: usize = f
+        .blocks
+        .values()
+        .filter(|b| !(b.done && b.reconstructed))
+        .map(|b| b.have_data.iter().filter(|&&h| !h).count())
+        .sum();
+    (missing + total.saturating_sub(seen)) as u64
+}
+
+/// The block at base 0 arrived or was rebuilt.
+fn head_whole(f: &FrameBuf) -> bool {
+    f.blocks.values().any(|b| b.base_shard == 0 && b.done)
+}
+
+/// Zero every shard of `f` that neither arrived nor was rebuilt: frame memory is reused, so
+/// a hole holds a previous AU's bytes until a partial hands it up.
+fn zero_holes(f: &mut FrameBuf) {
+    let sb = f.shard_bytes;
+    let mut have = vec![false; f.buf.len() / sb];
+    for b in f.blocks.values() {
+        let rebuilt = b.done && b.reconstructed;
+        for (i, &h) in b.have_data.iter().enumerate() {
+            if let Some(slot) = have.get_mut(b.base_shard + i) {
+                *slot |= h || rebuilt;
+            }
+        }
+    }
+    for (i, _) in have.iter().enumerate().filter(|(_, h)| !**h) {
+        f.buf[i * sb..(i + 1) * sb].fill(0);
+    }
+}
+
+/// A slice-streamed frame's blocks tile `0..total_data`, each starting where the last
+/// ended. Bases were range-checked on arrival, but a gap or overlap would still hand up
+/// wrong bytes marked complete, with no loss counter moving.
+fn tiles(f: &FrameBuf) -> bool {
+    let total_data = f.frame_bytes.div_ceil(f.shard_bytes).max(1);
+    let mut next = 0usize;
+    (0..f.block_count).all(|bi| match f.blocks.get(&(bi as u16)) {
+        Some(b) if b.base_shard == next => {
+            next += b.data_shards;
+            true
+        }
+        _ => false,
+    }) && next == total_data
+}
+
+impl FrameBuf {
+    /// The completed AU, trailing-shard zero padding trimmed. With `parts`, a
+    /// slice-progressive consumer already holds the prefix: only the suffix goes up
+    /// (`last`), or the whole AU if nothing was delivered early.
+    fn into_frame(mut self, frame_index: u32, parts: bool) -> Frame {
+        self.buf.truncate(self.frame_bytes);
+        let (data, part) = if parts {
+            let lo = (self.delivered_shards * self.shard_bytes).min(self.frame_bytes);
+            let part = FramePart {
+                offset: lo as u32,
+                first: lo == 0,
+                last: true,
+            };
+            if lo == 0 {
+                (self.buf, Some(part))
+            } else {
+                (self.buf[lo..].to_vec().into(), Some(part))
+            }
+        } else {
+            (self.buf, None)
+        };
+        Frame {
+            data,
+            frame_index,
+            pts_ns: self.pts_ns,
+            flags: self.user_flags,
+            epoch: self.epoch,
+            stream: 0,
+            complete: true,
+            part,
+            received_ns: 0, // stamped by Session::poll_frame at the session boundary
+            new_format: None,
+        }
+    }
+
+    /// The prefix part this packet unlocked, if its block extended the contiguous run
+    /// of finished blocks (possibly unlocking out-of-order ones after it). Only
+    /// successful completes count; it stops short of the final block, whose
+    /// zero-padded tail is trimmed only at completion.
+    fn next_prefix_part(&mut self, frame_index: u32) -> Option<Frame> {
+        let start = self.delivered_shards;
+        while let Some(b) = self.blocks.get(&self.next_part_block) {
+            if !(b.done && (b.reconstructed || b.data_received == b.data_shards)) {
+                break;
+            }
+            if self.block_count != 0 && (self.next_part_block as usize) + 1 >= self.block_count {
+                break;
+            }
+            // A prefix is only a prefix if this block starts where the last ended.
+            // An in-bounds but non-contiguous base must not extend it.
+            if b.base_shard != self.delivered_shards {
+                break;
+            }
+            self.delivered_shards = b.base_shard + b.data_shards;
+            self.next_part_block += 1;
+        }
+        if self.delivered_shards == start {
+            return None;
+        }
+        let (lo, hi) = (
+            start * self.shard_bytes,
+            self.delivered_shards * self.shard_bytes,
+        );
+        Some(Frame {
+            data: self.buf[lo..hi].to_vec().into(),
+            frame_index,
+            pts_ns: self.pts_ns,
+            flags: self.user_flags,
+            epoch: self.epoch,
+            stream: 0,
+            complete: false,
+            part: Some(FramePart {
+                offset: lo as u32,
+                first: start == 0,
+                last: false,
+            }),
+            received_ns: 0, // stamped by Session::poll_frame at the session boundary
+            new_format: None,
+        })
+    }
+}
+
+impl ReassemblyWindow {
+    /// Track the newest frame. Declare incomplete frames outside [`LOSS_WINDOW_NS`]
+    /// or [`HARD_LOSS_WINDOW`] lost (video: `frames_dropped`, which requests a
+    /// recovery keyframe, and the holes of those no partial took in `dead_shards_lost`).
+    /// Prune `completed` to [`REORDER_WINDOW`].
+    #[allow(clippy::too_many_arguments)]
+    fn advance_window(
+        &mut self,
+        frame_index: u32,
+        pts_ns: u64,
+        stats: &StatsCounters,
+        count_drops: bool,
+        recovery_pool: &mut Vec<Vec<u8>>,
+        in_flight_bytes: &mut usize,
+        // `Some(sink)` = deliver CHUNK_ALIGNED frames instead of only dropping them.
+        mut partial_sink: Option<&mut Option<Frame>>,
+        // The frame a NACK is out for: it waits for its loss window.
+        hold: Option<u32>,
+    ) {
+        // A packet of a newer frame than any yet: the sender finished the frames before it.
+        let opened = self
+            .newest_frame
+            .is_none_or(|(n, _)| n != frame_index && frame_index.wrapping_sub(n) <= u32::MAX / 2);
+        let (newest, newest_pts) = match self.newest_frame {
+            // Newer iff within the forward half of the index space.
+            Some((n, p)) if frame_index.wrapping_sub(n) > u32::MAX / 2 => (n, p),
+            _ => (frame_index, pts_ns),
+        };
+        self.newest_frame = Some((newest, newest_pts));
+        // Every verdict below hangs off `newest`, which only a newer frame moves: a shard of a
+        // frame already seen changes nothing.
+        if !opened {
+            return;
+        }
+
+        let completed = &mut self.completed;
+        let partial_on = partial_sink.is_some();
+        let (mut dead, mut holes) = (0u64, 0u64);
+        self.frames.retain(|&idx, f| {
+            let chunked = partial_on && f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0;
+            // Chunk-aligned partials use [`PARTIAL_WINDOW_NS`]; everything else the full window.
+            let window_ns = if chunked {
+                PARTIAL_WINDOW_NS
+            } else {
+                LOSS_WINDOW_NS
+            };
+            let overtaken = chunked && opened && idx != frame_index && Some(idx) != hold;
+            let keep = !(overtaken && f.frame_bytes > 0)
+                && newest.wrapping_sub(idx) <= HARD_LOSS_WINDOW
+                && newest_pts.saturating_sub(f.pts_ns) <= window_ns;
+            if !keep {
+                // Remember the index so a straggler cannot resurrect the frame
+                // (which would re-allocate and double-count the drop). Restored
+                // shards join late-shard memory exactly like an emitted frame.
+                completed.insert(idx, Done::of(f));
+                *in_flight_bytes -= frame_cost(f);
+                let (d, h) = retire(idx, f, partial_sink.as_deref_mut(), stats);
+                (dead, holes) = (dead + d, holes + h);
+                for block in f.blocks.values_mut() {
+                    reclaim_parity(block, recovery_pool, in_flight_bytes);
+                }
+            }
+            keep
+        });
+        if dead > 0 && count_drops {
+            StatsCounters::add(&stats.frames_dropped, dead);
+            StatsCounters::add(&stats.dead_shards_lost, holes);
+        }
+        let positions = &mut self.positions;
+        self.completed.retain(|&idx, done| {
+            let keep = newest.wrapping_sub(idx) <= REORDER_WINDOW;
+            if !keep && count_drops {
+                done.settle(positions);
+            }
+            keep
+        });
+    }
+
+    /// Frame sits outside the loss window. Accepting a shard would only allocate a
+    /// buffer that the next [`advance_window`](Self::advance_window) immediately drops.
+    fn is_stale(&self, frame_index: u32, pts_ns: u64) -> bool {
+        match self.newest_frame {
+            Some((n, newest_pts)) => {
+                let behind = n.wrapping_sub(frame_index);
+                behind <= u32::MAX / 2
+                    && (behind > HARD_LOSS_WINDOW
+                        || newest_pts.saturating_sub(pts_ns) > LOSS_WINDOW_NS)
+            }
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    /// A parked partial is part of the discarded past and must not survive
+    /// [`Reassembler::reset`] as the first frame after jump-to-live.
+    #[test]
+    fn reset_drops_a_parked_partial() {
+        let mut r = Reassembler::new(
+            ReassemblerLimits {
+                min_shard_bytes: 64,
+                max_shard_bytes: 64,
+                max_data_shards: 8,
+                max_total_shards: 16,
+                max_frame_bytes: 4096,
+            },
+            0,
+        );
+        r.pending_partial = Some(Frame {
+            data: vec![0u8; 64].into(),
+            frame_index: 7,
+            pts_ns: 1,
+            flags: 0,
+            epoch: 0,
+            stream: 0,
+            complete: false,
+            part: None,
+            received_ns: 0,
+            new_format: None,
+        });
+        r.reset();
+        assert!(
+            r.take_partial().is_none(),
+            "a pre-flush partial must not survive reset()"
+        );
+    }
+}
+
+#[cfg(test)]
+mod firewall_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn lim() -> ReassemblerLimits {
+        ReassemblerLimits {
+            min_shard_bytes: 16,
+            max_shard_bytes: 64,
+            max_data_shards: 8,
+            max_total_shards: 12,
+            max_frame_bytes: 4096,
+        }
+    }
+
+    fn header(
+        shard_bytes: u16,
+        data: u16,
+        rec: u16,
+        shard_index: u16,
+        block_index: u16,
+        block_count: u16,
+        frame_bytes: u32,
+    ) -> PacketHeader {
+        PacketHeader {
+            frame_bytes,
+            user_flags: USER_FLAG_SLICE_STREAM,
+            block_index,
+            block_count,
+            data_shards: data,
+            recovery_shards: rec,
+            shard_index,
+            shard_bytes,
+            ..PacketHeader::default()
+        }
+    }
+
+    /// A sentinel and a final block pass, each with the base and extent it proves.
+    #[test]
+    fn each_wire_shape_passes_with_its_own_extent() {
+        let geom =
+            |h: PacketHeader| firewall(&h, 16, &lim()).map(|g| (g.base_shard, g.need_shards));
+        // A sentinel at shard 10, and a final block of 3 closing a 20-shard frame.
+        assert_eq!(geom(header(16, 5, 1, 0, 1, 0, 160)), Some((10, 15)));
+        assert_eq!(geom(header(16, 3, 1, 0, 2, 3, 320)), Some((17, 20)));
+        // A final block with more data than its frame holds is refused.
+        assert_eq!(geom(header(16, 8, 1, 0, 2, 3, 112)), None);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        /// Whatever the firewall passes fits the packet, places its block inside the
+        /// extent the packet proves, and keeps that extent inside the frame budget.
+        #[test]
+        fn an_accepted_header_places_its_block_inside_its_own_extent(
+            shard_bytes in proptest::sample::select(vec![0u16, 15, 16, 17, 32, 64, 66]),
+            data in 0u16..10,
+            rec in 0u16..6,
+            shard_index in 0u16..14,
+            block_index in 0u16..8,
+            block_count in 0u16..8,
+            frame_bytes in prop_oneof![Just(0u32), (0u32..300).prop_map(|k| k * 16), 0u32..4200],
+            short in 0usize..2,
+        ) {
+            let lim = lim();
+            let h = header(shard_bytes, data, rec, shard_index, block_index, block_count,
+                frame_bytes);
+            let body_len = (shard_bytes as usize).saturating_sub(short);
+            if let Some(g) = firewall(&h, body_len, &lim) {
+                prop_assert!(body_len >= g.shard_bytes);
+                prop_assert!(g.shard_index < g.data_shards + g.recovery_shards);
+                prop_assert!(g.data_shards <= lim.max_data_shards);
+                prop_assert!(g.base_shard + g.data_shards <= g.need_shards);
+                prop_assert!((g.need_shards - 1) * g.shard_bytes < lim.max_frame_bytes);
+            }
+        }
+    }
+}

@@ -1,27 +1,21 @@
-// punktfunk virtual Xbox 360 XUSB companion — UMDF2 driver presenting the XUSB device interface so
-// classic XInput (XInputGetState) reads the pad with no kernel bus driver (the HIDMaestro approach).
-//
-// xinput1_4.dll enumerates GUID_DEVINTERFACE_XUSB, opens the Nth instance (= player slot), and polls
-// it with buffered IOCTLs. We register the interface and answer those IOCTLs from controller state the
-// host publishes into a shared DATA section; a game's rumble (SET_STATE) is published back for the
-// host to forward. Byte formats are the source-verified xusb22 wire layout (HIDMaestro
-// driver/companion.c + nefarius/XInputHooker XUSB.h + ViGEm XUSB_REPORT).
-//
-// The host channel is the **sealed pad channel** (design/gamepad-channel-sealing.md, proto v2): the
-// DATA section (`pf_driver_proto::gamepad::XusbShm`) is UNNAMED — we reach it only through a handle
-// the SYSTEM host duplicated into this WUDFHost, bootstrapped over the named `Global\pfxusb-boot-<i>`
-// mailbox. The whole handshake + all shared-memory access lives in `pf_umdf_util` (audited unsafe
-// layer): this crate's channel/IOCTL/state logic is 100% SAFE Rust. The only `unsafe` here is the
-// unavoidable WDF setup FFI in DriverEntry/EvtDeviceAdd, each with a `// SAFETY:` proof.
-//
-// We answer the WAIT_* IOCTLs with STATUS_INVALID_DEVICE_REQUEST, which makes xinput1_4 fall back to
-// synchronous GET_STATE polling — so no manual queue is needed for classic XInput. A periodic WDF
-// timer (the pf-gamepad pattern) owns the sealed-channel pump: adoption, re-delivery and host-gone
-// detection all happen there, so the IOCTL path reads the CACHED view instead of re-opening the
-// bootstrap mailbox (open+map+close+unmap + 2 allocs) on EVERY XInput poll.
+//! punktfunk virtual Xbox 360 XUSB companion — a UMDF2 driver presenting the XUSB device
+//! interface, so classic XInput reads the pad with no kernel bus driver.
+//!
+//! xinput1_4.dll enumerates `GUID_DEVINTERFACE_XUSB`, opens the Nth instance (the player slot)
+//! and polls it with buffered IOCTLs. They are answered from the controller state the host
+//! publishes into a shared section; a game's rumble (SET_STATE) goes back the same way. Byte
+//! formats are the xusb22 wire layout.
+//!
+//! The host channel is the sealed pad channel (design/gamepad-channel-sealing.md): the section
+//! (`pf_driver_proto::gamepad::XusbShm`) is unnamed, reached only through a handle the host
+//! duplicated into this WUDFHost, bootstrapped over the `Global\pfxusb-boot-<i>` mailbox. Its
+//! unsafe surface lives in `pf_umdf_util`, so the only `unsafe` here is WDF setup FFI.
+//!
+//! A periodic WDF timer owns the channel pump (adoption, re-delivery, host-gone) and completes
+//! the pended `WAIT_FOR_INPUT` requests, so the IOCTL path reads the cached view and never
+//! opens the mailbox per poll.
 
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
-// Every remaining `unsafe {}` (all WDF setup FFI) must carry a `// SAFETY:` proof.
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use pf_driver_proto::gamepad::XusbShm;
@@ -236,6 +230,10 @@ extern "C" fn evt_timer(_timer: WDFTIMER) {
         return;
     }
     let state = build_wait_state(data);
+    #[expect(
+        clippy::unnecessary_safety_comment,
+        reason = "the block is the `while let` scrutinee"
+    )]
     // SAFETY: `wq` is the live manual queue created in EvtDeviceAdd — the contract
     // `retrieve_next_request` requires. `None` simply means nobody is waiting.
     while let Some(request) = unsafe { wdf::retrieve_next_request(wq) } {

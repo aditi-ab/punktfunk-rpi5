@@ -1,6 +1,5 @@
 package io.unom.punktfunk
 
-import android.Manifest
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -9,14 +8,14 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.AudioEffect
-import android.media.audiofx.NoiseSuppressor
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.os.Build
 import android.text.InputType
 import android.util.Log
 import android.view.KeyEvent
-import android.view.Surface
+import android.view.PointerIcon
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -66,11 +65,13 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.security.IdentityLoad
@@ -78,15 +79,10 @@ import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.kit.SessionAccess
 import io.unom.punktfunk.kit.SessionEndReason
-import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.VideoFit
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.kit.library.GameEnd
 import io.unom.punktfunk.kit.library.LibraryClient
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -99,10 +95,16 @@ import kotlinx.coroutines.withContext
  * the connect that produced this handle.
  */
 @Composable
-fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> Unit) {
+fun StreamScreen(
+    session: ActiveSession,
+    /** The hinge across the window ([rememberFoldHinge]), or null. */
+    hinge: IntRect?,
+    /** The session ended as a woken host not yet ready: dial it again; true when that is on its way. */
+    wakeRedial: () -> Boolean = { false },
+    onSessionEnded: (SessionEndReason) -> Unit,
+) {
     val handle = session.handle
     val initialSettings = session.settings
-    val micEnabled = initialSettings.micEnabled
     val context = LocalContext.current
     val activity = context as? MainActivity
     // The View hosting this composition — the one that receives the stream's touch/pointer events
@@ -127,19 +129,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     val initialAccess = remember(handle) { NativeBridge.nativeAccessState(handle) }
     // The Compose state the session's peripherals write (see [StreamUi]).
     val ui = remember(handle) { StreamUi(handle, initialAccess, initialSettings.statsVerbosity, initialSettings.invertScroll) }
-
-    // Start mic only if the user enabled it AND granted RECORD_AUDIO (else the AAudio input fails).
-    val micWanted = micEnabled && ContextCompat.checkSelfPermission(
-        context,
-        Manifest.permission.RECORD_AUDIO,
-    ) == PackageManager.PERMISSION_GRANTED
-
-    // The Java AEC/NS pair backstopping the native VoiceCommunication capture preset, hung off the
-    // audio session id `nativeStartMic` returns. Attached in surfaceCreated (where the mic starts)
-    // and released on every path that stops the mic — the surface teardown AND the final dispose —
-    // so a surface recreate re-attaches to the fresh stream instead of leaking effect engines.
-    // All three touch points run on the main thread; a plain list is race-free.
-    val micEffects = remember { mutableListOf<AudioEffect>() }
 
     LaunchedEffect(ui.micHint) {
         if (ui.micHint != null) {
@@ -201,11 +190,16 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // panel's. Set when the view is created.
     var videoView by remember { mutableStateOf<SurfaceView?>(null) }
 
+    // Video, audio and the mic, started and stopped with the video surface.
+    val planes = remember(handle) {
+        StreamPlanes(context, session, ui, isTv, isChromeOs, streamHz, streamSize)
+    }
+
     // Everything that runs beside the picture for the session — the pad router and its chords,
     // the mouse and TV-remote pointers, clipboard, feedback, sensors, the USB captures.
     val peripherals = remember(handle) {
         StreamPeripherals(
-            context, activity, session, ui, ring, haptics, isTv, micEffects,
+            context, activity, session, ui, ring, haptics, isTv, planes::stopMic,
             keyCapture = { keyCapture },
             videoView = { videoView },
             containerSize = { containerSize },
@@ -239,6 +233,18 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     LaunchedEffect(handle) {
         NativeBridge.nativeSetInvertScroll(handle, ui.invertScroll)
     }
+    // A roam: the default network or its addresses changed. The socket already follows it; the
+    // nudge tells the host now instead of at the next datagram.
+    DisposableEffect(handle) {
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val watch = object : ConnectivityManager.NetworkCallback() {
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                NativeBridge.nativePathChanged(handle)
+            }
+        }
+        runCatching { cm?.registerDefaultNetworkCallback(watch) }
+        onDispose { runCatching { cm?.unregisterNetworkCallback(watch) } }
+    }
     // The companion panel (design/android-dual-screen.md): a second screen below the picture —
     // the lower half of a hinge with room for it, else a small second display — carries pages the
     // player flips between. Only while streaming; showing the pad brings its page forward.
@@ -247,7 +253,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // The Second screen setting (off: a phone on a TV) keeps the pair from forming at all; a
     // half-open fold then still takes the pad alone, as before the panel existed.
     val secondScreen = initialSettings.secondScreen
-    val fold = rememberFoldHinge()?.let { foldSplit(it, rootSize) }
+    val fold = hinge?.let { foldSplit(it, rootSize) }
     val hingeCompanion = secondScreen && fold?.carriesCompanion(rootSize.height) == true
     val companionDisplay = rememberCompanionDisplay().takeIf { secondScreen && !hingeCompanion }
     val companionUp = hingeCompanion || companionDisplay != null
@@ -303,45 +309,27 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     var statsView by remember { mutableStateOf(CompanionMemory.statsView(context)) }
 
     // Host-gone watchdog and the live access level.
-    SessionWatchEffect(handle, initialAccess, ui, peripherals, onSessionEnded)
-
-    // One-shot teardown guard. Both the SurfaceView callback and DisposableEffect tear down on the
-    // way out, but `nativeClose` frees the handle — so once it's closed, NO path may touch the handle
-    // again (use-after-free → SIGSEGV: the consistent back-while-streaming crash). Both run on the
-    // main thread, so a plain flag is race-free; AtomicBoolean just makes the intent explicit.
-    val closed = remember { AtomicBoolean(false) }
-    // The mic opens off the UI thread (AAudio input opens can take hundreds of ms), one start at a
-    // time. Every stop bumps `micGen`, so a start that lost its surface meanwhile undoes itself.
-    val micStarter = remember {
-        Executors.newSingleThreadExecutor { r -> Thread(r, "pf-mic-start").apply { isDaemon = true } }
-    }
-    val micGen = remember { AtomicInteger(0) }
+    SessionWatchEffect(handle, initialAccess, ui, peripherals, wakeRedial, onSessionEnded)
 
     // Everything this stream does to the window — wake/Wi-Fi locks, the refresh pin, ALLM, the
-    // cutout and soft-keyboard modes, the landscape lock — and the prior values it puts back.
+    // cutout and soft-keyboard modes — and the prior values it puts back.
     val streamWindow = remember(handle) {
         StreamWindow(activity, context, composeView, lowLatencyMode, isTv, streamHz, streamSize)
     }
 
 
     DisposableEffect(handle) {
+        SessionGate.owner.attach(handle)
         streamWindow.attach()
         peripherals.start()
         // The panel's refresh pin, unbuffered input dispatch and the render-rate vote.
         streamWindow.pinDisplay()
         onDispose {
-            closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
-            micGen.incrementAndGet()
-            micStarter.shutdown()
             peripherals.stop()
             streamWindow.detach()
-            // Leaving the stream: stop the mic + audio + decode threads and tear down the session.
-            releaseMicEffects(micEffects)
-            NativeBridge.nativeStopMic(handle)
-            NativeBridge.nativeStopAudio(handle)
-            NativeBridge.nativeStopVideo(handle)
-            NativeBridge.nativeVideoDrain(handle, false)
-            SessionGate.close(handle) // the QUIC close drains for up to 300 ms, off this thread
+            planes.dispose()
+            // Closes an ended session only. A recreated activity's screen attaches to a live one.
+            SessionGate.owner.detach(handle)
         }
     }
 
@@ -374,7 +362,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // End action lives on has nowhere to appear there, so a held session would be one nothing
     // outside the app could stop.
     val keepAliveSpan = keepAliveSpanMs(initialSettings, isTv)
-    val keepAlive = keepAliveSpan != null
 
     // Ending from a path that fires while the app is already away — minutes after the recomposer
     // paused, so the disposal that `onSessionEnded` schedules will not run until the user comes
@@ -388,6 +375,16 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     }
 
     KeepAliveEffects(session, hostRecord, keepAliveSpan, { endAway(it) }, onSessionEnded)
+
+    // "Keep screen awake": asked every few seconds, since with the setting off the answer
+    // follows the player's input. With it on the answer never changes.
+    LaunchedEffect(handle) {
+        while (true) {
+            ui.screenHeld = NativeBridge.nativeHoldsScreenAwake(handle, initialSettings.keepAwake)
+            streamWindow.holdAwake(ui.screenHeld)
+            delay(5_000)
+        }
+    }
 
     // Auto-engage pointer capture at stream start (setting on + a mouse actually present).
     // Delayed a beat: the grab needs window focus and the capture view attached.
@@ -480,7 +477,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             hostRecord?.let { kh ->
                 scope.launch(Dispatchers.IO) {
                     (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
-                        HostActions.invoke(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.name, act.id, act.label)
+                        HostActions.invoke(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.name, act.id, act.label, kh.port)
                     }
                 }
             }
@@ -512,10 +509,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 scope.launch {
                     val outcome = withContext(Dispatchers.IO) {
                         (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
-                            LibraryClient.endGame(
-                                kh.address, kh.effectiveMgmtPort, id.certPem, id.privateKeyPem,
-                                kh.fpHex, appId,
-                            )
+                            LibraryClient.endGame(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, appId, kh.port)
                         } ?: GameEnd.Failed("this device has no identity yet")
                     }
                     // Gone either way: leave as End stream does. A refusal keeps the stream.
@@ -536,6 +530,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         screenLayouts = { layoutsOffered },
         screenLayout = { layout },
         cycleScreens = ::cycleScreens,
+        padType = { activity?.gamepadRouter?.padType ?: Gamepad.PREF_AUTO },
+        padTypeAvailable = {
+            activity?.gamepadRouter?.let { it.sendsEnabled() && it.forwardedDevices().isNotEmpty() } == true
+        },
+        // This stream only: the next one starts from the Controller type setting.
+        cyclePadType = { activity?.gamepadRouter?.let { it.setPadType(nextPadType(it.padType)) } },
     )
     // The summon rides a pointer gesture but TYPES, so it also needs the KEYBOARD grant
     // (dismissing is always allowed).
@@ -565,7 +565,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             keys = KeySink { vk, down -> NativeBridge.nativeSendKey(handle, vk, down, 0) },
             trackpad = {
                 streamTouchInput(
-                    NativeTouchSink(handle), null, ::videoFrame, trackpad = true,
+                    NativeTouchSink(handle, peripherals::handBack), null, ::videoFrame, trackpad = true,
                     onCycleStats = { ui.statsVerbosity = ui.statsVerbosity.next() },
                     onKeyboard = showKeyboard,
                     onDial = {},
@@ -607,128 +607,13 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                     SurfaceView(ctx).apply {
                         videoView = this
                         holder.addCallback(object : SurfaceHolder.Callback {
-                            override fun surfaceCreated(holder: SurfaceHolder) {
-                                // The keep-alive's drain, if one is running: the decode thread is
-                                // about to take the frame queue back.
-                                NativeBridge.nativeVideoDrain(handle, false)
-                                // Low-latency mode: rank MediaCodecList decoders for the negotiated
-                                // MIME (framework-only API) and hand the chosen one to Rust, which
-                                // creates it by name and applies the per-SoC vendor low-latency keys.
-                                // Off ⇒ no ranking: the platform resolves its default decoder for the
-                                // MIME, exactly as before the overhaul.
-                                val mime = NativeBridge.nativeVideoMime(handle)
-                                val choice = if (lowLatencyMode) VideoDecoders.pickDecoder(mime) else null
-                                NativeBridge.nativeStartVideo(
-                                    handle,
-                                    holder.surface,
-                                    choice?.name ?: "",
-                                    lowLatencyMode,
-                                    choice?.lowLatencyFeature ?: false,
-                                    isTv,
-                                    isChromeOs,
-                                    initialSettings.presentPriorityWire(),
-                                    initialSettings.smoothBuffer,
-                                    // The refresh of the panel this view is on — from the mode TABLE
-                                    // (streamPanelFps), because display.refreshRate reports a per-uid
-                                    // override, not the panel. Fallback: the (possibly lying) live rate.
-                                    this@apply.display?.streamPanelFps(streamHz, streamSize)?.takeIf { it > 0 }
-                                        ?: (this@apply.display?.refreshRate ?: 0f).roundToInt(),
-                                    // The SurfaceView's on-screen pixel size — the coordinate space the
-                                    // ASurfaceControl layer composites in (the aspect-fitted video rect,
-                                    // not the window's rotated buffer geometry). 0 if not laid out yet;
-                                    // native falls back to the window buffer size.
-                                    this@apply.width,
-                                    this@apply.height,
-                                )
-                                NativeBridge.nativeStartAudio(handle, lowLatencyMode, isTv)
-                                // The MIC grant is read live (a surface recreate re-runs this, and
-                                // the mask may have changed since the last one): without it no
-                                // capture opens — the host never attached this session to its mic
-                                // service, so the platform's recording indicator would announce a
-                                // mic nobody can hear.
-                                if (micWanted && ui.accessGrants and SessionAccess.MIC != 0) {
-                                    val gen = micGen.incrementAndGet()
-                                    val echo = initialSettings.echoCancel
-                                    val main = ContextCompat.getMainExecutor(context)
-                                    if (!micStarter.isShutdown) micStarter.execute {
-                                        if (micGen.get() != gen) return@execute
-                                        val sessionId = NativeBridge.nativeStartMic(handle, echo)
-                                        // Stopped during the open: that stop found nothing to stop.
-                                        if (micGen.get() != gen) {
-                                            NativeBridge.nativeStopMic(handle)
-                                            return@execute
-                                        }
-                                        main.execute {
-                                            if (micGen.get() != gen) return@execute
-                                            if (ui.accessGrants and SessionAccess.MIC == 0) {
-                                                NativeBridge.nativeStopMic(handle) // revoked meanwhile
-                                                return@execute
-                                            }
-                                            if (echo) attachMicEffects(sessionId, micEffects)
-                                            // Did a capture actually open? That — not the setting —
-                                            // puts the mute control on screen. A restart after a
-                                            // surface recreate comes back already muted if the user
-                                            // muted: the flag lives on the session handle.
-                                            ui.micRunning = NativeBridge.nativeMicActive(handle)
-                                        }
-                                    }
-                                }
-                            }
+                            override fun surfaceCreated(holder: SurfaceHolder) =
+                                planes.surfaceCreated(holder, this@apply)
 
-                            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                                // The view's CURRENT pixel size, for the ASurfaceControl layer's
-                                // destination rect. It is reported here and not only at
-                                // surfaceCreated because the view grows a frame or two after the
-                                // stream screen appears — hiding the system bars and switching on
-                                // cutout drawing both resize it, and neither recreates the surface.
-                                // A layer left on the start-up rect paints the picture small, in the
-                                // top-left corner. The view's own size, not the buffer geometry in
-                                // `width`/`height`: the layer composites in the view's space.
-                                NativeBridge.nativeVideoSurfaceSize(
-                                    handle, this@apply.width, this@apply.height,
-                                )
-                                // Re-assert the frame-rate vote: a buffer-geometry change can reset
-                                // the surface's frame-rate setting on some OEM builds, silently
-                                // dropping the 120 Hz pin mid-stream. Mirrors the native hint's
-                                // policy (FIXED_SOURCE; ALWAYS only on the TV low-latency path —
-                                // phones stay seamless so a re-hint can never force a mode flicker).
-                                if (streamHz > 0) runCatching {
-                                    holder.surface.setFrameRate(
-                                        streamHz.toFloat(),
-                                        Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
-                                        if (isTv && lowLatencyMode) {
-                                            Surface.CHANGE_FRAME_RATE_ALWAYS
-                                        } else {
-                                            Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS
-                                        },
-                                    )
-                                }
-                            }
+                            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) =
+                                planes.surfaceChanged(holder, this@apply)
 
-                            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                // Surface gone (backgrounding, or on the way out). Stop the threads that
-                                // render to it — but only while the session is still open. Once
-                                // DisposableEffect has closed it, the handle is freed; dereferencing it
-                                // here is the use-after-free that crashed on back-navigation.
-                                if (!closed.get()) {
-                                    micGen.incrementAndGet()
-                                    releaseMicEffects(micEffects)
-                                    NativeBridge.nativeStopMic(handle)
-                                    // No capture, no control — but the MUTE state is deliberately left
-                                    // standing (native keeps it on the handle), so the restart in
-                                    // surfaceCreated brings the user's choice back with it.
-                                    ui.micRunning = false
-                                    // Audio is the one plane the keep-alive does NOT stop — the
-                                    // sound carrying on is the whole point of it. Video stops
-                                    // either way (its Surface is gone), but with the session held
-                                    // something must keep popping access units, or the queue
-                                    // stands and the client asks the host for a keyframe every
-                                    // two seconds until the user comes back.
-                                    if (!keepAlive) NativeBridge.nativeStopAudio(handle)
-                                    NativeBridge.nativeStopVideo(handle)
-                                    if (keepAlive) NativeBridge.nativeVideoDrain(handle, true)
-                                }
-                            }
+                            override fun surfaceDestroyed(holder: SurfaceHolder) = planes.surfaceDestroyed()
                         })
                     }
                 },
@@ -880,7 +765,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                             touchMode == TouchMode.TOUCH ->
                                 streamTouchPassthrough(NativeTouchSink(handle), stylus, frame)
                             else -> streamTouchInput(
-                                if (touchMode == TouchMode.OFF) DroppedTouchSink else NativeTouchSink(handle),
+                                if (touchMode == TouchMode.OFF) {
+                                    DroppedTouchSink
+                                } else {
+                                    NativeTouchSink(handle, peripherals::handBack)
+                                },
                                 stylus,
                                 frame,
                                 trackpad = touchMode != TouchMode.POINTER,
@@ -937,6 +826,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             }
         }
     Box(Modifier.fillMaxSize().background(Color.Black).onSizeChanged { rootSize = it }) {
+        StreamPointer(
+            hidden = !ring.committed,
+            host = ui.hostPointer,
+            scale = videoFrame().at(containerSize).placement.let { minOf(it.scaleX, it.scaleY).toFloat() },
+            Modifier.fillMaxSize(),
+        )
         // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe up in
         // the mouse modes) AND the pointer-capture grab target. It never draws or takes touches,
         // and it stays in the activity's window wherever the picture is: that window keeps focus.
@@ -983,11 +878,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             }
             companionDisplay?.let {
                 when (layout) {
-                    ScreenLayout.SWAPPED -> CompanionOnDisplay(it, pictureHz = streamHz) {
+                    ScreenLayout.SWAPPED -> CompanionOnDisplay(it, pictureHz = streamHz, lit = ui.screenHeld) {
                         picture(Modifier.fillMaxSize(), ::videoFrame, pictureSurface, true)
                     }
                     // The lower half keeps the panel's own rate: it is the touch screen under a game.
-                    ScreenLayout.SPANNED -> CompanionOnDisplay(it, pictureHz = 0) {
+                    ScreenLayout.SPANNED -> CompanionOnDisplay(it, pictureHz = 0, lit = ui.screenHeld) {
                         picture(Modifier.fillMaxSize(), ::lowerFrame, pictureSurface, false)
                     }
                     ScreenLayout.PANEL -> CompanionOnDisplay(it, content = companion)
@@ -1039,15 +934,6 @@ private fun TouchFallbackHint(modifier: Modifier = Modifier) {
 }
 
 /**
- * Attach the Java echo-canceller + noise-suppressor pair to the mic stream's audio session — the
- * backstop for HALs whose VoiceCommunication capture path doesn't cancel on its own (the native
- * side already opened the stream under that preset). [sessionId] `<= 0` means native allocated no
- * session (echo cancellation off, or the preset fell back to the plain open), so there is nothing
- * to hang an effect on. Created effects land in [into] for [releaseMicEffects]; `create()`
- * returning null (unsupported / claimed) is quietly nothing — the HAL preset still does its part.
- * Needs no extra permission: the effect APIs attach to our own recording session.
- */
-/**
  * Engage a USB capture on [dev], asking the user for access first when we don't already hold it.
  *
  * Returns the receiver left waiting on that grant — the caller unregisters it on teardown — or null
@@ -1094,23 +980,6 @@ internal fun requestUsbCapture(
         ),
     )
     return receiver
-}
-
-private fun attachMicEffects(sessionId: Int, into: MutableList<AudioEffect>) {
-    if (sessionId <= 0) return
-    if (AcousticEchoCanceler.isAvailable()) {
-        AcousticEchoCanceler.create(sessionId)?.let { it.setEnabled(true); into.add(it) }
-    }
-    if (NoiseSuppressor.isAvailable()) {
-        NoiseSuppressor.create(sessionId)?.let { it.setEnabled(true); into.add(it) }
-    }
-}
-
-/** Release every attached mic effect engine. Idempotent — the list is cleared, and both stop
- * paths (surface teardown, final dispose) may call it in either order. */
-internal fun releaseMicEffects(effects: MutableList<AudioEffect>) {
-    effects.forEach { runCatching { it.release() } }
-    effects.clear()
 }
 
 /**
@@ -1230,6 +1099,27 @@ internal fun StreamStartBanner(text: String, alpha: Float, modifier: Modifier = 
             .padding(horizontal = 14.dp, vertical = 8.dp),
         color = Color.White,
         fontSize = 15.sp,
+    )
+}
+
+/**
+ * The mouse pointer over the stream: the host's shape while the client draws it ([host], at
+ * [scale] view pixels per frame pixel), else hidden so the host's cursor in the picture is the
+ * only one — or the system's while [hidden] is false (the ring).
+ *
+ * Android takes the icon of the deepest view under the mouse that has one. Compose's own view
+ * keeps the icon a hovered text field left, which beats one on the window, and Compose rewrites
+ * it at will. This empty view covers the whole stream from deeper than both.
+ */
+@Composable
+internal fun StreamPointer(hidden: Boolean, host: HostShape?, scale: Float, modifier: Modifier = Modifier) {
+    AndroidView(
+        modifier = modifier,
+        factory = { View(it) },
+        update = { v ->
+            v.pointerIcon =
+                if (hidden) host?.icon(scale) ?: PointerIcon.getSystemIcon(v.context, PointerIcon.TYPE_NULL) else null
+        },
     )
 }
 

@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import io.unom.punktfunk.kit.Gamepad
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -7,7 +8,8 @@ import org.json.JSONObject
 /*
  * The in-stream quick-action ring's configuration — the `overlay_actions` setting, one JSON blob
  * (schema v2, design/touch-client-overlay.md §3.2). The Kotlin twin of pf-client-core's
- * `overlay_actions.rs`; the Rust tests are the contract, `OverlayActionsTest` ports them.
+ * `overlay_actions.rs`; `OverlayActionsTest` replays the shared contract,
+ * `clients/shared/overlay-actions-vectors.json`.
  *
  * Parsing never fails: fewer than six slots pad with empty, more are truncated, an unknown id or a
  * dangling `shortcut:` reference is an empty slot, an absent field takes its default, and an
@@ -32,11 +34,14 @@ sealed class SlotId {
     /** The host's guide button (Xbox / PS / Steam), as a synthetic pad tap. */
     object Guide : SlotId()
 
-    /** The host's quick-access button — `BTN_MISC1`, the Deck's `…`. */
+    /** The host's Quick Access: the Deck's `…` where the pad has it, Steam's chord elsewhere. */
     object Qam : SlotId()
 
     /** Controller mouse: the pad drives the host pointer instead of its virtual pad. */
     object PadMouse : SlotId()
+
+    /** Step the controller type the host emulates, live ([nextPadType]). */
+    object PadType : SlotId()
 
     /** Silence this device's speakers. Local: the host keeps playing for anyone joined to it. */
     object StreamMute : SlotId()
@@ -61,6 +66,7 @@ sealed class SlotId {
             Guide -> "guide"
             Qam -> "qam"
             PadMouse -> "pad_mouse"
+            PadType -> "pad_type"
             StreamMute -> "stream_mute"
             SwapScreens -> "swap_screens"
             is Host -> "host:$actionId"
@@ -82,6 +88,7 @@ sealed class SlotId {
             "guide" -> Guide
             "qam" -> Qam
             "pad_mouse" -> PadMouse
+            "pad_type" -> PadType
             "stream_mute" -> StreamMute
             "swap_screens" -> SwapScreens
             else -> when {
@@ -93,13 +100,37 @@ sealed class SlotId {
     }
 }
 
+/** What the Controller type slot steps through, as GamepadPref wire bytes: Automatic, then the
+ *  pads every host builds. Twin of the Rust `PAD_TYPE_CYCLE`. */
+val PAD_TYPE_CYCLE = intArrayOf(
+    Gamepad.PREF_AUTO, Gamepad.PREF_XBOX360, Gamepad.PREF_XBOXONE,
+    Gamepad.PREF_DUALSENSE, Gamepad.PREF_DUALSHOCK4, Gamepad.PREF_STEAMDECK,
+)
+
+/** The type after [current]; one outside the cycle (picked in Settings) steps to Automatic. */
+fun nextPadType(current: Int): Int {
+    val at = PAD_TYPE_CYCLE.indexOf(current)
+    return if (at < 0) Gamepad.PREF_AUTO else PAD_TYPE_CYCLE[(at + 1) % PAD_TYPE_CYCLE.size]
+}
+
+/** The Controller type slot's state word. */
+fun padTypeLabel(pref: Int): String = when (pref) {
+    Gamepad.PREF_AUTO -> "Automatic"
+    Gamepad.PREF_XBOX360 -> "Xbox 360"
+    Gamepad.PREF_XBOXONE -> "Xbox One"
+    Gamepad.PREF_DUALSENSE -> "DualSense"
+    Gamepad.PREF_DUALSHOCK4 -> "DualShock 4"
+    Gamepad.PREF_STEAMDECK -> "Steam Deck"
+    else -> "Other"
+}
+
 /** A custom key chord. [keys] are names from the shared keymap tables, never raw key codes. */
 data class Shortcut(val id: String, val label: String = "", val keys: List<String> = emptyList())
 
 /**
  * The Windows virtual-key code a shortcut key name stands for (the wire speaks VKs); `null` for
  * a name this build does not know. Twin of the Rust `key_vk`: `OverlayActionsTest` replays
- * `crates/punktfunk-core/testdata/key-vk-vectors.json`, so a new name lands there first.
+ * `crates/core/punktfunk-core/testdata/key-vk-vectors.json`, so a new name lands there first.
  */
 fun keyVk(name: String): Int? {
     val n = name.trim().lowercase()

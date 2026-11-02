@@ -13,57 +13,30 @@ import org.junit.Test
  */
 class PadPresenceTest {
 
-    /** A real pad: the source class plus hardware behind it, in either of the two shapes. */
+    /** A real pad: the source class plus a stick or a HAT (a d-pad-only pad or arcade stick). */
     @Test
     fun realPadsCount() {
-        assertTrue(
-            Gamepad.looksLikeController(
-                padSource = true, virtual = false, hasStick = true, hasFaceButtons = true,
-            ),
-        )
-        // An arcade stick / d-pad-only pad — buttons, no analog stick.
-        assertTrue(
-            Gamepad.looksLikeController(
-                padSource = true, virtual = false, hasStick = false, hasFaceButtons = true,
-            ),
-        )
-        // A wheel or flight stick — axes, no A/B.
-        assertTrue(
-            Gamepad.looksLikeController(
-                padSource = true, virtual = false, hasStick = true, hasFaceButtons = false,
-            ),
-        )
+        assertTrue(Gamepad.looksLikeController(padSource = true, virtual = false, hasStick = true))
     }
 
     /** The gaming-phone shoulder triggers and OEM game-mode overlays: a virtual device wearing the
      * gamepad source class. This is the field report — the console UI that could not be dismissed. */
     @Test
     fun virtualDevicesAreNotControllers() {
-        assertFalse(
-            Gamepad.looksLikeController(
-                padSource = true, virtual = true, hasStick = true, hasFaceButtons = true,
-            ),
-        )
+        assertFalse(Gamepad.looksLikeController(padSource = true, virtual = true, hasStick = true))
     }
 
-    /** A device that claims a pad source with nothing behind it is not a pad either. */
+    /** A TV remote claims the gamepad source and, through a generic key layout, the A/B keys. With
+     * no stick or HAT it is not a controller: the field report is a Philips TV listing three. */
     @Test
-    fun aSourceClaimWithoutHardwareIsNotAController() {
-        assertFalse(
-            Gamepad.looksLikeController(
-                padSource = true, virtual = false, hasStick = false, hasFaceButtons = false,
-            ),
-        )
+    fun aRemoteWithGamepadKeysIsNotAController() {
+        assertFalse(Gamepad.looksLikeController(padSource = true, virtual = false, hasStick = false))
     }
 
     /** And a keyboard/mouse with sticks it never reports on the joystick source stays out. */
     @Test
     fun nonPadSourcesNeverCount() {
-        assertFalse(
-            Gamepad.looksLikeController(
-                padSource = false, virtual = false, hasStick = true, hasFaceButtons = true,
-            ),
-        )
+        assertFalse(Gamepad.looksLikeController(padSource = false, virtual = false, hasStick = true))
     }
 
     /**
@@ -170,6 +143,15 @@ class PadPresenceTest {
         assertFalse(Gamepad.isSc2VidPid(0x28DE, 0x1205)) // Steam Deck
         assertFalse(Gamepad.isSc2VidPid(0x28DE, 0x1102)) // classic Steam Controller
         assertFalse(Gamepad.isSc2VidPid(0x054C, 0x0CE6)) // DualSense
+    }
+
+    /** A remote that claims gamepad buttons gets no wire pad from its D-pad, OK or Back; a pad's
+     * first button, or any key from a device with a stick, does. */
+    @Test
+    fun onlyPadInputOpensAWirePad() {
+        assertTrue(GamepadRouter.opensSlotOnKey(gamepadButton = true, hasStick = false))
+        assertTrue(GamepadRouter.opensSlotOnKey(gamepadButton = false, hasStick = true))
+        assertFalse(GamepadRouter.opensSlotOnKey(gamepadButton = false, hasStick = false))
     }
 
     private companion object {

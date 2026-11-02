@@ -1,6 +1,6 @@
 // Client settings presets — named bundles of setting overrides applied on top of the global
 // defaults (design/client-settings-profiles.md §4). The Swift half of the model whose Rust
-// original is `crates/pf-client-core/src/presets.rs`; the two are mirrored field for field so a
+// original is `crates/client/pf-client-core/src/presets.rs`; the two are mirrored field for field so a
 // future export/import has one shape to speak.
 //
 // A preset overrides only the fields the user touched; everything else keeps following the
@@ -99,9 +99,12 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
     public var refreshHz: Int?
     public var matchWindow: Bool?
     public var bitrateKbps: Int?
+    public var pyrowaveBpp: Double?
     public var renderScale: Double?
     /// A `VideoFit` raw value.
     public var videoFit: String?
+    /// `"this"` or `"all"`.
+    public var screens: String?
     public var codec: String?
     public var hdrEnabled: Bool?
     public var compositor: Int?
@@ -154,13 +157,17 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
 
     // MARK: Codable
 
-    private enum Key: String, CaseIterable {
+    /// Every overlay key, as serialized. `SharedFoundationTests` walks it through the decode,
+    /// encode, `OverlayField.clear` and `isOverridden` switches.
+    enum Key: String, CaseIterable {
         case width, height
         case refreshHz = "refresh_hz"
         case matchWindow = "match_window"
         case bitrateKbps = "bitrate_kbps"
+        case pyrowaveBpp = "pyrowave_bpp"
         case renderScale = "render_scale"
         case videoFit = "video_fit"
+        case screens
         case codec
         case hdrEnabled = "hdr_enabled"
         case compositor
@@ -200,8 +207,10 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         refreshHz = int(.refreshHz)
         matchWindow = bool(.matchWindow)
         bitrateKbps = int(.bitrateKbps)
+        pyrowaveBpp = dbl(.pyrowaveBpp)
         renderScale = dbl(.renderScale)
         videoFit = str(.videoFit)
+        screens = str(.screens)
         codec = str(.codec)
         hdrEnabled = bool(.hdrEnabled)
         compositor = int(.compositor)
@@ -243,8 +252,10 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         try c.encodeIfPresent(refreshHz, forKey: AnyKey(Key.refreshHz.rawValue))
         try c.encodeIfPresent(matchWindow, forKey: AnyKey(Key.matchWindow.rawValue))
         try c.encodeIfPresent(bitrateKbps, forKey: AnyKey(Key.bitrateKbps.rawValue))
+        try c.encodeIfPresent(pyrowaveBpp, forKey: AnyKey(Key.pyrowaveBpp.rawValue))
         try c.encodeIfPresent(renderScale, forKey: AnyKey(Key.renderScale.rawValue))
         try c.encodeIfPresent(videoFit, forKey: AnyKey(Key.videoFit.rawValue))
+        try c.encodeIfPresent(screens, forKey: AnyKey(Key.screens.rawValue))
         try c.encodeIfPresent(codec, forKey: AnyKey(Key.codec.rawValue))
         try c.encodeIfPresent(hdrEnabled, forKey: AnyKey(Key.hdrEnabled.rawValue))
         try c.encodeIfPresent(compositor, forKey: AnyKey(Key.compositor.rawValue))
@@ -303,8 +314,10 @@ public enum OverlayField {
         case "refresh_hz": overlay.refreshHz = nil
         case "match_window": overlay.matchWindow = nil
         case "bitrate_kbps": overlay.bitrateKbps = nil
+        case "pyrowave_bpp": overlay.pyrowaveBpp = nil
         case "render_scale": overlay.renderScale = nil
         case "video_fit": overlay.videoFit = nil
+        case "screens": overlay.screens = nil
         case "codec": overlay.codec = nil
         case "hdr_enabled": overlay.hdrEnabled = nil
         case "compositor": overlay.compositor = nil
@@ -346,8 +359,10 @@ public enum OverlayField {
         case "refresh_hz": return o.refreshHz != nil
         case "match_window": return o.matchWindow != nil
         case "bitrate_kbps": return o.bitrateKbps != nil
+        case "pyrowave_bpp": return o.pyrowaveBpp != nil
         case "render_scale": return o.renderScale != nil
         case "video_fit": return o.videoFit != nil
+        case "screens": return o.screens != nil
         case "codec": return o.codec != nil
         case "hdr_enabled": return o.hdrEnabled != nil
         case "compositor": return o.compositor != nil
@@ -505,10 +520,12 @@ public struct PresetCatalog: Codable, Equatable, Sendable {
         presets.first { $0.id == id }
     }
 
-    /// The binding a host resolves to, dropping a dangling id: a preset deleted out from under a
-    /// host is "no preset" (today's behaviour), never an error and never a blocked connect.
-    public func binding(for host: StoredHost) -> StreamPreset? {
-        host.presetID.flatMap { preset(id: $0) }
+    /// The binding a connect resolves to: the launched title's own, else the host's default.
+    /// A dangling id is skipped, never an error: a deleted title binding falls through to the
+    /// host's default, and a deleted default is "no preset".
+    public func binding(for host: StoredHost, launch: String? = nil) -> StreamPreset? {
+        launch.flatMap { host.gamePresets?[$0] }.flatMap { preset(id: $0) }
+            ?? host.presetID.flatMap { preset(id: $0) }
     }
 
     /// This host's pinned presets, in card order, with duplicates and dangling ids dropped —

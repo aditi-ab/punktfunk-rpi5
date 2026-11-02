@@ -38,8 +38,9 @@ import android.view.WindowManager
  * phone adds is a frame remap: sensors report in the device's natural-portrait frame, while
  * the wire wants the controller frame the player sees (x right, y up, z out of the screen), so
  * each sample is rotated by the current display rotation — a phone clipped landscape must yaw
- * when the player yaws, not roll. The matrix is derived and pinned by `DeviceGyroTest`;
- * correctable in one place if on-glass says otherwise.
+ * when the player yaws, not roll. The matrix is derived and pinned by `DeviceGyroVectorTest`
+ * (the table Apple's `DeviceGyroRemap` runs too); correctable in one place if on-glass says
+ * otherwise.
  */
 class DeviceGyro(
     context: Context,

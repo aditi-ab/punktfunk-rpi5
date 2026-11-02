@@ -1,0 +1,858 @@
+//! Native `punktfunk/1` capture→encode→send data plane.
+//!
+//! Owns the synthetic and software protocol-test sources, speed-test probes, the paced submit,
+//! and [`SessionContext`], the per-session inputs `serve_session` hands to [`virtual_stream`],
+//! around the [`StreamCommon`] every source takes.
+//! The virtual-display loop itself is [`state::StreamState`]: bring-up in `new`, the tick loop
+//! in `run`, one file per concern under `stream/`.
+//!
+//! Pin `PUNKTFUNK_IDD_ADAPTIVE=0`, `PUNKTFUNK_DELIVERY=burst`, `PUNKTFUNK_STREAMED_AU=0` for
+//! the rebuild-free A/B levers. Evidence: `design/midstream-resolution-resize.md`.
+
+use super::wiring::{SessionShared, StreamEnds};
+use super::*;
+use crate::native::bitrate::apply_fec_target;
+use crate::send_pacing::{frame_driven_enabled, CaptureCredit};
+
+mod cursor;
+mod encode;
+mod facts;
+mod pipeline;
+mod ramp;
+mod rebuild;
+mod rebuild_plan;
+mod recovery;
+#[cfg(target_os = "windows")]
+mod resize;
+mod screens;
+mod send;
+mod session_watch;
+mod state;
+mod swap;
+mod synth_abr;
+pub(super) use self::pipeline::{spawn_display_prep, DisplayPrep, PrepHandle, PreparedDisplay};
+/// The pipeline steps both stream loops take, for GameStream as `crate::native::pipeline`.
+#[cfg(feature = "gamestream")]
+pub(crate) mod shared {
+    pub(crate) use super::pipeline::open_session_encoder;
+    pub(crate) use super::rebuild::{
+        count_capture_loss, follow_source_mode, rebuild_after_capture_loss, CaptureLossRebuild,
+        SourceFollow,
+    };
+    pub(crate) use super::state::session_client_label;
+    pub(crate) use crate::native::bitrate::{encoder_bps_for_budget, WireFraming};
+}
+// `control.rs` bounds its spacing exemption by the same step length.
+pub(crate) use self::ramp::RAMP_STEP_MAX_MS;
+use self::send::{send_loop, AuMeta, ChunkMsg, FrameMsg, SendMsg, SendStats};
+// `native.rs` asks before offering a mid-stream reconfig.
+pub(crate) use self::send::reconfig_allowed;
+use self::session_watch::{session_watch_enabled, session_watcher_loop, SessionSwitch};
+pub(super) use self::state::session_client_label;
+use self::state::StreamState;
+// `main.rs` parses the content script; `native.rs` builds the context and dispatches.
+pub(super) use self::synth_abr::{synthetic_abr_stream, SynthAbrContext};
+pub use self::synth_abr::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
+
+/// Test frames at 60 Hz. The frames have no size, so an accepted mode switch or codec ask is
+/// delivered as the next epoch, the way a rebuilt pipeline delivers one.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn synthetic_stream(
+    session: &mut Session,
+    frames: u32,
+    stop: &AtomicBool,
+    ends: &super::wiring::StreamEnds,
+    fec_target: &AtomicU8,
+    timing_conn: Option<&super::link::SessionLink>,
+    probe_seq: bool,
+    (mut mode, mut format): (punktfunk_core::Mode, punktfunk_core::quic::VideoFormat),
+) -> Result<()> {
+    let (probe_rx, probe_result_tx) = (&ends.probe_rx, &ends.probe_result_tx);
+    let interval = std::time::Duration::from_millis(1000 / 60);
+    let mut epoch = 0u8;
+    for idx in 0..frames {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let asked_mode = ends.reconfig.try_iter().last();
+        let asked_codec = ends.format_rx.try_iter().last();
+        if asked_mode.is_some() || asked_codec.is_some() {
+            epoch = epoch.wrapping_add(1);
+            session.set_epoch(epoch);
+            mode = asked_mode.unwrap_or(mode);
+            if let Some(codec) = asked_codec {
+                format.codec = crate::encode::codec_to_wire(codec);
+            }
+            let _ = ends.reconfig_result_tx.send(super::wiring::Delivered {
+                mode,
+                format,
+                epoch,
+                corrects: false,
+            });
+            if asked_codec.is_some() {
+                let _ = ends.format_result_tx.send(asked_codec);
+            }
+        }
+        apply_fec_target(session, fec_target);
+        service_probes(session, stop, probe_rx, probe_result_tx, probe_seq);
+        let data = test_frame(idx, 64 * 1024);
+        let pts_ns = now_ns();
+        session
+            .submit_frame(&data, pts_ns, (FLAG_PIC | FLAG_SOF) as u32)
+            .map_err(|e| anyhow!("submit_frame: {e:?}"))?;
+        // 0xCF host_us is near-zero here (no capture/encode); the datagram still proves the plane.
+        if let Some(tc) = timing_conn {
+            let t = punktfunk_core::quic::HostTiming {
+                pts_ns,
+                host_us: (now_ns().saturating_sub(pts_ns) / 1000).min(u32::MAX as u64) as u32,
+                stages: None,
+            };
+            let _ = tc.send_datagram(punktfunk_core::quic::encode_host_timing_datagram(&t));
+        }
+        std::thread::sleep(interval);
+    }
+    tracing::info!(frames, "synthetic stream complete");
+    Ok(())
+}
+
+/// A moving picture through the software H.264 encoder until the session stops. Linux only,
+/// because the encoder is; elsewhere a client gets a refusal it can read, not a hang.
+///
+/// Named, not resolved from the ladder: `auto` never picks software, and `PUNKTFUNK_ENCODER`
+/// is latched long before a session arrives.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn software_stream(
+    session: &mut Session,
+    codec: crate::encode::Codec,
+    mode: punktfunk_core::config::Mode,
+    bitrate_kbps: u32,
+    stop: &AtomicBool,
+    probe_rx: &std::sync::mpsc::Receiver<ProbeShaped>,
+    probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    fec_target: &AtomicU8,
+    probe_seq: bool,
+) -> Result<()> {
+    use crate::capture::Capturer;
+    anyhow::ensure!(
+        codec == crate::encode::Codec::H264,
+        "the software source encodes H.264 only, and {codec:?} was negotiated"
+    );
+    let (w, h, fps) = (mode.width, mode.height, mode.refresh_hz.max(1));
+    let mut capturer = crate::capture::SyntheticCapturer::new(w, h, fps);
+    let mut frame = capturer
+        .next_frame(pf_capture::FirstFrame::Default)
+        .context("first synthetic frame")?;
+    let mut encoder =
+        pf_encode::open_software_h264(frame.format, w, h, fps, u64::from(bitrate_kbps) * 1000)
+            .context("open the software encoder")?;
+    let interval = std::time::Duration::from_nanos(1_000_000_000 / u64::from(fps));
+    let mut frames = 0u64;
+    while !stop.load(Ordering::SeqCst) {
+        apply_fec_target(session, fec_target);
+        service_probes(session, stop, probe_rx, probe_result_tx, probe_seq);
+        encoder.submit(&frame).context("encode submit")?;
+        while let Some(au) = encoder.poll().context("encode poll")? {
+            let mut flags = u32::from(FLAG_PIC);
+            if au.keyframe {
+                flags |= u32::from(FLAG_SOF);
+            }
+            if session.submit_frame(&au.data, au.pts_ns, flags).is_err() {
+                tracing::info!(frames, "software stream ended: the transport refused");
+                return Ok(());
+            }
+            frames += 1;
+        }
+        std::thread::sleep(interval);
+        frame = capturer
+            .next_frame(pf_capture::FirstFrame::Default)
+            .context("synthetic frame")?;
+    }
+    tracing::info!(frames, "software stream complete");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn software_stream(
+    _session: &mut Session,
+    _codec: crate::encode::Codec,
+    _mode: punktfunk_core::config::Mode,
+    _bitrate_kbps: u32,
+    _stop: &AtomicBool,
+    _probe_rx: &std::sync::mpsc::Receiver<ProbeShaped>,
+    _probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    _fec_target: &AtomicU8,
+    _probe_seq: bool,
+) -> Result<()> {
+    anyhow::bail!("the software source needs the software encoder, which is Linux-only")
+}
+
+/// Probe ceiling: 10 Gbps / 5 s. Above the session cap (8 Gbps,
+/// [`MAX_BITRATE_KBPS`](crate::native::bitrate::MAX_BITRATE_KBPS)) so a probe can show headroom
+/// past the rate a session will actually use.
+const MAX_PROBE_KBPS: u32 = 10_000_000;
+const MAX_PROBE_MS: u32 = 5_000;
+/// One pump's send ceiling: a whole catch-up backlog in one batch overruns a ~400 KiB send
+/// buffer. The rest follows on the next pump, which video shares.
+const PROBE_PUMP_BYTES: u64 = 64 * 1024;
+
+/// A speed-test burst in flight: zero-filled [`FLAG_PROBE`] AUs at `target_kbps` for
+/// `duration_ms`, both clamped to `MAX_PROBE_*`. The send loop pumps it between AUs, so video
+/// keeps flowing and the burst reads the headroom beside the live stream. A shaped request
+/// ([`ProbeShaped`]) releases each period's bytes at once, in groups on a clock.
+struct ProbeBurst {
+    filler: Vec<u8>,
+    target_kbps: u32,
+    /// Pacing rate and its anchor: the budget is what has elapsed since `start`, so a pump
+    /// that arrives late sends the backlog instead of forfeiting it.
+    bytes_per_sec: u64,
+    start: std::time::Instant,
+    deadline: std::time::Instant,
+    bytes_sent: u64,
+    packets_sent: u32,
+    /// Wire packets this burst offered, and those the send buffer refused. Counted per submit:
+    /// video shares the loop now, so a session-stats delta would fold its shards in.
+    wire_offered: u32,
+    send_dropped: u32,
+    /// `0` is the smooth train; otherwise `rate / burst_hz` bytes come due every period.
+    burst_hz: u16,
+    /// Bytes one pump may release of a shaped burst (`u64::MAX` = the whole backlog).
+    group_bytes: u64,
+    /// The clock a shaped burst's groups leave on; `None` = line rate.
+    clock: Option<crate::send_pacing::GroupClock>,
+}
+
+impl ProbeBurst {
+    /// `None` = nothing to burst, answered with [`declined`]: an empty request, or a client
+    /// without VIDEO_CAP_PROBE_SEQ. That client has one reassembly window and would drop probe
+    /// frames as stale — and a burst in video's index space reads as a multi-thousand-frame
+    /// loss once it ends.
+    fn begin(req: impl Into<ProbeShaped>, probe_seq: bool) -> Option<ProbeBurst> {
+        let req: ProbeShaped = req.into();
+        if !probe_seq {
+            tracing::info!(
+                "declining speed-test probe: client predates VIDEO_CAP_PROBE_SEQ (its reassembler \
+                 cannot window probe-space frames)"
+            );
+            return None;
+        }
+        let target_kbps = req.target_kbps.min(MAX_PROBE_KBPS);
+        let duration_ms = req.duration_ms.min(MAX_PROBE_MS);
+        if target_kbps == 0 || duration_ms == 0 {
+            return None;
+        }
+        let bytes_per_sec = u64::from(target_kbps) * 125;
+        // ≤16 KiB ≈ a dozen MTU shards; a 256 KiB AU overflowed a ~400 KiB send buffer on one submit.
+        let chunk = (bytes_per_sec / 240).clamp(1200, 16 * 1024) as usize;
+        let start = std::time::Instant::now();
+        Some(ProbeBurst {
+            filler: vec![0u8; chunk],
+            target_kbps,
+            bytes_per_sec,
+            start,
+            deadline: start + std::time::Duration::from_millis(u64::from(duration_ms)),
+            bytes_sent: 0,
+            packets_sent: 0,
+            wire_offered: 0,
+            send_dropped: 0,
+            burst_hz: req.burst_hz,
+            group_bytes: match req.group_bytes {
+                0 => u64::MAX,
+                b => u64::from(b),
+            },
+            clock: (req.burst_hz > 0 && req.group_rate_kbps > 0).then(|| {
+                crate::send_pacing::GroupClock::new(u64::from(req.group_rate_kbps) * 1_000, start)
+            }),
+        })
+    }
+
+    fn period(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(1.0 / f64::from(self.burst_hz.max(1)))
+    }
+
+    /// Bytes the burst is allowed to have sent by now: elapsed × rate, held at the whole
+    /// request so a late pump delivers the budget without overshooting it. A shaped burst
+    /// is owed each period's bytes the moment the period starts.
+    fn allowed_bytes(&self) -> u64 {
+        let elapsed = self.start.elapsed().min(self.deadline - self.start);
+        let whole = ((self.deadline - self.start).as_secs_f64() * self.bytes_per_sec as f64) as u64;
+        if self.burst_hz == 0 {
+            return (elapsed.as_secs_f64() * self.bytes_per_sec as f64) as u64;
+        }
+        let periods = (elapsed.as_secs_f64() / self.period().as_secs_f64()).floor() + 1.0;
+        ((periods * self.bytes_per_sec as f64 / f64::from(self.burst_hz)) as u64).min(whole)
+    }
+
+    /// Send what the budget allows now, at most [`PROBE_PUMP_BYTES`], then hand the thread
+    /// back. Sending the backlog is what keeps the measured rate true when video held the
+    /// loop for an AU. A clocked group waits for its instant and leaves whole.
+    fn pump(&mut self, session: &mut Session) {
+        let now = std::time::Instant::now();
+        if self.clock.as_ref().is_some_and(|c| !c.ahead(now).is_zero()) {
+            return;
+        }
+        let mut budget = self.allowed_bytes().min(self.bytes_sent + PROBE_PUMP_BYTES);
+        if self.clock.is_some() {
+            budget = budget.min(self.bytes_sent.saturating_add(self.group_bytes));
+        }
+        let before = self.bytes_sent;
+        while self.bytes_sent < budget {
+            // WouldBlock/ENOBUFS is part of what the probe measures (`send_dropped`) — keep going.
+            if let Ok((offered, dropped)) = session.submit_probe_frame(&self.filler, now_ns()) {
+                self.wire_offered += offered;
+                self.send_dropped += dropped;
+            }
+            self.bytes_sent += self.filler.len() as u64;
+            self.packets_sent += 1;
+        }
+        if let Some(c) = self.clock.as_mut() {
+            c.advance((self.bytes_sent - before) as usize, now);
+        }
+    }
+
+    /// The requested duration has elapsed. Callers pump before they ask, so the last of the
+    /// budget is already on the wire.
+    fn expired(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+
+    /// How long the caller may spend elsewhere: until the next filler comes due, zero while
+    /// the budget is behind, and never past the burst's own deadline. A shaped burst with a
+    /// backlog is due at its next group's instant, otherwise at the next period.
+    fn next_due(&self) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        let due = if self.burst_hz == 0 {
+            self.start
+                + std::time::Duration::from_secs_f64(
+                    self.bytes_sent as f64 / self.bytes_per_sec as f64,
+                )
+        } else if self.bytes_sent < self.allowed_bytes() {
+            now + self
+                .clock
+                .as_ref()
+                .map_or(std::time::Duration::ZERO, |c| c.ahead(now))
+        } else {
+            let elapsed = now.saturating_duration_since(self.start);
+            let periods = (elapsed.as_secs_f64() / self.period().as_secs_f64()).floor() as u32 + 1;
+            self.start + self.period() * periods
+        };
+        due.saturating_duration_since(now)
+            .min(self.deadline.saturating_duration_since(now))
+    }
+
+    /// Serve the whole burst on this thread, then report it. It pumps before it asks, so a
+    /// thread woken past the deadline still sends what the window owed.
+    pub(super) fn run(mut self, session: &mut Session, stop: &AtomicBool) -> ProbeResult {
+        loop {
+            self.pump(session);
+            if self.expired() || stop.load(Ordering::SeqCst) {
+                return self.finish();
+            }
+            std::thread::sleep(self.next_due().min(std::time::Duration::from_micros(200)));
+        }
+    }
+
+    /// End the burst and report it. Both figures are what happened, so a burst cut short by
+    /// `stop` or a teardown reports itself rather than the request.
+    fn finish(self) -> ProbeResult {
+        let duration_ms = self.start.elapsed().as_millis() as u32;
+        let wire_packets_sent = self.wire_offered.saturating_sub(self.send_dropped);
+        tracing::info!(
+            target_kbps = self.target_kbps,
+            duration_ms,
+            bytes_sent = self.bytes_sent,
+            au_count = self.packets_sent,
+            wire_offered = self.wire_offered,
+            wire_packets_sent,
+            send_dropped = self.send_dropped,
+            "speed-test probe burst complete"
+        );
+        ProbeResult {
+            bytes_sent: self.bytes_sent,
+            packets_sent: self.packets_sent,
+            duration_ms,
+            wire_packets_sent,
+            send_dropped: self.send_dropped,
+        }
+    }
+}
+
+/// All-zero: the client reads it as a decline and keeps its negotiated ceiling.
+pub(super) fn declined() -> ProbeResult {
+    ProbeResult {
+        bytes_sent: 0,
+        packets_sent: 0,
+        duration_ms: 0,
+        wire_packets_sent: 0,
+        send_dropped: 0,
+    }
+}
+
+/// Pump the live burst, else take the next request. One slice per call: the send loop goes
+/// straight back to its AUs, so the encode channel never fills and the capture pool keeps its
+/// spare buffers. Never while a streamed AU is open.
+fn service_burst(
+    session: &mut Session,
+    burst: &mut Option<ProbeBurst>,
+    probe_rx: &std::sync::mpsc::Receiver<ProbeShaped>,
+    probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    probe_seq: bool,
+) {
+    match burst.as_mut() {
+        Some(b) => {
+            b.pump(session);
+            // Filler is never resent, and an AU's plaintext was drained when it was sealed:
+            // let go of the tap's copies now, not at the next AU after the whole burst.
+            session.drain_plaintext(|_| {});
+            if b.expired() {
+                let done = burst.take().expect("armed on this branch");
+                let _ = probe_result_tx.send(done.finish());
+            }
+        }
+        None => {
+            if let Ok(req) = probe_rx.try_recv() {
+                match ProbeBurst::begin(req, probe_seq) {
+                    Some(b) => *burst = Some(b),
+                    None => {
+                        let _ = probe_result_tx.send(declined());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A diagnostic session (`EXT_DELIVERY_PROBE_ONLY`): the bound data plane serves every
+/// probe in full and nothing else — no display, encoder, launch or seat — until the client
+/// closes, [`PROBE_ONLY_MAX`] passes, or the probes have cost [`PROBE_ONLY_BYTES`]. Past the
+/// byte cap the rest are declined; the per-request clamps still apply to each.
+pub(crate) fn probe_only_stream(common: &mut StreamCommon, probe_seq: bool) -> Result<()> {
+    const PROBE_ONLY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+    const PROBE_ONLY_BYTES: u64 = 2 << 30;
+    tracing::info!("diagnostic session: probes only, no pipeline");
+    let started = std::time::Instant::now();
+    while !common.life.stopping() && started.elapsed() < PROBE_ONLY_MAX {
+        if common.session.stats().bytes_sent >= PROBE_ONLY_BYTES {
+            while common.ends.probe_rx.try_recv().is_ok() {
+                let _ = common.ends.probe_result_tx.send(declined());
+            }
+        } else {
+            service_probes(
+                &mut common.session,
+                common.life.stop_flag(),
+                &common.ends.probe_rx,
+                &common.ends.probe_result_tx,
+                probe_seq,
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    tracing::info!(
+        bytes = common.session.stats().bytes_sent,
+        secs = started.elapsed().as_secs(),
+        "diagnostic session over"
+    );
+    Ok(())
+}
+
+/// Serve pending speed-test requests between frames, blocking here for each burst. The
+/// synthetic and software sources hold no capture buffers and owe no deadline; the
+/// virtual-display path pumps [`ProbeBurst`] from its send loop instead.
+fn service_probes(
+    session: &mut Session,
+    stop: &AtomicBool,
+    probe_rx: &std::sync::mpsc::Receiver<ProbeShaped>,
+    probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    probe_seq: bool,
+) {
+    while let Ok(req) = probe_rx.try_recv() {
+        let result = match ProbeBurst::begin(req, probe_seq) {
+            Some(burst) => burst.run(session, stop),
+            None => declined(),
+        };
+        let _ = probe_result_tx.send(result);
+    }
+}
+
+/// Seal one AU and send it on the session's [`Pacer`](crate::send_pacing::Pacer): every
+/// group on the clock at the link rate. Chunks go out as they are sealed, so the first
+/// packet leaves after one chunk, not the frame. `ring` keeps its plaintext for a NACK.
+fn paced_submit(
+    session: &mut Session,
+    data: &[u8],
+    pts_ns: u64,
+    flags: u32,
+    frame_index: u32,
+    pacer: &mut crate::send_pacing::Pacer,
+    mut ring: Option<&mut recovery::ResendRing>,
+) -> Result<PaceStat> {
+    pacer.begin(session.frame_wire_len(data, flags));
+    session.drain_plaintext(|_| {});
+    if let Some(r) = ring.as_deref_mut() {
+        r.begin(frame_index);
+    }
+    let sealed =
+        session.seal_frame_chunks_at(data, pts_ns, flags, frame_index, &mut |chunk, send| {
+            let mut refs: Vec<&[u8]> = chunk.iter().map(|w| w.as_slice()).collect();
+            crate::send_pacing::inject_video_drop(&mut refs);
+            pacer.send(&refs, |g| send(g).map(|_| ()))
+        });
+    let (stat, sock_ns) = pacer.finish();
+    session.note_sock_ns(sock_ns);
+    match ring {
+        Some(r) => session.drain_plaintext(|p| r.note(p)),
+        None => session.drain_plaintext(|_| {}),
+    }
+    sealed.map_err(|e| anyhow!("seal_frame: {e:?}"))?;
+    Ok(stat)
+}
+
+/// Send already-sealed wires on the pacer: one flush of a streamed AU ([`handle_chunk`]).
+fn pace_sealed(
+    session: &mut Session,
+    wires: Vec<Vec<u8>>,
+    pacer: &mut crate::send_pacing::Pacer,
+) -> Result<()> {
+    let mut refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+    crate::send_pacing::inject_video_drop(&mut refs);
+    let result = pacer.send(&refs, |g| session.send_sealed(g).map(|_| ()));
+    drop(refs);
+    session.reclaim_wires(wires);
+    result.map_err(|e| anyhow!("send_sealed: {e:?}"))
+}
+
+/// What every stream source takes from its session: the bound session, its schedule, the
+/// stream thread's [`StreamEnds`], the [`SessionShared`] values and the session's identity.
+/// [`SessionContext`] and [`SynthAbrContext`] both carry one.
+///
+/// [`StreamEnds`]: super::wiring::StreamEnds
+/// [`SessionShared`]: super::wiring::SessionShared
+pub(crate) struct StreamCommon {
+    pub(crate) session: Session,
+    pub(crate) mode: punktfunk_core::Mode,
+    pub(crate) seconds: u32,
+    /// The flags every thread of the session reads, and the one `end` that writes them.
+    pub(crate) life: crate::lifecycle::Lifecycle,
+    /// Session totals for the summary; the encode loop notes every bitrate it runs at.
+    pub(crate) counters: Arc<crate::session_status::SessionCounters>,
+    pub(crate) ends: super::wiring::StreamEnds,
+    pub(crate) shared: super::wiring::SessionShared,
+    /// Total wire budget (kbps): video + FEC + framing + audio reservation, PyroWave's pin too.
+    pub(crate) bitrate_kbps: u32,
+    pub(crate) audio_reserved_kbps: u32,
+    pub(crate) shard_payload: u16,
+    pub(crate) timing_conn: Option<super::link::SessionLink>,
+    /// Without this, a mid-session probe consumes video indexes the gap detector cannot see.
+    pub(crate) probe_seq: bool,
+    pub(crate) stats: Arc<StatsRecorder>,
+    pub(crate) client_label: String,
+    pub(crate) bringup: Arc<crate::bringup::Trace>,
+    /// A clone of the data socket for the sender's kernel-queue probe; `None` on the web plane.
+    pub(crate) wire_sock: Option<std::net::UdpSocket>,
+    pub(crate) codec: crate::encode::Codec,
+    /// Per-session handles the management routes act on; published to the registry.
+    pub(crate) controls: crate::session_status::SessionControls,
+    pub(crate) client_name: Option<String>,
+    /// 10-bit alone does not imply HDR: 10-bit SDR is its own path.
+    pub(crate) hdr: bool,
+    pub(crate) bit_depth: u8,
+    pub(crate) chroma: crate::encode::ChromaFormat,
+    /// The colour the Welcome promised.
+    pub(crate) color: punktfunk_core::quic::ColorInfo,
+}
+
+impl StreamCommon {
+    /// The mode and video format the Welcome promised.
+    pub(crate) fn opened_as(&self) -> (punktfunk_core::Mode, punktfunk_core::quic::VideoFormat) {
+        let format = state::video_format(self.codec, self.bit_depth, self.color, self.chroma);
+        (self.mode, format)
+    }
+}
+
+/// Owned per-session inputs for [`virtual_stream`]: the [`StreamCommon`] plus what a display
+/// needs. The whole context moves onto the stream thread.
+pub(super) struct SessionContext {
+    pub(super) common: StreamCommon,
+    pub(super) compositor: crate::vdisplay::Compositor,
+    /// Per-instance, not via `PUNKTFUNK_GAMESCOPE_NODE` — two sessions must not overwrite each other.
+    pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
+    /// What the handshake's format rule read, re-run for a codec change.
+    pub(super) format_facts: super::handshake::FormatFacts,
+    /// The handshake's encode resolution, which the session keeps for every open.
+    pub(super) encoder: Arc<crate::encode::Resolved>,
+    pub(super) host_knobs: &'static super::HostKnobs,
+    pub(super) knobs: super::SessionKnobs,
+    /// `Hello::bitrate_kbps == 0`. A mode switch re-resolves PyroWave's pin either way, and an
+    /// Automatic rate is held inside the new bounds. Another codec's explicit rate stays.
+    pub(super) bitrate_auto: bool,
+    /// PyroWave's bits per pixel for every pin this session resolves (`session_pyrowave_bpp`).
+    pub(super) pyrowave_bpp: f64,
+    pub(super) conn: super::link::SessionLink,
+    pub(super) cursor_forward: bool,
+    pub(super) streamed_au: bool,
+    /// H.264/HEVC slices per frame; 1 = single-slice. TV-SoC decoders (Amlogic) wedge on
+    /// multi-slice.
+    pub(super) slices: u32,
+    pub(super) launch: Option<String>,
+    pub(super) launch_target: Option<crate::library::LaunchTarget>,
+    /// This session's launch record, claimed before prep and the launch hold.
+    pub(super) launch_claim: Option<crate::launchreg::Claim>,
+    /// [`crate::session_launch::Prepared::stamp`].
+    pub(super) launch_stamp: Option<f64>,
+    pub(super) launch_owner: crate::session_launch::LaunchOwner,
+    /// Where this session's launch outcome goes; the control task writes it to
+    /// the client ([`punktfunk_core::quic::LaunchOutcome`]).
+    pub(super) launch_outcome: crate::gamelease::OutcomeTx,
+    /// Threaded into the EDID CTA HDR block before `create` so host apps tone-map to the client's panel.
+    pub(super) client_hdr: Option<pf_frame::HdrMeta>,
+    /// Admitted by `mode_conflict: join`: share the live display instead of creating one.
+    pub(super) join_live: bool,
+    /// A joiner's view and fit ([`SessionPlan::reframe_to`](crate::session_plan::SessionPlan::reframe_to)).
+    pub(super) reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
+    /// The encoder's framing, published for the input thread.
+    pub(super) frame_map: super::input::FrameMap,
+    /// The session gamescope's X displays, published for the clipboard.
+    #[cfg(target_os = "linux")]
+    pub(super) gamescope_xwayland: pf_clipboard::GamescopeXwayland,
+    pub(super) resize_ms: Arc<AtomicU32>,
+    #[cfg(target_os = "linux")]
+    pub(super) input_tx: std::sync::mpsc::SyncSender<super::input::ClientInput>,
+    /// Isolated gamescope spawn identity. `None` = shared planes. See `design/gamescope-multiuser.md`.
+    #[cfg(target_os = "linux")]
+    pub(super) isolation: Option<crate::vdisplay::SessionIsolation>,
+    #[cfg(target_os = "linux")]
+    pub(super) input_route: super::input::InputRoute,
+    #[cfg(target_os = "linux")]
+    pub(super) inj_shared_tx: std::sync::mpsc::Sender<punktfunk_core::input::InputEvent>,
+    #[cfg(target_os = "linux")]
+    pub(super) inj_session_tx: Option<std::sync::mpsc::Sender<punktfunk_core::input::InputEvent>>,
+    /// The seat's own session: it follows the seat's Game Mode switch (`seats/session_switch.rs`).
+    #[cfg(target_os = "linux")]
+    pub(super) follows_seat: bool,
+    /// The client's screens when the session negotiated them, screen 0 first; `None` without.
+    pub(super) screens: Option<Vec<punktfunk_core::quic::v2::msg::Screen>>,
+}
+
+/// The virtual-display session: bring up, then tick until the client leaves.
+pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDisplay>) -> Result<()> {
+    pf_frame::thread_qos::boost_thread_priority(true);
+    StreamState::new(ctx, prepared)?.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punktfunk_core::quic::ProbeRequest;
+
+    /// A host session onto an in-process link, and the client that reads it back.
+    fn loopback_sessions() -> (Session, Session) {
+        use punktfunk_core::config::{Config, Role};
+        let (host_tp, client_tp) = punktfunk_core::transport::loopback_pair(0, 0);
+        (
+            Session::new(
+                Config::defaults(Role::Host),
+                punktfunk_core::session::MediaV2::default(),
+                Box::new(host_tp),
+            )
+            .expect("host session"),
+            Session::new(
+                Config::defaults(Role::Client),
+                punktfunk_core::session::MediaV2::default(),
+                Box::new(client_tp),
+            )
+            .expect("client session"),
+        )
+    }
+
+    /// One pump sends one slice, not the burst: the budget is what has elapsed. Across a
+    /// burst's worth of pumps the slices still add up to the bytes the client asked for.
+    #[test]
+    fn a_burst_spends_its_byte_budget_across_pumps() {
+        let (mut host, _client) = loopback_sessions();
+        let req = ProbeRequest {
+            target_kbps: 8_000,
+            duration_ms: 200,
+        };
+        let mut burst = ProbeBurst::begin(req, true).expect("a capable client arms a burst");
+        let chunk = burst.filler.len() as u64;
+        burst.pump(&mut host);
+        assert!(
+            burst.bytes_sent <= 2 * chunk,
+            "the first pump sends a slice, not the burst: {} bytes",
+            burst.bytes_sent
+        );
+        let mut pumps = 1;
+        while !burst.expired() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            burst.pump(&mut host);
+            pumps += 1;
+        }
+        burst.pump(&mut host); // the last budgeted bytes, as the send loop does before it finishes
+        assert!(pumps > 5, "a 200 ms burst pumps many times: {pumps}");
+        let budget = 200 * 8_000 / 8; // duration_ms × kbps / 8 = bytes
+        let r = burst.finish();
+        assert!(
+            r.bytes_sent >= budget * 8 / 10 && r.bytes_sent <= budget + chunk,
+            "delivered {} of a {budget} byte budget",
+            r.bytes_sent
+        );
+        assert_eq!(r.send_dropped, 0, "an in-process link refuses nothing");
+        assert!(
+            u64::from(r.wire_packets_sent) >= u64::from(r.packets_sent),
+            "each filler AU is at least one wire packet"
+        );
+    }
+
+    /// Video AUs keep leaving the host through a burst, and the burst's report counts only
+    /// its own filler: the client's probe counter matches it exactly.
+    #[test]
+    fn video_flows_through_a_burst_and_stays_out_of_its_report() {
+        let (mut host, mut client) = loopback_sessions();
+        let req = ProbeRequest {
+            target_kbps: 8_000,
+            duration_ms: 100,
+        };
+        let mut burst = ProbeBurst::begin(req, true).expect("a capable client arms a burst");
+        let video = vec![7u8; 16 * 1024];
+        let (mut video_frames, mut sent_video) = (0u32, 0u32);
+        let drain = |client: &mut Session, video_frames: &mut u32| {
+            while let Ok(f) = client.poll_frame() {
+                if f.flags & FLAG_PROBE as u32 == 0 {
+                    *video_frames += 1;
+                }
+            }
+        };
+        while !burst.expired() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            burst.pump(&mut host);
+            host.submit_frame(&video, now_ns(), (FLAG_PIC | FLAG_SOF) as u32)
+                .expect("a video AU during the burst");
+            sent_video += 1;
+            drain(&mut client, &mut video_frames);
+        }
+        burst.pump(&mut host);
+        drain(&mut client, &mut video_frames);
+        let r = burst.finish();
+        assert!(
+            sent_video > 3 && video_frames >= sent_video - 1,
+            "video kept flowing: {video_frames} of {sent_video} AUs arrived"
+        );
+        let st = client.stats();
+        assert_eq!(
+            u64::from(r.wire_packets_sent),
+            st.probe_packets_received,
+            "the report counts probe packets, never the video shards beside them"
+        );
+        assert!(
+            st.packets_received > st.probe_packets_received,
+            "video shared the wire with the burst"
+        );
+    }
+
+    /// A burst reports once and leaves nothing armed, and a client that cannot window probe
+    /// indexes is declined without arming anything.
+    #[test]
+    fn a_burst_disarms_itself_and_reports_once() {
+        let (mut host, _client) = loopback_sessions();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<ProbeShaped>();
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
+        let mut burst: Option<ProbeBurst> = None;
+        let req = ProbeRequest {
+            target_kbps: 4_000,
+            duration_ms: 20,
+        };
+        req_tx.send(req.into()).unwrap();
+        service_burst(&mut host, &mut burst, &req_rx, &res_tx, true);
+        assert!(burst.is_some(), "the request arms a burst");
+        assert!(res_rx.try_recv().is_err(), "no result until the burst ends");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        service_burst(&mut host, &mut burst, &req_rx, &res_tx, true);
+        assert!(burst.is_none(), "an expired burst leaves nothing armed");
+        let r = res_rx.try_recv().expect("the finished burst reports");
+        assert!(r.bytes_sent > 0 && r.duration_ms >= 20, "{r:?}");
+        assert!(res_rx.try_recv().is_err(), "one result per request");
+        req_tx.send(req.into()).unwrap();
+        service_burst(&mut host, &mut burst, &req_rx, &res_tx, false);
+        assert!(burst.is_none(), "an old client arms nothing");
+        assert_eq!(res_rx.try_recv().expect("a decline"), declined());
+    }
+
+    /// A thread that reaches its burst only after the deadline still sends the window, so
+    /// the client never reads a descheduled host as one that sent nothing.
+    #[test]
+    fn a_burst_run_late_still_sends_its_window() {
+        let (mut host, _client) = loopback_sessions();
+        let req = ProbeRequest {
+            target_kbps: 5_000,
+            duration_ms: 25,
+        };
+        let burst = ProbeBurst::begin(req, true).expect("a capable client arms a burst");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let r = burst.run(&mut host, &AtomicBool::new(false));
+        let budget = 25 * 5_000 / 8;
+        assert!(
+            r.bytes_sent * 100 >= budget * 90,
+            "sent {} of a {budget} byte window",
+            r.bytes_sent
+        );
+    }
+
+    /// Teardown mid-burst: the report is what went out, not what was asked for.
+    #[test]
+    fn a_burst_cut_short_reports_what_it_sent() {
+        let (mut host, _client) = loopback_sessions();
+        let req = ProbeRequest {
+            target_kbps: 8_000,
+            duration_ms: 5_000,
+        };
+        let mut burst = ProbeBurst::begin(req, true).expect("a capable client arms a burst");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        burst.pump(&mut host);
+        let r = burst.finish();
+        assert!(
+            r.duration_ms >= 20 && r.duration_ms < 5_000,
+            "the window is what elapsed: {} ms",
+            r.duration_ms
+        );
+        assert!(
+            r.bytes_sent > 0 && r.bytes_sent < 5_000 * 8_000 / 8,
+            "the bytes are what went out: {}",
+            r.bytes_sent
+        );
+    }
+
+    #[test]
+    fn reconfig_allowed_gates_gamescope_and_per_client_mode() {
+        use crate::vdisplay::Compositor::{
+            Gamescope, Hyprland, Kwin, Mutter, Niri, Umbriel, Wlroots,
+        };
+        assert!(!reconfig_allowed(Some(Gamescope), false, false));
+        assert!(!reconfig_allowed(Some(Gamescope), true, false));
+        assert!(!reconfig_allowed(Some(Kwin), true, false));
+        assert!(!reconfig_allowed(Some(Mutter), true, false));
+        assert!(!reconfig_allowed(None, true, false));
+        for c in [Kwin, Mutter, Wlroots, Hyprland, Niri, Umbriel] {
+            assert!(
+                reconfig_allowed(Some(c), false, false),
+                "{c:?} should allow live reconfigure"
+            );
+        }
+        assert!(reconfig_allowed(None, false, false));
+    }
+
+    #[test]
+    fn reconfig_allowed_rejects_a_monitor_mirror_on_every_backend() {
+        use crate::vdisplay::Compositor::{Hyprland, Kwin, Mutter, Niri, Umbriel, Wlroots};
+        for c in [Kwin, Mutter, Wlroots, Hyprland, Niri, Umbriel] {
+            assert!(
+                reconfig_allowed(Some(c), false, false),
+                "{c:?} without a pin should still allow live reconfigure"
+            );
+            assert!(
+                !reconfig_allowed(Some(c), false, true),
+                "{c:?} mirroring a physical head must reject a resize"
+            );
+        }
+    }
+}

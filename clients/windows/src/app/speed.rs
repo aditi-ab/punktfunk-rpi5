@@ -2,16 +2,15 @@
 //! real data plane, have the host burst probe filler for 2 s up to its 3 Gbps ceiling, and
 //! report goodput · loss · a recommended bitrate (≈70 % of measured), applied in one tap.
 
-use super::lucide;
 use super::style::*;
-use super::{Screen, Svc};
+use super::{saved, Screen, Svc};
 use crate::trust::KnownHosts;
 use pf_client_core::presets::PresetsFile;
+use pf_fluent::Token;
 use windows_reactor::*;
 
-/// Speed-test lifecycle. Held as ROOT state (the probe worker completes it via
-/// `Svc::set_speed`, and thread-driven updates only re-render through a prop change — see the
-/// app module docs). The hosts page resets it to `Running` before navigating here.
+/// Speed-test lifecycle, root state: the probe worker completes it via `Svc::set_speed`, and
+/// the hosts page resets it to `Running` before navigating here.
 #[derive(Clone, PartialEq)]
 pub(crate) enum SpeedState {
     Running,
@@ -23,8 +22,8 @@ pub(crate) enum SpeedState {
         /// host without a ramp, which gets no loss line.
         clean: Option<(f64, f32, f64)>,
         recommended_kbps: u32,
-        /// What the check found: `(id, figures, offered profile)` per finding.
-        findings: Vec<(u8, [u32; 3], Option<u8>)>,
+        /// What the check found: `(id, figures)` per finding.
+        findings: Vec<(u8, [u32; 3])>,
     },
 }
 
@@ -41,89 +40,103 @@ impl PartialEq for SpeedProps {
     }
 }
 
-pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
-    let ctx = &props.svc.ctx;
+/// The speed test screen. One probe run per mount: navigating here again re-mounts and
+/// re-runs it.
+pub(crate) struct SpeedPage;
+
+impl Component for SpeedPage {
+    type Input = SpeedProps;
+    type Message = ();
+
+    fn create(props: &SpeedProps, _cx: &ComponentContext<Self>) -> Self {
+        start_probe(&props.svc);
+        SpeedPage
+    }
+
+    fn view(&self, props: &SpeedProps, _cx: &mut ViewContext<'_, Self>) -> View {
+        speed_page(props)
+    }
+}
+
+/// Run the probe against `Shared::target` on a worker thread, publishing into root state.
+fn start_probe(svc: &Svc) {
+    use std::sync::atomic::Ordering;
+    let ctx = &svc.ctx;
+    let target = ctx.shared.target.lock().unwrap().clone();
+    let (set_speed, shared, identity) = (
+        svc.set_speed.clone(),
+        ctx.shared.clone(),
+        ctx.identity.clone(),
+    );
+    // The generation the hosts page stamped for THIS run; a stale worker (user backed out and
+    // started another test) must not publish over the newer run.
+    let generation = shared.speed_gen.load(Ordering::SeqCst);
+    std::thread::Builder::new()
+        .name("pf-speedtest".into())
+        .spawn(move || {
+            let outcome = pf_client_core::speed::run_network_check_with(
+                &target.host.addr,
+                target.host.port,
+                target.host.fp_hex.as_deref(),
+                identity,
+                |_| {},
+            );
+            if shared.speed_gen.load(Ordering::SeqCst) != generation {
+                return; // superseded
+            }
+            set_speed.call(match outcome {
+                Ok(r) => SpeedState::Done {
+                    mbps: f64::from(r.speed.ceiling_kbps) / 1000.0,
+                    clean: r.speed.clean.map(|c| {
+                        (
+                            f64::from(c.rate_kbps) / 1000.0,
+                            c.loss_pct,
+                            f64::from(c.jitter_us) / 1000.0,
+                        )
+                    }),
+                    recommended_kbps: pf_client_core::speed::recommended_kbps(r.speed.ceiling_kbps),
+                    findings: r.findings.iter().map(|f| (f.id as u8, f.numbers)).collect(),
+                },
+                Err(msg) => SpeedState::Failed(msg),
+            });
+        })
+        .ok();
+}
+
+fn speed_page(props: &SpeedProps) -> View {
+    let (ctx, pal) = (&props.svc.ctx, &props.svc.pal);
     let set_screen = &props.svc.set_screen;
     let target = ctx.shared.target.lock().unwrap().clone();
-
-    // One probe run per mount (navigating here again re-mounts and re-runs).
-    cx.use_effect((), {
-        let set_speed = props.svc.set_speed.clone();
-        let shared = ctx.shared.clone();
-        let identity = ctx.identity.clone();
-        let target = target.clone();
-        move || {
-            use std::sync::atomic::Ordering;
-            // The generation the hosts page stamped for THIS run; a stale worker (user backed
-            // out and started another test) must not publish over the newer run.
-            let generation = shared.speed_gen.load(Ordering::SeqCst);
-            std::thread::Builder::new()
-                .name("pf-speedtest".into())
-                .spawn(move || {
-                    let outcome = pf_client_core::speed::run_network_check_with(
-                        &target.addr,
-                        target.port,
-                        target.fp_hex.as_deref(),
-                        identity,
-                        |_| {},
-                    );
-                    if shared.speed_gen.load(Ordering::SeqCst) != generation {
-                        return; // superseded
-                    }
-                    set_speed.call(match outcome {
-                        Ok(r) => SpeedState::Done {
-                            mbps: f64::from(r.speed.ceiling_kbps) / 1000.0,
-                            clean: r.speed.clean.map(|c| {
-                                (
-                                    f64::from(c.rate_kbps) / 1000.0,
-                                    c.loss_pct,
-                                    f64::from(c.jitter_us) / 1000.0,
-                                )
-                            }),
-                            recommended_kbps: pf_client_core::speed::recommended_kbps(
-                                r.speed.ceiling_kbps,
-                            ),
-                            findings: r
-                                .findings
-                                .iter()
-                                .map(|f| (f.id as u8, f.numbers, f.profile))
-                                .collect(),
-                        },
-                        Err(msg) => SpeedState::Failed(msg),
-                    });
-                })
-                .ok();
-        }
-    });
-
     let back_btn = {
         let ss = set_screen.clone();
-        button("Close")
-            .icon(lucide::icon("arrow-left"))
+        icon_button("arrow-left", "Close")
             .on_click(move || ss.call(Screen::Hosts))
             .horizontal_alignment(HorizontalAlignment::Center)
     };
-    let headline = if target.name.is_empty() {
+    let headline = if target.host.name.is_empty() {
         "Network speed test".to_string()
     } else {
-        format!("Network speed test \u{00B7} {}", target.name)
+        format!("Network speed test \u{00B7} {}", target.host.name)
     };
 
     match &props.state {
         SpeedState::Running => busy_page(
+            pal,
             &headline,
             "Measuring the path over the real data plane \u{2014} a 2 s probe burst\u{2026}",
             vec![back_btn.into()],
         ),
         SpeedState::Failed(msg) => {
             let content = vstack((
-                text_block(headline)
+                text(headline)
                     .font_size(18.0)
-                    .semibold()
+                    .font_weight(FontWeight::SEMI_BOLD)
                     .horizontal_alignment(HorizontalAlignment::Center),
-                InfoBar::new("Speed test failed")
+                InfoBar::new()
+                    .title("Speed test failed")
+                    .is_open(true)
                     .message(msg.clone())
-                    .error()
+                    .severity(InfoBarSeverity::Error)
                     .is_closable(false),
                 back_btn,
             ))
@@ -146,7 +159,11 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
             // it: the one-off this test was started with, else the host's binding.
             let target = ctx.shared.target.lock().unwrap().clone();
             let bound = KnownHosts::load()
-                .resolve(target.fp_hex.as_deref(), &target.addr, target.port)
+                .resolve(
+                    target.host.fp_hex.as_deref(),
+                    &target.host.addr,
+                    target.host.port,
+                )
                 .and_then(|h| h.preset_id.clone());
             let preset = match target.preset.as_deref() {
                 Some("") => None,
@@ -158,26 +175,24 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
             let write_global = {
                 let (ctx, ss) = (ctx.clone(), set_screen.clone());
                 move || {
-                    // Rebase on the file before the whole-struct save — same discipline as
-                    // `commit()`; another writer may have moved it under this snapshot.
+                    // The file under its lock, as `commit()` edits it: another writer may have
+                    // moved it under this snapshot.
                     let mut s = ctx.settings.lock().unwrap();
-                    *s = crate::trust::Settings::load();
-                    s.bitrate_kbps = kbps;
-                    s.save();
+                    *s = crate::trust::Settings::update(|file| {
+                        file.bitrate_kbps = kbps;
+                        true
+                    });
                     ss.call(Screen::Hosts);
                 }
             };
             let write_preset = |id: String| {
-                let ss = set_screen.clone();
+                let (ss, st) = (set_screen.clone(), props.svc.set_status.clone());
                 move || {
-                    let mut catalog = PresetsFile::load();
-                    if let Some(slot) = catalog.presets.iter_mut().find(|x| x.id == id) {
-                        slot.overrides.bitrate_kbps = Some(kbps);
-                        if let Err(e) = catalog.save() {
-                            tracing::warn!(error = %format!("{e:#}"),
-                                "saving the measured bitrate");
-                        }
-                    }
+                    let r = super::settings::update_preset(&id, |p| {
+                        p.overrides.bitrate_kbps = Some(kbps)
+                    });
+                    // The host list it returns to redraws anyway; no revision to bump.
+                    saved(r, &st, None);
                     ss.call(Screen::Hosts);
                 }
             };
@@ -186,106 +201,77 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
             // bitrate could legitimately mean either layer — offer both rather than
             // guessing (the GTK client's Ask tier; this shell used to silently CREATE an
             // override on the preset).
-            let mut buttons: Vec<Element> = Vec::new();
+            let mut buttons: Vec<View> = Vec::new();
             match &preset {
                 None => buttons.push(
-                    button(format!("Use {recommended_mbps:.0} Mb/s"))
-                        .accent()
-                        .icon(lucide::icon("check"))
+                    icon_button("check", format!("Use {recommended_mbps:.0} Mb/s"))
+                        .style(ButtonStyle::Accent)
                         .on_click(write_global.clone())
                         .into(),
                 ),
                 Some(p) if p.overrides.bitrate_kbps.is_some() => buttons.push(
-                    button(format!(
-                        "Set {recommended_mbps:.0} Mb/s in \u{201c}{}\u{201d}",
-                        p.name
-                    ))
-                    .accent()
-                    .icon(lucide::icon("check"))
+                    icon_button(
+                        "check",
+                        format!(
+                            "Set {recommended_mbps:.0} Mb/s in \u{201c}{}\u{201d}",
+                            p.name
+                        ),
+                    )
+                    .style(ButtonStyle::Accent)
                     .on_click(write_preset(p.id.clone()))
                     .into(),
                 ),
                 Some(p) => {
                     buttons.push(
-                        button("Set as default")
-                            .icon(lucide::icon("check"))
+                        icon_button("check", "Set as default")
                             .on_click(write_global.clone())
                             .into(),
                     );
                     buttons.push(
-                        button(format!("Set in \u{201c}{}\u{201d}", p.name))
-                            .accent()
-                            .icon(lucide::icon("check"))
+                        icon_button("check", format!("Set in \u{201c}{}\u{201d}", p.name))
+                            .style(ButtonStyle::Accent)
                             .on_click(write_preset(p.id.clone()))
                             .into(),
                     );
                 }
             }
-            // The profile a finding offered goes on this host's record; the next connect asks
-            // for it. Only a saved host has a record.
-            if let (Some(profile), Some(fp)) = (
-                findings.iter().find_map(|(_, _, p)| *p),
-                target.fp_hex.clone(),
-            ) {
-                let ss = set_screen.clone();
-                buttons.push(
-                    button(format!(
-                        "Use paced delivery ({})",
-                        pf_client_core::findings::profile_name(profile)
-                    ))
-                    .icon(lucide::icon("check"))
-                    .on_click(move || {
-                        let mut known = KnownHosts::load();
-                        if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
-                            h.delivery = Some(profile);
-                            if let Err(e) = known.save() {
-                                tracing::warn!(error = %format!("{e:#}"),
-                                    "saving the host's delivery profile");
-                            }
-                        }
-                        ss.call(Screen::Hosts);
-                    })
-                    .into(),
-                );
-            }
             buttons.push({
                 let ss = set_screen.clone();
-                button("Close")
-                    .icon(lucide::icon("x"))
+                icon_button("x", "Close")
                     .on_click(move || ss.call(Screen::Hosts))
                     .into()
             });
-            let finding_lines: Vec<Element> = findings
+            let finding_lines: Vec<View> = findings
                 .iter()
-                .map(|(id, numbers, _)| {
-                    text_block(pf_client_core::findings::text(*id, *numbers))
+                .map(|(id, numbers)| {
+                    text(pf_client_core::findings::text(*id, *numbers))
                         .font_size(12.0)
-                        .foreground(ThemeRef::SecondaryText)
+                        .foreground(pal.get(Token::SecondaryText))
                         .horizontal_alignment(HorizontalAlignment::Center)
                         .into()
                 })
                 .collect();
             let results = card(
                 vstack((
-                    text_block(format!("{mbps:.0} Mbit/s"))
+                    text(format!("{mbps:.0} Mbit/s"))
                         .font_size(34.0)
-                        .bold()
+                        .font_weight(FontWeight::BOLD)
                         .horizontal_alignment(HorizontalAlignment::Center),
-                    text_block(match clean {
+                    text(match clean {
                         Some((rate, loss, jitter)) => format!(
                             "at {rate:.0} Mbit/s \u{00B7} {loss:.1} % loss \u{00B7} {jitter:.1} ms jitter"
                         ),
                         None => "measured".to_string(),
                     })
                         .font_size(12.0)
-                        .foreground(ThemeRef::SecondaryText)
+                        .foreground(pal.get(Token::SecondaryText))
                         .horizontal_alignment(HorizontalAlignment::Center),
-                    text_block(format!(
+                    text(format!(
                     "Recommended bitrate: {recommended_mbps:.0} Mb/s (\u{2248}70 % of measured, \
                      leaving headroom for FEC and loss)"
                 ))
                     .font_size(12.0)
-                    .foreground(ThemeRef::SecondaryText)
+                    .foreground(pal.get(Token::SecondaryText))
                     .horizontal_alignment(HorizontalAlignment::Center),
                     vstack(finding_lines).spacing(4.0),
                     hstack(buttons)
@@ -295,9 +281,9 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                 .spacing(12.0),
             );
             vstack((
-                text_block(headline)
+                text(headline)
                     .font_size(18.0)
-                    .semibold()
+                    .font_weight(FontWeight::SEMI_BOLD)
                     .horizontal_alignment(HorizontalAlignment::Center),
                 results,
             ))

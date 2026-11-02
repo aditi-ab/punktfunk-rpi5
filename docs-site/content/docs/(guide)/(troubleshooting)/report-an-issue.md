@@ -30,17 +30,24 @@ blocked — see [Ports](/docs/ports), or grab the log [by hand](#logs-without-th
 
 ## 3. Export everything from the web console
 
-Open the [web console](/docs/web-console), pick **Troubleshooting** in the sidebar, and press
+In the [web console](/docs/web-console), open **Diagnostics** → **Troubleshooting** and press
 **Export all**. You get one text file, `punktfunk-diagnostics-YYYYMMDD-HHMMSS.txt`, with the health
 checks, the host and plugin log, and every client log the host holds.
 
 **Read it before you post it.** Nothing is redacted: it holds host names, IP addresses and device
 names.
 
-## 4. File the issue
+## 4. File the report
 
-Open an issue at [git.unom.io/unom/punktfunk/issues](https://git.unom.io/unom/punktfunk/issues), or
-ask on [Discord](https://discord.gg/wzEGg9y45z) first. Include:
+Post in the `bug-reports` forum on [Discord](https://discord.gg/wzEGg9y45z) and attach the export
+there. Not on Discord? Use the form on the
+[community page](https://punktfunk.unom.io/community#bugs): we confirm it by email, then you follow
+the report and reply through a private link. The form takes text only, so paste the parts of the
+export that matter.
+
+The title and first post of every report go on our
+[public tracker](https://git.unom.io/unom/punktfunk/issues), so keep host names and addresses out of
+them. Replies and attachments stay in the Discord thread. Include:
 
 - host and client versions (the console's **Host** page; the first line of each client log)
 - host OS and desktop, GPU, the client device, wired or Wi-Fi

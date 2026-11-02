@@ -3,8 +3,10 @@ package io.unom.punktfunk.console
 import android.os.Vibrator
 import android.view.InputDevice
 import io.unom.punktfunk.HostActions
+import io.unom.punktfunk.ProfilesAnswer
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.SettingsFields
+import io.unom.punktfunk.SpeedTestPhase
 import io.unom.punktfunk.StatsVerbosity
 import io.unom.punktfunk.StreamPreset
 import io.unom.punktfunk.kit.Gamepad
@@ -23,9 +25,10 @@ import org.json.JSONObject
 
 /**
  * The JSON that crosses into the Skia console — written in the console's OWN model shapes
- * (`crates/pf-console-ui/src/model.rs` `HostRow`/`WakeStatus`/`PairPhase`, `library.rs`
+ * (`crates/client/pf-console-ui/src/model.rs` `HostRow`/`WakeStatus`/`PairPhase`, `library.rs`
  * `LibraryGame`/`LibraryPhase`, `pf-client-core/src/trust.rs` `Settings`/`KnownHosts`), so there
  * is no Android-side mirror type to drift; the Rust structs deserialize these directly.
+ * `clients/shared/console-bridge-vectors.json` holds a sample of each pushed model these write.
  */
 internal object ConsoleJson {
     // ---- host rows (`HostRow`) ------------------------------------------------------------
@@ -123,6 +126,7 @@ internal object ConsoleJson {
                 // Ids, not chips: the bind screen only compares them. Pinned copies below
                 // inherit the map — a card is the same host's shelf.
                 .put("game_presets", JSONObject(h.gamePresets))
+                .put("profile", profileJson(h))
             out.put(base)
             // A pinned card shares the primary tile's live state under its own key.
             for (pid in h.pinnedPresetIds.distinct()) {
@@ -189,7 +193,30 @@ internal object ConsoleJson {
                     ?.let(::presetChip) ?: JSONObject.NULL,
             )
             .put("game_presets", JSONObject(h.gamePresets))
+            .put("profile", profileJson(h))
     }
+
+    /** One `enumerate` row, as the console's `ListedProfile` reads it. */
+    fun profileRow(p: io.unom.punktfunk.kit.ListedProfile): JSONObject = JSONObject()
+        .put("id", p.id)
+        .put("display_name", p.displayName)
+        .put("accent", p.accent ?: JSONObject.NULL)
+        .put("avatar", p.avatar ?: JSONObject.NULL)
+        .put("owner", p.owner)
+        .put("legacy_seat", p.legacySeat)
+        .put(
+            "seat",
+            p.seat?.let {
+                JSONObject()
+                    .put("state", it.state.name.lowercase())
+                    .put("detail", it.detail ?: JSONObject.NULL)
+                    .put("occupant", it.occupant ?: JSONObject.NULL)
+                    .put("steam_sign_in", it.steamSignIn ?: JSONObject.NULL)
+            } ?: JSONObject.NULL,
+        )
+
+    /** The saved profile pick as `{id, display_name, remember}`, or `null`. */
+    private fun profileJson(h: KnownHost): Any = h.asProfile?.toJson() ?: JSONObject.NULL
 
     /** `KnownHosts` (Rust) — only what the console needs to build a link: id, address, fp. */
     fun knownHosts(saved: List<KnownHost>): String {
@@ -229,8 +256,11 @@ internal object ConsoleJson {
     }
 
     // ---- wake / pair ------------------------------------------------------------------------
+    // `req` is the command's own, copied verbatim: the console drops a push whose key it is
+    // not waiting on.
 
     fun wakeStatus(
+        req: JSONObject,
         key: String,
         name: String,
         seconds: Int,
@@ -238,6 +268,7 @@ internal object ConsoleJson {
         online: Boolean,
         thenConnect: Boolean,
     ): String = JSONObject()
+        .put("req", req)
         .put("key", key)
         .put("name", name)
         .put("seconds", seconds)
@@ -246,19 +277,68 @@ internal object ConsoleJson {
         .put("then_connect", thenConnect)
         .toString()
 
-    fun pairIdle(): String = "\"Idle\""
-    fun pairBusy(): String = "\"Busy\""
-    fun pairFailed(msg: String): String = JSONObject().put("Failed", msg).toString()
-    fun pairPaired(key: String): String =
-        JSONObject().put("Paired", JSONObject().put("key", key)).toString()
+    fun pairBusy(req: JSONObject): String = pair(req, "Busy")
+    fun pairFailed(req: JSONObject, msg: String): String = pair(req, JSONObject().put("Failed", msg))
+    fun pairPaired(req: JSONObject, key: String): String =
+        pair(req, JSONObject().put("Paired", JSONObject().put("key", key)))
+
+    /** `PairStatus`: the phase under the `Pair` or `RequestAccess` command's `req`. */
+    private fun pair(req: JSONObject, phase: Any): String =
+        JSONObject().put("req", req).put("phase", phase).toString()
+
+    // ---- speed test / profiles ----------------------------------------------------------------
+
+    /** `SpeedPhase`: unit variants are bare strings. */
+    fun speedPhase(p: SpeedTestPhase): String = when (p) {
+        SpeedTestPhase.Connecting -> "\"Connecting\""
+        SpeedTestPhase.Measuring -> "\"Measuring\""
+        is SpeedTestPhase.Failed -> JSONObject().put("Failed", p.message).toString()
+        is SpeedTestPhase.Done -> JSONObject().put(
+            "Done",
+            JSONObject()
+                .put("throughput_kbps", p.throughputKbps)
+                .put("wall", p.wall)
+                .put(
+                    "clean",
+                    p.clean?.let {
+                        JSONObject()
+                            .put("rate_kbps", it.rateKbps)
+                            .put("loss_pct", it.lossPct)
+                            .put("jitter_us", it.jitterUs)
+                    } ?: JSONObject.NULL,
+                )
+                .put("recommended_kbps", p.recommendedKbps)
+                .put(
+                    "findings",
+                    JSONArray(
+                        p.findings.map { f ->
+                            JSONObject().put("id", f.id).put("severity", f.severity)
+                                .put("numbers", JSONArray(f.numbers))
+                        },
+                    ),
+                ),
+        ).toString()
+    }
+
+    /** `SpeedPhase::Progress`: a mid-burst figure for the console's graph. */
+    fun speedProgress(kbps: Int): String =
+        JSONObject().put("Progress", JSONObject().put("kbps", kbps)).toString()
+
+    /** The answer to `ConsoleCmd::FetchProfiles`, as the console's `ProfilesAnswer`. */
+    fun profilesAnswer(answer: ProfilesAnswer): String = when (answer) {
+        is ProfilesAnswer.Listed -> JSONObject().put("Listed", JSONArray(answer.rows.map(::profileRow))).toString()
+        ProfilesAnswer.NoProfiles -> "\"NoProfiles\""
+        is ProfilesAnswer.Failed -> JSONObject().put("Failed", answer.why).toString()
+    }
 
     // ---- library ------------------------------------------------------------------------------
 
     /**
-     * `[LibraryGame]` from the Kotlin catalog — the desktop service's `to_model` mapping.
-     * Without `stats` the Recent and Most played sorts fall back to host order.
+     * `{"req", "games": [LibraryGame]}` from the Kotlin catalog — the desktop service's
+     * `to_model` mapping, under the `FetchLibrary` command's `req`. Without `stats` the Recent
+     * and Most played sorts fall back to host order.
      */
-    fun libraryGames(games: List<GameEntry>): String {
+    fun libraryGames(req: JSONObject, games: List<GameEntry>): String {
         val out = JSONArray()
         for (g in games) {
             out.put(
@@ -277,7 +357,7 @@ internal object ConsoleJson {
                     .put("install", g.install?.let(::installJson) ?: JSONObject.NULL),
             )
         }
-        return out.toString()
+        return JSONObject().put("req", req).put("games", out).toString()
     }
 
     private fun installJson(i: TitleInstall): JSONObject = JSONObject().put("state", i.state).apply {
@@ -290,12 +370,11 @@ internal object ConsoleJson {
         t.isNotEmpty() && t.length <= 32 && t[0] in 'a'..'z' &&
             t.all { it in 'a'..'z' || it in '0'..'9' || it == '-' }
 
-    fun libraryError(title: String, body: String, canRetry: Boolean): String = JSONObject()
-        .put(
-            "Error",
-            JSONObject().put("title", title).put("body", body).put("can_retry", canRetry),
-        )
-        .toString()
+    /** `{"req", "phase": {"Error": …}}` under the `FetchLibrary` command's `req`. */
+    fun libraryError(req: JSONObject, title: String, body: String, canRetry: Boolean): String {
+        val error = JSONObject().put("title", title).put("body", body).put("can_retry", canRetry)
+        return JSONObject().put("req", req).put("phase", JSONObject().put("Error", error)).toString()
+    }
 
     fun stringArray(items: Collection<String>): String = JSONArray(items).toString()
 

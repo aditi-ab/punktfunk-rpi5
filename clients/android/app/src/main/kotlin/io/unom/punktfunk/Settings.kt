@@ -20,6 +20,9 @@ data class Settings(
     val height: Int = 0,
     val hz: Int = 0,
     val bitrateKbps: Int = 0,
+    /** PyroWave quality, bits per pixel from 0.5 to 2: the most a PyroWave session sends. Shown
+     *  as the rate it needs ([PyroWaveQuality]), never as bits per pixel. */
+    val pyrowaveBpp: Double = 1.6,
     /**
      * Render-resolution multiplier: the client asks the host to render/encode at `chosen mode ×
      * renderScale` and the compositor downscales the larger decoded frame to the SurfaceView
@@ -254,6 +257,12 @@ data class Settings(
     /** Off, the host's rumble never reaches a pad or this phone's motor. Read once per session. */
     val padRumble: Boolean = true,
     /**
+     * On, a stream holds the screen awake for as long as it runs. Off, only while the player's
+     * input is recent ([NativeBridge.nativeHoldsScreenAwake]), so the device's own timeout runs
+     * over a game left alone. Read once per session.
+     */
+    val keepAwake: Boolean = true,
+    /**
      * Opt-in: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
      * phone's own vibration motor — for clip-on gamepads that ship without rumble motors, where
      * the phone body is the only actuator in the player's hands. Off by default; read once per
@@ -271,15 +280,6 @@ data class Settings(
      * without a gyroscope (TVs), where this would be a silent no-op.
      */
     val gyroOnPhone: Boolean = false,
-
-    /**
-     * Capture a Steam Controller 2 (wired / Puck dongle over USB, or an already-paired BLE pad)
-     * and pass it through AS-IS: the host presents a real `28DE:1302` that its Steam drives
-     * directly (Linux hosts). ON by default — it engages only when such a controller is actually
-     * present at stream start, so it costs nothing otherwise; the toggle exists for the rare
-     * setup where the OS-level pad (lizard mode) is preferred.
-     */
-    val sc2Capture: Boolean = true,
 
     /**
      * Capture a USB-connected Sony controller (DualSense / DualSense Edge / DualShock 4) and
@@ -438,8 +438,11 @@ private fun probeDisplay(context: Context, secondScreen: Boolean = true): Displa
 
 /**
  * The device's native display mode as a landscape `(width, height, hz)` — the long edge is the
- * width, since we stream a desktop. Falls back to 1920×1080@60 if no display can be read at all
- * (see [probeDisplay] for the cold-start fallback that makes that a last resort).
+ * width, since we stream a desktop. `hz` is the panel's highest refresh at its current size, from
+ * the mode TABLE: the live mode is whatever the system holds the app at, and Android 15+ holds a
+ * game at 60. A TV keeps its live HDMI mode, which the box's own setting picked.
+ * Falls back to 1920×1080@60 if no display can be read at all (see [probeDisplay] for the
+ * cold-start fallback that makes that a last resort).
  */
 fun nativeDisplayMode(
     context: Context,
@@ -450,12 +453,14 @@ fun nativeDisplayMode(
     val mode = display.mode
     val w = mode.physicalWidth
     val h = mode.physicalHeight
-    // ROUNDED, not truncated: TVs report the fractional NTSC rates over HDMI (59.94, 29.97,
-    // 23.976), and `toInt()` turns 59.94 into 59 — a rate no display mode anywhere has, which the
-    // host then serves by clamping DOWN to the highest mode it advertises at or below it. Rounding
-    // also keeps this agreeing with `Display.streamPanelFps`, which already rounds; the two
-    // describe the same panel and must not disagree.
-    val hz = kotlin.math.round(mode.refreshRate).toInt().coerceAtLeast(1)
+    val rate = if (isTvDevice(context)) {
+        mode.refreshRate
+    } else {
+        display.sameResolutionModes().maxOfOrNull { it.refreshRate } ?: mode.refreshRate
+    }
+    // ROUNDED, not truncated: 59.94 must not become 59, a rate no display mode has, which the
+    // host serves by clamping DOWN. Agrees with `Display.streamPanelFps`, which also rounds.
+    val hz = kotlin.math.round(rate).toInt().coerceAtLeast(1)
     // A picture spanning two screens is two equal halves at this screen's size
     // (design/android-dual-screen.md §3.2); the codec ceiling clamps the ask later.
     return Triple(maxOf(w, h), minOf(w, h) * (if (spanned && secondScreen) 2 else 1), hz)
@@ -561,10 +566,17 @@ fun safeDisplayMode(
 }
 
 /**
- * True when this device's display can actually present HDR10, so we should advertise HDR to the
- * host. On an SDR panel we advertise `0` instead — the host then sends a proper 8-bit BT.709 stream
- * rather than BT.2020 PQ the panel would mis-tone-map (the washed-out/dark failure). Mirrors the
- * capability gate the Apple/Windows clients apply.
+ * Whether to ask the host for HDR10: the panel lists HDR10 or HDR10+, and the OS can light HDR
+ * above SDR white. [headroom] is `Display.isHdrSdrRatioAvailable`, or `null` where Android gives no
+ * such signal: below API 34, on a TV, or on a screen other than the built-in one (a TV or an HDMI
+ * sink shows HDR itself). A built-in panel without headroom tone-maps PQ under its SDR white, a
+ * darker picture than the SDR stream. The Apple client's potential-EDR-headroom gate is the twin.
+ */
+internal fun advertiseHdr(hdr10: Boolean, headroom: Boolean?): Boolean = hdr10 && headroom != false
+
+/**
+ * True when the picture's display can present HDR10 ([advertiseHdr]), so the session asks the host
+ * for it. Otherwise the host sends 8-bit BT.709, and the HDR toggle says the display can't.
  */
 fun displaySupportsHdr(context: Context): Boolean {
     val display = probeDisplay(context)
@@ -587,10 +599,18 @@ fun displaySupportsHdr(context: Context): Boolean {
         display.hdrCapabilities?.supportedHdrTypes?.forEach { add(it) }
     }
     // HDR10/HDR10+ only: the stream is BT.2020 PQ — a Dolby-Vision/HLG-only panel can't present it.
-    val supported = types.any {
+    val hdr10 = types.any {
         it == Display.HdrCapabilities.HDR_TYPE_HDR10 || it == Display.HdrCapabilities.HDR_TYPE_HDR10_PLUS
     }
-    Log.i("punktfunk", "display HDR types=$types → advertise HDR10=$supported")
+    val headroom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+        !isTvDevice(context) && display.displayId == Display.DEFAULT_DISPLAY
+    ) {
+        display.isHdrSdrRatioAvailable
+    } else {
+        null
+    }
+    val supported = advertiseHdr(hdr10, headroom)
+    Log.i("punktfunk", "display HDR types=$types headroom=${headroom ?: "n/a"} → advertise HDR10=$supported")
     return supported
 }
 
@@ -628,6 +648,22 @@ object RenderScale {
     /** Clamp a raw multiplier into [0.5, 4.0]; a missing / non-positive / NaN value → 1.0. */
     fun sanitize(raw: Double): Double = if (raw > 0.0) raw.coerceIn(0.5, 4.0) else 1.0
 
+    /**
+     * A typed percent as a multiplier, sanitized. A percent, because whole percents keep every
+     * client storing the same hundredths. Twin of core's `from_percent`.
+     */
+    fun fromPercent(percent: Int): Double = sanitize(percent / 100.0)
+
+    /** The whole percent a stored multiplier reads as. */
+    fun percent(scale: Double): Int = Math.round(sanitize(scale) * 100.0).toInt()
+
+    /**
+     * Which of [PRESETS] a stored multiplier is; null for a typed one. Compared in hundredths:
+     * the prefs keep a Float, so 0.67 reads back as 0.6700000167.
+     */
+    fun presetIndex(scale: Double): Int? =
+        PRESETS.indexOfFirst { kotlin.math.abs(it - scale) < 0.005 }.takeIf { it >= 0 }
+
     /** "Native (1×)" / "1.5×" / "2× · supersample" — the picker label. */
     fun label(scale: Double): String = when {
         scale == 1.0 -> "Native (1×)"
@@ -660,6 +696,9 @@ object RenderScale {
 
 /** (scale, label) for the render-scale picker. `1.0` = Native. */
 val RENDER_SCALE_OPTIONS = RenderScale.PRESETS.map { it to RenderScale.label(it) }
+
+/** Dropdown sentinel for "Custom…" in the render-scale picker: no multiplier is negative. */
+const val CUSTOM_RENDER_SCALE = -1.0
 
 /** [Settings.videoFit] values and labels, the desktop and console wording. */
 val VIDEO_FIT_OPTIONS = listOf("fit" to "Fit", "crop" to "Crop to fill", "stretch" to "Stretch to fill")
@@ -1008,12 +1047,21 @@ fun Settings.preferredCodec(): Int = when (codec) {
     else -> 0
 }
 
-/** (kbps, label). `0` = host default. */
+/** (kbps, label). `0` = Automatic. 5 Mbps apart to 50, where most links settle. */
 val BITRATE_OPTIONS = listOf(
     0 to "Automatic",
+    5_000 to "5 Mbps",
     10_000 to "10 Mbps",
+    15_000 to "15 Mbps",
     20_000 to "20 Mbps",
+    25_000 to "25 Mbps",
+    30_000 to "30 Mbps",
+    35_000 to "35 Mbps",
+    40_000 to "40 Mbps",
+    45_000 to "45 Mbps",
     50_000 to "50 Mbps",
+    60_000 to "60 Mbps",
+    80_000 to "80 Mbps",
     100_000 to "100 Mbps",
     150_000 to "150 Mbps",
     200_000 to "200 Mbps",
@@ -1040,6 +1088,8 @@ val COMPOSITOR_OPTIONS = listOf(
     1 to "KWin (KDE Plasma)",
     3 to "Mutter (GNOME)",
     5 to "Hyprland",
+    7 to "niri",
+    8 to "Umbriel",
     2 to "wlroots (Sway / River)",
     4 to "gamescope",
 )

@@ -45,3 +45,9 @@ if defined LOGGED (
 ) else (
   "%BUN%" "%RUNNER%"
 )
+
+rem 78 is the runner refusing to run a plugin outside the AppContainer it can't build
+rem (SANDBOX_REFUSED_EXIT, sdk\src\runner.ts). The task restarts a failed run every minute, 999
+rem times, and each would refuse again - so that one status ends the task cleanly instead. The
+rem reason is in runner.log and on the console's Troubleshooting page.
+if %ERRORLEVEL% EQU 78 exit /b 0

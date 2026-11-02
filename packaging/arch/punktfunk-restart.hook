@@ -1,8 +1,10 @@
-# Restart the running host, web console and plugin runner once the transaction is done.
+# Restart the running host, web console, plugin runner, seat supervisor and door once the
+# transaction is done.
 [Trigger]
 Operation = Upgrade
 Type = Package
 Target = punktfunk-host
+Target = punktfunk-seats
 Target = punktfunk-web
 Target = punktfunk-scripting
 Target = punktfunk-bun

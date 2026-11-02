@@ -6,40 +6,41 @@
 #   bash scripts/steamdeck/update.sh --pull    # `git pull` first (if the source is a git checkout)
 #
 # The branch the checkout follows is its channel: `stable` moves at each release, `main` is canary.
-# Switch with the guided installer's --channel, or `git switch <branch>` then --pull.
+# Switch with the guided installer's --channel, or `git switch <branch>` then --pull. This script
+# has no --channel of its own.
 #
 set -euo pipefail
-log()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
-ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
-# warn was USED below but never defined — under `set -e` the first warn call ("command not
-# found") aborted the whole update before the service restarts.
-warn() { printf '\033[1;33m  !!\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
-# Create a system group if it is missing (needs sudo). Idempotent, and mirrors what the
-# deb/rpm/arch scriptlets do — a udev rule that chgrp's to a group nobody created fails silently.
-ensure_group() {
-    getent group "$1" >/dev/null 2>&1 && return 0
-    sudo groupadd --system "$1" 2>/dev/null || return 1
-    ok "created the '$1' system group"
-}
-
-SRC="${PUNKTFUNK_SRC:-$HOME/punktfunk}"
-BOX="${PUNKTFUNK_BOX:-pf2}"
-TARGET_DIR="$SRC/target-steamos"
-BIN="$TARGET_DIR/release/punktfunk-host"
-# The PyroWave encode worker — a separate executable next to the host, and the only one this
-# script setcaps (see the capability block in the sudo section). Never a hardlink or a mode of
-# $BIN: a shared inode shares the file capability and voids the KWin .desktop grant.
-WORKER="$TARGET_DIR/release/punktfunk-encode-worker"
-[ -d "$SRC/crates/punktfunk-host" ] || die "no punktfunk source at $SRC (set PUNKTFUNK_SRC)"
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+SWITCH="  git -C $SRC fetch && git -C $SRC switch stable   # releases
+  git -C $SRC fetch && git -C $SRC switch main     # canary"
+# An ignored word would rebuild the same tree and report it as an update.
+case "$*" in
+    ""|--pull) ;;
+    *) die "update.sh takes --pull or nothing, not '$*'. Nothing was rebuilt.
+  To change channel, switch the branch, then run update.sh --pull:
+$SWITCH" ;;
+esac
+[ -d "$SRC/crates/host/punktfunk-host" ] || die "no punktfunk source at $SRC (set PUNKTFUNK_SRC)"
 WEB=0; [ -f "$HOME/.config/systemd/user/punktfunk-web.service" ] && WEB=1
+
+# Once across the exec below, so a refused password isn't asked for again after the pull.
+SUDO_OK=${PF_SUDO_OK:-}
+[ -n "$SUDO_OK" ] || acquire_sudo "sudo needs your password to (re)apply the gamepad udev rule, vhci-hcd, input group, UDP buffers, and seats:"
+# The version the console shows, in the same scheme as this channel's feed (build-version.sh).
+PF_BUILD_VERSION="$(bash "$SRC/scripts/steamdeck/build-version.sh" "$SRC")"
+# The door's seats run a copy only sudo moves, so a new build without it updates nothing they run.
+if [ "$SUDO_OK" = 0 ] && door_on && { [ "${1:-}" = --pull ] || [ "$(door_version)" != "$PF_BUILD_VERSION" ]; }; then
+    die "With Reachable without logging in on, an update needs your password. Nothing was pulled or rebuilt.
+  Run this in Konsole and enter your password when asked:
+  bash $SRC/scripts/steamdeck/update.sh --pull"
+fi
 
 if [ "${1:-}" = "--pull" ]; then
     [ -d "$SRC/.git" ] || die "$SRC is not a git checkout — rsync new source then run without --pull"
     git -C "$SRC" symbolic-ref -q HEAD >/dev/null \
         || die "$SRC isn't on a branch, so there is nothing to pull. Pick a channel, then re-run:
-  git -C $SRC fetch && git -C $SRC switch stable   # releases
-  git -C $SRC fetch && git -C $SRC switch main     # canary"
+$SWITCH"
     # A build regenerates these committed files (bun2nix). When main carries a stale copy, the
     # rebuild dirties it and the next pull that touches it aborts. Restoring derived paths is
     # lossless. Not `reset --hard`: this is the operator's own checkout.
@@ -51,24 +52,22 @@ if [ "${1:-}" = "--pull" ]; then
   one with 'git -C $SRC checkout -- <file>') and re-run. Nothing was rebuilt or restarted."
     ok "pulled"
     # Bash keeps running the text it read before the pull. Build with the pulled tree's recipe.
-    PUNKTFUNK_SRC="$SRC" PUNKTFUNK_BOX="$BOX" exec bash "$SRC/scripts/steamdeck/update.sh"
+    PF_SUDO_OK="$SUDO_OK" PUNKTFUNK_SRC="$SRC" PUNKTFUNK_BOX="$BOX" exec bash "$SRC/scripts/steamdeck/update.sh"
 fi
 
-# The version the console shows, in the same scheme as this channel's feed (build-version.sh).
-PF_BUILD_VERSION="$(bash "$SRC/scripts/steamdeck/build-version.sh" "$SRC")"
-
+bash "$SRC/scripts/steamdeck/heal-box.sh" "$BOX"
 log "Rebuilding host (release)"
 # nvenc,vulkan-encode matches the packaged builds (deb/arch) — see install.sh.
 # punktfunk-encode-worker rides along: host and worker version-check each other over their socket
 # and fall back to the in-process encoder on any mismatch, so an update must never move one
-# without the other.
+# without the other. punktfunk-seats is the door's supervisor (door.sh).
 distrobox enter "$BOX" -- bash -lc "set -e
 export PATH=\$HOME/.cargo/bin:\$PATH CARGO_TARGET_DIR='$TARGET_DIR' PUNKTFUNK_BUILD_VERSION='$PF_BUILD_VERSION'
-cd '$SRC' && cargo build -r -p punktfunk-host -p punktfunk-encode-worker --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode"
+cd '$SRC' && cargo build -r -p punktfunk-host -p punktfunk-encode-worker -p punktfunk-seats --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode"
 MISSING="$({ ldd "$BIN" 2>/dev/null || true; } | awk '/not found/ {print $1}' | sort -u | tr '\n' ' ')"
 [ -z "$MISSING" ] || die "the host rebuilt, but SteamOS still cannot load it. Missing: $MISSING
      Another rebuild will not help, and the services were left as they are. Report it:
-     https://git.unom.io/unom/punktfunk/issues"
+     https://punktfunk.unom.io/community#bugs"
 ok "host rebuilt"
 if [ "$WEB" = 1 ]; then
     log "Rebuilding web console"
@@ -101,6 +100,10 @@ sed 's|^ExecStart=.*|ExecStart=%h/.local/bin/punktfunk-scripting|' \
     "$SRC/scripts/punktfunk-scripting.service" > "$HOME/.config/systemd/user/punktfunk-scripting.service"
 systemctl --user daemon-reload
 ok "plugin runner rebuilt (opt-in service: systemctl --user enable --now punktfunk-scripting)"
+
+# Status tray: rebuilt with the host, and retrofitted onto installs that predate it.
+log "Rebuilding the status tray"
+PUNKTFUNK_SRC="$SRC" PUNKTFUNK_BOX="$BOX" bash "$SRC/scripts/steamdeck/install-tray.sh"
 
 # HDR gamescope (punktfunk-gamescope): rebuild when the packaging tree changed or the installed
 # binary stopped working — also RETROFITS it onto older installs that predate it (fast no-op
@@ -157,102 +160,24 @@ if [ -f "$HOST_ENV" ] && ! grep -q '^RADV_PERFTEST=' "$HOST_ENV"; then
     ok "host.env: added RADV_PERFTEST=video_encode"
 fi
 mkdir -p "$HOME/.local/share/applications"
-sed "s|^Exec=.*|Exec=$TARGET_DIR/release/punktfunk-host|" "$SRC/packaging/linux/io.unom.Punktfunk.Host.desktop" \
-    > "$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"
+rm -f "$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"  # the CamelCase name
+sed "s|^Exec=.*|Exec=$TARGET_DIR/release/punktfunk-host|" "$SRC/packaging/linux/io.unom.punktfunk.host.desktop" \
+    > "$HOME/.local/share/applications/io.unom.punktfunk.host.desktop"
 ok "KWin desktop-capture authorization refreshed"
 
-# Retrofit the system bits install.sh now sets up but older installs predate (idempotent). vhci-hcd =
-# usbip transport for the native Steam Deck pad; 60-punktfunk.rules = /dev/uhid + vhci access; input
-# group = uhid write; the kde-authorized grant (per-user, no root) = Desktop-mode input. A stock Deck
-# needs a sudo PASSWORD, so PROMPT for it rather than silently skipping (skipping = gamepads stay dead).
-SUDO_OK=0
-if sudo -n true 2>/dev/null; then
-    SUDO_OK=1
-elif [ -t 0 ]; then
-    warn "sudo needs your password to (re)apply the gamepad udev rule, vhci-hcd, input group, and UDP buffers:"
-    sudo -v && SUDO_OK=1 || true
-fi
+# The system tuning install.sh applies, from this checkout's files (lib.sh).
 if [ "$SUDO_OK" = 1 ]; then
-    if [ -f "$SRC/scripts/60-punktfunk.rules" ]; then
-        sudo install -m644 "$SRC/scripts/60-punktfunk.rules" /etc/udev/rules.d/60-punktfunk.rules
-        sudo udevadm control --reload-rules >/dev/null 2>&1 || true
-        sudo udevadm trigger >/dev/null 2>&1 || true
-        ok "gamepad udev rule ensured"
-    fi
-    if [ -f "$SRC/scripts/punktfunk-modules.conf" ]; then
-        sudo install -m644 "$SRC/scripts/punktfunk-modules.conf" /etc/modules-load.d/punktfunk.conf
-        sudo modprobe vhci-hcd 2>/dev/null || true
-        ok "vhci-hcd autoload ensured (native Steam Deck controller)"
-    fi
-    # UDP buffers: older installs (or sudo-skipped ones) still run the stock 416 KB cap.
-    if [ ! -f /etc/sysctl.d/99-punktfunk-net.conf ]; then
-        printf 'net.core.wmem_max=33554432\nnet.core.rmem_max=33554432\n' | sudo tee /etc/sysctl.d/99-punktfunk-net.conf >/dev/null
-        sudo sysctl -q -p /etc/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
-        ok "UDP socket buffers raised to 32 MB (persisted)"
-    fi
-    if id -nG "$USER" | grep -qw input; then :; else
-        sudo usermod -aG input "$USER"
-        warn "added $USER to the 'input' group — REBOOT (or log out/in) for it to apply"
-    fi
-    # 'punktfunk' owns the usbip vhci attach/detach nodes (60-punktfunk.rules), deliberately NOT
-    # 'input' — writing 'attach' materialises an arbitrary emulated USB device, a root-only kernel
-    # primitive that must not ride on the group every gamepad guide tells you to join
-    # (security-review 2026-08-05 M-4). No Deck install ever created it, so the rule's chgrp failed
-    # and the native Steam Deck pad silently never attached. Retrofit both group and membership.
-    # `if ensure_group` (not `ensure_group || true`): a failed groupadd must not fall through to a
-    # usermod against a group that does not exist — under `set -e` that would abort the update
-    # before the service restarts at the bottom, leaving the host down.
-    if ensure_group punktfunk; then
-        if id -nG "$USER" | grep -qw punktfunk; then :; else
-            sudo usermod -aG punktfunk "$USER"
-            warn "added $USER to the 'punktfunk' group (usbip vhci — the native Steam Deck pad needs it)"
-            warn "  — REBOOT (or log out/in) for it to apply. That group can emulate arbitrary USB"
-            warn "  devices; 'sudo gpasswd -d $USER punktfunk' drops it if you do not want the native pad."
-        fi
-    else
-        warn "could not create the 'punktfunk' group — the native Steam Deck pad will not attach."
-        warn "By hand: sudo groupadd --system punktfunk; sudo usermod -aG punktfunk $USER"
-    fi
-    # Capabilities, re-applied because this script just REBUILT both binaries and a rebuilt file is
-    # a new inode — file capabilities do not follow it.
-    #
-    #   host   -> `setcap -r`. It must carry NO capability, ever: KWin identifies a client by
-    #             resolving /proc/<pid>/exe against a .desktop Exec= (the one refreshed above), and
-    #             the kernel refuses that readlink for a capability-carrying process, so every
-    #             Desktop-mode session dies with "KWin does not expose zkde_screencast_unstable_v1
-    #             to this client". This also heals a Deck that ran 0.26.0-1's installer and has
-    #             only ever updated since — install.sh's removal is not reachable from this path.
-    #   worker -> `cap_sys_nice=ep`. Separate binary, spawned per PyroWave session, no Wayland/
-    #             D-Bus/network, so nothing resolves its /proc/<pid>/exe. Without the capability
-    #             every driver refuses every elevated global-priority class and the lever is inert.
-    #
-    # Both best-effort: `setcap -r` exits non-zero on a file that has no capability, and a failed
-    # grant just means the encode runs at default priority.
-    if [ -x "$BIN" ]; then
-        sudo setcap -r "$BIN" 2>/dev/null || true
-    fi
-    if [ -x "$WORKER" ]; then
-        if sudo setcap 'cap_sys_nice=ep' "$WORKER" 2>/dev/null; then
-            ok "re-granted CAP_SYS_NICE to the encode worker (rebuild = new inode)"
-        else
-            warn "could not grant CAP_SYS_NICE to $WORKER — PyroWave stays at default GPU priority"
-        fi
-    fi
-    # Register the tuning on Valve's atomic-update preserve list (see install.sh §4): without
-    # this, every SteamOS A/B update strips the three files above again (verified live —
-    # gamepads silently degrade to Xbox 360, UDP buffers back to 208 KB).
-    if [ -f "$SRC/scripts/punktfunk-atomic-keep.conf" ]; then
-        sudo install -Dm644 "$SRC/scripts/punktfunk-atomic-keep.conf" /etc/atomic-update.conf.d/punktfunk.conf
-        ok "system tuning registered to survive SteamOS updates (atomic-update.conf.d)"
-    fi
+    apply_system_tuning
+    [ "$WEB" = 0 ] || door_install
 else
     warn "no usable sudo — SKIPPED gamepad/udev/vhci/UDP tuning (all root-only; no user-space alternative)."
     warn "A stock SteamOS 'deck' account has NO password — set one with 'passwd', then re-run. Gamepads stay"
     warn "Xbox-360 until this runs and you reboot."
+    door_refresh
 fi
 echo
 warn "If the controller still shows as an Xbox 360 pad, REBOOT the Deck once — the 'input' group and the"
-warn "vhci-hcd module only become live for the host service on a fresh login."
+warn "vhci-hcd module only become live for the host service after a reboot."
 GRANT_SRC="$SRC/scripts/headless/kde-authorized"
 GRANT_DST="$HOME/.local/share/flatpak/db/kde-authorized"
 if [ ! -s "$GRANT_DST" ] && [ -s "$GRANT_SRC" ]; then
@@ -261,18 +186,27 @@ if [ ! -s "$GRANT_DST" ] && [ -s "$GRANT_SRC" ]; then
     ok "seeded KDE RemoteDesktop grant (Desktop-mode input)"
 fi
 
-# GameStream is the console's setting; a unit flag locks its toggle. An older install's
+# The host unit follows scripts/punktfunk-host.service; its ExecStart keeps this install's flags.
+# GameStream is the console's setting and a unit flag locks its toggle, so an older install's
 # --gamestream moves into the store and stays on.
-HOST_UNIT="$HOME/.config/systemd/user/punktfunk-host.service"
-if grep -qs -- '^ExecStart=.* --gamestream' "$HOST_UNIT"; then
+HOST_UNIT="$UNITS/punktfunk-host.service"
+EXEC="$(sed -n 's/^ExecStart=//p' "$HOST_UNIT" 2>/dev/null | head -n1)"
+case "$EXEC" in *" --gamestream"*)
     if "$BIN" settings set gamestream true >/dev/null; then
-        sed -i '/^ExecStart=/s/ --gamestream//' "$HOST_UNIT"
-        systemctl --user daemon-reload
+        EXEC="${EXEC/ --gamestream/}"
         ok "GameStream moved to the console's Host settings (still on)"
     else
         warn "GameStream stays pinned in $HOST_UNIT, so the console can't change it"
-    fi
+    fi ;;
+esac
+if [ -n "$EXEC" ]; then
+    write_host_unit "$EXEC"
 fi
+# An older console unit pinned the port that unit flag held; it reads mgmt-endpoint, as install.sh's does.
+[ "$WEB" = 0 ] || sed -i "s#set +a; export PUNKTFUNK_MGMT_URL=https://127.0.0.1:[0-9]* #[ ! -f $CONFIG/mgmt-endpoint ] || . $CONFIG/mgmt-endpoint; set +a; export #" \
+    "$UNITS/punktfunk-web.service"
+door_yield_web_unit
+systemctl --user daemon-reload
 
 log "Restarting services"
 # --no-block: when this script runs INSIDE punktfunk-rebuild-check.service (ordered

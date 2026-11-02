@@ -1,33 +1,24 @@
-// PyroWave native Metal decoder — the Apple twin of pf-client-core's Vulkan decoder
-// (crates/pf-client-core/src/video_pyrowave.rs), reimplemented on the presenter's own MTLDevice
-// so decode + CSC + present share one device with zero interop (design/pyrowave-codec-plan.md
-// §4.7). No upstream C/C++ ships in the app: the bitstream parse below reimplements
-// pyrowave_decoder.cpp's push_packet/decode_packet walk, and the two compute kernels
-// (MetalWaveletShaders.swift) are hand-ported from the vendored GLSL. The §4.2 upstream pin
-// covers this hand-port: a vendored bump means re-diffing two decode shaders and the two 8-byte
-// header structs, and it is already a protocol-version event.
+// PyroWave native Metal decoder: the Apple twin of the Vulkan decoder in
+// crates/client/pf-client-video/src/video_pyrowave.rs, on the presenter's own MTLDevice so decode,
+// CSC and present share one device. The packet walk ports pyrowave_decoder.cpp's
+// push_packet/decode_packet; MetalWaveletShaders.swift hand-ports the vendored GLSL. A vendored
+// PyroWave bump means re-diffing both decode shaders and the two 8-byte header structs.
 //
-// Wire shape (all fixed by the host encoder, punktfunk-host encode/linux/pyrowave.rs):
-// • One AU = one frame = a self-delimiting stream of packets. Each packet is one 32x32
-//   coefficient block for one (component, level, band), self-sized by its 8-byte
-//   BitstreamHeader; a per-frame START_OF_FRAME sequence header carries dims + total block
-//   count + the VUI bits (chroma 4:2:0, BT.709/BT.2020, limited/full).
-// • With `USER_FLAG_CHUNK_ALIGNED` (Phase 4) the AU is a whole number of `shard_payload`-sized
-//   windows, each 4-byte-prefixed (used-len u16 LE + kind u16 LE): kind 0 = whole packets,
-//   1/2/3 = FRAG chain for a packet bigger than one window. A missing shard of a partial frame
-//   arrives as an all-zero window (used = 0) → skipped, its blocks reconstruct as zeros
-//   (localized blur, the Phase-4 design intent). The reassembler enables partial delivery
-//   core-side automatically for PyroWave sessions.
-// • Decode acceptance mirrors upstream decode_is_ready(allow_partial=true): a frame with no
-//   SOF or with no more than half its blocks is dropped rather than decoded to garbage.
+// Wire shape (fixed by the host encoder, pf-encode's enc/linux/pyrowave.rs):
+// • One AU is one frame of packets, each one 32x32 coefficient block for one (component, level,
+//   band), sized by its 8-byte BitstreamHeader. A per-frame START_OF_FRAME header carries dims,
+//   the block count and the VUI bits (4:2:0, BT.709/BT.2020, limited/full).
+// • With `USER_FLAG_CHUNK_ALIGNED` the AU is whole `shard_payload` windows, each prefixed with
+//   used-len u16 LE + kind u16 LE: kind 0 = whole packets, 1/2/3 = a FRAG chain. A lost shard
+//   arrives as an all-zero window and is skipped; its blocks decode as zeros (local blur).
+// • A frame with no SOF, or with half its blocks or fewer, is dropped, as upstream does.
 //
-// GPU structure per frame (mirroring pyrowave_decoder.cpp's barriers): one concurrent compute
-// encoder with all ~42 dequant dispatches (each writes a distinct band layer — no intra-stage
-// hazards), then one concurrent encoder per iDWT level (5) — encoder boundaries provide the
-// write→sampled-read synchronization the Vulkan version expresses as pipeline barriers. The
-// output is a ring of 4 plane sets (Y full-res + Cb/Cr half-res R8Unorm); ring depth plus
-// same-queue hazard tracking keeps a set alive while the presenter still samples it (the same
-// scheme as the Vulkan client's ring).
+// No copy of the AU: the core assembles it in a `WaveletAccessUnitPool` slot (one shared
+// MTLBuffer), the parse records where each packet lies, and the dequant kernel reads it there;
+// only a FRAG chain or a misaligned body moves, within the AU. GPU, per frame: one
+// concurrent encoder for the ~42 dequant dispatches, then one per iDWT level (encoder
+// boundaries stand in for Vulkan's barriers), into a ring of 4 plane sets that stays alive
+// while the presenter samples it.
 
 #if canImport(Metal)
 import Foundation
@@ -100,14 +91,13 @@ struct WaveletLayout {
     }
 }
 
-/// One parsed frame, CPU side: the per-block payload offset table + the flat payload words the
-/// dequant kernel consumes (packet words INCLUDING each 8-byte header, as upstream uploads
-/// them), plus the sequence header's facts.
+/// One parsed frame, CPU side: where each block's packet lies in the pool buffer the dequant
+/// kernel reads, plus the sequence header's facts.
 struct ParsedWaveletFrame {
     var layout: WaveletLayout
-    /// Per 32x32 block: u32 word offset into `payload`, or UInt32.max = block missing.
+    /// Per 32x32 block: u32 word offset of its packet (header included) from the pool
+    /// buffer's start, or UInt32.max = block missing.
     var offsets: [UInt32]
-    var payload: [UInt32]
     var totalBlocks: Int
     var decodedBlocks: Int
     /// VUI bits from the sequence header (BitstreamSequenceHeader).
@@ -132,77 +122,86 @@ enum WaveletBitstream {
     private static let winFragCont: UInt16 = 2
     private static let winFragLast: UInt16 = 3
 
-    /// Parse one AU into the dequant kernel's inputs. `windowSize` > 0 with `chunkAligned`
-    /// walks the Phase-4 shard-window framing first; otherwise the AU is one packet stream.
-    /// nil = drop the frame (malformed, no SOF, or not enough blocks survived loss to be worth
-    /// decoding — upstream's `decoded_blocks > total/2` partial rule).
-    static func parse(au: Data, chunkAligned: Bool, windowSize: Int) -> ParsedWaveletFrame? {
+    /// Parse one AU where it lies: `count` bytes at `base`, `wordBase` u32 words into the
+    /// buffer the dequant kernel reads. `windowSize` > 0 with `chunkAligned` walks the
+    /// shard-window framing, moving packets within the AU; otherwise the AU is one packet
+    /// stream. nil = drop the frame (malformed, no SOF, or not enough blocks survived loss —
+    /// upstream's `decoded_blocks > total/2` partial rule).
+    static func parse(
+        base: UnsafeMutablePointer<UInt8>, count: Int, wordBase: Int,
+        chunkAligned: Bool, windowSize: Int
+    ) -> ParsedWaveletFrame? {
         var state = ParseState()
-        // Reserve the coefficient buffer ONCE, up front. Every packet's payload is a slice of the
-        // AU, so `au.count / 4` words is a tight upper bound — reserving it here lets the per-packet
-        // appends stay amortized O(1). (Reserving per packet forces Swift to allocate the exact new
-        // size each time, turning the walk O(n²) — invisible on the tiny golden fixtures, but ~5 ms
-        // per 1.4 MB frame on a real 5120x1440 stream.)
-        state.payload.reserveCapacity(au.count / 4)
-        let ok = au.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Bool in
-            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return false
-            }
-            let count = raw.count
-            if chunkAligned, windowSize >= 8 {
-                // Whole windows only; a trailing partial window would be a framing bug.
-                guard count % windowSize == 0 else { return false }
-                var frag: [UInt8] = []
-                var fragLive = false
-                var pos = 0
-                while pos < count {
-                    let win = UnsafeBufferPointer(start: base + pos, count: windowSize)
-                    pos += windowSize
-                    let used = Int(win[0]) | (Int(win[1]) << 8)
-                    let kind = UInt16(win[2]) | (UInt16(win[3]) << 8)
-                    // A zeroed (missing) shard or an overrun drops the window AND breaks any
-                    // fragment chain riding across it (mirrors video_pyrowave.rs push_window).
-                    guard used > 0, 4 + used <= windowSize else {
-                        frag.removeAll(keepingCapacity: true)
-                        fragLive = false
-                        continue
-                    }
-                    let body = UnsafeBufferPointer(start: win.baseAddress! + 4, count: used)
-                    switch kind {
-                    case winPacked:
-                        frag.removeAll(keepingCapacity: true)
-                        fragLive = false
-                        guard state.pushPackets(body) else { return false }
-                    case winFragFirst:
-                        frag.removeAll(keepingCapacity: true)
-                        frag.append(contentsOf: body)
-                        fragLive = true
-                    case winFragCont:
-                        if fragLive { frag.append(contentsOf: body) }
-                    case winFragLast:
-                        if fragLive {
-                            frag.append(contentsOf: body)
-                            let ok = frag.withUnsafeBufferPointer { state.pushPackets($0) }
-                            guard ok else { return false }
-                        }
-                        frag.removeAll(keepingCapacity: true)
-                        fragLive = false
-                    default:
-                        frag.removeAll(keepingCapacity: true)
-                        fragLive = false
-                    }
-                }
-                return true
-            }
-            return state.pushPackets(UnsafeBufferPointer(start: base, count: count))
+        let ok: Bool
+        if chunkAligned, windowSize >= 8 {
+            // Whole windows only; a trailing partial window would be a framing bug.
+            guard count % windowSize == 0 else { return nil }
+            ok = walkWindows(
+                base: base, count: count, wordBase: wordBase, windowSize: windowSize,
+                state: &state)
+        } else {
+            ok = state.pushPackets(UnsafeBufferPointer(start: base, count: count), wordBase: wordBase)
         }
         guard ok, let frame = state.finish() else { return nil }
-        // Upstream decode_is_ready(allow_partial=true): with no SOF the frame is undecodable;
-        // at half the blocks or fewer it is presumed garbage.
+        // The old upstream partial rule: with no SOF the frame is undecodable; at half the
+        // blocks or fewer it is presumed garbage.
         guard frame.totalBlocks > 0, frame.decodedBlocks > frame.totalBlocks / 2 else {
             return nil
         }
         return frame
+    }
+
+    /// The shard-window walk: used u16 + kind u16, then whole packets (PACKED) or one piece of
+    /// a FRAG chain. A body off 4-byte alignment slides back into its own window prefix and a
+    /// chain closes up over the prefixes it spans, so every packet is read inside the AU. A
+    /// zeroed (lost) window drops itself and breaks any chain across it (mirrors
+    /// video_pyrowave.rs push_in_place).
+    private static func walkWindows(
+        base: UnsafeMutablePointer<UInt8>, count: Int, wordBase: Int, windowSize: Int,
+        state: inout ParseState
+    ) -> Bool {
+        // The open FRAG chain: where it starts and where its next body goes.
+        var chain: (at: Int, end: Int)?
+        func push(_ at: Int, _ end: Int) -> Bool {
+            state.pushPackets(
+                UnsafeBufferPointer(start: base + at, count: end - at), wordBase: wordBase + at / 4)
+        }
+        var pos = 0
+        while pos < count {
+            let win = base + pos
+            let bodyPos = pos + 4
+            pos += windowSize
+            let len = Int(win[0]) | (Int(win[1]) << 8)
+            let kind = UInt16(win[2]) | (UInt16(win[3]) << 8)
+            guard len > 0, 4 + len <= windowSize else {
+                chain = nil
+                continue
+            }
+            func slide(to: Int) -> Int {
+                if to != bodyPos {
+                    UnsafeMutableRawPointer(base + to).copyMemory(from: base + bodyPos, byteCount: len)
+                }
+                return to + len
+            }
+            let low = bodyPos & ~3
+            switch kind {
+            case winPacked:
+                chain = nil
+                guard push(low, slide(to: low)) else { return false }
+            case winFragFirst:
+                chain = (low, slide(to: low))
+            case winFragCont:
+                if let open = chain { chain = (open.at, slide(to: open.end)) }
+            case winFragLast:
+                if let open = chain {
+                    chain = nil
+                    guard push(open.at, slide(to: open.end)) else { return false }
+                }
+            default:
+                chain = nil
+            }
+        }
+        return true
     }
 
     /// Streaming packet-walk state (pyrowave_decoder.cpp push_packet + decode_packet). The
@@ -212,7 +211,6 @@ enum WaveletBitstream {
     private struct ParseState {
         var layout: WaveletLayout?
         var offsets: [UInt32] = []
-        var payload: [UInt32] = []
         var totalBlocks = 0
         var decodedBlocks = 0
         var bt2020 = false
@@ -220,7 +218,9 @@ enum WaveletBitstream {
         var fullRange = false
         var sawSOF = false
 
-        mutating func pushPackets(_ buf: UnsafeBufferPointer<UInt8>) -> Bool {
+        /// Walk the packets in `buf`, which starts `wordBase` words into the pool buffer and
+        /// 4-byte aligned, recording where each block's packet lies.
+        mutating func pushPackets(_ buf: UnsafeBufferPointer<UInt8>, wordBase: Int) -> Bool {
             guard let base = buf.baseAddress else { return true }
             var pos = 0
             let count = buf.count
@@ -269,18 +269,8 @@ enum WaveletBitstream {
                 if let layout, blockIndex < layout.blockCount32 {
                     // First write wins (duplicate packets are ignored, like upstream).
                     if offsets[blockIndex] == .max {
-                        offsets[blockIndex] = UInt32(payload.count)
+                        offsets[blockIndex] = UInt32(wordBase + pos / 4)
                         decodedBlocks += 1
-                        // Bulk-copy the packet's coefficient words in one memcpy rather than
-                        // word-by-word. All Apple platforms are little-endian, so the wire's LE
-                        // u32s land in the [UInt32] buffer verbatim; memcpy has no alignment
-                        // requirement, so a non-word-aligned `base + pos` is fine. `reserveCapacity`
-                        // up in `parse` keeps the grow amortized O(1).
-                        let dstWord = payload.count
-                        payload.append(contentsOf: repeatElement(0, count: payloadWords))
-                        payload.withUnsafeMutableBytes { dst in
-                            _ = memcpy(dst.baseAddress! + dstWord * 4, base + pos, payloadWords * 4)
-                        }
                     }
                 } else if layout != nil {
                     return false // out-of-bounds block index — corrupt stream
@@ -303,10 +293,114 @@ enum WaveletBitstream {
         func finish() -> ParsedWaveletFrame? {
             guard let layout else { return nil }
             return ParsedWaveletFrame(
-                layout: layout, offsets: offsets, payload: payload,
+                layout: layout, offsets: offsets,
                 totalBlocks: totalBlocks, decodedBlocks: decodedBlocks,
                 bt2020: bt2020, pq: pq, fullRange: fullRange)
         }
+    }
+}
+
+/// Access-unit memory the core assembles PyroWave frames in: one shared MTLBuffer the dequant
+/// kernel reads where the reassembler wrote, cut into slots of an AU and the kernel's
+/// read-past-the-end slack. A slot is free once the core released it and no decode reads it.
+public final class WaveletAccessUnitPool: AccessUnitMemory {
+    /// Past an AU: the slack the kernel's 64-bit sign load needs. 4096-byte slot strides keep
+    /// every AU 4-byte aligned.
+    static let slackBytes = 64
+    /// AUs in flight at once: a few reassembling, one queued, the decodes still reading.
+    static let slots = 8
+
+    let buffer: MTLBuffer
+    /// Bytes an AU may take.
+    let capacity: Int
+    let stride: Int
+    private let lock = NSLock()
+    private var lentToCore = [Bool](repeating: false, count: WaveletAccessUnitPool.slots)
+    private var readByDecode = [Bool](repeating: false, count: WaveletAccessUnitPool.slots)
+    private var free = Array((0..<WaveletAccessUnitPool.slots).reversed())
+
+    /// Room for an AU at `width`×`height`: 6 bits a pixel at 4:2:0, 9 at 4:4:4 (the host's
+    /// 4.0 bpp ceiling plus window padding), as the Vulkan ring sizes it; 1 MiB at least.
+    static func capacity(width: Int, height: Int, chroma444: Bool) -> Int {
+        let px = max(width, 1) * max(height, 1)
+        let bytes = chroma444 ? px * 9 / 8 : px * 3 / 4
+        return max((bytes + 4095) & ~4095, 1 << 20)
+    }
+
+    init?(device: MTLDevice, capacity: Int) {
+        self.capacity = (capacity + 3) & ~3
+        stride = (self.capacity + Self.slackBytes + 4095) & ~4095
+        guard let buffer = device.makeBuffer(length: stride * Self.slots, options: .storageModeShared)
+        else { return nil }
+        buffer.label = "pyrowave AU pool"
+        self.buffer = buffer
+    }
+
+    /// Byte offset of `token`'s slot, or nil for a token that is not this pool's.
+    func slotStart(_ token: UInt64) -> Int? {
+        token < UInt64(Self.slots) ? Int(token) * stride : nil
+    }
+
+    public func take(_ count: Int) -> (base: UnsafeMutableRawPointer, count: Int, token: UInt64)? {
+        guard count <= capacity else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let index = free.popLast() else { return nil }
+        lentToCore[index] = true
+        return (buffer.contents() + index * stride, capacity, UInt64(index))
+    }
+
+    public func release(_ token: UInt64) {
+        guard token < UInt64(Self.slots) else { return }
+        let index = Int(token)
+        lock.lock()
+        lentToCore[index] = false
+        if !readByDecode[index] { free.append(index) }
+        lock.unlock()
+    }
+
+    public func locate(_ pointer: UnsafeRawPointer) -> (token: UInt64, offset: Int)? {
+        let base = UnsafeRawPointer(buffer.contents())
+        guard pointer >= base, pointer < base + stride * Self.slots else { return nil }
+        let offset = base.distance(to: pointer)
+        return (UInt64(offset / stride), offset)
+    }
+
+    /// A slot for an AU that lies elsewhere (the heap, a fixture), copied in and held for a
+    /// decode; nil when it does not fit or no slot is free. `decode` frees it.
+    func stage(_ au: Data) -> AccessUnit.InPlace? {
+        guard au.count <= capacity else { return nil }
+        lock.lock()
+        guard let index = free.popLast() else {
+            lock.unlock()
+            return nil
+        }
+        readByDecode[index] = true
+        lock.unlock()
+        au.withUnsafeBytes { src in
+            if let from = src.baseAddress, !src.isEmpty {
+                (buffer.contents() + index * stride).copyMemory(from: from, byteCount: src.count)
+            }
+        }
+        return AccessUnit.InPlace(token: UInt64(index), offset: index * stride, count: au.count)
+    }
+
+    /// A decode reads `token`'s slot from now until `done`.
+    func reading(_ token: UInt64) {
+        guard token < UInt64(Self.slots) else { return }
+        lock.lock()
+        readByDecode[Int(token)] = true
+        lock.unlock()
+    }
+
+    /// The decode reading `token`'s slot is over.
+    func done(_ token: UInt64) {
+        guard token < UInt64(Self.slots) else { return }
+        let index = Int(token)
+        lock.lock()
+        readByDecode[index] = false
+        if !lentToCore[index] { free.append(index) }
+        lock.unlock()
     }
 }
 
@@ -357,6 +451,9 @@ public final class MetalWaveletDecoder {
     private let idwtPipeline: MTLComputePipelineState
     private let idwtShiftPipeline: MTLComputePipelineState
     private let mirrorSampler: MTLSamplerState
+    /// Where the AUs lie. The pump swaps in a bigger one when a mode outgrows it; a decode
+    /// in flight keeps the old one through its completion. PUMP THREAD.
+    var pool: WaveletAccessUnitPool
 
     // Size-dependent state, rebuilt when the SOF dims change (this is also the mid-stream
     // Reconfigure/resize path — the wavelet decoder is fixed-size per geometry).
@@ -373,7 +470,6 @@ public final class MetalWaveletDecoder {
         var cb: MTLTexture
         var cr: MTLTexture
         var offsets: MTLBuffer
-        var payload: MTLBuffer
     }
 
     private var slots: [Slot] = []
@@ -393,13 +489,21 @@ public final class MetalWaveletDecoder {
     }
 
     /// The pump thread owns `decode`; everything mutable is confined to it. `tenBit` is the
-    /// session's negotiated depth (`connection.bitDepth >= 10`).
-    init?(device: MTLDevice, queue: MTLCommandQueue, tenBit: Bool = false, ringDepth: Int = 4) {
+    /// session's negotiated depth (`connection.bitDepth >= 10`); `pool` is where the core
+    /// assembles the AUs, or a 4 MiB one of the decoder's own for AUs handed in as `Data`.
+    init?(
+        device: MTLDevice, queue: MTLCommandQueue, tenBit: Bool = false, ringDepth: Int = 4,
+        pool: WaveletAccessUnitPool? = nil
+    ) {
         self.device = device
         self.queue = queue
         self.tenBit = tenBit
         self.ringDepth = max(2, ringDepth)
         self.ringSlots = DispatchSemaphore(value: self.ringDepth)
+        guard let pool = pool ?? WaveletAccessUnitPool(device: device, capacity: 4 << 20) else {
+            return nil
+        }
+        self.pool = pool
         do {
             let lib = try device.makeLibrary(source: waveletShaderSource, options: nil)
             guard let dequantFn = lib.makeFunction(name: "wavelet_dequant") else { return nil }
@@ -434,17 +538,38 @@ public final class MetalWaveletDecoder {
         mirrorSampler = sampler
     }
 
-    /// Decode one AU. Synchronous CPU parse + async GPU decode: returns false when the frame
-    /// was dropped (malformed / SOF lost / not enough blocks); on true, `completion` fires on a
-    /// Metal callback thread once the planes are decoded (nil = the GPU pass errored).
-    /// PUMP THREAD only.
+    /// `decode(_:)` of an AU in its own memory: copied into a pool slot first. Tests, and the
+    /// pump's fallback for an AU the core assembled elsewhere.
     func decode(
         au: Data, chunkAligned: Bool, windowSize: Int,
         completion: @escaping @Sendable (WaveletPlanes?) -> Void
     ) -> Bool {
+        guard let placed = pool.stage(au) else { return false }
+        return decode(placed, chunkAligned: chunkAligned, windowSize: windowSize, completion: completion)
+    }
+
+    /// Decode one AU where it lies in `pool`. Synchronous CPU parse + async GPU decode:
+    /// returns false when the frame was dropped (malformed / SOF lost / not enough blocks);
+    /// on true, `completion` fires on a Metal callback thread once the planes are decoded
+    /// (nil = the GPU pass errored). The slot goes back to the pool either way. PUMP THREAD only.
+    func decode(
+        _ placed: AccessUnit.InPlace, chunkAligned: Bool, windowSize: Int,
+        completion: @escaping @Sendable (WaveletPlanes?) -> Void
+    ) -> Bool {
+        let pool = self.pool
+        guard let slotStart = pool.slotStart(placed.token),
+              placed.offset % 4 == 0, placed.offset >= slotStart,
+              placed.count <= slotStart + pool.capacity - placed.offset
+        else { return false }
+        pool.reading(placed.token)
+        var committed = false
+        defer { if !committed { pool.done(placed.token) } }
+
         guard
             let frame = WaveletBitstream.parse(
-                au: au, chunkAligned: chunkAligned, windowSize: windowSize)
+                base: (pool.buffer.contents() + placed.offset).assumingMemoryBound(to: UInt8.self),
+                count: placed.count, wordBase: placed.offset / 4,
+                chunkAligned: chunkAligned, windowSize: windowSize)
         else { return false }
 
         let wide = tenBit || frame.pq
@@ -454,49 +579,33 @@ public final class MetalWaveletDecoder {
         }
         guard let layout, !slots.isEmpty else { return false }
 
-        // Bound in-flight decodes to the ring's depth. The slot buffers are `.storageModeShared`
+        // Bound in-flight decodes to the ring's depth. The offset buffers are `.storageModeShared`
         // and re-filled by the CPU below, and Metal's hazard tracking orders GPU work against GPU
-        // work only — it does not stop this memcpy landing while an earlier dispatch is still
-        // reading the same slot. Upstream's Vulkan twin is fence-synchronous for this reason.
-        // Timed, so a wedged GPU drops a frame instead of parking the pump thread forever.
+        // work only — it does not stop this write landing while an earlier dispatch is still
+        // reading the same slot. Timed, so a wedged GPU drops a frame instead of parking the pump
+        // thread forever.
         guard ringSlots.wait(timeout: .now() + .milliseconds(250)) == .success else { return false }
-        var committed = false
-        defer { if !committed { ringSlots.signal() } }
+        var submitted = false
+        defer { if !submitted { ringSlots.signal() } }
 
-        var slot = slots[nextSlot]
-        // Grow the payload buffer to the frame (+16-byte zeroed guard: the kernel's 64-bit
-        // sign-window load and eager plane-byte prefetch may read past the payload end —
-        // upstream pads its Vulkan buffer for exactly this).
-        let payloadBytes = frame.payload.count * 4
-        if slot.payload.length < payloadBytes + 16 {
-            guard
-                let grown = device.makeBuffer(
-                    length: max(64 * 1024, (payloadBytes + 16) * 2), options: .storageModeShared)
-            else { return false }
-            slot.payload = grown
-            slots[nextSlot] = slot
-        }
+        let slot = slots[nextSlot]
         frame.offsets.withUnsafeBytes { src in
             slot.offsets.contents().copyMemory(
                 from: src.baseAddress!, byteCount: min(src.count, slot.offsets.length))
         }
-        frame.payload.withUnsafeBytes { src in
-            slot.payload.contents().copyMemory(from: src.baseAddress!, byteCount: src.count)
-        }
-        memset(slot.payload.contents() + payloadBytes, 0, 16)
 
         guard let cmd = queue.makeCommandBuffer() else { return false }
 
         // Stage 1: dequant — every (component, level, band) block grid in one concurrent
         // encoder (each dispatch writes its own band layer; no intra-stage hazards, exactly
-        // like the barrier-free Vulkan dispatch loop).
+        // like the barrier-free Vulkan dispatch loop). The payload is the pool buffer itself.
         guard let dequant = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) else {
             return false
         }
         dequant.label = "pyrowave dequant"
         dequant.setComputePipelineState(dequantPipeline)
         dequant.setBuffer(slot.offsets, offset: 0, index: 0)
-        dequant.setBuffer(slot.payload, offset: 0, index: 1)
+        dequant.setBuffer(pool.buffer, offset: 0, index: 1)
         for level in 0..<WaveletLayout.decompositionLevels {
             for component in 0..<3 {
                 if level == 0 && component != 0 && !layout.chroma444 { continue } // 4:2:0
@@ -569,12 +678,16 @@ public final class MetalWaveletDecoder {
             y: slot.y, cb: slot.cb, cr: slot.cr,
             csc: CscRows.rows(frame.cscSignal, depth: wide ? 10 : 8, msbPacked: wide),
             pq: frame.pq)
-        let slotReleased = ringSlots // captured directly: the handler must not retain the decoder
+        // Captured directly: the handler must not retain the decoder.
+        let slotReleased = ringSlots
+        let token = placed.token
         cmd.addCompletedHandler { buffer in
             slotReleased.signal()
+            pool.done(token)
             completion(buffer.error == nil ? planes : nil)
         }
         cmd.commit()
+        submitted = true
         committed = true
         nextSlot = (nextSlot + 1) % ringDepth
         return true
@@ -635,10 +748,9 @@ public final class MetalWaveletDecoder {
                 let cb = plane(cw, ch, "pyrowave Cb[\(i)]"),
                 let cr = plane(cw, ch, "pyrowave Cr[\(i)]"),
                 let offsets = device.makeBuffer(
-                    length: max(newLayout.blockCount32 * 4, 4), options: .storageModeShared),
-                let payload = device.makeBuffer(length: 64 * 1024, options: .storageModeShared)
+                    length: max(newLayout.blockCount32 * 4, 4), options: .storageModeShared)
             else { return false }
-            newSlots.append(Slot(y: y, cb: cb, cr: cr, offsets: offsets, payload: payload))
+            newSlots.append(Slot(y: y, cb: cb, cr: cr, offsets: offsets))
         }
 
         coefficients = coeff

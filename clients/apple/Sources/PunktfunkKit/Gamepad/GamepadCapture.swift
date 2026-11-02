@@ -72,14 +72,15 @@ public final class GamepadCapture {
         /// also replace a plausible gravity vector with free-fall.
         var lastAccel: (Int16, Int16, Int16) = (0, 0, 0)
         // Hold-Select→guide gesture state (pf-client-core's `SelectGesture`, adapted to
-        // this class's mask-diff model): a Select pressed ALONE is held out of the mask
-        // until it resolves into a tap (delivered on release) or — past `guideHold` — a
-        // synthetic guide, down until release.
+        // this class's mask-diff model): a Select pressed ALONE at `selectDownAt` is held out
+        // of the mask until `gestureFiltered` or `gestureHoldFired` resolves it.
         var selectPending = false
+        var selectDownAt: TimeInterval = 0
         var selectAsGuide = false
-        /// A delivered tap's release is owed (`tapTimer` scheduled) — its down went out
-        /// outside `buttons`, so `flush` must know to lift it.
+        /// A delivered tap of `tapBit` owes its release (`tapTimer` scheduled) — its down
+        /// went out outside `buttons`, so `flush` must know to lift it.
         var tapReleaseOwed = false
+        var tapBit = GamepadWire.back
         /// `Select+A` opened the ring: neither press reached the host, so neither release may.
         var swallowA = false
         var swallowSelect = false
@@ -133,16 +134,26 @@ public final class GamepadCapture {
         escapeChordElements + statsChordElements.filter { !escapeChordElements.contains($0) }
     /// pf-client-core's `DISCONNECT_HOLD` — the same 1.5 s on every client.
     private static let disconnectHold: TimeInterval = 1.5
-    /// pf-client-core's `GUIDE_HOLD`: hold Select alone this long → the HOST's guide goes
-    /// down (until release, so a long hold is the host's long-press — a Gaming-Mode
-    /// host's QAM). The gesture exists because iOS reserves the physical Home press (the
-    /// Game Overlay; sanctioned opt-out only via the user's iOS 27+ Home-button setting)
-    /// and tvOS never delivers it at all.
-    private static let guideHold: TimeInterval = 0.35
+    /// pf-client-core's `GUIDE_HOLD`: hold Select alone this long and it is the HOST's guide.
+    /// The gesture exists because iOS reserves the physical Home press (the Game Overlay;
+    /// sanctioned opt-out only via the user's iOS 27+ Home-button setting) and tvOS never
+    /// delivers it at all.
+    static let guideHold: TimeInterval = 0.35
+    /// pf-client-core's `GUIDE_COMMIT`: a lone Select held this long sends the guide while
+    /// still held, so a long hold is the host's long-press — a Gaming-Mode host's QAM. Until
+    /// then an `escapeChord` partner may still join.
+    private static let guideCommit: TimeInterval = 1.0
+    /// What a pending Select becomes when `joined` buttons press after `held` seconds (`0` =
+    /// its own release): the guide past `guideHold`, else a real Select. An `escapeChord`
+    /// partner always keeps it a Select, so the escape chord never presses guide.
+    static func pendingSelectBecomes(held: TimeInterval, joined: UInt32) -> UInt32 {
+        held >= guideHold && joined & escapeChord & ~GamepadWire.back == 0
+            ? GamepadWire.guide : GamepadWire.back
+    }
     /// pf-client-core's `TAP_PRESS`: a held-back Select tap is delivered as a press with
     /// its release this far behind — back-to-back transitions can fold into nothing in
     /// the host's per-pad input fold.
-    private static let tapPress: TimeInterval = 0.05
+    nonisolated private static let tapPress: TimeInterval = 0.05
     private var chordTimer: Timer?
     /// Fired ON MAIN once the escape chord has been held `disconnectHold` — the session owner
     /// disconnects. On tvOS this (plus the Siri Remote's hold-Back) is the ONLY way out of a
@@ -328,21 +339,69 @@ public final class GamepadCapture {
     }
 
     /// A one-shot synthetic tap of a system button on the host's pad (pf-client-core's
-    /// `GamepadService.tapButton`): down now, up `tapPress` later, on the first forwarded slot's
-    /// wire index — pad 0 when none is open, which is best-effort (the host pad may not exist).
-    /// The quick-action ring's route to the host's guide on a device whose OS keeps the physical
-    /// Home press for itself. Deliberately outside `slot.buttons` and the system-buttons policy:
-    /// this is the ring's own press, not the player's.
+    /// `GamepadService.tapButton`), on the first forwarded slot's wire index — pad 0 when none
+    /// is open, which is best-effort (the host pad may not exist). The quick-action ring's
+    /// route to the host's guide on a device whose OS keeps the physical Home press for itself.
+    /// `misc1` is the Quick Access action, pressed as that pad's host device reads it
+    /// (`GamepadWire.quickAccessPresses`). Deliberately outside `slot.buttons` and the
+    /// system-buttons policy: this is the ring's own press, not the player's.
     public func tapButton(_ bit: UInt32) {
         guard let wire else { return }
         let pad = slots.first?.pad ?? 0
-        wire.send(.gamepadButton(bit, down: true, pad: pad))
-        let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.wire?.send(.gamepadButton(bit, down: false, pad: pad))
+        let presses = bit == GamepadWire.misc1
+            ? GamepadWire.quickAccessPresses(
+                hasButton: connection.hasQuickAccess(declared: slots.first?.pref))
+            : [bit]
+        let events = Self.tapEvents(presses)
+        // One timer per moment: two timers due together fire in no promised order.
+        for delay in Set(events.map(\.after)).sorted() {
+            let due = events.filter { $0.after == delay }
+            guard delay > 0 else {
+                for e in due { wire.send(.gamepadButton(e.bit, down: e.down, pad: pad)) }
+                continue
             }
+            let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    for e in due { self?.wire?.send(.gamepadButton(e.bit, down: e.down, pad: pad)) }
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
         }
-        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    /// A synthetic tap's wire events (pf-client-core's `tap_events`): each press `tapPress`
+    /// after the one before, then every release together, last pressed first. Apart, because
+    /// core folds per-transition sends into one state, and because a chord's first button has
+    /// to be held before its second counts.
+    nonisolated static func tapEvents(
+        _ presses: [UInt32]
+    ) -> [(bit: UInt32, down: Bool, after: TimeInterval)] {
+        let downs = presses.enumerated().map {
+            (bit: $0.element, down: true, after: Double($0.offset) * tapPress)
+        }
+        let up = Double(presses.count) * tapPress
+        return downs + presses.reversed().map { (bit: $0, down: false, after: up) }
+    }
+
+    /// The controller type every forwarded pad declares (`.auto` = each pad as itself).
+    public var padType: PunktfunkConnection.GamepadType { manager.typeSetting }
+
+    /// Whether any physical controller holds a slot.
+    public var hasForwardedPads: Bool { !slots.isEmpty }
+
+    /// Emulate `type` for the rest of this stream. The host builds a pad from its arrival and
+    /// never swaps a built one, so each slot whose declared kind moves is closed and reopened.
+    /// The SC2 passthrough declares its own kind and is left alone.
+    public func setPadType(_ type: PunktfunkConnection.GamepadType) {
+        manager.typeSetting = type
+        for slot in slots {
+            guard let dc = manager.forwarded.first(where: { $0.controller === slot.controller }),
+                  manager.declaredKind(for: dc) != slot.pref else { continue }
+            closeSlot(slot)
+            openSlot(dc)
+        }
+        updateEscapeChord()
+        updateDeviceGyro()
     }
 
     /// Bring `slots` in line with the forwarded set: close any slot no longer wanted (flushing its
@@ -630,16 +689,16 @@ public final class GamepadCapture {
     }
 
     /// The hold-Select→guide state machine over one sync's raw mask (pf-client-core's
-    /// `SelectGesture` rules): Select pressed ALONE is suppressed while pending; another
-    /// button joining makes it real (unsuppressed — the diff sends its down); released
-    /// inside `guideHold` it's a tap, delivered out-of-band on release with the release
-    /// `tapPress` behind; past the threshold `gestureHoldFired` turned it into a synthetic
-    /// guide, lifted here when Select physically releases.
+    /// `SelectGesture` rules): Select pressed ALONE is suppressed while pending. Pending ends
+    /// on the first of: a press joining, which makes it what `pendingSelectBecomes` says (a
+    /// real Select, unsuppressed so the diff sends its down, or the guide); its release, a
+    /// tap of the same choice delivered out-of-band with the release `tapPress` behind; or
+    /// `guideCommit` (`gestureHoldFired`). A guide is lifted here when Select physically
+    /// releases. `Select+A` inside `guideHold` is the ring chord.
     ///
     /// One deliberate divergence from the Rust worker: while transformed into a guide the
     /// Select stays OUT of `slot.buttons`, so the escape chord doesn't complete on top of
-    /// an in-flight guide-hold — release Select and press the chord plainly instead (the
-    /// chord's four-at-once press never lingers in pending long enough to be affected).
+    /// an in-flight guide-hold — release Select and press the chord plainly instead.
     private func gestureFiltered(_ slot: Slot, _ rawIn: UInt32) -> UInt32 {
         let back = GamepadWire.back
         var raw = rawIn
@@ -649,7 +708,7 @@ public final class GamepadCapture {
             if raw & back != 0 { raw &= ~back } else { slot.swallowSelect = false }
         }
         let backDown = raw & back != 0
-        let othersDown = raw & ~back != 0
+        let others = raw & ~back
         if slot.selectAsGuide {
             if backDown { return raw & ~back }
             slot.selectAsGuide = false
@@ -657,12 +716,13 @@ public final class GamepadCapture {
             return raw
         }
         if slot.selectPending {
+            let held = ProcessInfo.processInfo.systemUptime - slot.selectDownAt
             if !backDown {
                 endPending(slot)
-                deliverTap(slot)
+                deliverTap(slot, Self.pendingSelectBecomes(held: held, joined: 0))
                 return raw
             }
-            if raw & GamepadWire.a != 0 {
+            if raw & GamepadWire.a != 0, held < Self.guideHold {
                 // `Select+A`, Select first: the ring chord — swallowed on both buttons.
                 endPending(slot)
                 slot.swallowSelect = true
@@ -670,19 +730,22 @@ public final class GamepadCapture {
                 onRingChord?(slot.pad)
                 return raw & ~back & ~GamepadWire.a
             }
-            if othersDown {
-                // A combo after all — Select unsuppresses and the diff sends its down.
+            if others != 0 {
                 endPending(slot)
-                return raw
+                if Self.pendingSelectBecomes(held: held, joined: others) == back { return raw }
+                slot.selectAsGuide = true
+                sendGuide(slot, down: true, raw: false)
+                return raw & ~back
             }
             return raw & ~back
         }
-        if backDown, !othersDown, slot.buttons & back == 0 {
+        if backDown, others == 0, slot.buttons & back == 0 {
             // Newly pressed, alone: hold it back. An owed tap release goes out first so
             // the host never sees two downs in a row.
             if slot.tapReleaseOwed { finishTap(slot) }
             slot.selectPending = true
-            let timer = Timer(timeInterval: Self.guideHold, repeats: false) { [weak self, weak slot] _ in
+            slot.selectDownAt = ProcessInfo.processInfo.systemUptime
+            let timer = Timer(timeInterval: Self.guideCommit, repeats: false) { [weak self, weak slot] _ in
                 MainActor.assumeIsolated {
                     if let self, let slot { self.gestureHoldFired(slot) }
                 }
@@ -695,8 +758,8 @@ public final class GamepadCapture {
         return raw
     }
 
-    /// The hold threshold passed with Select still pending → it IS the guide now, down
-    /// until the physical release (`gestureFiltered`'s `selectAsGuide` branch lifts it).
+    /// `guideCommit` passed with Select still pending → it IS the guide now, down until the
+    /// physical release (`gestureFiltered`'s `selectAsGuide` branch lifts it).
     private func gestureHoldFired(_ slot: Slot) {
         guard slot.selectPending else { return }
         slot.selectPending = false
@@ -711,12 +774,13 @@ public final class GamepadCapture {
         slot.gestureTimer = nil
     }
 
-    /// Deliver a held-back Select tap: the press now, its release `tapPress` behind. Both
-    /// sends bypass `slot.buttons` (the raw mask no longer carries Select, so the diff
-    /// stays consistent); `tapReleaseOwed` is what `flush` checks so the press can't
-    /// outlive the slot.
-    private func deliverTap(_ slot: Slot) {
-        wire?.send(.gamepadButton(GamepadWire.back, down: true, pad: slot.pad))
+    /// Deliver a held-back Select as a tap of `bit` (Select or the guide): the press now, its
+    /// release `tapPress` behind. Both sends bypass `slot.buttons` (the raw mask no longer
+    /// carries Select, so the diff stays consistent); `tapReleaseOwed` is what `flush` checks
+    /// so the press can't outlive the slot.
+    private func deliverTap(_ slot: Slot, _ bit: UInt32) {
+        wire?.send(.gamepadButton(bit, down: true, pad: slot.pad))
+        slot.tapBit = bit
         slot.tapReleaseOwed = true
         let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self, weak slot] _ in
             MainActor.assumeIsolated {
@@ -733,7 +797,7 @@ public final class GamepadCapture {
         slot.tapReleaseOwed = false
         slot.tapTimer?.invalidate()
         slot.tapTimer = nil
-        wire?.send(.gamepadButton(GamepadWire.back, down: false, pad: slot.pad))
+        wire?.send(.gamepadButton(slot.tapBit, down: false, pad: slot.pad))
     }
 
     /// Forward the guide (Home/PS) transition directly — it's kept out of `buttonMask` (the legacy

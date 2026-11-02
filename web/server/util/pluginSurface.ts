@@ -1,7 +1,14 @@
 // One request to a plugin's loopback surface on the console's behalf, answered same-origin as
 // JSON, so no plugin markup or secret reaches the console origin. The routes under
 // routes/api/plugin-* validate their own ids and hand the rest to `pluginSurface`.
-import { type H3Event, readRawBody, setResponseStatus } from "h3";
+import {
+	getRequestHeader,
+	type H3Event,
+	readRawBody,
+	setResponseStatus,
+} from "h3";
+import { PASSWORD_HEADER } from "../../src/lib/password-gates";
+import { confirmPassword } from "./confirm";
 import { putAndGrant } from "./handedPaths";
 import { callPlugin, pluginJson } from "./pluginProxy";
 
@@ -11,8 +18,10 @@ type Method = "GET" | "PUT" | "POST";
  * Forward the request's method and body to `path` on plugin `id` and relay the answer.
  *
  * `methods` is all that is forwarded (405 otherwise). A PUT with `grantForm` saves through
- * `putAndGrant` and merges its `access` outcome into the answer. `notFound` is the body a plugin's
- * 404 becomes: marked, so the host API's own 404 under `bun run dev` never reads as it.
+ * `putAndGrant`, which asks for the console password (in `PASSWORD_HEADER`) when the save hands a
+ * folder over, and merges its `access` outcome into the answer. `notFound` is the body a plugin's
+ * 404 becomes: marked, so the host API's own 404 under `bun run dev` never reads as it. A plugin's
+ * 401 refuses our secret, not the session, so it answers 502 like an unreachable plugin.
  */
 export async function pluginSurface(
 	event: H3Event,
@@ -36,9 +45,19 @@ export async function pluginSurface(
 			: ((await readRawBody(event, false)) as Uint8Array | undefined);
 	const { res, access } =
 		method === "PUT" && opts.grantForm
-			? await putAndGrant(id, path, body, opts.grantForm)
-			: { res: await callPlugin(id, path, method, body), access: undefined };
-	if (!res) {
+			? await putAndGrant(id, path, body, opts.grantForm, () =>
+					confirmPassword(event, getRequestHeader(event, PASSWORD_HEADER)),
+				)
+			: {
+					res: await callPlugin(id, path, {
+						method,
+						headers:
+							method === "GET" ? {} : { "content-type": "application/json" },
+						body,
+					}),
+					access: undefined,
+				};
+	if (!res || res.status === 401) {
 		setResponseStatus(event, 502);
 		return { error: `plugin ${id} is not reachable` };
 	}

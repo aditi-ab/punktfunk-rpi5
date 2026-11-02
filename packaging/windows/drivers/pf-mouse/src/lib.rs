@@ -14,7 +14,6 @@
 //! idle device sends nothing — a constant stream would read as user activity.
 
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
-// Every remaining `unsafe {}` (all WDF setup FFI) must carry a `// SAFETY:` proof.
 
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use std::sync::Mutex;

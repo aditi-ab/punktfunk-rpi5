@@ -8,9 +8,10 @@ import {
 	authConfigured,
 	csrfRequestOrigin,
 	isCrossSiteMutation,
-	safeNextPath,
+	sessionConfig,
 	verifyUiPassword,
 } from "./auth";
+import { safeNextPath } from "./paths";
 
 describe("safeNextPath", () => {
 	test("keeps a same-origin path with its query and hash", () => {
@@ -103,6 +104,33 @@ describe("verifyUiPassword", () => {
 
 	test("no key at all fails closed", () => {
 		expect(authConfigured()).toBe(false);
+	});
+});
+
+// The seal key a door switch carries between two consoles with different management tokens.
+describe("sessionConfig", () => {
+	beforeEach(() => {
+		delete process.env.PUNKTFUNK_UI_SECRET;
+	});
+
+	test("seeds the key file from the token, so earlier cookies still unseal", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pf-key-"));
+		process.env.PUNKTFUNK_CONFIG_DIR = dir;
+		process.env.PUNKTFUNK_MGMT_TOKEN = "a".repeat(64);
+		const seal = sessionConfig().password;
+		expect(readFileSync(join(dir, "web-session-key"), "utf8").trim()).toBe(
+			seal,
+		);
+		expect(statSync(join(dir, "web-session-key")).mode & 0o777).toBe(0o600);
+	});
+
+	test("a carried key file wins over this console's own token", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pf-key-"));
+		const carried = "c".repeat(64);
+		writeFileSync(join(dir, "web-session-key"), `${carried}\n`);
+		process.env.PUNKTFUNK_CONFIG_DIR = dir;
+		process.env.PUNKTFUNK_MGMT_TOKEN = "d".repeat(64);
+		expect(sessionConfig().password).toBe(carried);
 	});
 });
 

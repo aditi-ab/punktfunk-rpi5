@@ -14,6 +14,7 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -120,15 +121,19 @@ internal fun PictureSurface(handle: Long, modifier: Modifier = Modifier) {
     )
 }
 
-/** Every display as one `pf.display` line: what a dual-screen device reports, for its bundle. */
+/**
+ * Every display as one `pf.display` line for the bundle: what a dual-screen device reports, and
+ * the refresh rates its mode table offers at the current resolution.
+ */
 internal fun describeDisplays(context: Context, dm: DisplayManager): String {
     val presentation = dm.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION).map { it.displayId }
     return dm.displays.joinToString(" | ") { d ->
         val m = context.createDisplayContext(d).resources.displayMetrics
+        val hz = d.sameResolutionModes().map { it.refreshRate.roundToInt() }.distinct().sorted()
         "id=${d.displayId} \"${d.name}\" ${m.widthPixels}x${m.heightPixels} dpi=${m.densityDpi} " +
             "xdpi=${m.xdpi.roundToInt()} in=${String.format(Locale.ROOT, "%.1f", d.diagonalInches(context))} " +
             "sizeless=${d.sizeless(context)} flags=0x${Integer.toHexString(d.flags)} " +
-            "presentation=${d.displayId in presentation}"
+            "presentation=${d.displayId in presentation} hz=${hz.joinToString("/")}"
     }
 }
 
@@ -154,13 +159,30 @@ internal fun rememberCompanionDisplay(): Display? {
  * [content] on [display], as a `Presentation` shown while the activity is started. Its window is
  * not focusable: a tap on a focusable window moves key focus to that display, and the handheld's
  * own buttons would stop reaching the stream. A [pictureHz] means the window holds the picture:
- * it stays lit, pins the panel to the stream's refresh and takes input unbuffered, as
+ * it stays lit while [lit], pins the panel to the stream's refresh and takes input unbuffered, as
  * [StreamWindow] does for the activity's window.
  */
 @Composable
-internal fun CompanionOnDisplay(display: Display, pictureHz: Int? = null, content: @Composable () -> Unit) {
+internal fun CompanionOnDisplay(
+    display: Display,
+    pictureHz: Int? = null,
+    lit: Boolean = true,
+    content: @Composable () -> Unit,
+) {
     val activity = LocalContext.current as? ComponentActivity ?: return
     val latest by rememberUpdatedState(content)
+    // The picture's window, while one is up. Any window with the flag keeps the whole device
+    // awake, so this one follows the stream's own window ([StreamWindow.holdAwake]).
+    var pictureWindow by remember { mutableStateOf<Window?>(null) }
+    LaunchedEffect(pictureWindow, lit) {
+        pictureWindow?.let { w ->
+            if (lit) {
+                w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+    }
     // A Presentation cancels itself when its display's metrics change; the next one takes the new ones.
     var generation by remember { mutableIntStateOf(0) }
     DisposableEffect(activity, display.displayId, generation, pictureHz) {
@@ -173,7 +195,10 @@ internal fun CompanionOnDisplay(display: Display, pictureHz: Int? = null, conten
             setViewTreeSavedStateRegistryOwner(activity)
             setContent { PunktfunkTheme { latest() } }
         }
-        if (pictureHz != null) p.window?.let { holdPicture(it, view, display, pictureHz) }
+        if (pictureHz != null) p.window?.let {
+            holdPicture(it, view, display, pictureHz)
+            pictureWindow = it
+        }
         p.setContentView(view)
         var disposed = false
         p.setOnDismissListener { if (!disposed) generation++ }
@@ -189,6 +214,7 @@ internal fun CompanionOnDisplay(display: Display, pictureHz: Int? = null, conten
         activity.lifecycle.addObserver(observer)
         onDispose {
             disposed = true
+            pictureWindow = null
             activity.lifecycle.removeObserver(observer)
             p.dismiss()
         }
@@ -196,11 +222,11 @@ internal fun CompanionOnDisplay(display: Display, pictureHz: Int? = null, conten
 }
 
 /**
- * The picture's window: lit, pinned to a [hz] stream's mode, input off the vsync batch. Dies with
- * it. `0` pins nothing: the lower half of a spanned picture keeps the panel's own rate.
+ * The picture's window: pinned to a [hz] stream's mode, input off the vsync batch. Dies with it.
+ * `0` pins nothing: the lower half of a spanned picture keeps the panel's own rate. Whether it
+ * stays lit is [CompanionOnDisplay]'s `lit`.
  */
 private fun holdPicture(window: Window, view: View, display: Display, hz: Int) {
-    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     if (hz > 0) display.streamModeFor(hz)?.let { m ->
         window.attributes = window.attributes.apply { preferredDisplayModeId = m.modeId }
     }

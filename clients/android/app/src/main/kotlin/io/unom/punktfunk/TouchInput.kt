@@ -58,6 +58,28 @@ private const val ACCEL_GAIN = 0.6f
 private const val ACCEL_SPEED_FLOOR = 0.3f
 private const val ACCEL_MAX = 3.0f
 
+/** The pointer gain for a finger speed in px per ms: 1 up to [ACCEL_SPEED_FLOOR], then rising by
+ *  [ACCEL_GAIN] per px/ms, capped at [ACCEL_MAX]. */
+internal fun pointerAccel(speed: Float): Float =
+    (1f + ACCEL_GAIN * (speed - ACCEL_SPEED_FLOOR).coerceAtLeast(0f)).coerceAtMost(ACCEL_MAX)
+
+/** The values `clients/shared/touch-vectors.json` pins against the Apple client's `TouchTuning`.
+ *  The gesture code reads the constants above; these only let a test see them. */
+internal object TouchTuning {
+    val tapDragMs = TAP_DRAG_MS
+    val longPressMs = LONG_PRESS_MS
+    val pointerSens = POINTER_SENS
+    val accelGain = ACCEL_GAIN
+    val accelSpeedFloor = ACCEL_SPEED_FLOOR
+    val accelMax = ACCEL_MAX
+    val keyboardSwipeFraction = KB_SWIPE_FRACTION
+    val dialArmDeg = DIAL_ARM_DEG
+    val dialCommitDeg = DIAL_COMMIT_DEG
+
+    /** The dial's slop in tap slops. */
+    val dialSlopInTapSlops = DIAL_SLOP / TAP_SLOP
+}
+
 /**
  * Touch → mouse, run inside the stream overlay's `pointerInput`. Two models, chosen by the
  * Trackpad-mode setting:
@@ -613,8 +635,7 @@ private class Gesture(
         prevY = p.position.y
         prevT = p.uptimeMillis
         val speed = hypot(dx, dy) / dt // finger px per ms
-        val accel = (1f + ACCEL_GAIN * (speed - ACCEL_SPEED_FLOOR).coerceAtLeast(0f))
-            .coerceAtMost(ACCEL_MAX)
+        val accel = pointerAccel(speed)
         accX += dx * POINTER_SENS * accel
         accY += dy * POINTER_SENS * accel
         val outX = accX.toInt() // truncates toward zero → remainder kept w/ sign

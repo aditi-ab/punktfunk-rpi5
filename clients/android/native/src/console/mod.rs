@@ -3,10 +3,9 @@
 //! Kotlin retains trust, discovery, library, wake, and pairing services and exchanges their serde
 //! models through JNI. Console actions return through a blocking event poll and command drain.
 //!
-//! `nativeConsoleCreate` returns an opaque integer key into an `Arc<ConsoleHost>` table. Lookups
-//! retain the host across destroy-vs-poll races; destroy removes the key, and the final reference
-//! stops and joins the render thread. Surface, model, menu, pointer, key, and text calls all use the
-//! same retained lookup rather than exposing a Rust pointer to Kotlin.
+//! `nativeConsoleCreate` returns an opaque integer key into an `Arc<ConsoleHost>` table. The console
+//! lives for the process, so nothing removes its key. Surface, model, menu, pointer, key, and text
+//! calls all use the same keyed lookup rather than exposing a Rust pointer to Kotlin.
 
 mod egl;
 mod gpu;
@@ -20,9 +19,11 @@ use jni::EnvUnowned;
 
 use crate::session::{jni_guard, HandleTable};
 use pf_client_core::menu_nav::MenuSample;
-use pf_console_ui::bridge::{self, CreateOptions, EntryJson, MenuCode, PadsJson, PresetJson};
+use pf_console_ui::bridge::{
+    self, CreateOptions, EntryJson, GamesPush, MenuCode, PadsJson, PhasePush, PresetJson,
+};
 use pf_console_ui::{
-    HostRow, Insets, LibraryGame, LibraryPhase, PairPhase, Platform, SpeedPhase, Stale, WakeStatus,
+    HostRow, Insets, PairStatus, Platform, ProfilesAnswer, SpeedPhase, Stale, WakeStatus,
 };
 use std::time::Duration;
 
@@ -101,17 +102,22 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleCrea
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Remove one console key; the final retained call then stops and joins the render thread.
-/// Zero, stale, duplicate, and concurrent destroys are no-ops.
+/// `NativeBridge.nativePadMark(pref)` — the console's 24-unit outline for a `GamepadPref` wire
+/// byte's pad family ([`pf_console_ui::glyphs::pad_icon`]), as SVG path data; empty for Automatic.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleDestroy(
-    _env: EnvUnowned,
-    _this: JObject,
-    handle: jlong,
-) {
-    jni_guard((), || {
-        drop(CONSOLES.remove(handle));
-    })
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMark<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    pref: jint,
+) -> JString<'local> {
+    use punktfunk_core::config::GamepadPref;
+    let pref = GamepadPref::from_u8(pref.clamp(0, u8::MAX as jint) as u8);
+    let path = match pref {
+        GamepadPref::Auto => "",
+        other => pf_console_ui::glyphs::pad_icon(other).0,
+    };
+    env.with_env(|env| env.new_string(path))
+        .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeConsoleSurfaceCreated(handle, surface)` — the `SurfaceView`'s surface is
@@ -417,16 +423,16 @@ json_pusher!(
 );
 
 json_pusher!(
-/// `NativeBridge.nativeConsoleSetPair(handle, json)` — the pairing ceremony's phase
-/// (`"Idle"`, `"Busy"`, `{"Failed": "why"}`, `{"Paired": {"key": "…"}}`).
+/// `NativeBridge.nativeConsoleSetPair(handle, json)` — the pairing ceremony's phase and the
+/// command's `req` (`{"req": …, "phase": "Busy" | {"Failed": "why"} | {"Paired": {"key": "…"}}}`).
     Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetPair,
-    PairPhase,
+    PairStatus,
     |h, p| h.handles.console.set_pair(p)
 );
 
 json_pusher!(
-/// `NativeBridge.nativeConsoleSetWake(handle, json)` — the wake-and-wait card's status
-/// (`WakeStatus` JSON, or `null` to clear).
+/// `NativeBridge.nativeConsoleSetWake(handle, json)` — the wake card's status under the
+/// `Wake`'s `req` (`WakeStatus` JSON), or `null` when the wake ended.
     Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetWake,
     Option<WakeStatus>,
     |h, w| h.handles.console.set_wake(w)
@@ -456,6 +462,30 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleAdva
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `NativeBridge.nativeConsoleSetProfiles(handle, fpHex, json)` — the answer to
+/// `ConsoleCmd::FetchProfiles` for the host pinned to `fpHex`: `{"Listed": [rows]}`,
+/// `"NoProfiles"` or `{"Failed": "why"}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetProfiles(
+    mut env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    fp_hex: JString,
+    json: JString,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if let (Some(h), Ok(fp), Some(a)) = (
+            CONSOLES.get(handle),
+            fp_hex.try_to_string(env),
+            json_arg::<ProfilesAnswer>(env, &json),
+        ) {
+            h.handles.console.set_profiles(&fp, a);
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// `NativeBridge.nativeConsoleNotice(handle, text)` — a one-shot toast from a service worker.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleNotice(
@@ -473,9 +503,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleNoti
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `NativeBridge.nativeConsoleLibraryBegin(handle)` — a fetch is starting for the shelf on
-/// screen: bumps the fetch epoch and sets `Loading`. Call this — not a bare `Loading` phase —
-/// so the shelf can tell its own result from a previous host's cached one.
+/// `NativeBridge.nativeConsoleLibraryBegin(handle)` — a fetch is starting: `Loading`, and the
+/// posters a superseded fetch left go.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibraryBegin(
     _env: EnvUnowned,
@@ -506,15 +535,16 @@ json_pusher!(
 );
 
 json_pusher!(
-/// `NativeBridge.nativeConsoleLibraryPhase(handle, json)` — `"Loading"`, `"Empty"`, `"Ready"`,
-/// or `{"Error": {"title", "body", "can_retry"}}`.
+/// `NativeBridge.nativeConsoleLibraryPhase(handle, json)` — `{"req": …, "phase": "Loading" |
+/// "Empty" | "Ready" | {"Error": {"title", "body", "can_retry"}}}`, `req` the `FetchLibrary`'s.
     Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibraryPhase,
-    LibraryPhase,
-    |h, p| h.handles.library.set_phase(p)
+    PhasePush,
+    |h, p| h.handles.library.set_phase(&p.req, p.phase)
 );
 
-/// `NativeBridge.nativeConsoleLibraryGames(handle, json, cached)` — the catalog (`[LibraryGame]`);
-/// `cached` = this is the last-known list from the cache, shown while the fetch runs.
+/// `NativeBridge.nativeConsoleLibraryGames(handle, json, cached)` — the catalog as
+/// `{"req": …, "games": [LibraryGame]}`, `req` the `FetchLibrary`'s; `cached` = this is the
+/// last-known list from the cache, shown while the fetch runs.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibraryGames(
     mut env: EnvUnowned,
@@ -524,14 +554,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
     cached: jboolean,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        if let (Some(h), Some(games)) = (
-            CONSOLES.get(handle),
-            json_arg::<Vec<LibraryGame>>(env, &json),
-        ) {
+        if let (Some(h), Some(p)) = (CONSOLES.get(handle), json_arg::<GamesPush>(env, &json)) {
             if cached {
-                h.handles.library.set_games_cached(games);
+                h.handles.library.set_games_cached(&p.req, p.games);
             } else {
-                h.handles.library.set_games(games);
+                h.handles.library.set_games(&p.req, p.games);
             }
         }
         Ok(())
@@ -556,6 +583,28 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
         let id = id.try_to_string(env)?;
         let bytes = env.convert_byte_array(&bytes)?;
         h.handles.library.push_art(id, bytes);
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeConsoleAvatar(handle, url, bytes)` — a profile's picture, encoded,
+/// under the URL `ConsoleCmd::FetchAvatar` named.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleAvatar(
+    mut env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    url: JString,
+    bytes: JByteArray,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let Some(h) = CONSOLES.get(handle) else {
+            return Ok(());
+        };
+        let url = url.try_to_string(env)?;
+        let bytes = env.convert_byte_array(&bytes)?;
+        h.handles.console.set_avatar(&url, bytes);
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()

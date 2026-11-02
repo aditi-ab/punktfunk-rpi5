@@ -35,6 +35,7 @@ public final class ConsoleBridge {
         case licenses = 17
         case padTest = 18
         case libraryDownloads = 19
+        case profiles = 20
     }
 
     /// A discrete menu event, as the shell numbers them.
@@ -71,9 +72,26 @@ public final class ConsoleBridge {
         case pageUp = 8, pageDown = 9, tab = 10, y = 11, x = 12
     }
 
+    /// Every `ConsoleCmd` by the name serde gives it. The app's command switch has no default,
+    /// so a case here is a case it handles; a test holds this list to the shared vectors.
+    public enum Command: String, CaseIterable {
+        case fetchLibrary = "FetchLibrary", refreshRunning = "RefreshRunning"
+        case pair = "Pair", requestAccess = "RequestAccess", sendLogs = "SendLogs"
+        case speedTest = "SpeedTest", saveHost = "SaveHost", updateHost = "UpdateHost"
+        case forgetHost = "ForgetHost", wake = "Wake", cancelWake = "CancelWake"
+        case probe = "Probe", setPin = "SetPin", fetchProfiles = "FetchProfiles"
+        case fetchAvatar = "FetchAvatar"
+        case wakeProfile = "WakeProfile", setProfile = "SetProfile", bindPreset = "BindPreset"
+        case setClipboard = "SetClipboard", unpairHost = "UnpairHost", savePreset = "SavePreset"
+        case deletePreset = "DeletePreset", padTest = "PadTest", loadLicenses = "LoadLicenses"
+        case promptAnswer = "PromptAnswer", padAction = "PadAction", hostAction = "HostAction"
+        case endGame = "EndGame", install = "Install"
+    }
+
     /// Where the session the console asked for stands.
     public enum Phase: UInt8 {
         case connecting = 0, streaming = 1, failed = 2, ended = 3, reconnecting = 4
+        case awaitingApproval = 6
     }
 
     /// `nil` when the options JSON or Skia's Metal context fails; the log says which.
@@ -134,6 +152,14 @@ public final class ConsoleBridge {
 
     public func push(_ kind: Push, _ json: String) {
         punktfunk_console_push(handle, kind.rawValue, json)
+    }
+
+    /// A profile's picture, encoded, under the URL `FetchAvatar` named.
+    public func avatar(url: String, bytes: Data) {
+        bytes.withUnsafeBytes { raw in
+            punktfunk_console_avatar(
+                handle, url, raw.bindMemory(to: UInt8.self).baseAddress, UInt(raw.count))
+        }
     }
 
     /// One title's poster, encoded; the shell decodes it at the size it draws.

@@ -50,6 +50,7 @@ final class AudioDeviceSwitchTests: XCTestCase {
         return false
     }
 
+    @MainActor
     func testPlaybackFollowsAnOutputDeviceChange() throws {
         guard let portStr = ProcessInfo.processInfo.environment["PUNKTFUNK_LOOPBACK_PORT"],
               let port = UInt16(portStr)
@@ -59,6 +60,9 @@ final class AudioDeviceSwitchTests: XCTestCase {
         guard let original = AudioDevices.defaultOutputDevice() else {
             throw XCTSkip("no default output device")
         }
+        try XCTSkipIf(
+            AudioDevices.isRunningSomewhere(original),
+            "something is playing on the default output — moving it would hop that audio")
         let others = AudioDevices.outputs()
             .compactMap { AudioDevices.deviceID(forUID: $0.uid) }
             .filter { $0 != original }

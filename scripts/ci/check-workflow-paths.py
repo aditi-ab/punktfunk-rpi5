@@ -7,9 +7,19 @@ in each `paths:` leg (push, pull_request) the workflow has. A leg with no `paths
 every change and needs nothing. A missing line means a change to that crate merges without
 the build that compiles it.
 
-Usage: python3 scripts/ci/check-workflow-paths.py [--self-test]
+A package recipe reads files that are not crates: udev rules, units, desktop entries. For each
+row of RECIPES, every tracked file the workflow's recipes name outside a comment must match a
+glob in each `paths:` leg too. A workflow with both a push and a pull_request leg keeps the two
+lists equal, so the second is never the one that rots.
+
+packaging-lint compiles nothing: its `pull_request` paths must match every file it lints and
+every workflow it checks.
+
+Usage: python3 scripts/ci/check-workflow-paths.py [--self-test | --lanes]
+--lanes runs the checks that need no cargo: the lane, the recipes and the two-leg match.
 """
 import functools
+import glob
 import json
 import os
 import re
@@ -28,7 +38,7 @@ LINUX_HOST_AND_CLIENT = [
 LINUX_HOST_FEATURES = "punktfunk-host/nvenc,punktfunk-host/vulkan-encode"
 
 # (workflow, manifest, target triple, packages, --features). Packages None = every member.
-# One row per workflow: the arch with the widest feature set.
+# One row per workflow and workspace: the arch with the widest feature set.
 BUILDS = [
     ("windows-host", "Cargo.toml", "x86_64-pc-windows-msvc",
      ["punktfunk-host", "punktfunk-tray", "display-disturb"],
@@ -37,6 +47,7 @@ BUILDS = [
      ["punktfunk-client-windows", "punktfunk-client-session", "punktfunk-cli"], None),
     ("windows-drivers", "packaging/windows/drivers/Cargo.toml", "x86_64-pc-windows-msvc",
      None, None),
+    ("windows-host", "crates/host/pf-seat-keeper/Cargo.toml", "x86_64-pc-windows-msvc", None, None),
     ("setup-windows", "Cargo.toml", "x86_64-pc-windows-msvc",
      ["punktfunk-setup", "punktfunk-setup-win"], None),
     ("macos-host", "Cargo.toml", "aarch64-apple-darwin",
@@ -52,6 +63,20 @@ BUILDS = [
 ]
 
 LEGS = ("push", "pull_request")
+
+# The lane re-runs when any workflow changes, since it holds each one's path lists.
+LINT_LANE = ".gitea/workflows/packaging-lint.yml"
+
+# workflow -> the recipes it builds from. A file a recipe names is an input of that workflow.
+RECIPES = {
+    "deb": ["packaging/debian/*.sh"],
+    "rpm": ["packaging/rpm/*.spec", "packaging/rpm/*.sh", "packaging/gamescope/*.spec",
+            "packaging/gamescope/*.sh", "packaging/bazzite/build-sysext.sh",
+            "packaging/linux/sysext-lib.sh"],
+    "arch": ["packaging/arch/PKGBUILD", "packaging/arch/*.sh", "packaging/gamescope/PKGBUILD"],
+    "nix": ["packaging/nix/*.nix", "flake.nix"],
+    "flatpak": ["packaging/flatpak/*.yml", "packaging/flatpak/*.sh", "packaging/flatpak/*.py"],
+}
 
 
 def path_legs(text):
@@ -97,6 +122,71 @@ def uncovered(crate_dirs, globs):
     return sorted(d for d in miss if not any(d.startswith(m + "/") for m in miss))
 
 
+def unmatched(files, globs):
+    """Files no glob matches."""
+    res = [glob_re(g) for g in globs]
+    return sorted(f for f in files if not any(r.match(f) for r in res))
+
+
+@functools.lru_cache(maxsize=None)
+def tracked_files():
+    return subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True).split("\n")[:-1]
+
+
+def recipe_files(workflow):
+    return sorted({os.path.relpath(f, ROOT) for g in RECIPES[workflow]
+                   for f in glob.glob(os.path.join(ROOT, g))})
+
+
+def lane_files():
+    """Everything packaging-lint.yml lints, reads or re-runs on."""
+    shell = subprocess.check_output(["sh", "scripts/ci/lint-shell.sh", "--list"], cwd=ROOT,
+                                    text=True).split()
+    tracked = tracked_files()
+    return {LINT_LANE, *shell,
+            *(f for f in tracked if f.endswith((".spec", "PKGBUILD"))
+              or (f.startswith(".gitea/workflows/") and f.endswith(".yml"))),
+            *(f for w in RECIPES for f in recipe_files(w))}
+
+
+def named_files(text, tracked):
+    """Tracked files and directories `text` names outside a comment.
+
+    A crate or client directory is the cargo graph's. `$R/` and `%{buildroot}/` prefixes are
+    stepped over; `/usr/…` is not a repo path.
+    """
+    def alt(names):
+        return "|".join(map(re.escape, sorted(names)))
+
+    top_dirs = {t.split("/")[0] for t in tracked if "/" in t} - {"crates", "clients"}
+    token = re.compile(r"(?:(?<![\w/.$}%%-])|\$\{?\w+\}?/|%%\{\w+\}/)"
+                       r"((?:%s)/[\w./@+-]*[\w/]|%s)(?![\w/-]|\.\w)"
+                       % (alt(top_dirs), alt(t for t in tracked if "/" not in t)))
+    known = set(tracked)
+    dirs = {t.rsplit("/", 1)[0] for t in tracked if "/" in t}
+    dirs |= {d.rsplit("/", 1)[0] for d in dirs if "/" in d}
+    out = set()
+    for line in text.splitlines():
+        for m in token.finditer(re.sub(r"(^|\s)#.*$", "", line)):
+            name = m.group(1).rstrip("/")
+            if name in known or name in dirs:
+                out.add(name)
+    return out
+
+
+def input_misses(names, globs, tracked):
+    """Names no glob reaches. A directory counts when any file under it matches."""
+    res = [glob_re(g) for g in globs]
+    known = set(tracked)
+
+    def hit(path):
+        return any(r.match(path) for r in res)
+
+    return sorted(n for n in names
+                  if not (hit(n) if n in known
+                          else any(hit(t) for t in tracked if t.startswith(n + "/"))))
+
+
 @functools.lru_cache(maxsize=None)
 def metadata(manifest, triple, features):
     cmd = ["cargo", "metadata", "--format-version", "1", "--locked",
@@ -118,7 +208,7 @@ def local_crate_dirs(meta, roots):
     }
 
 
-def check():
+def build_errors():
     errors = []
     for workflow, manifest, triple, roots, features in BUILDS:
         path = f".gitea/workflows/{workflow}.yml"
@@ -129,12 +219,59 @@ def check():
             for d in uncovered(dirs, legs.get(leg, ["**"])):
                 errors.append(f"::error file={path}::{leg} paths miss '{d}/**' "
                               f"(compiled for {triple})")
+    return errors
+
+
+def lane_errors():
+    with open(os.path.join(ROOT, LINT_LANE), encoding="utf-8") as f:
+        globs = path_legs(f.read()).get("pull_request", ["**"])
+    return [f"::error file={LINT_LANE}::pull_request paths miss '{m}'"
+            for m in unmatched(lane_files(), globs)]
+
+
+def recipe_errors():
+    errors, tracked = [], tracked_files()
+    for workflow in RECIPES:
+        path = f".gitea/workflows/{workflow}.yml"
+        with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+            legs = path_legs(f.read())
+        where = {}
+        for recipe in recipe_files(workflow):
+            where.setdefault(recipe, recipe)
+            with open(os.path.join(ROOT, recipe), encoding="utf-8") as f:
+                for name in named_files(f.read(), tracked):
+                    where.setdefault(name, recipe)
+        for leg in LEGS:
+            for name in input_misses(where, legs.get(leg, ["**"]), tracked):
+                errors.append(f"::error file={path}::{leg} paths miss '{name}' "
+                              f"(read by {where[name]})")
+    return errors
+
+
+def leg_errors():
+    errors = []
+    for path in sorted(glob.glob(os.path.join(ROOT, ".gitea/workflows/*.yml"))):
+        with open(path, encoding="utf-8") as f:
+            legs = path_legs(f.read())
+        if all(leg in legs for leg in LEGS) and legs["push"] != legs["pull_request"]:
+            diff = sorted(set(legs["push"]) ^ set(legs["pull_request"]))
+            errors.append(f"::error file={os.path.relpath(path, ROOT)}::push and pull_request "
+                          f"paths differ at '{diff[0]}' and {len(diff) - 1} more")
+    return errors
+
+
+def check(lanes_only=False):
+    errors = lane_errors() + recipe_errors() + leg_errors()
+    if not lanes_only:
+        errors = build_errors() + errors
     for e in errors:
         print(e)
     if errors:
         print(f"{len(errors)} missing path filter(s): add each line to that leg.", file=sys.stderr)
         return 1
-    print(f"check-workflow-paths: {len(BUILDS)} builds covered")
+    print("check-workflow-paths: packaging lane and recipes covered" if lanes_only
+          else f"check-workflow-paths: {len(BUILDS)} builds, the recipes and the packaging lane "
+               "covered")
     return 0
 
 
@@ -177,6 +314,30 @@ jobs:
     expect("no paths leg runs always", uncovered(dirs, ["**"]), [])
     expect("prefix is not a match", uncovered({"crates/ab"}, ["crates/a/**"]), ["crates/ab"])
     expect("one line per tree", uncovered(dirs, []), ["clients/cli", "crates/a", "crates/b"])
+    files = ["packaging/arch/PKGBUILD", "scripts/ci/x.sh", "scripts/pf-dm-helper"]
+    expect("lane misses a script", unmatched(files, ["packaging/**", "scripts/*.sh"]),
+           ["scripts/ci/x.sh", "scripts/pf-dm-helper"])
+    expect("lane covers a tree", unmatched(files, ["packaging/**", "scripts/**"]), [])
+    files = ["scripts/60-x.rules", "scripts/headless/run.sh", "scripts/headless/env.sh",
+             "packaging/linux/a.desktop", "packaging/linux/b.service", "web/x.ts",
+             "crates/host/h/src/lib.rs", "Cargo.lock", "README.md", "flake.nix"]
+    recipe = """\
+# install scripts/skipped-in-comment
+install -Dm0644 "$R/scripts/60-x.rules" "$pkgdir/usr/lib/udev/rules.d/60-x.rules"
+install -Dm0644 packaging/linux/a.desktop %{buildroot}%{_datadir}/a.desktop # packaging/linux/b.service
+cp -r scripts/headless/ "$STAGE/usr/share/"
+cp /usr/share/packaging/linux/b.service crates/host/h/src/lib.rs Cargo.lock.bak README.md.
+install -Dm0644 %{buildroot}/packaging/linux/b.service the web console
+"""
+    expect("recipe names", sorted(named_files(recipe, files)),
+           ["README.md", "packaging/linux/a.desktop", "packaging/linux/b.service",
+            "scripts/60-x.rules", "scripts/headless"])
+    expect("a glob per file", input_misses({"scripts/60-x.rules", "web/x.ts"}, ["scripts/*.rules"],
+                                            files), ["web/x.ts"])
+    expect("a directory needs one match", input_misses({"scripts/headless"},
+                                                       ["scripts/headless/env.sh"], files), [])
+    expect("a directory with none", input_misses({"scripts/headless"}, ["scripts/*.rules"], files),
+           ["scripts/headless"])
     if fails:
         return 1
     print("check-workflow-paths self-test ok")
@@ -186,8 +347,10 @@ jobs:
 def main(argv):
     if argv[1:] == ["--self-test"]:
         return self_test()
+    if argv[1:] == ["--lanes"]:
+        return check(lanes_only=True)
     if argv[1:]:
-        print("usage: check-workflow-paths.py [--self-test]", file=sys.stderr)
+        print("usage: check-workflow-paths.py [--self-test | --lanes]", file=sys.stderr)
         return 2
     return check()
 

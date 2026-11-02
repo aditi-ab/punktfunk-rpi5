@@ -1,0 +1,21 @@
+# ThreadSanitizer suppressions for audit.yml's `tsan` job. One entry per race it hides, each
+# with the reason that race is not one. An entry whose reason no longer holds is deleted, not
+# kept: this file is where the job's signal goes to die otherwise.
+
+# tokio's I/O driver learns of a new `ScheduledIo` from epoll. `add_source` initialises it and
+# registers its address as the event token; the driver thread reaches it only through a token
+# an `epoll_wait` returned after that. TSan orders nothing across the kernel carrying the
+# pointer, so it reports the initialising write against every later read on the driver thread.
+race:tokio::runtime::io::registration_set::RegistrationSet>::allocate
+
+# libpipewire's `pw_context_new` asks glibc's `getpwuid` for the user name, and two host threads
+# that connect to PipeWire at once (the mic loop, the audio defaults heal) both run it. The
+# writes TSan pairs up are both inside `getpwuid`, which fills its one static buffer under a
+# lock of glibc's own that the sanitizer cannot see. libpipewire copies the name out after that
+# lock is released: a real window, on two lookups of one uid that leave identical bytes.
+# Upstream's to close with `getpwuid_r`.
+race:pw_get_user_name
+
+# A tokio runtime that a test leaves running when the process exits. A thread that outlives
+# `main` is no race.
+thread:tokio::runtime::blocking::pool::Spawner>::spawn_thread

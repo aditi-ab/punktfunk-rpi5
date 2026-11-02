@@ -8,10 +8,6 @@ fn main() {
     // is the TARGET (both the x64 and the cross-compiled ARM64 Windows builds pass).
     #[cfg(windows)]
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
-        // Stage the Windows App SDK runtime bootstrap + resources.pri next to the exe
-        // (framework-dependent deployment; `main` calls `windows_reactor::bootstrap()`).
-        windows_reactor_setup::as_framework_dependent();
-
         // The Lucide icon font, into `Assets/` beside the exe — where `ms-appx:///Assets/`
         // resolves, and so where `app::lucide::FAMILY` looks for it. A shipped build gets it
         // from packaging/assets instead (pack-msix.ps1 copies that directory into the layout);
@@ -20,7 +16,7 @@ fn main() {
         let font = "packaging/assets/lucide.ttf";
         println!("cargo:rerun-if-changed={font}");
         // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out; three up is target/<profile>,
-        // the directory reactor-setup stages the bootstrap into. Same derivation it uses.
+        // the exe's directory.
         let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
         let exe_dir = out.ancestors().nth(3).expect("target/<profile>");
         let assets = exe_dir.join("Assets");

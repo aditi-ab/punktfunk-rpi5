@@ -45,7 +45,8 @@ German:
 - Accessibility tool: no.
 - What it does: forwards system-reserved keyboard shortcuts (Alt+Tab, Windows key, language key)
   from a hardware keyboard to the user's own computer during a remote-desktop stream. It requests
-  key filtering only (`flagRequestFilterKeyEvents`), no events and no window content.
+  key filtering only (`flagRequestFilterKeyEvents`), only while a stream is on screen, no events
+  and no window content.
 
 ### Review video
 

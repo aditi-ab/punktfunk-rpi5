@@ -242,8 +242,12 @@ public enum AV1 {
     /// header stays in-band (spec-legal: it's bit-identical to the one in `av1C`, which is
     /// rebuilt from the same keyframe), preserving the host's self-contained-keyframe policy.
     public static func sampleBuffer(
-        au: AccessUnit, format: CMVideoFormatDescription
+        au: AccessUnit, format: CMVideoFormatDescription, in pool: AccessUnitSlotPool? = nil
     ) -> CMSampleBuffer? {
+        if let pool, let placed = au.inPlace,
+           let sample = sampleInPlace(au: au, placed: placed, pool: pool, format: format) {
+            return sample
+        }
         // Pass 1: byte scan only — total repacked size of the kept OBUs.
         var total = 0
         forEachOBU(in: au.data) { base, header, payload, type in
@@ -277,6 +281,41 @@ public enum AV1 {
             }
         }
     }
+
+    /// The temporal unit as the sample, where it lies in its pool slot: only the leading
+    /// temporal delimiter is left out, by offset. Needs every OBU to carry its size field and
+    /// no padding OBU (dropping one would move bytes). nil = repack.
+    private static func sampleInPlace(
+        au: AccessUnit, placed: AccessUnit.InPlace, pool: AccessUnitSlotPool,
+        format: CMVideoFormatDescription
+    ) -> CMSampleBuffer? {
+        guard let slotStart = pool.slotStart(placed.token), placed.offset >= slotStart,
+              placed.count <= slotStart + pool.capacity - placed.offset
+        else { return nil }
+        var skip = 0
+        var fits = true
+        var kept = 0
+        forEachOBU(in: au.data) { base, header, payload, type in
+            guard base[header.lowerBound] & 0x02 != 0, type != OBUType.padding else {
+                fits = false
+                return false
+            }
+            if type == OBUType.temporalDelimiter {
+                guard header.lowerBound == 0, payload.isEmpty else {
+                    fits = false
+                    return false
+                }
+                skip = header.upperBound
+            } else {
+                kept += 1
+            }
+            return true
+        }
+        guard fits, kept > 0 else { return nil }
+        return SamplePack.sample(
+            in: pool, token: placed.token, offset: placed.offset + skip,
+            length: placed.count - skip, ptsNs: au.ptsNs, format: format)
+    }
 }
 
 extension VideoCodec {
@@ -291,14 +330,15 @@ extension VideoCodec {
         }
     }
 
-    /// Codec-dispatching sample wrap (see `formatDescription(fromKeyframe:)`).
+    /// Codec-dispatching sample wrap (see `formatDescription(fromKeyframe:)`). `pool` is where
+    /// the core assembled the AU, for a sample over the AU itself.
     public func sampleBuffer(
-        au: AccessUnit, format: CMVideoFormatDescription
+        au: AccessUnit, format: CMVideoFormatDescription, in pool: AccessUnitSlotPool? = nil
     ) -> CMSampleBuffer? {
         switch self {
-        case .av1: return AV1.sampleBuffer(au: au, format: format)
+        case .av1: return AV1.sampleBuffer(au: au, format: format, in: pool)
         case .pyrowave: return nil
-        default: return AnnexB.sampleBuffer(au: au, format: format, codec: self)
+        default: return AnnexB.sampleBuffer(au: au, format: format, codec: self, in: pool)
         }
     }
 }

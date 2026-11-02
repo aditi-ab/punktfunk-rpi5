@@ -31,7 +31,7 @@ class SettingsFieldsTest {
     /** A value that differs from the default in every row, so a dropped row shows as a mismatch. */
     private fun moved(): Settings = Settings(
         width = 3840, height = 2160, hz = 120,
-        bitrateKbps = 40_000, renderScale = 0.5, videoFit = "crop", secondScreen = false,
+        bitrateKbps = 40_000, pyrowaveBpp = 1.0, renderScale = 0.5, videoFit = "crop", secondScreen = false,
         hdrEnabled = false, tenBitSdr = true, compositor = 2, gamepad = 3, gamepadForwarding = false,
         systemButtons = "host", guideGesture = "off", audioChannels = 6, audioFormat = AUDIO_FORMAT_LOSSLESS_96,
         codec = "av1", micEnabled = true, echoCancel = false, keepHostAudio = true,
@@ -40,7 +40,8 @@ class SettingsFieldsTest {
         reduceUiResolution = true, gamepadUiMode = GAMEPAD_UI_ALWAYS, uiPalette = "crimson",
         lowLatencyMode = false, presentPriority = "smooth", smoothBuffer = 2, autoWakeEnabled = false,
         backgroundKeepAlive = true, backgroundTimeoutMinutes = 30, padRumble = false,
-        rumbleOnPhone = true, gyroOnPhone = true, sc2Capture = false, dsCapture = false,
+        keepAwake = false,
+        rumbleOnPhone = true, gyroOnPhone = true, dsCapture = false,
         padHaptics = false, padSpeaker = true, mouseMode = MouseMode.CAPTURE, invertScroll = true,
         overlayActions = "{\"ring\":[]}", backOpensRing = false, startIn = "library", defaultHost = "desk",
     )
@@ -73,7 +74,7 @@ class SettingsFieldsTest {
     @Test
     fun thePresetOverlayRoundTripsEveryRow() {
         val want = moved()
-        val overlay = SettingsOverlay().absorb(Settings(), want)
+        val overlay = SettingsFields.PRESET.fold(SettingsOverlay()) { o, f -> o.pin(f.key, want) }
         assertEquals(SettingsFields.PRESET_KEYS, overlay.overridden() - SettingsOverlay.FIELD_RESOLUTION + setOf("width", "height"))
         val back = SettingsOverlay.fromJson(JSONObject(overlay.toJson().toString()))
         assertEquals(overlay, back)

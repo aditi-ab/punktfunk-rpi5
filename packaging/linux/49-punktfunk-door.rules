@@ -1,0 +1,44 @@
+// "Reachable without logging in" moves the box's host between a user's session and a system
+// service, which needs root. Members of the `punktfunk-update` group may START the two root helper
+// templates that do it, and nothing else:
+//
+//     sudo usermod -aG punktfunk-update <your user>
+//
+// The group ships empty, as for 49-punktfunk-update.rules. `verb == "start"` keeps stop, restart
+// and enable out of the grant. A member starts the templates for their own account only, and the
+// helper takes the instance name as data: it refuses `on` while the door is on for someone else,
+// and `off` for anyone but the account the door is on for.
+//
+// The door runs as the `punktfunk` user and may start only the off template: it turns itself off
+// when its console asks, and never turns on.
+polkit.addRule(function (action, subject) {
+    if (
+        action.id != "org.freedesktop.systemd1.manage-units" ||
+        action.lookup("verb") != "start"
+    ) {
+        return;
+    }
+    var unit = action.lookup("unit") || "";
+    var own = function (verb) {
+        return unit == "punktfunk-door-" + verb + "@" + subject.user + ".service";
+    };
+    if ((own("on") || own("off")) && subject.isInGroup("punktfunk-update")) {
+        return polkit.Result.YES;
+    }
+    if (/^punktfunk-door-off@[a-z0-9_.@-]+\.service$/.test(unit) && subject.user == "punktfunk") {
+        return polkit.Result.YES;
+    }
+});
+
+// The door powers the box and has no login session, so anyone logged in at the desk turns its
+// call into the -multiple-sessions action. The door itself refuses a device while another one
+// streams on any seat. -ignore-inhibit stays ungranted. It also blocks sleep while someone plays
+// on a seat, whose seatless session may not.
+polkit.addRule(function (action, subject) {
+    if (
+        subject.user == "punktfunk" &&
+        /^org\.freedesktop\.login1\.((power-off|reboot|suspend)(-multiple-sessions)?|inhibit-block-sleep)$/.test(action.id)
+    ) {
+        return polkit.Result.YES;
+    }
+});

@@ -12,15 +12,16 @@ Samsung TV the same page installs as an app: [Samsung TV](/docs/samsung-tv).
 
 ## 1. Turn on browser streaming on the host
 
-1. In the host's [web console](/docs/web-console), open **Host → Settings** and turn on **Browser
+1. In the host's [web console](/docs/web-console), open **Host** and turn on **Browser
    streaming**.
 2. Click **Show advanced** and set **Browser origins** to the address you will open the page at,
    for example `https://192.168.1.10:8443`. Left empty, any page open in a browser on your network
    can reach the host. The list is a rule for browser pages: the Samsung TV app sends no origin
    and is admitted either way, and pairing is what lets it stream.
 3. Click **Restart Punktfunk**.
-4. Open UDP 9778 on the host: it is in the `punktfunk-native` firewall profile
-   ([Ports](/docs/ports)). The video goes from the host to the browser directly.
+4. Open UDP 9778 on the host. On Linux it is in the `punktfunk-native` firewall profile; on
+   Windows the host adds its **Punktfunk Browser** rule at the restart ([Ports](/docs/ports)).
+   The video goes from the host to the browser directly.
 
 ## 2. Run the page
 
@@ -78,6 +79,19 @@ every time.
 The page uses what the browser offers: HEVC and AV1 where it decodes them, HDR on an HDR display
 where it has WebGPU (unless **Video plane** is **WebGL2**), controller rumble where it drives the
 pad's motors, and the microphone from the quick menu where it can encode Opus.
+
+## Networks that block UDP
+
+Many office and guest networks block UDP, which the stream uses. When the page can't reach the host
+over UDP, it switches by itself within a few seconds to a WebSocket connection through the machine
+that runs the page, which passes the stream on to the host. There is nothing to set.
+
+This path adds latency, and on a network that loses packets the picture stutters more than over
+UDP. The machine that runs the page has to be reachable over HTTPS from the network you are on.
+Streaming over this path is a preview.
+
+On a host older than Punktfunk 0.47, a browser that pairs this way shows in the console as being on
+your local network.
 
 ## Console mode
 

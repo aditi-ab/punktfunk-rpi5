@@ -15,10 +15,13 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import java.util.UUID
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * BLE transport for a Steam Controller 2 paired directly with the device (no Puck). The standard
+ * BLE transport for a Steam Controller paired directly with the device (no Puck or dongle): a
+ * Steam Controller 2, or a 2015 pad on Bluetooth firmware ([isClassic]). The standard
  * HID service (0x1812) is claimed by the OS (and would feed the pad through the ordinary input
  * stack in lizard-crippled form), so this talks Valve's vendor GATT service instead — the same
  * approach Steam itself uses on hosts without a dongle.
@@ -31,6 +34,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * [Sc2Device], where tests reach it: the `0x45` re-prepend on the way up, and on the way down
  * the per-report characteristic each output id is routed to and the feature characteristic
  * every command goes to, id byte stripped in both directions.
+ *
+ * The 2015 pad notifies 19-byte segments on [CLASSIC_INPUT] and takes and answers features in
+ * segments on the same feature characteristic; core turns its input into wired frames
+ * ([NativeBridge.nativeSc1BleInput]), so [onReport] carries those. It has no lizard watchdog.
  *
  * The link re-acquires by itself — `autoConnect` leaves the request with the stack, so a pad that
  * powers off mid-session reconnects on its own and [onClosed] only means "release the slot".
@@ -57,7 +64,12 @@ class Sc2BleLink(
         val ch: BluetoothGattCharacteristic,
         val payload: ByteArray,
         val acked: Boolean,
+        /** A read of [ch] instead: its value lands in [reads]. */
+        val read: Boolean = false,
     )
+
+    /** Values of the feature characteristic read by [exchange]. */
+    private val reads = LinkedBlockingQueue<ByteArray>()
 
     /** Writes waiting for the link. Rumble supersedes rumble; the rest are never dropped. */
     private val writes = OutReportQueue<GattWrite>()
@@ -77,6 +89,13 @@ class Sc2BleLink(
     @Volatile private var chars: Map<String, BluetoothGattCharacteristic> = emptyMap()
 
     @Volatile private var featureChar: BluetoothGattCharacteristic? = null
+
+    /** The connected pad is a 2015 Steam Controller; set at discovery, before any report. */
+    @Volatile var isClassic = false
+        private set
+
+    /** Core's state for the 2015 pad's input; touched only on the GATT callback thread. */
+    private var classicState = ByteArray(0)
 
     /** Set by [stop] so a disconnect tears the link down instead of re-arming it. */
     @Volatile private var stopped = false
@@ -131,6 +150,10 @@ class Sc2BleLink(
      */
     fun writeRaw(kind: Int, data: ByteArray) {
         if (state != State.READY) return
+        if (isClassic) {
+            if (kind == 1) writeClassic(data)
+            return
+        }
         if (kind == 0) {
             val out = Sc2Device.outputWrite(data) ?: return
             val ch = chars[out.charUuid]
@@ -140,6 +163,55 @@ class Sc2BleLink(
             val payload = Sc2Device.featurePayload(data) ?: return
             write(featureChar ?: return, payload, acked = true, OutReportQueue.NO_COALESCE)
         }
+    }
+
+    /**
+     * One feature query: written to the feature characteristic, then read back, as SDL reads a
+     * feature over GATT. A reply that does not echo the query (a keep-alive slipped in) asks again,
+     * twice at most. Blocks up to a second per try; never call it from a GATT callback.
+     */
+    fun exchange(request: ByteArray): ByteArray? {
+        val ch = featureChar ?: return null
+        if (isClassic) return exchangeClassic(ch, request)
+        val payload = Sc2Device.featurePayload(request.copyOf(64)) ?: return null
+        repeat(3) {
+            reads.clear()
+            writes.offer(GattWrite(ch, payload, acked = true), OutReportQueue.NO_COALESCE)
+            writes.offer(GattWrite(ch, ByteArray(0), acked = true, read = true), OutReportQueue.NO_COALESCE)
+            pump()
+            val value = reads.poll(1, TimeUnit.SECONDS) ?: return null
+            val reply = byteArrayOf(request[0]) + value
+            if (reply.size > 1 && reply[1] == request[1]) return reply
+        }
+        return null
+    }
+
+    /** One wired feature frame to the 2015 pad, as its segments, each without the report id. */
+    private fun writeClassic(frame: ByteArray) {
+        val ch = featureChar ?: return
+        val segs = NativeBridge.nativeSc1BleSegments(frame)
+        for (at in segs.indices step SEGMENT) {
+            write(ch, segs.copyOfRange(at + 1, at + SEGMENT), acked = true, OutReportQueue.NO_COALESCE)
+        }
+    }
+
+    /**
+     * [exchange] for the 2015 pad: the query goes out as segments, and the reply comes back one
+     * segment per read until its last. Blocks up to a second per read.
+     */
+    private fun exchangeClassic(ch: BluetoothGattCharacteristic, request: ByteArray): ByteArray? {
+        reads.clear()
+        writeClassic(request.copyOf(65))
+        var read = ByteArray(0)
+        repeat(CLASSIC_READS) {
+            writes.offer(GattWrite(ch, ByteArray(0), acked = true, read = true), OutReportQueue.NO_COALESCE)
+            pump()
+            val value = reads.poll(1, TimeUnit.SECONDS) ?: return null
+            read += byteArrayOf(CLASSIC_REPORT) + value
+            val reply = NativeBridge.nativeSc1BleReply(read) ?: return@repeat
+            return reply.takeIf { it.size > 1 && it[1] == request[1] }
+        }
+        return null
     }
 
     /**
@@ -179,6 +251,9 @@ class Sc2BleLink(
     private enum class Sent { OK, BUSY, FAILED }
 
     private fun send(g: BluetoothGatt, w: GattWrite): Sent {
+        if (w.read) {
+            return if (runCatching { g.readCharacteristic(w.ch) }.getOrDefault(false)) Sent.OK else Sent.FAILED
+        }
         val type = if (w.acked) {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         } else {
@@ -221,6 +296,11 @@ class Sc2BleLink(
      *  the feature characteristic. Off feeds the firmware watchdog; on hands the pad back. */
     private fun sendLizard(frame: ByteArray) {
         if (state != State.READY) return
+        if (isClassic) {
+            (if (frame === Sc2Device.ENABLE_LIZARD) Sc1Device.LIZARD_ON else Sc1Device.LIZARD_OFF)
+                .forEach(::writeClassic)
+            return
+        }
         val ch = featureChar ?: return
         val payload = Sc2Device.featurePayload(frame) ?: return
         // One key for both settings: the newest supersedes a pending one.
@@ -264,6 +344,7 @@ class Sc2BleLink(
     private fun forgetConnection() {
         chars = emptyMap()
         featureChar = null
+        isClassic = false
         pendingSubs.clear()
         subsIndex = 0
         writes.clear()
@@ -315,12 +396,16 @@ class Sc2BleLink(
             }
             pendingSubs.clear()
             val found = HashMap<String, BluetoothGattCharacteristic>()
+            var classic = false
             for (ch in valve.characteristics) {
                 found[ch.uuid.toString().lowercase()] = ch
                 val short = shortUuid(ch.uuid) ?: continue
                 val canNotify = ch.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
-                if (canNotify && short in NOTIFY_LOW..NOTIFY_HIGH) pendingSubs.add(ch)
+                if (short == CLASSIC_INPUT) classic = true
+                if (canNotify && (short in NOTIFY_LOW..NOTIFY_HIGH || short == CLASSIC_INPUT)) pendingSubs.add(ch)
             }
+            if (classic) classicState = NativeBridge.nativeSc1BleState()
+            isClassic = classic
             chars = found
             featureChar = found[Sc2Device.BLE_FEATURE_CHAR]
             if (featureChar == null) {
@@ -340,9 +425,30 @@ class Sc2BleLink(
             pump()
         }
 
+        override fun onCharacteristicRead(
+            g: BluetoothGatt,
+            ch: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int,
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) reads.offer(value)
+            inFlight.set(false)
+            pump()
+        }
+
+        /** Below 33 only; from 33 the stack calls the overload above. */
+        @Deprecated("Replaced at API 33 by the overload that carries the value")
+        override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+            if (Build.VERSION.SDK_INT >= 33) return
+            @Suppress("DEPRECATION")
+            val value = ch.value
+            if (status == BluetoothGatt.GATT_SUCCESS && value != null) reads.offer(value)
+            inFlight.set(false)
+            pump()
+        }
+
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
-            val framed = Sc2Device.frameIncoming(value)
-            onReport(framed, framed.size)
+            deliver(ch, value)
         }
 
         /** Below 33 only; from 33 the stack calls both, and the overload above has the value. */
@@ -351,16 +457,28 @@ class Sc2BleLink(
             if (Build.VERSION.SDK_INT >= 33) return
             @Suppress("DEPRECATION")
             val data = ch.value ?: return
-            val framed = Sc2Device.frameIncoming(data)
-            onReport(framed, framed.size)
+            deliver(ch, data)
         }
+    }
+
+    /** One notification up to [onReport]: the 2015 pad's segments through core, else framed. */
+    private fun deliver(ch: BluetoothGattCharacteristic, value: ByteArray) {
+        if (isClassic) {
+            if (shortUuid(ch.uuid) != CLASSIC_INPUT) return
+            val frame = NativeBridge.nativeSc1BleInput(classicState, byteArrayOf(CLASSIC_REPORT) + value) ?: return
+            onReport(frame, frame.size)
+            return
+        }
+        val framed = Sc2Device.frameIncoming(value)
+        onReport(framed, framed.size)
     }
 
     private fun subscribeNext(g: BluetoothGatt) {
         if (subsIndex >= pendingSubs.size) {
             state = State.READY
-            Log.i(TAG, "SC2 BLE link up (${pendingSubs.size} notify chars)")
+            Log.i(TAG, "SC2 BLE link up (${pendingSubs.size} notify chars, classic=$isClassic)")
             sendLizard(Sc2Device.DISABLE_LIZARD)
+            if (isClassic) return
             // The firmware watchdog re-enables lizard mode; refresh on SDL's cadence until the
             // host's Steam takes over via the raw plane (its writes land through writeRaw too).
             lizardTicker = Thread({
@@ -404,6 +522,14 @@ class Sc2BleLink(
         private const val VALVE_UUID_TAIL = "-1735-4313-b402-38567131e5f3"
         private const val NOTIFY_LOW = 0x100f6c75L
         private const val NOTIFY_HIGH = 0x100f6c7aL
+
+        /** The 2015 pad's input characteristic, and the report id its segments carry over HID. */
+        private const val CLASSIC_INPUT = 0x100f6c33L
+        private const val CLASSIC_REPORT: Byte = 0x03
+        private const val SEGMENT = 20
+
+        /** Reads one 2015-pad reply may take: four segments, and empty reads between them. */
+        private const val CLASSIC_READS = 8
         private val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         private val NAME_HINTS =

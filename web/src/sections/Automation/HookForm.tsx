@@ -1,9 +1,11 @@
 import { keepPreviousData } from "@tanstack/react-query";
 import { type FC, useEffect, useMemo, useState } from "react";
 import { useListPairedClients } from "@/api/gen/clients/clients";
+import { useGetHostInfo } from "@/api/gen/host/host";
 import { useGetLibraryPage } from "@/api/gen/library/library";
 import type { HookEntry } from "@/api/gen/model/hookEntry";
 import { useListNativeClients } from "@/api/gen/native/native";
+import { useListProfiles } from "@/api/gen/profiles/profiles";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Combobox, type ComboboxOption } from "@/components/ui/combobox";
@@ -79,6 +81,11 @@ export const HookForm: FC<{
 		{ query: { enabled: filtered && typed.includes(":") } },
 	);
 	const clients = useListNativeClients({ query: { enabled: filtered } });
+	// One list of hooks for the box; a profile narrows one to that player (R9: one profile, none).
+	const profiles = useListProfiles({
+		query: { enabled: filtered, retry: false },
+	});
+	const players = profiles.data ?? [];
 	const moonlight = useListPairedClients({ query: { enabled: filtered } });
 	const appOptions: ComboboxOption[] = useMemo(
 		() =>
@@ -126,6 +133,12 @@ export const HookForm: FC<{
 	// Only the launch stage waits for anyone; the host refuses `hold` on any other kind.
 	const holdable = draft.on.trim() === "game.launching";
 	const holds = holdable && draft.hold === true;
+	// The host says whether it can elevate (`null`: never) and whether an administrator allowed
+	// it. A stored elevated hook stays visible, so it can be turned back off.
+	const elevatedOn = useGetHostInfo().data?.elevated_commands;
+	const elevates = kind === "run" && draft.elevated === true;
+	const showElevated =
+		kind === "run" && (typeof elevatedOn === "boolean" || elevates);
 	const ready = draft.on.trim().length > 0 && action.trim().length > 0;
 
 	const commit = () => {
@@ -140,6 +153,7 @@ export const HookForm: FC<{
 			...(draft.debounce_ms ? { debounce_ms: draft.debounce_ms } : {}),
 			...(draft.timeout_s ? { timeout_s: draft.timeout_s } : {}),
 			...(holds ? { hold: true } : {}),
+			...(elevates ? { elevated: true } : {}),
 			...(kind === "webhook" && draft.hmac_secret_file
 				? { hmac_secret_file: draft.hmac_secret_file }
 				: {}),
@@ -309,6 +323,38 @@ export const HookForm: FC<{
 								</SelectContent>
 							</Select>
 						</div>
+						{players.length > 1 && (
+							<div className="space-y-2">
+								<Label htmlFor="hook-profile">
+									{m.automation_filter_profile()}
+								</Label>
+								<Select
+									value={draft.filter?.profile ?? ANY_DEVICE}
+									onValueChange={(v) =>
+										set({
+											filter: {
+												...draft.filter,
+												profile: v === ANY_DEVICE ? undefined : v,
+											},
+										})
+									}
+								>
+									<SelectTrigger id="hook-profile">
+										<SelectValue />
+									</SelectTrigger>
+									<SelectContent>
+										<SelectItem value={ANY_DEVICE}>
+											{m.automation_filter_none()}
+										</SelectItem>
+										{players.map((p) => (
+											<SelectItem key={p.id} value={p.id}>
+												{p.display_name}
+											</SelectItem>
+										))}
+									</SelectContent>
+								</Select>
+							</div>
+						)}
 						<div className="space-y-2">
 							<Label htmlFor="hook-app">{m.automation_filter_app()}</Label>
 							{/* The event carries the store-qualified id (`steam:570`), so that is what
@@ -360,6 +406,32 @@ export const HookForm: FC<{
 						</Label>
 						<p className="pl-7 text-xs text-muted-foreground">
 							{m.automation_field_hold_help()}
+						</p>
+					</div>
+				)}
+
+				{showElevated && (
+					<div className="space-y-1">
+						<Label className="flex items-start gap-3 text-sm font-normal">
+							<Checkbox
+								checked={elevates}
+								disabled={elevatedOn === false && !elevates}
+								onCheckedChange={(n) => set({ elevated: n === true })}
+								className="mt-0.5"
+							/>
+							<span>{m.automation_field_elevated()}</span>
+						</Label>
+						<p className="pl-7 text-xs text-muted-foreground">
+							{elevatedOn === false ? (
+								<>
+									{m.automation_field_elevated_off()}{" "}
+									<code className="font-mono">
+										punktfunk-host hooks elevated on
+									</code>
+								</>
+							) : (
+								m.automation_field_elevated_help()
+							)}
 						</p>
 					</div>
 				)}

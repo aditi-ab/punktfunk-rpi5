@@ -61,8 +61,8 @@ pub(super) fn take_by_pts<V: Copy>(q: &mut VecDeque<(u64, V)>, pts_us: u64) -> O
 /// The AU `user_flags` for a decoded output, keyed by the echoed `presentationTimeUs`. Recovery
 /// signalling (FLAG_SOF IDR marker / RECOVERY_ANCHOR / RECOVERY_POINT) rides the AU's flags, which are
 /// only in scope at feed time — so the feed side parks `(pts_us, flags)` here and the present side
-/// looks them up to fold [`ReanchorGate::on_decoded`]. A miss (probe filler, or an entry aged past
-/// the cap) reads `0` — no recovery flags, decoded normally.
+/// looks them up to report the picture to core's freeze ([`NativeClient::recovery_on_decoded`]). A
+/// miss (probe filler, or an entry aged past the cap) reads `0` — no recovery flags, decoded normally.
 pub(super) fn take_flags(map: &mut VecDeque<(u64, u32)>, pts_us: u64) -> u32 {
     take_by_pts(map, pts_us).unwrap_or(0)
 }
@@ -82,13 +82,8 @@ pub(super) fn p50_max_ms(mut v: Vec<u64>) -> (f64, f64) {
 
 /// The `received` point for one arriving AU: the core's reassembly stamp, which keys the
 /// in-flight map the decode stage pairs against. The connector already noted receipt for the
-/// overlay and matches each 0xCF to its frame; draining the timings here logs the host's
-/// phase-lock ACK when it changes.
-pub(super) fn note_received_frame(
-    client: &NativeClient,
-    frame: &Frame,
-    last_phase_ack: &mut Option<i32>,
-) -> i128 {
+/// overlay; draining the timings here matches each 0xCF to its frame.
+pub(super) fn note_received_frame(client: &NativeClient, frame: &Frame) -> i128 {
     // Reassembly completion, NOT the pull instant: stamping at the pull would fold the hand-off
     // queue wait into the network figure. 0 = older core.
     let received_ns = if frame.received_ns > 0 {
@@ -96,16 +91,7 @@ pub(super) fn note_received_frame(
     } else {
         now_realtime_ns()
     };
-    while let Ok(t) = client.next_host_timing(Duration::ZERO) {
-        if t.applied_phase_ns != *last_phase_ack {
-            log::info!(
-                target: "pf.phase",
-                "host applied_phase={:?}us",
-                t.applied_phase_ns.map(|n| n / 1000)
-            );
-            *last_phase_ack = t.applied_phase_ns;
-        }
-    }
+    while client.next_host_timing(Duration::ZERO).is_ok() {}
     received_ns
 }
 

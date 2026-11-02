@@ -5,7 +5,7 @@
 # /var/lib/extensions/, survives OS updates, and is toggled/updated without a reboot.
 #
 # Counterpart to ../arch/build-sysext.sh (which wraps a pacman package for SteamOS). This one
-# wraps the Fedora RPMs (punktfunk, -web, -scripting, -bun) and additionally:
+# wraps the Fedora RPMs (punktfunk, -web, -scripting, -seats, -bun) and additionally:
 #   * relocates the RPMs' /etc payload to /usr/share/punktfunk/etc/ (a sysext carries ONLY /usr;
 #     punktfunk-sysext(8) copies these into the real /etc on install),
 #   * bakes SELinux labels in as squashfs pseudo-xattrs, computed with matchpathcon from the
@@ -90,8 +90,8 @@ if [ -e "$STAGE/usr/bin/punktfunk-web-server" ] || [ -e "$STAGE/usr/bin/punktfun
     echo "the punktfunk-bun RPM must be among the inputs — web and scripting run on it" >&2; exit 1; }
 fi
 
-# A sysext carries only /usr. Relocate the RPMs' /etc payload (gamescope-session drop-in, tray
-# autostart entry) under /usr/share/punktfunk/etc/ — punktfunk-sysext copies it into /etc.
+# A sysext carries only /usr. Relocate the RPMs' /etc payload (the gamescope-session drop-in)
+# under /usr/share/punktfunk/etc/ — punktfunk-sysext copies it into /etc.
 if [ -d "$STAGE/etc" ]; then
   mkdir -p "$STAGE/usr/share/punktfunk/etc"
   cp -a "$STAGE/etc/." "$STAGE/usr/share/punktfunk/etc/"
@@ -132,6 +132,10 @@ fi
 
 # Self-update: the helper rides inside the image.
 install -Dm0755 "$HERE/punktfunk-sysext.sh" "$STAGE/usr/bin/punktfunk-sysext"
+# The UDP buffer sysctl and the enabled door/seat units at every boot. Image-borne, so the first
+# update to it fixes the box.
+pf_stage_sysctl_unit "$STAGE"
+pf_stage_start_unit "$STAGE"
 
 # Compatibility marker. ID=fedora matches Bazzite & friends through os-release ID_LIKE;
 # VERSION_ID makes a major-rebased host refuse the old ABI instead of merging it.

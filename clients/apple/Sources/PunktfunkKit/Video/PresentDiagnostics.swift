@@ -170,6 +170,13 @@ final class FrameRateHint: @unchecked Sendable {
         pending = nil
         return p
     }
+    /// The stream rate's range as it stands, for a link started mid-session: `drain` hands a
+    /// CHANGE to the live link, and a fresh link that only drained would run without a rate.
+    func current() -> CAFrameRateRange? {
+        lock.lock()
+        defer { lock.unlock() }
+        return streamHz > 0 ? Self.range(hz: streamHz, boosted: boosted) : nil
+    }
     /// The nominal SOURCE interval in nanoseconds — the cadence clock's cushion ceiling. Read on
     /// every pacing, not just deadline: this box is where the negotiated stream rate already
     /// lives, staged from main on session start and every Reconfigure, and the decode-completion
@@ -188,151 +195,12 @@ final class FrameRateHint: @unchecked Sendable {
         _ = boosted
         return CAFrameRateRange(minimum: hz, maximum: hz, preferred: hz)
         #else
+        // Pinned at the panel's top rate: a frame shows at the first refresh after its pick, and
+        // a lower minimum lets the system drop the panel mid-stream (judder). `boosted` is moot.
+        _ = boosted
         let cap = max(hz, 120)
-        let preferred = boosted ? cap : hz
-        return CAFrameRateRange(minimum: preferred, maximum: cap, preferred: preferred)
+        return CAFrameRateRange(minimum: cap, maximum: cap, preferred: cap)
         #endif
-    }
-}
-
-/// The client half of phase-locked capture (design/phase-locked-capture.md): the decode
-/// callback deposits per-AU arrival and decode stamps (client CLOCK_REALTIME — the core's
-/// reassembly-completion time), the deadline link's thread deposits each target and its latch
-/// lead, and ~1 Hz that same thread flushes the circular arrival-phase statistic to the host. The statistic is a
-/// verbatim port of `punktfunk_core::phase::circular_latch` — the host's v3 controller
-/// (grid-locked submits, coherence-gated engage) was tuned against exactly it, and a
-/// period-smeared Wi-Fi link correctly reads coherence ≈ 0 there, so the controller never
-/// engages where alignment is physically pointless. Shared box (never captures the pipeline);
-/// a session's connection binds/unbinds like DecodeReport/KeyframeRecovery.
-final class PhaseReporter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var connection: PunktfunkConnection?
-    /// Arrival stamps since the last flush, client CLOCK_REALTIME, and each one's decode time.
-    /// Bounded: ~1 s at 240 fps.
-    private var arrivalsNs: [Int64] = []
-    private var decodesNs: [Int64] = []
-    /// Smallest update-to-update spacing this window: successive targets sit one panel period
-    /// apart except across skipped link updates (2×, 3×, …), so the window minimum IS the period.
-    /// Re-learned every flush so VRR/mode switches track both ways.
-    private var periodNs: Int64 = 0
-    private var prevTargetRealNs: Int64 = 0
-    private var lastFlushRealNs: Int64 = 0
-
-    func bind(_ c: PunktfunkConnection?) {
-        lock.lock()
-        connection = c
-        arrivalsNs.removeAll()
-        decodesNs.removeAll()
-        periodNs = 0
-        prevTargetRealNs = 0
-        lastFlushRealNs = 0
-        lock.unlock()
-    }
-
-    /// Decode-callback side: one AU's arrival (reassembly-completion) stamp and decode end.
-    func noteArrival(receivedNs: Int64, decodedNs: Int64) {
-        lock.lock()
-        if connection != nil, arrivalsNs.count < 256 {
-            arrivalsNs.append(receivedNs)
-            decodesNs.append(decodedNs - receivedNs)
-        }
-        lock.unlock()
-    }
-
-    /// Link-thread side, once per update: the update's target present and how far before it the
-    /// client renders (`latchLeadNs`: the late-latch budget, else the whole vend lead), on the
-    /// arrival stamps' realtime clock. Learns the period from target spacing — a budget back-off
-    /// must not read as a short period — and ~1 Hz reports (`report`), a fire-and-forget
-    /// datagram on the control plane.
-    func noteGrid(targetRealNs: Int64, latchLeadNs: Int64) {
-        lock.lock()
-        if prevTargetRealNs > 0 {
-            let delta = targetRealNs - prevTargetRealNs
-            // 2–100 ms accepts 10–500 Hz panels, rejects wakeup hiccups and clock jumps.
-            if delta > 2_000_000, delta < 100_000_000, periodNs == 0 || delta < periodNs {
-                periodNs = delta
-            }
-        }
-        prevTargetRealNs = targetRealNs
-        guard let c = connection, periodNs > 0, arrivalsNs.count >= 8,
-            targetRealNs - lastFlushRealNs >= 1_000_000_000
-        else {
-            lock.unlock()
-            return
-        }
-        lastFlushRealNs = targetRealNs
-        let period = periodNs
-        let report = Self.report(
-            targetRealNs: targetRealNs, latchLeadNs: latchLeadNs, periodNs: period,
-            arrivalsNs: arrivalsNs, decodesNs: decodesNs)
-        arrivalsNs.removeAll(keepingCapacity: true)
-        decodesNs.removeAll(keepingCapacity: true)
-        periodNs = 0
-        let offsetNs = c.clockOffsetNs
-        lock.unlock()
-        guard let report else { return }
-        if presentDebug {
-            print(String(
-                format: "pf-phase leadUs=%llu coherence=%u decodeUs=%lld latchLeadUs=%lld periodUs=%lld",
-                report.leadMeanNs / 1000, report.coherence, report.decodeNs / 1000,
-                latchLeadNs / 1000, period / 1000))
-            fflush(stdout)
-        }
-        c.reportPhase(
-            nextLatchHostNs: UInt64(max(0, report.readyByNs + offsetNs)),
-            latchPeriodNs: UInt32(clamping: period),
-            uncertaintyNs: 1_000_000, // skew residual — same conservative 1 ms as Android
-            arrivalLeadNs: UInt32(clamping: report.leadMeanNs),
-            coherenceMilli: report.coherence)
-    }
-
-    struct Report: Equatable {
-        let readyByNs: Int64
-        let leadMeanNs: UInt64
-        let coherence: UInt16
-        let decodeNs: Int64
-    }
-
-    /// The instant an arrival must beat — the latch point less the window's p75 decode time —
-    /// and the window's circular-mean arrival lead before it. The host's phase lock aims that
-    /// lead at ~2.5 ms, so frames are decoded just before the latch. Nil under 8 samples.
-    static func report(
-        targetRealNs: Int64, latchLeadNs: Int64, periodNs: Int64, arrivalsNs: [Int64],
-        decodesNs: [Int64]
-    ) -> Report? {
-        guard periodNs > 0 else { return nil }
-        let decodes = decodesNs.sorted()
-        let decodeNs = decodes.isEmpty ? 0 : max(0, decodes[decodes.count * 3 / 4])
-        let readyByNs = targetRealNs - latchLeadNs - decodeNs
-        let leadsUs = arrivalsNs.map { a -> UInt64 in
-            let m = (readyByNs - a) % periodNs
-            return UInt64(m < 0 ? m + periodNs : m) / 1000
-        }
-        guard let (leadMeanNs, coherence) = circularLatch(samplesUs: leadsUs, periodNs: periodNs)
-        else { return nil }
-        return Report(
-            readyByNs: readyByNs, leadMeanNs: leadMeanNs, coherence: coherence, decodeNs: decodeNs)
-    }
-
-    /// Verbatim port of `punktfunk_core::phase::circular_latch` (µs samples against an ns
-    /// period; nil under 8 samples). The MEAN is what a phase controller can steer under
-    /// jitter — a period-spanning distribution's median is immovable — and the coherence
-    /// (resultant length, ‰) says whether any phase exists to steer at all.
-    static func circularLatch(samplesUs: [UInt64], periodNs: Int64) -> (UInt64, UInt16)? {
-        guard samplesUs.count >= 8, periodNs > 0 else { return nil }
-        let periodUs = Double(periodNs) / 1000.0
-        var x = 0.0
-        var y = 0.0
-        for s in samplesUs {
-            let theta = Double(s).truncatingRemainder(dividingBy: periodUs) / periodUs * 2 * .pi
-            x += cos(theta)
-            y += sin(theta)
-        }
-        let n = Double(samplesUs.count)
-        let r = (x * x + y * y).squareRoot() / n
-        var meanTheta = atan2(y, x)
-        if meanTheta < 0 { meanTheta += 2 * .pi }
-        return (UInt64(meanTheta / (2 * .pi) * Double(periodNs)), UInt16(r * 1000.0))
     }
 }
 
@@ -358,6 +226,8 @@ final class PresentDebugStats: @unchecked Sendable {
     private var lastGlassPtsNs: UInt64 = 0
     private var glassDeltasMs: [Double] = []
     private var cadenceErrMs: [Double] = []
+    /// (glass step, source step) in ms per consecutive shown pair, for `glitch=`.
+    private var steps: [(glass: Double, source: Double)] = []
     private var displayMs: [Double] = []
     /// Present-issue → on-glass delay per frame (system presentedTime minus the render call's
     /// start) — the DIRECT decomposition of the display stage: ring/pairing wait lives upstream
@@ -381,17 +251,25 @@ final class PresentDebugStats: @unchecked Sendable {
     private let linkPeriod: () -> CFTimeInterval
     /// The hosting panel, read live per line — a window can move to another screen.
     private let panel: () -> PanelInfo
+    /// The Direct gate: presents it issued this window (`direct=`), and its mode switches.
+    private var directPresents = 0
+    private let scanoutSwitches: () -> Int
 
     init(
         cadence: CadenceClock?, pace: @escaping () -> String,
         linkPeriod: @escaping () -> CFTimeInterval,
-        panel: @escaping () -> PanelInfo = { PanelInfo(minHz: 0, maxHz: 0) }
+        panel: @escaping () -> PanelInfo = { PanelInfo(minHz: 0, maxHz: 0) },
+        scanoutSwitches: @escaping () -> Int = { 0 }
     ) {
         self.cadence = cadence
         self.pace = pace
         self.linkPeriod = linkPeriod
         self.panel = panel
+        self.scanoutSwitches = scanoutSwitches
     }
+
+    /// One present issued through the Direct gate.
+    func directPresent() { lock.lock(); directPresents += 1; lock.unlock() }
 
     /// Decoder output, every frame on every pacing — before the re-anchor gate and the store.
     func decoded(isRepeat: Bool) {
@@ -445,6 +323,7 @@ final class PresentDebugStats: @unchecked Sendable {
                 if lastGlassPtsNs > 0, ptsNs > lastGlassPtsNs, !isRepeat {
                     let srcDeltaNs = Int64(ptsNs - lastGlassPtsNs)
                     cadenceErrMs.append(Double(abs(glassDeltaNs - srcDeltaNs)) / 1e6)
+                    steps.append((Double(glassDeltaNs) / 1e6, Double(srcDeltaNs) / 1e6))
                 }
             }
             lastGlassNs = atNs
@@ -467,6 +346,21 @@ final class PresentDebugStats: @unchecked Sendable {
         let sorted = counts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
         let hist = sorted.prefix(4).map { "\($0.key):\($0.value)" }.joined(separator: ",")
         return (hist, 1 - Double(sorted[0].value) / Double(deltasMs.count))
+    }
+
+    /// Shown pairs whose glass step, in panel refreshes, is longer than their source step (a
+    /// repeat) or shorter (a skip). Exact at 1:1 and 2:1; a fractional cadence counts its own
+    /// alternation.
+    static func glitches(
+        steps: [(glass: Double, source: Double)], refreshMs: Double
+    ) -> (repeats: Int, skips: Int) {
+        guard refreshMs > 0 else { return (0, 0) }
+        var rep = 0, skip = 0
+        for s in steps {
+            let g = (s.glass / refreshMs).rounded(), c = (s.source / refreshMs).rounded()
+            if g > c { rep += 1 } else if g < c { skip += 1 }
+        }
+        return (rep, skip)
     }
 
     /// The window's per-frame samples so far, for tests.
@@ -504,12 +398,13 @@ final class PresentDebugStats: @unchecked Sendable {
         let (hist, judder) = Self.gridHistogram(deltasMs: glassDeltasMs, panel: panel)
         let cadErr = Self.percentiles(cadenceErrMs)
         let display = Self.percentiles(displayMs)
+        let glitch = Self.glitches(steps: steps, refreshMs: panel.minInterval * 1000)
         let glassLine = String(
             format: " displayMs p50=%.1f p95=%.1f cadErrMs p50=%.2f p95=%.2f n=%d "
-                + "grid=%.2f hist=%@ judder=%.2f repeats=%d/%d panel=%@",
+                + "grid=%.2f hist=%@ judder=%.2f glitch=%d/%d repeats=%d/%d panel=%@",
             display.p50, display.p95, cadErr.p50, cadErr.p95, cadenceErrMs.count,
-            panel.minInterval * 1000, hist, judder, decodedRepeats, shownRepeats,
-            panel.description)
+            panel.minInterval * 1000, hist, judder, glitch.repeats, glitch.skips,
+            decodedRepeats, shownRepeats, panel.description)
         // Loop health, appended only where a loop exists — `late`/`frames` is WP8's cushion
         // criterion and `reanchor` says whether the estimate is tracking at all.
         let loop = cadence?.health()
@@ -524,19 +419,23 @@ final class PresentDebugStats: @unchecked Sendable {
         let line = String(
             format: "pf-present pace=%@ linkMs=%.2f decoded=%d ok=%d fail=%d empty=%d "
                 + "gated=%d noDrawable=%d dropped=%d qDrop=%d qDry=%d maxRenderMs=%.1f "
-                + "inflightMax=%d forced=%d glassDeltaMs p50=%.2f max=%.2f n=%d "
+                + "inflightMax=%d forced=%d direct=%d scanSwitch=%d "
+                + "glassDeltaMs p50=%.2f max=%.2f n=%d "
                 + "latchMs p50=%.2f max=%.2f vendLeadMs p50=%.2f max=%.2f",
             pace(), linkPeriod() * 1000,
             decoded, ok, failed, empty, gated, noDrawable, dropped,
             smoothing.overflowDrops, smoothing.underflows, maxRenderMs, inflightMax,
-            gate?.drainForced() ?? 0, p50, dMax, deltas.count, latchP50, latchMax,
+            gate?.drainForced() ?? 0, directPresents, scanoutSwitches(),
+            p50, dMax, deltas.count, latchP50, latchMax,
             vendP50, vendMax) + glassLine + cadenceLine
+        directPresents = 0
         decoded = 0; decodedRepeats = 0; shownRepeats = 0
         ok = 0; failed = 0; empty = 0; dropped = 0; gated = 0; noDrawable = 0
         maxRenderMs = 0
         maxInFlight = inFlight // the window peak restarts from the live depth
         glassDeltasMs.removeAll(keepingCapacity: true)
         cadenceErrMs.removeAll(keepingCapacity: true)
+        steps.removeAll(keepingCapacity: true)
         displayMs.removeAll(keepingCapacity: true)
         latchMs.removeAll(keepingCapacity: true)
         vendLeadMs.removeAll(keepingCapacity: true)

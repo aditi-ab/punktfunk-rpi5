@@ -1,8 +1,11 @@
 //! The WinUI 3 (windows-reactor) application shell.
 //!
-//! Declarative React-like model: this root component routes on a `Screen` value held in
-//! `use_async_state` so background threads (discovery, the spawned session's stdout reader) can
-//! drive navigation. Each screen lives in its own submodule:
+//! One root component, [`Shell`], holds the shell's state, and everything that changes it
+//! arrives as a [`Msg`]: event handlers and worker threads (discovery, the spawned session's
+//! reader, the probes) post through an [`AsyncSetState`], a typed handle on the root's queue.
+//! Screens are functions of that state; the four with state of their own (hosts, pairing, the
+//! speed test and the ring editor) are child components fed by props. Each screen lives in its
+//! own submodule:
 //!
 //! * [`hosts`] — saved/discovered/manual host list, plus per-host forget + speed test
 //! * [`connect`] — the trust gate and session lifecycle glue (connect / request-access flows)
@@ -11,64 +14,44 @@
 //! * [`settings`] — persisted preferences · [`licenses`] — the license notices screen ·
 //!   [`help`] — the in-stream keyboard-shortcuts reference (reached from the host list)
 //! * [`stream`] — the stream status card (the stream itself runs in the spawned session window)
-//! * [`style`] — the shared look (cards, pills, monograms), following the windows-reactor
-//!   gallery: Mica backdrop, a centred max-width column, theme brushes (`ThemeRef`)
-//!
-//! **Re-render discipline** — MEASURED rules, not folklore: each is pinned by a
-//! characterization test in `tests/reactor_semantics.rs` against the exact windows-reactor
-//! rev in Cargo.toml. Re-run that suite on every bump; a red test means this note is stale.
-//!
-//! * A child's *sync* `use_state` re-renders it — including under element-equal
-//!   non-component wrappers (`border`, `scroll_viewer`), and including writes from
-//!   handlers fired through the harness backend
-//!   (`sync_state_child_under_element_equal_border_rerenders`,
-//!   `sync_state_from_backend_fired_event_rerenders`).
-//! * **BUT the real WinUI backend does not honour that last rule.** Measured 2026-07-29:
-//!   settings was componentized with its scope as local sync state, and a live UIA pick in
-//!   the scope ComboBox changed nothing on screen — `on_selection_changed` wired in the
-//!   real backend never pumped the pass the harness pumps (the de-hoist is reverted in this
-//!   branch's history; repro = tests/reactor_semantics.rs case 3 passing while the same
-//!   flow fails live). So per-screen EVENT-driven UI state ALSO stays in root as
-//!   `AsyncSetState` props — hoisting here is on real-backend evidence, not engine rules.
-//! * An `AsyncSetState` written from a background thread does NOT re-render its owning
-//!   component: the value lands and the dirty flag is set, but the rerender request is
-//!   keyed by the component's own HostId, which is never registered — only the root's is —
-//!   so it is silently dropped and surfaces on the next unrelated pass
-//!   (`async_state_child_under_element_equal_border_rerenders` asserts the drop). So
-//!   everything THREAD-driven (discovery, HUD stats, speed-test results, spawn events)
-//!   is held as *root* state and passed down as props.
-//! * Corollary: state a root tween is KEYED on (`screen`, the settings section, `show_add`)
-//!   must stay in root regardless — the tween workers are root effects writing root async
-//!   state, and root can only start a tween off a trigger it owns.
+//! * [`style`] — the shared look (cards, pills, monograms), following the WinUI gallery: Mica
+//!   backdrop, a centred max-width column, theme brushes
 
 mod connect;
-mod embedded_png;
 mod help;
 mod hosts;
 mod launcher_icons;
 mod library;
 mod licenses;
-/// The shell's Lucide icon set — the console's own marks, baked for WinUI.
+/// The shell's Lucide icon set — the console's own marks, drawn for WinUI.
 mod lucide;
 mod os_icons;
 mod pair;
+mod profiles;
 /// The quick-action ring's editor — the ring itself, a section of the settings page.
 mod quick_actions;
+/// The shell's decisions as plain functions, table-tested without a window.
+mod rules;
 mod settings;
 mod speed;
 mod stream;
 mod style;
 
 use crate::trust::{KnownHosts, Settings};
-use hosts::HostsProps;
-use pf_client_core::discovery::{self, DiscoveredHost, DiscoveryEvent};
+use hosts::{HostRef, HostsProps};
+use pf_client_core::collate::SortKey;
+use pf_client_core::discovery::{self, DiscoveredHost};
 use pf_client_core::gamepad::GamepadService;
+use pf_client_core::orchestrate::{self, HostTarget};
+use pf_client_core::settings::GamepadUi;
 use pf_client_core::start;
+use pf_fluent::motion::Tween;
+use pf_fluent::Palette;
+use rules::LinkGate;
 use speed::{SpeedProps, SpeedState};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use windows_reactor::*;
 
 #[derive(Clone, PartialEq)]
@@ -81,6 +64,8 @@ pub(crate) enum Screen {
     /// Wake-on-LAN "wait until up": a magic packet was sent to an offline saved host and we're
     /// polling mDNS for it to reappear (re-sending periodically) before dialing. Cancelable.
     Waking,
+    /// The wake ran out of budget: Try again replays it for the same target, Cancel goes home.
+    WakeParked,
     Stream,
     Settings,
     /// Open-source / third-party license notices (reached from Settings).
@@ -97,22 +82,13 @@ pub(crate) enum Screen {
 }
 
 /// The host we're about to connect to / pair with / speed-test (carried into those screens
-/// via `Shared::target`).
+/// via `Shared::target`), plus this connect's own asks.
 #[derive(Clone, Default)]
 pub(crate) struct Target {
-    pub(crate) name: String,
-    pub(crate) addr: String,
-    pub(crate) port: u16,
-    pub(crate) fp_hex: Option<String>,
+    /// A saved tile's is [`HostTarget::from`] its record; a discovered one's carries the
+    /// advert's pin, MACs and mgmt port, which the library screen fetches from.
+    pub(crate) host: HostTarget,
     pub(crate) pair_optional: bool,
-    /// Wake-on-LAN MAC(s) for this host (from the saved store or the live advert) — used to send a
-    /// magic packet before connecting to an offline host. Empty when none is known.
-    pub(crate) mac: Vec<String>,
-    /// This host's management-API port (saved store or live advert), where the library screen
-    /// fetches from. `None` = unknown, use [`pf_client_core::library::DEFAULT_MGMT_PORT`]. Carried
-    /// on the target for the same reason as `mac`: the library screen has no `KnownHost` in hand,
-    /// and assuming 47990 there is what made a moved mgmt port work on the LAN but not over a VPN.
-    pub(crate) mgmt_port: Option<u16>,
     /// A ONE-OFF settings preset for this connect ("Connect with"): `Some(id)` overrides the
     /// host's binding for this launch, `Some("")` forces the global defaults on a bound host,
     /// `None` honors the binding. It never rebinds anything — the default changes only through
@@ -122,34 +98,25 @@ pub(crate) struct Target {
     /// survives a detour through the PIN ceremony (a deep link's `launch=` toward an unpaired
     /// host must still launch the game once pairing succeeds).
     pub(crate) launch: Option<String>,
+    /// A link's `as=`: the profile this connect plays as, an id or a name. It wins over the
+    /// saved pick for this connect only.
+    pub(crate) link_profile: Option<String>,
+    /// Opened by a link: a pairing on its way continues into this connect.
+    pub(crate) from_link: bool,
 }
 
-/// Stable app services handed to the page components as props. Each routed screen that uses
-/// hooks (`hosts_page`/`pair_page`/`speed_page`/`library_page`) is mounted as its own
-/// `component(...)`, so its hooks live in an isolated slot list — calling them on the shared
-/// parent `cx` would change the hook order whenever the screen changes (reactor's
-/// Rules-of-Hooks guard aborts).
-///
-/// `Svc` compares equal by `ctx` identity (it never meaningfully changes across renders), so a
-/// page whose props are just `Svc` re-renders only via its own state hooks, never spuriously
-/// from the parent.
-#[derive(Clone)]
-pub(crate) struct Svc {
-    pub(crate) ctx: Arc<AppCtx>,
-    pub(crate) set_screen: AsyncSetState<Screen>,
-    pub(crate) set_status: AsyncSetState<String>,
-    /// Speed-test lifecycle lives in root state (thread-driven — see the module docs); the hosts
-    /// page resets it to `Running` before navigating, the probe worker completes it.
-    pub(crate) set_speed: AsyncSetState<SpeedState>,
-    /// Library fetch/art state — root for the same reason; the hosts page kicks a fetch
-    /// off before navigating, the worker (and the art stream) completes it.
-    pub(crate) set_library: AsyncSetState<library::LibraryState>,
-}
-
-impl PartialEq for Svc {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.ctx, &other.ctx)
+/// Finish a store write from a page: bump `rev`, so the page redraws from the files it reads
+/// while drawing, and put a failure on the status line. `Some` holds what the edit returned.
+pub(crate) fn saved<R, E: std::fmt::Display>(
+    r: std::result::Result<R, E>,
+    set_status: &AsyncSetState<String>,
+    rev: Option<(u64, &AsyncSetState<u64>)>,
+) -> Option<R> {
+    if let Some((rev, set_rev)) = rev {
+        set_rev.call(rev + 1);
     }
+    r.map_err(|e| set_status.call(format!("Couldn't save \u{2014} {e:#}")))
+        .ok()
 }
 
 /// Cross-thread shell state driven off the UI thread: the current target, the live spawned
@@ -187,6 +154,12 @@ pub(crate) struct Shared {
     /// PIN-pairing generation (the same guard): bumped per attempt and by Cancel, so a
     /// ceremony the user left still saves its pin but neither connects nor navigates.
     pub(crate) pair_gen: std::sync::atomic::AtomicU64,
+    /// Opens the profile picker over whatever screen is up. Installed by root; a connect's worker
+    /// thread raises the picker through it ([`profiles::then_connect`]).
+    pub(crate) set_picker: Mutex<Option<AsyncSetState<Option<profiles::PickerAsk>>>>,
+    /// Opens the wait for a profile's seat the same way ([`profiles::seat_then`]).
+    pub(crate) set_seat: Mutex<Option<AsyncSetState<Option<profiles::SeatWait>>>>,
+    pub(crate) pictures: Mutex<profiles::Pictures>,
 }
 
 pub struct AppCtx {
@@ -202,12 +175,500 @@ pub struct AppCtx {
     pub(crate) probes: Mutex<settings::DeviceProbes>,
 }
 
-pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_reactor::Result<()> {
-    // The BRAND marks load as file:/// URIs — the host tiles' OS marks and the library's
-    // launcher marks. Put the embedded PNGs on disk first. (The Lucide UI set needs nothing
-    // here: it is a font beside the exe, which XAML loads on demand.)
-    os_icons::install();
-    launcher_icons::install();
+/// A typed handle on the shell's message queue: `call` posts the value as its [`Msg`], from the
+/// UI thread or any worker. Cloning is cheap and holds no value.
+pub(crate) struct AsyncSetState<T> {
+    queue: ComponentCompletion<Msg>,
+    wrap: fn(T) -> Msg,
+}
+
+impl<T> Clone for AsyncSetState<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            wrap: self.wrap,
+        }
+    }
+}
+
+impl<T> AsyncSetState<T> {
+    pub(crate) fn call(&self, value: T) {
+        // `false` once the window is gone, when there is nothing left to update.
+        let _ = self.queue.clone().complete((self.wrap)(value));
+    }
+}
+
+/// Stable app services handed to the pages as props: the app, the theme's colours, and the
+/// setters a page navigates and reports through. Equal by `ctx` identity and palette, so a page
+/// whose props are just `Svc` redraws on a theme change and on nothing else.
+#[derive(Clone)]
+pub(crate) struct Svc {
+    pub(crate) ctx: Arc<AppCtx>,
+    pub(crate) pal: Palette,
+    pub(crate) set_screen: AsyncSetState<Screen>,
+    pub(crate) set_status: AsyncSetState<String>,
+    /// The status line for what isn't a failure. Pages reach it through [`Svc::note`] and
+    /// [`Svc::report`].
+    set_note: AsyncSetState<(String, InfoBarSeverity)>,
+    /// The hosts page resets the speed test to `Running` before navigating; the probe worker
+    /// completes it.
+    pub(crate) set_speed: AsyncSetState<SpeedState>,
+    /// The hosts page starts a library fetch before navigating; the worker and the art
+    /// stream complete it.
+    pub(crate) set_library: AsyncSetState<library::LibraryState>,
+}
+
+impl Svc {
+    /// Progress or a plain remark on the status line.
+    pub(crate) fn note(&self, msg: String) {
+        self.set_note.call((msg, InfoBarSeverity::Informational));
+    }
+
+    /// A finished action's sentence on the status line, styled by how it ended.
+    pub(crate) fn report(&self, outcome: Result<String, String>) {
+        match outcome {
+            Ok(msg) => self.set_note.call((msg, InfoBarSeverity::Success)),
+            Err(msg) => self.set_status.call(msg),
+        }
+    }
+}
+
+impl PartialEq for Svc {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ctx, &other.ctx) && self.pal == other.pal
+    }
+}
+
+/// The shell's input: the app, equal by identity.
+#[derive(Clone)]
+pub(crate) struct ShellInput(Arc<AppCtx>);
+
+impl PartialEq for ShellInput {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Everything that changes the shell: one variant per piece of state, the tweens' frames, and
+/// the window's own reports.
+pub(crate) enum Msg {
+    Screen(Screen),
+    /// A failure, kept until the next status write. Empty clears the line.
+    Status(String),
+    /// A status line that reports no failure, cleared after [`NOTE_LIFE`].
+    Note((String, InfoBarSeverity)),
+    Hosts(Vec<DiscoveredHost>),
+    Probed(HashMap<String, bool>),
+    Hud(Box<stream::HudSample>),
+    Speed(SpeedState),
+    Library(library::LibraryState),
+    EndGame(library::EndGameUi),
+    LibrarySort(SortKey),
+    Forget(Option<HostRef>),
+    Rename(Option<HostRef>),
+    ShowAdd(bool),
+    Hover(Option<String>),
+    HostsRev(u64),
+    SettingsNav(String),
+    SettingsScope(String),
+    SettingsDelete(Option<String>),
+    SettingsEdit(bool),
+    CustomRes(bool),
+    CustomScale(bool),
+    SettingsRev(u64),
+    Picker(Option<profiles::PickerAsk>),
+    Seat(Option<profiles::SeatWait>),
+    /// A `punktfunk://` link, from argv or a later instance.
+    Link(String),
+    LinkConfirm(Option<Box<orchestrate::ConnectPlan>>),
+    Pads(usize),
+    Width(f64),
+    Scheme(ColorScheme),
+    /// Windows changed its accent or contrast.
+    Colors(Palette),
+    /// Escape in the window: the topmost open sheet closes.
+    Escape,
+    Tick(Anim),
+    /// The window exists; [`crate::shell_window`] has its handle.
+    Window,
+}
+
+/// Which tween a [`Msg::Tick`] advances.
+#[derive(Clone, Copy)]
+pub(crate) enum Anim {
+    Screen,
+    Section,
+    AddHost,
+}
+
+/// 14 × 16 ms ≈ 220 ms for a navigation, 12 for the Add-host sheet.
+const ENTER_FRAMES: u32 = 14;
+const ADD_FRAMES: u32 = 12;
+
+/// Outlasts the 5 s connect budget behind an in-flight note, so a dead host's failure replaces
+/// the note rather than following a blank line.
+const NOTE_LIFE: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// The shell's state. `settings_*` and `custom_*` are the settings page's, held here because
+/// that page is a plain function of this state.
+pub(crate) struct Shell {
+    ctx: Arc<AppCtx>,
+    queue: ComponentCompletion<Msg>,
+    pal: Palette,
+    /// The window's client width, which the tile grids lay out by.
+    width: f64,
+    screen: Screen,
+    status: String,
+    status_severity: InfoBarSeverity,
+    /// Clears a note. Any later status write drops it, which cancels the clear.
+    note_timer: Option<ComponentTimer>,
+    hosts: Vec<DiscoveredHost>,
+    /// Saved-host reachability, keyed by `KnownHost::card_key`, from the probe sweep.
+    probed: HashMap<String, bool>,
+    hud: stream::HudSample,
+    speed: SpeedState,
+    library: library::LibraryState,
+    end_game: library::EndGameUi,
+    /// The shelf's order: the shared `library_sort`, read at start and written on each pick.
+    library_sort: SortKey,
+    forget: Option<HostRef>,
+    rename: Option<HostRef>,
+    show_add: bool,
+    /// The hovered host tile's stable id, for the card's pointer-over fill.
+    hover: Option<String>,
+    /// Bumped when a menu action rewrites the known-hosts store behind the tiles.
+    hosts_rev: u64,
+    /// The Settings sidebar section, kept across visits this run.
+    settings_nav: String,
+    /// The layer the settings page edits: "" for the defaults, else a preset id.
+    settings_scope: String,
+    settings_delete: Option<String>,
+    settings_edit: bool,
+    /// Resolution / Render scale sit on Custom… while the stored value is a listed one.
+    custom_res: bool,
+    custom_scale: bool,
+    /// Bumped by every settings commit: a preset-scope edit changes what the page shows
+    /// without changing any state it reads.
+    settings_rev: u64,
+    picker: Option<profiles::PickerAsk>,
+    seat: Option<profiles::SeatWait>,
+    /// A link that named its host by something guessable, awaiting "Open this link?".
+    link_confirm: Option<Box<orchestrate::ConnectPlan>>,
+    pads: usize,
+    enter: Tween,
+    section_enter: Tween,
+    add_enter: Tween,
+    /// Keeps [`Msg::Colors`] arriving while the window lives.
+    _colors: Option<pf_fluent::Watch>,
+}
+
+impl Shell {
+    fn set<T>(&self, wrap: fn(T) -> Msg) -> AsyncSetState<T> {
+        AsyncSetState {
+            queue: self.queue.clone(),
+            wrap,
+        }
+    }
+
+    fn svc(&self) -> Svc {
+        Svc {
+            ctx: self.ctx.clone(),
+            pal: self.pal,
+            set_screen: self.set(Msg::Screen),
+            set_status: self.set(Msg::Status),
+            set_note: self.set(Msg::Note),
+            set_speed: self.set(Msg::Speed),
+            set_library: self.set(Msg::Library),
+        }
+    }
+}
+
+impl Component for Shell {
+    type Input = ShellInput;
+    type Message = Msg;
+
+    fn create(input: &ShellInput, cx: &ComponentContext<Self>) -> Self {
+        let ctx = input.0.clone();
+        let library_sort = SortKey::parse(&ctx.settings.lock().unwrap().library_sort);
+        let shell = Shell {
+            ctx: ctx.clone(),
+            queue: cx.completion(),
+            pal: Palette::system(),
+            width: WINDOW_W,
+            screen: Screen::Hosts,
+            status: String::new(),
+            status_severity: InfoBarSeverity::Error,
+            note_timer: None,
+            hosts: Vec::new(),
+            probed: HashMap::new(),
+            hud: stream::HudSample::default(),
+            speed: SpeedState::Running,
+            library: library::LibraryState::default(),
+            end_game: library::EndGameUi::default(),
+            library_sort,
+            forget: None,
+            rename: None,
+            show_add: false,
+            hover: None,
+            hosts_rev: 0,
+            // Opens on General, the first sidebar item, as the Apple client does.
+            settings_nav: "general".into(),
+            settings_scope: String::new(),
+            settings_delete: None,
+            settings_edit: false,
+            custom_res: false,
+            custom_scale: false,
+            settings_rev: 0,
+            picker: None,
+            seat: None,
+            link_confirm: None,
+            pads: 0,
+            enter: Tween::start(0.0, 1.0, ENTER_FRAMES, Msg::Tick(Anim::Screen), cx),
+            section_enter: Tween::settled(1.0),
+            add_enter: Tween::settled(0.0),
+            _colors: {
+                let queue = cx.completion();
+                pf_fluent::watch(move || {
+                    let _ = queue.clone().complete(Msg::Colors(Palette::system()));
+                })
+            },
+        };
+        // A connect's worker thread raises the picker and the seat wait through these.
+        *ctx.shared.set_picker.lock().unwrap() = Some(shell.set(Msg::Picker));
+        *ctx.shared.set_seat.lock().unwrap() = Some(shell.set(Msg::Seat));
+        // Before the link poll starts: a link queued at startup is explicit intent and wins.
+        open_start_screen(&shell.svc());
+        poll_links(shell.set(Msg::Link));
+        browse_hosts(&ctx, shell.set(Msg::Hosts));
+        poll_pads(ctx.gamepad.clone(), shell.set(Msg::Pads));
+        poll_hud(ctx.shared.clone(), shell.set(|h| Msg::Hud(Box::new(h))));
+        probe_saved_hosts(ctx.shared.clone(), shell.set(Msg::Probed));
+        let _ = cx.run_window(|w| {
+            crate::shell_window::adopt(w.as_raw());
+            Msg::Window
+        });
+        shell
+    }
+
+    fn update(&mut self, msg: Msg, cx: &ComponentContext<Self>) {
+        match msg {
+            Msg::Screen(s) => {
+                if s != self.screen {
+                    self.screen = s;
+                    self.enter = Tween::start(0.0, 1.0, ENTER_FRAMES, Msg::Tick(Anim::Screen), cx);
+                }
+            }
+            Msg::Status(s) => {
+                self.status = s;
+                self.status_severity = InfoBarSeverity::Error;
+                self.note_timer = None;
+            }
+            Msg::Note((s, severity)) => {
+                self.status = s;
+                self.status_severity = severity;
+                self.note_timer = Some(cx.set_timeout(NOTE_LIFE, Msg::Status(String::new())));
+            }
+            Msg::Hosts(h) => self.hosts = h,
+            Msg::Probed(p) => self.probed = p,
+            Msg::Hud(h) => self.hud = *h,
+            Msg::Speed(s) => self.speed = s,
+            Msg::Library(l) => self.library = l,
+            Msg::EndGame(e) => self.end_game = e,
+            Msg::LibrarySort(k) => self.library_sort = k,
+            Msg::Forget(f) => self.forget = f,
+            Msg::Rename(r) => self.rename = r,
+            Msg::ShowAdd(open) => {
+                if open != self.show_add {
+                    self.show_add = open;
+                    // Closing unmounts the sheet at once: nothing to animate.
+                    self.add_enter = if open {
+                        Tween::start(0.0, 1.0, ADD_FRAMES, Msg::Tick(Anim::AddHost), cx)
+                    } else {
+                        Tween::settled(0.0)
+                    };
+                }
+            }
+            Msg::Hover(h) => self.hover = h,
+            Msg::HostsRev(r) => self.hosts_rev = r,
+            Msg::SettingsNav(tag) => {
+                // The content column slides in on a section switch; the sidebar stays put.
+                if tag != self.settings_nav {
+                    self.settings_nav = tag;
+                    self.section_enter =
+                        Tween::start(0.0, 1.0, ENTER_FRAMES, Msg::Tick(Anim::Section), cx);
+                }
+            }
+            Msg::SettingsScope(s) => self.settings_scope = s,
+            Msg::SettingsDelete(d) => self.settings_delete = d,
+            Msg::SettingsEdit(e) => self.settings_edit = e,
+            Msg::CustomRes(c) => self.custom_res = c,
+            Msg::CustomScale(c) => self.custom_scale = c,
+            Msg::SettingsRev(r) => self.settings_rev = r,
+            Msg::Picker(p) => self.picker = p,
+            Msg::Seat(s) => self.seat = s,
+            Msg::Link(url) => route_link(
+                &self.ctx,
+                &url,
+                &self.screen,
+                &self.set(Msg::Screen),
+                &self.set(Msg::Status),
+                &self.set(Msg::LinkConfirm),
+            ),
+            Msg::LinkConfirm(p) => self.link_confirm = p,
+            Msg::Pads(n) => {
+                // Controller-optimized UI, on each change of the count. While a connect, a
+                // stream, the console or a who-plays question holds the shell, the console
+                // waits for the next first pad.
+                if n != self.pads {
+                    let prev = std::mem::replace(&mut self.pads, n);
+                    let busy = rules::console_waits(
+                        &self.screen,
+                        self.picker.is_some(),
+                        self.seat.is_some(),
+                    );
+                    open_console_on_pad(&self.svc(), busy, prev, n);
+                }
+            }
+            Msg::Width(w) => self.width = w,
+            Msg::Scheme(s) => self.pal = self.pal.with_scheme(s),
+            Msg::Colors(p) => self.pal = p.with_scheme(self.pal.scheme),
+            // The topmost sheet first, each closed the way its own Cancel closes it.
+            Msg::Escape => {
+                if let Some(w) = self.seat.take() {
+                    w.abandon();
+                } else if let Some(a) = self.picker.take() {
+                    a.abandon();
+                } else if self.settings_edit {
+                    self.settings_edit = false;
+                    self.settings_rev += 1;
+                } else if self.rename.is_some() {
+                    self.rename = None;
+                } else {
+                    self.update(Msg::ShowAdd(false), cx);
+                }
+            }
+            Msg::Tick(anim) => match anim {
+                Anim::Screen => self.enter.tick(Msg::Tick(anim), cx),
+                Anim::Section => self.section_enter.tick(Msg::Tick(anim), cx),
+                Anim::AddHost => self.add_enter.tick(Msg::Tick(anim), cx),
+            },
+            Msg::Window => {}
+        }
+    }
+
+    fn view(&self, _input: &ShellInput, cx: &mut ViewContext<'_, Self>) -> View {
+        cx.window_title("Punktfunk");
+        // A floor under every layout: below it the header and cards would clip rather than
+        // reflow (the pages adapt down to it).
+        cx.window_visuals(
+            WindowVisuals::new()
+                .backdrop(WindowBackdrop::Mica)
+                .constraints(WindowConstraints {
+                    min_width: Some(420.0),
+                    min_height: Some(360.0),
+                    max_width: None,
+                    max_height: None,
+                }),
+        );
+        let scheme = cx.callback(Msg::Scheme);
+        cx.on_color_scheme(scheme);
+        let size = cx.callback(|s: WindowSize| Msg::Width(s.width));
+        cx.on_window_size(size);
+
+        let svc = self.svc();
+        let pal = &self.pal;
+        let body: View = match &self.screen {
+            Screen::Hosts => component::<hosts::HostsPage>(
+                "hosts",
+                HostsProps {
+                    svc: svc.clone(),
+                    hosts: self.hosts.clone(),
+                    probed: self.probed.clone(),
+                    status: self.status.clone(),
+                    severity: self.status_severity,
+                    forget: self.forget.clone(),
+                    rename: self.rename.clone(),
+                    show_add: self.show_add,
+                    add_anim: self.add_enter.eased(),
+                    hover: self.hover.clone(),
+                    hosts_rev: self.hosts_rev,
+                    width: self.width,
+                    set_forget: self.set(Msg::Forget),
+                    set_rename: self.set(Msg::Rename),
+                    set_show_add: self.set(Msg::ShowAdd),
+                    set_hover: self.set(Msg::Hover),
+                    set_hosts_rev: self.set(Msg::HostsRev),
+                },
+            )
+            .into(),
+            Screen::Connecting => connect::connecting_page(pal, &self.ctx, &self.status),
+            Screen::RequestAccess => connect::request_access_page(pal, &self.ctx, &svc.set_screen),
+            Screen::Waking => connect::waking_page(pal, &self.ctx, &svc.set_screen),
+            Screen::WakeParked => {
+                connect::wake_parked_page(pal, &self.ctx, &svc.set_screen, &svc.set_status)
+            }
+            Screen::Settings => settings::settings_page(self),
+            Screen::Licenses => licenses::licenses_page(pal, &self.ctx, &svc.set_screen),
+            Screen::Help => help::help_page(pal, &svc.set_screen),
+            Screen::Pair => component::<pair::PairPage>("pair", svc.clone()).into(),
+            Screen::SpeedTest => component::<speed::SpeedPage>(
+                "speed",
+                SpeedProps {
+                    svc: svc.clone(),
+                    state: self.speed.clone(),
+                },
+            )
+            .into(),
+            Screen::Library => library::library_page(self),
+            // The stream runs in the punktfunk-session child's own window; this screen is
+            // its status card.
+            Screen::Stream => stream::session_page(pal, &self.ctx, &self.hud),
+        };
+        // The caption, which Settings' back arrow rides on: NavigationView's own back button
+        // raises no event here, and the WinUI pattern puts it in the title bar.
+        let caption = TitleBar::new()
+            .title("Punktfunk")
+            .icon(Icon::image_data(EncodedImage::from_static(APP_ICON)))
+            .is_back_button_visible(self.screen == Screen::Settings)
+            .is_back_button_enabled(true)
+            .on_back_requested(cx.callback(|()| Msg::Screen(Screen::Hosts)));
+        let (escape, sheet_open) = (cx.callback(|()| Msg::Escape), self.sheet_open());
+        Border::new()
+            .content(
+                Grid::new()
+                    .rows([GridLength::Auto, GridLength::STAR])
+                    .children((
+                        caption,
+                        Grid::new().grid_row(1).children((
+                            entrance(body, &self.screen, self.enter.eased()),
+                            profiles::picker_slot(pal, &self.picker, &self.set(Msg::Picker)),
+                            profiles::seat_slot(pal, &self.seat, &self.set(Msg::Seat)),
+                        )),
+                    )),
+            )
+            // Escape tunnels through here from any focused element, so it closes a sheet
+            // that never took focus.
+            .on_preview_key_down(RoutedCallback::new(move |k: KeyEventInfo| {
+                let close = sheet_open && k.key == VirtualKey::ESCAPE;
+                if close {
+                    escape.call(());
+                }
+                close
+            }))
+            // At root, not on a page: a link can arrive while any screen is up.
+            .content_dialog(self.link_confirmation())
+    }
+}
+
+/// The caption's mark: the unplated app logo, sharp at the title bar's 16 DIPs up to 300 %.
+const APP_ICON: &[u8] =
+    include_bytes!("../../packaging/assets/Square44x44Logo.targetsize-48_altform-unplated.png");
+
+/// The window's first client size, in DIPs.
+const WINDOW_W: f64 = 1000.0;
+const WINDOW_H: f64 = 720.0;
+
+pub fn run(identity: (String, String), gamepad: GamepadService) -> windows::core::Result<()> {
     let ctx = Arc::new(AppCtx {
         identity,
         settings: Mutex::new(Settings::load()),
@@ -223,628 +684,303 @@ pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_react
             ctx.gamepad.set_pinned(Some(forward));
         }
     }
-    apply_window_icon_when_ready();
-    App::new()
-        .title("Punktfunk")
-        .inner_size(1000.0, 720.0)
-        // A floor under every layout: below this the header/cards would clip rather than
-        // reflow (the pages adapt down to it — see the hosts page's responsive grid).
-        .inner_constraints(InnerConstraints {
-            min_width: Some(420.0),
-            min_height: Some(360.0),
-            ..Default::default()
-        })
-        .backdrop(Backdrop::Mica)
-        .render(move |cx| root(cx, &ctx))
+    App::run_component_with_policy::<Shell>(
+        ShellInput(ctx),
+        WindowPolicy::new()
+            .title("Punktfunk")
+            .client_size(WINDOW_W, WINDOW_H),
+    )
 }
 
-/// Stamp the embedded app icon (build.rs, resource ordinal 1) onto the top-level window once it
-/// exists: `WM_SETICON` drives the title bar and Alt-Tab (plus the taskbar for unpackaged runs;
-/// the MSIX taskbar/Start icons come from the package assets). windows-reactor creates its
-/// window icon-less and exposes no handle before `App::render` blocks, so a short background
-/// poll finds our own window by its (unique) title.
-fn apply_window_icon_when_ready() {
-    use windows::Win32::libloaderapi::GetModuleHandleW;
-    use windows::Win32::minwindef::{LPARAM, WPARAM};
-    use windows::Win32::winuser::{
-        FindWindowW, GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON,
-        LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, WM_SETICON,
-    };
-    let _ = std::thread::Builder::new()
-        .name("pf-window-icon".into())
-        // SAFETY: every call in this thread is a Win32 window/icon API taking either a static wide
-        // literal, a handle it just obtained and checked, or the module handle of this process; none
-        // of them dereference caller memory, and the loop gives up after 100 tries.
-        .spawn(|| unsafe {
-            for _ in 0..100 {
-                let hwnd = FindWindowW(None, windows::core::w!("Punktfunk"));
-                if !hwnd.0.is_null() {
-                    let module = GetModuleHandleW(None);
-                    if module.0.is_null() {
-                        return;
-                    }
-                    // Small (title bar) and big (Alt-Tab) at their native metrics, both from
-                    // the multi-size .ico so nothing is scaled at draw time.
-                    // MAKEINTRESOURCE(1): the "pointer" IS the resource ordinal — not a
-                    // dangling pointer, and `ptr::dangling()` (an alignment-based address)
-                    // would name a different resource.
-                    #[allow(clippy::manual_dangling_ptr)]
-                    let ordinal_1 = windows::core::PCWSTR(1 as *const u16);
-                    for (which, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
-                        let px = GetSystemMetrics(metric);
-                        let icon = LoadImageW(
-                            Some(module),
-                            ordinal_1,
-                            IMAGE_ICON as u32,
-                            px,
-                            px,
-                            LR_DEFAULTCOLOR as u32,
-                        );
-                        if !icon.0.is_null() {
-                            SendMessageW(
-                                hwnd,
-                                WM_SETICON as u32,
-                                WPARAM(which as usize),
-                                LPARAM(icon.0 as isize),
-                            );
-                        }
-                    }
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
-}
+impl Shell {
+    /// Whether a sheet is up for [`Msg::Escape`] to close, in the set it walks.
+    fn sheet_open(&self) -> bool {
+        self.seat.is_some()
+            || self.picker.is_some()
+            || (self.screen == Screen::Settings && self.settings_edit)
+            || (self.screen == Screen::Hosts && (self.rename.is_some() || self.show_add))
+    }
 
-fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
-    let (screen, set_screen) = cx.use_async_state(Screen::Hosts);
-    let (hosts, set_hosts) = cx.use_async_state(Vec::<DiscoveredHost>::new());
-    let (status, set_status) = cx.use_async_state(String::new());
-    let (hud, set_hud) = cx.use_async_state(stream::HudSample::default());
-    let (speed, set_speed) = cx.use_async_state(SpeedState::Running);
-    // Per-host action state for the hosts page. Root, not page-local: the "…" overflow is a WinUI
-    // MenuFlyout whose item clicks are wired straight in the reactor backend, bypassing the normal
-    // event-dispatch flush — a sync page-local setter marks state dirty but never re-renders. See
-    // `hosts::HostsProps`.
-    let (forget, set_forget) = cx.use_async_state(Option::<hosts::HostRef>::None);
-    let (rename, set_rename) = cx.use_async_state(Option::<hosts::HostRef>::None);
-    let (show_add, set_show_add) = cx.use_async_state(false);
-    // Hovered host tile (its stable id), driving the WinUI-style card hover fill. Root state for
-    // the same reason as `forget`/`rename`: pointer enter/exit handlers are wired straight in the
-    // reactor backend, so only a root `AsyncSetState` reliably re-renders the page.
-    let (hover, set_hover) = cx.use_async_state(Option::<String>::None);
-    // Which Settings section the NavigationView shows (persists across visits this run).
-    // Opens on General — the first sidebar item, matching the Apple client's landing category.
-    let (settings_nav, set_settings_nav) = cx.use_async_state("general".to_string());
-    // Which LAYER the settings screen edits: "" = the global defaults, else a preset id
-    // (design/client-settings-profiles.md §5.1). Root state for the same reason as the section
-    // above — the ComboBox's change handler is wired in the reactor backend.
-    let (settings_scope, set_settings_scope) = cx.use_async_state(String::new());
-    // The preset a Delete… click is asking about; `Some` renders the confirmation. Root state
-    // because this page stays hook-free (its handlers are wired in the reactor backend).
-    let (settings_delete, set_settings_delete) = cx.use_async_state(Option::<String>::None);
-    // Whether the Edit-preset modal is up. Root state for the reactor-backend-handler reason
-    // above; guarded in the page so it only renders while a preset is actually in scope.
-    let (settings_edit, set_settings_edit) = cx.use_async_state(false);
-    // Resolution is on Custom… while the size typed there still matches a listed one. Root
-    // state for the same reason.
-    let (settings_custom_res, set_settings_custom_res) = cx.use_async_state(false);
-    // Bumped when a settings edit changes what the page should SHOW without changing any state
-    // it already reads — ANY edit through `settings::commit` (creating an override must surface
-    // its marker as immediately as resetting one clears it), a reset, a preset colour change.
-    // Root state comparison makes same-value calls free, so a counter is what forces the pass.
-    let (settings_rev, set_settings_rev) = cx.use_async_state(0u64);
-    // The hosts page's mirror of the same idea: pin/unpin from a tile's menu rewrites the
-    // known-hosts store behind the tiles, and the bump is what makes the pinned tile appear
-    // in the same gesture instead of on the next discovery tick.
-    let (hosts_rev, set_hosts_rev) = cx.use_async_state(0u64);
-    // `punktfunk://` links: the receiver thread queues them (from this launch's argv, or from a
-    // later instance over WM_COPYDATA) and this poll pulls them onto the UI thread. Thread-fed
-    // state must be root state, like the pad count below.
-    let (deep_link, set_deep_link) = cx.use_async_state(Option::<String>::None);
-    // A link that named its host by something GUESSABLE (its label, its address, the `host=`
-    // recovery parameter) rather than by the stable record id: `Some(plan)` arms the "Open this
-    // link?" confirmation built at the bottom of this function. The plan is byte-for-byte the one
-    // an id-referenced link carries, so confirming runs the identical dial one click later. Root
-    // state like every other dialog flag in this shell.
-    let (link_confirm, set_link_confirm) =
-        cx.use_async_state(Option::<Box<pf_client_core::orchestrate::ConnectPlan>>::None);
-    cx.use_effect((), {
-        let set_deep_link = set_deep_link.clone();
-        move || {
-            std::thread::Builder::new()
-                .name("pf-deeplink-poll".into())
-                .spawn(move || loop {
-                    for url in crate::deeplink::drain() {
-                        set_deep_link.call(Some(url));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                })
-                .ok();
-        }
-    });
-    // Connected-controller count, mirrored from the gamepad service by a poll thread
-    // (thread-driven state must be root state — see the module docs). Drives the hosts
-    // page's "Open console UI" hint; the compare in `call` makes the steady state free.
-    let (pads, set_pads) = cx.use_async_state(0usize);
-    cx.use_effect((), {
-        let (gp, set_pads) = (ctx.gamepad.clone(), set_pads.clone());
-        move || {
-            std::thread::Builder::new()
-                .name("pf-pads".into())
-                .spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                    set_pads.call(gp.pads().len());
-                })
-                .ok();
-        }
-    });
-    // Saved-host reachability, keyed by `fp_hex`, refreshed by the probe sweep below. Root state
-    // (thread-driven → must be root to re-render — see the module docs), passed to the hosts page.
-    let (probed, set_probed) = cx.use_async_state(HashMap::<String, bool>::new());
-    // Library fetch/art state (thread-driven → root; see `library::start_fetch`).
-    let (library, set_library) = cx.use_async_state(library::LibraryState::default());
-    let (end_game, set_end_game) = cx.use_async_state(library::EndGameUi::default());
-    // Where a bare launch opens (design/default-host.md). Once per process, before the poll
-    // below can deliver anything: a link queued at startup is explicit intent and wins, and
-    // `pending()` reads the queue WITHOUT draining it so the router still gets it.
-    cx.use_effect((), {
-        let (ctx, set_screen, set_library, set_status) = (
-            ctx.clone(),
-            set_screen.clone(),
-            set_library.clone(),
-            set_status.clone(),
-        );
-        move || {
-            if crate::deeplink::pending() {
-                return;
-            }
-            let settings = ctx.settings.lock().unwrap().clone();
-            let known = pf_client_core::trust::KnownHosts::load();
-            let (default, source) = start::default_host_with_source(&settings, &known);
-            tracing::info!(
-                start_in = start::StartIn::parse(&settings.start_in).as_str(),
-                default = default.map_or("none", |i| known.hosts[i].name.as_str()),
-                source = source.as_str(),
-                "client start"
-            );
-            let screen = start::start_screen(&settings, &known);
-            let Some(i) = screen.host_index() else { return };
-            let target = hosts::saved_target(&known.hosts[i]);
-            // The same three steps the "Browse library" menu item takes, in the same order.
-            *ctx.shared.target.lock().unwrap() = target.clone();
-            library::start_fetch(&ctx, &set_library);
-            set_screen.call(Screen::Library);
-            // Stream is the library PLUS a connect, never a screen of its own: the session
-            // window is the overlay, so ending it leaves the shelf on screen underneath.
-            if matches!(screen, start::Start::Stream(_)) {
-                connect::initiate_waking(&ctx, target, &set_screen, &set_status);
-            }
-        }
-    });
-
-    // Route an arriving link. Parsing, preset resolution and every refusal rule (only a stable
-    // record id dials unattended) live in `plan_from_link`. This end turns the outcome into the
-    // call a tile click makes, so a link gets the tile's wake, trust and error handling.
-    cx.use_effect(deep_link.clone(), {
-        let (ctx, set_screen, set_status, set_deep_link, set_link_confirm) = (
-            ctx.clone(),
-            set_screen.clone(),
-            set_status.clone(),
-            set_deep_link.clone(),
-            set_link_confirm.clone(),
-        );
-        let screen_now = screen.clone();
-        move || {
-            let Some(url) = deep_link.clone() else {
-                return;
-            };
-            set_deep_link.call(None);
-            let refuse = |msg: String| {
-                tracing::info!(%msg, "deep link refused");
-                set_status.call(msg);
-                set_screen.call(Screen::Hosts);
-            };
-            let link = match pf_client_core::deeplink::parse(&url) {
-                Ok(l) => l,
-                Err(e) => return refuse(e.message()),
-            };
-            // Rule 2 of §3: never preempt a live session. Only this layer knows one is running,
-            // which is why the brain leaves the check here: the child itself, or a connect
-            // still waiting on a wake or an approval. The screen stays where it is.
-            let busy = matches!(
-                screen_now,
-                Screen::Stream | Screen::Connecting | Screen::Waking | Screen::RequestAccess
-            ) || ctx.shared.session.lock().unwrap().is_running();
-            if busy {
-                let msg = "A session is already running \u{2014} end it first.";
-                tracing::info!(msg, "deep link refused");
-                set_status.call(msg.into());
-                return;
-            }
-            let known = KnownHosts::load();
-            let plan = pf_client_core::orchestrate::plan_from_link(
-                &link,
-                &known,
-                &pf_client_core::presets::PresetsFile::load(),
-                &ctx.settings.lock().unwrap().clone(),
-            );
-            use pf_client_core::orchestrate::PlanOutcome;
-            match plan {
-                Ok(PlanOutcome::Connect(p)) => dial_link(&ctx, &p, &set_screen, &set_status),
-                // The link named a saved, pinned host by its LABEL or its ADDRESS rather than
-                // by its record id. This app registers the `punktfunk` scheme (AppxManifest's
-                // windows.protocol / the installer's URL Protocol key), so any web page can
-                // hand us such a URL, and both of those references are guessable — it may not
-                // dial on its own. Arm the confirmation instead; OK runs `dial_link` on the
-                // very same plan, so the confirmed link and an id-referenced one are one code
-                // path. Deliberately NOT the PIN ceremony below: this host is already pinned,
-                // and re-pairing it would throw that pin away.
-                Ok(PlanOutcome::ConfirmConnect(p)) => set_link_confirm.call(Some(p)),
-                // Known but never pinned, or unknown: a link may not pair or trust on its own,
-                // so it opens the PIN ceremony seeded with what it CLAIMED: the name as claimed,
-                // the fingerprint pre-filling the pin (verified, not blind TOFU), and the launch
-                // and preset kept through the detour (§3.1, as in the GTK shell).
-                Ok(PlanOutcome::ConfirmUnknown(u)) => {
-                    let name = u.name.clone().unwrap_or_else(|| u.addr.clone());
-                    *ctx.shared.target.lock().unwrap() = Target {
-                        name: name.clone(),
-                        addr: u.addr.clone(),
-                        port: u.port,
-                        fp_hex: u.fp.clone(),
-                        pair_optional: false,
-                        mac: Vec::new(),
-                        // A link carries no mgmt port (nor a MAC), so this stays unknown until
-                        // an advert teaches it — same fallback as the hand-added case.
-                        mgmt_port: None,
-                        preset: u.preset.clone(),
-                        launch: u.launch.clone(),
-                    };
-                    set_status.call(format!(
-                        "{name} isn't paired with this device yet \u{2014} pair it to continue."
-                    ));
-                    set_screen.call(Screen::Pair);
-                }
-                Ok(PlanOutcome::Unsupported(route)) => refuse(format!(
-                    "Punktfunk can't open \u{201c}{}\u{201d} links yet.",
-                    route.as_str()
-                )),
-                Err(e) => refuse(e.message()),
-            }
-        }
-    });
-
-    cx.use_effect((), {
-        let set_hosts = set_hosts.clone();
-        let ctx = ctx.clone();
-        move || {
-            let (rx, rescan) = discovery::browse();
-            *ctx.shared.rescan.lock().unwrap() = Some(rescan);
-            std::thread::spawn(move || {
-                let mut acc: Vec<DiscoveredHost> = Vec::new();
-                while let Ok(event) = rx.recv_blocking() {
-                    match event {
-                        DiscoveryEvent::Resolved(h) => {
-                            if let Some(e) = acc.iter_mut().find(|e| e.key == h.key) {
-                                *e = h;
-                            } else {
-                                acc.push(h);
-                            }
-                        }
-                        // Goodbye or TTL expiry drops the advert from the live list; a
-                        // saved host stays on the page from the trust store.
-                        DiscoveryEvent::Removed { fullname } => {
-                            acc.retain(|e| e.fullname != fullname);
-                        }
-                    }
-                    set_hosts.call(acc.clone());
-                }
-            });
-        }
-    });
-
-    // HUD sample: the spawned session child's latest `stats:` line, mirrored into root state so
-    // the stream status page gets it as a *prop* (thread-driven state must be root state — see the
-    // module docs). The compare in `AsyncSetState::call` makes the idle case free.
-    cx.use_effect((), {
-        let shared = ctx.shared.clone();
-        let set_hud = set_hud.clone();
-        move || {
-            std::thread::Builder::new()
-                .name("pf-hud".into())
-                .spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                    set_hud.call(stream::HudSample {
-                        stats: shared.stats.lock().unwrap().clone(),
-                    });
-                })
-                .ok();
-        }
-    });
-
-    // Periodic reachability sweep (spawned once): a saved host reached only over a routed network
-    // (Tailscale/VPN) never advertises on mDNS, so presence can't come from the discovery stream
-    // alone. This probes every saved host (bounded, trust-agnostic QUIC handshake — one thread each
-    // so a slow/unreachable host doesn't delay the rest) and mirrors the results into root state so
-    // the tiles get them as a prop; the pip then reads `advertising OR probed-reachable` — the
-    // display-side companion to the dial-first connect fix. The compare in `call` makes idle free.
-    cx.use_effect((), {
-        let set_probed = set_probed.clone();
-        let shared = ctx.shared.clone();
-        move || {
-            std::thread::Builder::new()
-                .name("pf-probe".into())
-                .spawn(move || {
-                    loop {
-                        // A spawned session/browse child is running: the shell is hidden
-                        // (nobody sees the pips) and one of these hosts is mid-stream —
-                        // probing it is pure noise. Sleep through and sweep after it ends.
-                        if shared.session.lock().unwrap().is_running() {
-                            std::thread::sleep(Duration::from_secs(12));
-                            continue;
-                        }
-                        // `probe_known`, not a probe per host: it fans out, asks who answered
-                        // (so a stranger on a sleeping host's lease cannot light its pip), and
-                        // re-points a host found at an address it left.
-                        let hosts: Vec<_> = KnownHosts::load()
-                            .hosts
-                            .into_iter()
-                            .filter(|h| !h.addr.is_empty())
-                            .collect();
-                        let online = crate::trust::probe_known(&hosts, Duration::from_millis(2500));
-                        let map: HashMap<String, bool> =
-                            hosts.iter().map(|h| h.card_key()).zip(online).collect();
-                        set_probed.call(map);
-                        std::thread::sleep(Duration::from_secs(12));
-                    }
-                })
-                .ok();
-        }
-    });
-
-    // Screen-entrance animation: each navigation slides the new screen up a few px while fading it
-    // in (the Windows-Settings drill-in). It's a manual tween, not a composition animation, because
-    // reactor's DSL exposes no static transform/translation setter and its one-shot animations run
-    // from the visual's CURRENT value (a shown element is already at opacity 1, so nothing to fade
-    // from). So a worker thread steps a 0 → 1 `progress` after each navigation; the wrapper maps it
-    // to opacity (= progress) and a top margin (= (1-progress)·offset). The page components are
-    // memoised on unchanged props, so each step is just a cheap root re-render updating two props.
-    // A generation guard (bumped per navigation) stops a superseded tween so rapid nav can't fight.
-    let anim_gen = cx.use_ref(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
-    let (anim, set_anim) = cx.use_async_state((Option::<Screen>::None, 1.0f64));
-    cx.use_effect(screen.clone(), {
-        let (s, set_anim, generation) =
-            (screen.clone(), set_anim.clone(), anim_gen.borrow().clone());
-        move || {
-            use std::sync::atomic::Ordering::SeqCst;
-            let mine = generation.fetch_add(1, SeqCst) + 1;
-            std::thread::spawn(move || {
-                const STEPS: u32 = 14;
-                for i in 0..=STEPS {
-                    if generation.load(SeqCst) != mine {
-                        return; // a newer navigation superseded this tween
-                    }
-                    let p = f64::from(i) / f64::from(STEPS);
-                    let eased = 1.0 - (1.0 - p).powi(3); // ease-out cubic
-                    set_anim.call((Some(s.clone()), eased));
-                    std::thread::sleep(std::time::Duration::from_millis(16));
-                }
-            });
-        }
-    });
-    // Progress for THIS screen: 0 until the tween for it starts (fresh navigation starts hidden +
-    // offset, no flash), 1 once settled. A stale value for another screen reads as 0.
-    let progress = if anim.0.as_ref() == Some(&screen) {
-        anim.1
-    } else {
-        0.0
-    };
-
-    // Settings-section entrance: the same tween again, keyed on the selected section, so
-    // switching panes slides the CONTENT column up (the sidebar stays put — this must not wrap
-    // the NavigationView, so it can't ride the screen-level tween above). Entering Settings
-    // fresh leaves it settled at 1 (only the screen tween plays; no double animation).
-    let nav_gen = cx.use_ref(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
-    let (nav_anim, set_nav_anim) = cx.use_async_state((String::new(), 1.0f64));
-    cx.use_effect(settings_nav.clone(), {
-        let (s, set_nav_anim, generation) = (
-            settings_nav.clone(),
-            set_nav_anim.clone(),
-            nav_gen.borrow().clone(),
-        );
-        move || {
-            use std::sync::atomic::Ordering::SeqCst;
-            let mine = generation.fetch_add(1, SeqCst) + 1;
-            std::thread::spawn(move || {
-                const STEPS: u32 = 14;
-                for i in 0..=STEPS {
-                    if generation.load(SeqCst) != mine {
-                        return; // a newer section switch superseded this tween
-                    }
-                    let p = f64::from(i) / f64::from(STEPS);
-                    let eased = 1.0 - (1.0 - p).powi(3);
-                    set_nav_anim.call((s.clone(), eased));
-                    std::thread::sleep(std::time::Duration::from_millis(16));
-                }
-            });
-        }
-    });
-    let nav_progress = if nav_anim.0 == settings_nav {
-        nav_anim.1
-    } else {
-        0.0
-    };
-
-    // "Add host" modal entrance: the same manual tween as the screen navigation (see above for
-    // why it can't be a composition animation), stepping 0 → 1 when the modal opens. The hosts
-    // page maps it to the modal's opacity + a downward start offset (the slide-up) and the
-    // scrim's fade. Closing resets to 0 instantly — the modal unmounts, nothing to animate.
-    let add_gen = cx.use_ref(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
-    let (add_anim, set_add_anim) = cx.use_async_state(0.0f64);
-    cx.use_effect(show_add, {
-        let (set_add_anim, generation) = (set_add_anim.clone(), add_gen.borrow().clone());
-        move || {
-            use std::sync::atomic::Ordering::SeqCst;
-            let mine = generation.fetch_add(1, SeqCst) + 1;
-            if !show_add {
-                set_add_anim.call(0.0);
-                return;
-            }
-            std::thread::spawn(move || {
-                const STEPS: u32 = 12;
-                for i in 0..=STEPS {
-                    if generation.load(SeqCst) != mine {
-                        return; // reopened/closed mid-tween — a newer run owns the value
-                    }
-                    let p = f64::from(i) / f64::from(STEPS);
-                    set_add_anim.call(1.0 - (1.0 - p).powi(3)); // ease-out cubic
-                    std::thread::sleep(std::time::Duration::from_millis(16));
-                }
-            });
-        }
-    });
-
-    // Each hook-using screen is mounted as its own component so its hooks are isolated from
-    // root's (root's own hooks above stay a stable prefix regardless of which screen renders).
-    let svc = Svc {
-        ctx: ctx.clone(),
-        set_screen: set_screen.clone(),
-        set_status: set_status.clone(),
-        set_speed: set_speed.clone(),
-        set_library: set_library.clone(),
-    };
-    let body = match &screen {
-        Screen::Hosts => component(
-            hosts::hosts_page,
-            HostsProps {
-                svc,
-                hosts,
-                probed,
-                status,
-                pads,
-                forget,
-                rename,
-                show_add,
-                add_anim,
-                hover,
-                hosts_rev,
-                set_forget,
-                set_rename,
-                set_show_add,
-                set_hover,
-                set_hosts_rev: set_hosts_rev.clone(),
-            },
-        ),
-        // connecting_page / request_access_page / waking_page / settings_page / licenses_page /
-        // help_page use no hooks (they never touch `cx`), so calling them inline is sound.
-        Screen::Connecting => connect::connecting_page(ctx, &status),
-        Screen::RequestAccess => connect::request_access_page(ctx, &set_screen),
-        Screen::Waking => connect::waking_page(ctx, &set_screen),
-        Screen::Settings => settings::settings_page(
-            ctx,
-            &set_screen,
-            &settings_nav,
-            &set_settings_nav,
-            &settings_scope,
-            &set_settings_scope,
-            &settings_delete,
-            &set_settings_delete,
-            settings_edit,
-            &set_settings_edit,
-            settings_custom_res,
-            &set_settings_custom_res,
-            settings_rev,
-            &set_settings_rev,
-            nav_progress,
-        ),
-        Screen::Licenses => licenses::licenses_page(ctx, &set_screen),
-        Screen::Help => help::help_page(&set_screen),
-        Screen::Pair => component(pair::pair_page, svc),
-        Screen::SpeedTest => component(speed::speed_page, SpeedProps { svc, state: speed }),
-        Screen::Library => component(
-            library::library_page,
-            library::LibraryProps {
-                svc,
-                state: library,
-                end_game,
-                set_end_game,
-            },
-        ),
-        // The stream runs in the punktfunk-session child's own window; this screen is a
-        // status page (no hooks — inline is sound).
-        Screen::Stream => stream::session_page(ctx, &hud),
-    };
-
-    // The "Open this link?" confirmation for a guessable-reference link (see `link_confirm`).
-    // It lives at ROOT, not on a page: a link can arrive over WM_COPYDATA while any screen is
-    // up, and a WinUI ContentDialog is a popup rather than a visual child, so it rides above
-    // whatever is showing. Same discipline as the shell's other dialogs — ALWAYS MOUNTED, with
-    // `is_open` doing the arming, in a stable trailing slot (unmounting a ContentDialog trips
-    // the reactor backend's phantom-child bookkeeping; see hosts.rs's forget confirmation).
-    let link_dialog: Element = {
-        let pending = link_confirm;
-        // Name the host AND the game, because that is the whole point of asking: it's what
-        // lets someone tell their own shortcut from a link a web page just handed them.
+    /// The "Open this link?" confirmation for a guessable-reference link: Connect runs the
+    /// plan a stable-id link would have dialled, Cancel (and Escape) does nothing.
+    fn link_confirmation(&self) -> ContentDialog {
+        let pending = self.link_confirm.clone();
         let content = pending
             .as_ref()
-            .map(|p| {
-                let mut s = format!(
-                    "A link asks to connect to {} ({}).",
-                    p.host.name, p.host.addr
-                );
-                if let Some(id) = &p.launch {
-                    s.push_str(&format!(
-                        "\n\nIt also asks the host to launch \u{201c}{id}\u{201d}."
-                    ));
-                }
-                s.push_str(
-                    "\n\nIt names the host by its label or address, which anything that can open \
-                     a link could guess. Shortcuts made in Punktfunk name the host's id and \
-                     connect without asking.",
-                );
-                s
-            })
+            .map(|p| rules::link_prompt(&p.host.name, &p.host.addr, p.launch.as_deref()))
             .unwrap_or_default();
-        let (ctx2, ss, st, sc) = (
-            ctx.clone(),
-            set_screen.clone(),
-            set_status.clone(),
-            set_link_confirm.clone(),
+        let (ctx, ss, st, sc) = (
+            self.ctx.clone(),
+            self.set(Msg::Screen),
+            self.set(Msg::Status),
+            self.set(Msg::LinkConfirm),
         );
-        ContentDialog::new("Open this link?")
+        ContentDialog::new()
+            .title("Open this link?")
             .content(content)
             .primary_button_text("Connect")
             .close_button_text("Cancel")
             .is_open(pending.is_some())
             .on_closed(move |r: ContentDialogResult| {
                 sc.call(None);
-                // Cancel (and Escape, which WinUI also reports as `None`) does nothing at all.
                 if r == ContentDialogResult::Primary
                     && let Some(plan) = &pending
                 {
-                    dial_link(&ctx2, plan, &ss, &st);
+                    dial_link(&ctx, plan, &ss, &st);
                 }
             })
-            .into()
-    };
+    }
+}
 
-    // The Stream screen is a plain status card (the session child owns the real stream window);
-    // it's shown without the navigation entrance tween. Everything else slides + fades in.
-    let page: Element = if matches!(screen, Screen::Stream) {
-        body
-    } else {
-        let offset = (1.0 - progress) * 22.0;
-        border(body)
-            .opacity(progress)
-            .margin(Thickness {
-                left: 0.0,
-                top: offset,
-                right: 0.0,
-                bottom: 0.0,
-            })
-            .into()
+/// The screen's body inside its navigation entrance: slides up and fades in with `progress`.
+/// The Stream screen is a plain status card (the session child owns the real stream window)
+/// and is shown without the tween.
+fn entrance(body: View, screen: &Screen, progress: f64) -> View {
+    if matches!(screen, Screen::Stream) {
+        return body;
+    }
+    Border::new()
+        .content(body)
+        .opacity(progress)
+        .translation(0.0, (1.0 - progress) * 22.0)
+        .into()
+}
+
+/// `punktfunk://` links: the receiver thread queues them (from this launch's argv, or from a
+/// later instance over WM_COPYDATA), and this poll posts each one to the shell.
+fn poll_links(set_link: AsyncSetState<String>) {
+    std::thread::Builder::new()
+        .name("pf-deeplink-poll".into())
+        .spawn(move || loop {
+            for url in crate::deeplink::drain() {
+                set_link.call(url);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        })
+        .ok();
+}
+
+/// The connected-controller count, mirrored from the gamepad service on each change.
+fn poll_pads(gamepad: GamepadService, set_pads: AsyncSetState<usize>) {
+    std::thread::Builder::new()
+        .name("pf-pads".into())
+        .spawn(move || {
+            let mut last = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let n = gamepad.pads().len();
+                if n != last {
+                    last = n;
+                    set_pads.call(n);
+                }
+            }
+        })
+        .ok();
+}
+
+/// The spawned session child's latest stats window, mirrored for the stream status page on
+/// each change.
+fn poll_hud(shared: Arc<Shared>, set_hud: AsyncSetState<stream::HudSample>) {
+    std::thread::Builder::new()
+        .name("pf-hud".into())
+        .spawn(move || {
+            let mut last = stream::HudSample::default();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let now = stream::HudSample {
+                    stats: shared.stats.lock().unwrap().clone(),
+                };
+                if now != last {
+                    last = now.clone();
+                    set_hud.call(now);
+                }
+            }
+        })
+        .ok();
+}
+
+/// Controller-optimized UI: the first controller opens the console unless `busy` holds the
+/// shell or a session child is alive.
+fn open_console_on_pad(svc: &Svc, busy: bool, prev: usize, now: usize) {
+    if hosts::CONSOLE_UI_AVAILABLE
+        && !busy
+        && !svc.ctx.shared.session.lock().unwrap().is_running()
+        && orchestrate::console_opens(Settings::load().gamepad_ui(), prev, now)
+    {
+        connect::open_console(&svc.ctx, &svc.set_screen, &svc.set_status, true);
+    }
+}
+
+/// Open where a bare launch lands (`start::start_screen`): the console on Always, else the
+/// default host's library, plus a connect for Stream.
+fn open_start_screen(svc: &Svc) {
+    if crate::deeplink::pending() {
+        return;
+    }
+    let settings = svc.ctx.settings.lock().unwrap().clone();
+    // On Always the console is home, and it follows Start in itself.
+    if hosts::CONSOLE_UI_AVAILABLE && settings.gamepad_ui() == GamepadUi::Always {
+        connect::open_console(&svc.ctx, &svc.set_screen, &svc.set_status, false);
+        return;
+    }
+    let known = pf_client_core::trust::KnownHosts::load();
+    let (default, source) = start::default_host_with_source(&settings, &known);
+    tracing::info!(
+        start_in = start::StartIn::parse(&settings.start_in).as_str(),
+        default = default.map_or("none", |i| known.hosts[i].name.as_str()),
+        source = source.as_str(),
+        "client start"
+    );
+    let screen = start::start_screen(&settings, &known);
+    let Some(i) = screen.host_index() else { return };
+    let target = Target {
+        host: HostTarget::from(&known.hosts[i]),
+        ..Target::default()
     };
-    grid(vec![page, link_dialog]).into()
+    library::open_library(svc, target.clone());
+    // Stream is the library PLUS a connect, never a screen of its own: the session
+    // window is the overlay, so ending it leaves the shelf on screen underneath.
+    if matches!(screen, start::Start::Stream(_)) {
+        connect::initiate_waking(&svc.ctx, target, &svc.set_screen, &svc.set_status);
+    }
+}
+
+/// The app's single LAN browse: installs its rescan handle and mirrors the live advert list
+/// into `set_hosts` from a worker thread. A saved host stays on the page from the trust store
+/// when its advert goes.
+fn browse_hosts(ctx: &AppCtx, set_hosts: AsyncSetState<Vec<DiscoveredHost>>) {
+    let (rx, rescan) = discovery::browse();
+    *ctx.shared.rescan.lock().unwrap() = Some(rescan);
+    std::thread::spawn(move || {
+        let mut acc: Vec<DiscoveredHost> = Vec::new();
+        while let Ok(event) = rx.recv_blocking() {
+            rules::fold_advert(&mut acc, event);
+            set_hosts.call(acc.clone());
+        }
+    });
+}
+
+/// Periodic reachability sweep: a saved host reached only over a routed network (Tailscale or
+/// VPN) never advertises on mDNS, so presence can't come from the discovery stream alone. Probes
+/// every saved host (bounded, trust-agnostic QUIC handshake) and posts each changed result to
+/// `set_probed`, which is the whole of the Online pip.
+fn probe_saved_hosts(shared: Arc<Shared>, set_probed: AsyncSetState<HashMap<String, bool>>) {
+    std::thread::Builder::new()
+        .name("pf-probe".into())
+        .spawn(move || {
+            let mut last = HashMap::new();
+            loop {
+                // A spawned session/browse child is running: the shell is hidden
+                // (nobody sees the pips) and one of these hosts is mid-stream —
+                // probing it is pure noise. Sleep through and sweep after it ends.
+                if shared.session.lock().unwrap().is_running() {
+                    std::thread::sleep(crate::trust::PROBE_INTERVAL);
+                    continue;
+                }
+                // `probe_known`, not a probe per host: it fans out, asks who answered
+                // (so a stranger on a sleeping host's lease cannot light its pip), and
+                // re-points a host found at an address it left.
+                let hosts: Vec<_> = KnownHosts::load()
+                    .hosts
+                    .into_iter()
+                    .filter(|h| !h.addr.is_empty())
+                    .collect();
+                let online = crate::trust::probe_known(&hosts, crate::trust::PROBE_TIMEOUT);
+                let map: HashMap<String, bool> =
+                    hosts.iter().map(|h| h.card_key()).zip(online).collect();
+                if map != last {
+                    last = map.clone();
+                    set_probed.call(map);
+                }
+                std::thread::sleep(crate::trust::PROBE_INTERVAL);
+            }
+        })
+        .ok();
+}
+
+/// Route an arriving link. Parsing, preset resolution and every refusal rule (only a stable
+/// record id dials unattended) live in `plan_from_link`. This end turns the outcome into the
+/// call a tile click makes, so a link gets the tile's wake, trust and error handling.
+fn route_link(
+    ctx: &Arc<AppCtx>,
+    url: &str,
+    screen_now: &Screen,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+    set_link_confirm: &AsyncSetState<Option<Box<pf_client_core::orchestrate::ConnectPlan>>>,
+) {
+    let refuse = |msg: String| {
+        tracing::info!(%msg, "deep link refused");
+        set_status.call(msg);
+        set_screen.call(Screen::Hosts);
+    };
+    // Rule 2 of §3: never preempt a live session. Only this layer knows one is running,
+    // which is why the brain leaves the check here.
+    let running = ctx.shared.session.lock().unwrap().is_running();
+    let link = match rules::gate_link(url, screen_now, running) {
+        LinkGate::Plan(l) => l,
+        LinkGate::Refuse(msg) => return refuse(msg),
+        LinkGate::Hold(msg) => {
+            tracing::info!(%msg, "deep link refused");
+            set_status.call(msg);
+            return;
+        }
+    };
+    let known = KnownHosts::load();
+    let plan = pf_client_core::orchestrate::plan_from_link(
+        &link,
+        &known,
+        &pf_client_core::presets::PresetsFile::load(),
+        &ctx.settings.lock().unwrap().clone(),
+    );
+    use pf_client_core::orchestrate::PlanOutcome;
+    match plan {
+        Ok(PlanOutcome::Connect(mut p)) => {
+            // The plan's profile is the link's `as=`, else the saved pick: only the
+            // link's own wins over the picker.
+            p.profile = link.as_profile.clone();
+            dial_link(ctx, &p, set_screen, set_status)
+        }
+        // A pinned host named by its label or address, which any web page could guess: arm
+        // the confirmation, whose OK runs `dial_link` on this same plan. Not the PIN
+        // ceremony: re-pairing would throw the pin away.
+        Ok(PlanOutcome::ConfirmConnect(mut p)) => {
+            p.profile = link.as_profile.clone();
+            set_link_confirm.call(Some(p))
+        }
+        // Known but never pinned, or unknown: a link may not pair or trust on its own,
+        // so it opens the PIN ceremony seeded with what it CLAIMED: the name as claimed,
+        // the fingerprint pre-filling the pin (verified, not blind TOFU), and the launch,
+        // preset and `as=` profile kept through the detour (§3.1, as in the GTK shell).
+        Ok(PlanOutcome::ConfirmUnknown(u)) => {
+            let name = u.name.clone().unwrap_or_else(|| u.addr.clone());
+            // A link carries no mgmt port (nor a MAC), so those stay unknown until an advert
+            // teaches them — same fallback as the hand-added case.
+            *ctx.shared.target.lock().unwrap() = Target {
+                host: HostTarget {
+                    name: name.clone(),
+                    addr: u.addr.clone(),
+                    port: u.port,
+                    fp_hex: u.fp.clone(),
+                    ..HostTarget::default()
+                },
+                preset: u.preset.clone(),
+                launch: u.launch.clone(),
+                link_profile: u.profile.clone(),
+                from_link: true,
+                ..Target::default()
+            };
+            set_status.call(format!(
+                "{name} isn't paired with this device yet \u{2014} pair it to continue."
+            ));
+            set_screen.call(Screen::Pair);
+        }
+        Ok(PlanOutcome::Unsupported(route)) => refuse(format!(
+            "Punktfunk can't open \u{201c}{}\u{201d} links yet.",
+            route.as_str()
+        )),
+        Err(e) => refuse(e.message()),
+    }
 }
 
 /// Run a resolved link plan: the same four calls a host tile's click makes, so a link gets the
@@ -859,21 +995,20 @@ fn dial_link(
     set_status: &AsyncSetState<String>,
 ) {
     let target = Target {
-        name: plan.host.name.clone(),
-        addr: plan.host.addr.clone(),
-        port: plan.host.port,
-        fp_hex: plan.host.fp_hex.clone(),
-        pair_optional: false,
-        mac: plan.host.mac.clone(),
-        mgmt_port: plan.host.mgmt_port,
+        host: plan.host.clone(),
         preset: plan.preset_override.clone(),
         launch: None, // routed explicitly below (initiate_launch*)
+        link_profile: plan.profile.clone(),
+        ..Target::default()
     };
     // With a MAC it takes the dial first wake path, so a sleeping host wakes instead of
     // erroring — exactly what clicking its tile would do. The link's `launch=` id must reach
     // the session (`--launch`) — this used to drop it, so a game link opened a plain desktop
     // session.
-    match (plan.launch.clone(), plan.wake && !target.mac.is_empty()) {
+    match (
+        plan.launch.clone(),
+        plan.wake && !target.host.mac.is_empty(),
+    ) {
         (Some(id), true) => {
             connect::initiate_launch_waking(ctx, target, id, set_screen, set_status);
         }

@@ -89,19 +89,23 @@ mod linux {
                 allow_zerocopy: gpu,
                 expect_exact_dims: vout.expect_exact_dims,
                 producer,
-                policy: pf_capture::ZeroCopyPolicy {
-                    backend_is_gpu: gpu,
-                    ..Default::default()
-                },
+                ..Default::default()
+            },
+            || pf_capture::ZeroCopyPolicy {
+                backend_is_gpu: gpu,
                 ..Default::default()
             },
         )
         .context("attach the PipeWire capturer")?;
-        cap.set_active(true);
+        if let Some(feed) = cap.feed() {
+            feed.set_active(true);
+        }
         // A cursor-channel session in capture mode: the HOST composites, so the capturer must
         // keep surfacing the overlay (this is a no-op on the Linux portal capturer, but state it
         // the way the encode loop does).
-        cap.set_cursor_forward(false);
+        if let Some(cursor) = cap.cursor() {
+            cursor.set_forward(false);
+        }
 
         // Wiggle the pointer over the virtual output through the production injector (libei on
         // GNOME/KWin). The region ladder maps the absolute events onto the output by size match —
@@ -178,8 +182,10 @@ mod linux {
         let mut last_report = Instant::now();
         let mut live_seen = false;
         while Instant::now() < deadline {
-            // Damage-driven source: timeouts (gaps) are normal, hence the missing error arm.
-            if let Ok(f) = cap.next_frame_within(Duration::from_millis(500)) {
+            // Damage-driven source: timeouts (gaps) are normal, hence the missing error arm and
+            // the provisional budget, whose expiry convicts no offer.
+            let budget = pf_capture::FirstFrame::Provisional(Duration::from_millis(500));
+            if let Ok(f) = cap.next_frame(budget) {
                 frames += 1;
                 if let pf_frame::FramePayload::Cpu(data) = &f.payload {
                     if !prev.is_empty()
@@ -212,7 +218,7 @@ mod linux {
             }
             if last_report.elapsed() >= Duration::from_secs(2) {
                 last_report = Instant::now();
-                let live = cap.cursor();
+                let live = cap.cursor().and_then(|c| c.overlay());
                 if live.is_some() {
                     live_seen = true;
                 }

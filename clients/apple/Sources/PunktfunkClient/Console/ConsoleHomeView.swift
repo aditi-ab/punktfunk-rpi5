@@ -27,16 +27,19 @@ struct ConsoleHomeView: View {
     /// The console could not be built (no Metal device, or the shell refused).
     let onFailed: () -> Void
     let onPaired: (StoredHost, Data) -> Void
-    let connect: (StoredHost, PresetSelection) -> Void
+    /// The last argument is the profile id the console's own picker chose, nil for none.
+    let connect: (StoredHost, PresetSelection, String?) -> Void
     let connectDiscovered: (DiscoveredHost) -> Void
     let requestAccess: (StoredHost) -> Void
     let requestAccessDiscovered: (DiscoveredHost) -> Void
-    let launchTitle: (LibraryTarget, String) -> Void
+    let launchTitle: (LibraryTarget, String, String?) -> Void
     let connectShelf: (LibraryTarget) -> Void
     let wakeOnly: (StoredHost) -> Void
     /// A Back the console did not take. On a TV the press is the system's, so nothing is bound
     /// while the console sits at its root and this never fires there.
     var onQuit: () -> Void = {}
+    /// The host parked the connect for its operator; the console draws the wait.
+    var awaitingApproval = false
 
     @State private var console: ConsoleModel?
 
@@ -55,6 +58,9 @@ struct ConsoleHomeView: View {
                     discovery: discovery, power: .shared, nowPlaying: .shared)
             }
             .onChange(of: model.phase) { was, now in report(from: was, to: now) }
+            .onChange(of: awaitingApproval) { _, now in
+                if now, model.phase == .connecting { console?.session(.awaitingApproval) }
+            }
             .onChange(of: model.errorMessage) { _, message in
                 // The app's "Connection failed" alert stays down while the console is up, so the
                 // console says it — on the card that asked for the connect.

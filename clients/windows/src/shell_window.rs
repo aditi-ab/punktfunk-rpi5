@@ -5,37 +5,63 @@
 //! `Exited` event (clean end, error, crash, Disconnect kill), so the shell can never stay
 //! hidden with no child.
 //!
-//! windows-reactor exposes no window handle, so the HWND is resolved by its (unique)
-//! title and cached — the same pattern as `app::apply_window_icon_when_ready` and
-//! `stream::window_dpi`.
+//! The root component hands the window to [`adopt`] once reactor has created it.
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::Win32::windef::{HWND, RECT};
 use windows::Win32::winuser::{
-    FindWindowW, GetWindowRect, IsIconic, IsWindow, SetForegroundWindow, ShowWindow, SW_HIDE,
-    SW_SHOW,
+    GetWindowRect, IsIconic, IsWindow, SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOW,
 };
 
-static SHELL_HWND: AtomicIsize = AtomicIsize::new(0);
+static SHELL_HWND: AtomicUsize = AtomicUsize::new(0);
+
+/// Keep the shell window's handle and stamp the embedded app icon on it.
+pub(crate) fn adopt(hwnd: *mut core::ffi::c_void) {
+    SHELL_HWND.store(hwnd as usize, Ordering::Relaxed);
+    set_icon(hwnd.cast());
+}
 
 fn shell_hwnd() -> Option<HWND> {
-    // SAFETY: the cached value is an `HWND` this process obtained itself; it is re-validated with
-    // `IsWindow` before use (a stale handle is treated as absent), and the lookup calls take only
-    // static wide literals.
+    let h = SHELL_HWND.load(Ordering::Relaxed) as HWND;
+    // SAFETY: `IsWindow` accepts any value and dereferences nothing; a stale or unset handle
+    // reads as absent.
+    (!h.is_null() && unsafe { IsWindow(Some(h)) }.as_bool()).then_some(h)
+}
+
+/// The exe's icon resource (build.rs, ordinal 1) as the title bar, Alt-Tab and unpackaged
+/// taskbar icon. The MSIX taskbar and Start icons come from the package assets.
+fn set_icon(hwnd: HWND) {
+    use windows::Win32::libloaderapi::GetModuleHandleW;
+    use windows::Win32::winuser::{
+        GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON,
+        LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, WM_SETICON,
+    };
+    // MAKEINTRESOURCE(1): the "pointer" is the resource ordinal, so `ptr::dangling()` would
+    // name a different resource.
+    #[allow(clippy::manual_dangling_ptr)]
+    let ordinal_1 = windows::core::PCWSTR(1 as *const u16);
+    // SAFETY: `hwnd` is the live shell window; the module handle is this process's own and the
+    // ordinal names a resource in it. Nothing here dereferences caller memory.
     unsafe {
-        let cached = SHELL_HWND.load(Ordering::Relaxed);
-        if cached != 0 {
-            let h = HWND(cached as *mut _);
-            if IsWindow(Some(h)).as_bool() {
-                return Some(h);
+        let module = GetModuleHandleW(None);
+        if module.is_null() {
+            return;
+        }
+        // Small (title bar) and big (Alt-Tab) at their native metrics from the multi-size .ico.
+        for (which, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
+            let px = GetSystemMetrics(metric);
+            let icon = LoadImageW(
+                Some(module),
+                ordinal_1,
+                IMAGE_ICON as u32,
+                px,
+                px,
+                LR_DEFAULTCOLOR as u32,
+            );
+            if !icon.is_null() {
+                SendMessageW(hwnd, WM_SETICON as u32, which as usize, icon as isize);
             }
         }
-        let h = FindWindowW(None, windows::core::w!("Punktfunk"));
-        if h.0.is_null() {
-            return None;
-        }
-        SHELL_HWND.store(h.0 as isize, Ordering::Relaxed);
-        Some(h)
     }
 }
 

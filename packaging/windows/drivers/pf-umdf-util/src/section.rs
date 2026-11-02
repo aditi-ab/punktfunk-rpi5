@@ -2,10 +2,12 @@
 //!
 //! Synchronization fields use native-width atomics. A process-local mutex serializes potentially
 //! overlapping access widths, and bulk report bytes use relaxed atomics; the channel's sequence
-//! fences still provide aggregate consistency with the peer process.
+//! fences still provide aggregate consistency with the peer process. The raw accesses are
+//! [`SectionView`]'s; this module maps, unmaps and locks.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use pf_driver_proto::section::SectionView;
 use std::sync::Mutex;
 
 const FILE_MAP_RW: u32 = 0x0002 | 0x0004; // FILE_MAP_WRITE | FILE_MAP_READ
@@ -24,8 +26,10 @@ unsafe extern "system" {
 /// alignment. A local lock prevents overlapping atomic widths across callbacks, while protocol
 /// sequence fields provide acquire/release publication for each complete peer report.
 pub struct MappedView {
+    /// What `Drop` unmaps.
     base: *mut u8,
-    len: usize,
+    /// Never copied out of this field, so its `'static` ends with `Drop`.
+    view: SectionView<'static>,
     access: Mutex<()>,
 }
 
@@ -33,6 +37,7 @@ pub struct MappedView {
 unsafe impl Send for MappedView {}
 // SAFETY: `access` serializes overlapping local widths, and each physical memory access is atomic.
 // Compound reads may tear against the peer; sequence fields provide their aggregate consistency.
+// `copy_from_slice` alone is a plain write: its single-writer protocol keeps readers off the range.
 unsafe impl Sync for MappedView {}
 
 impl MappedView {
@@ -54,11 +59,7 @@ impl MappedView {
         if base.is_null() {
             return None;
         }
-        Some(MappedView {
-            base,
-            len,
-            access: Mutex::new(()),
-        })
+        Some(Self::adopt(base, len))
     }
 
     /// Map `len` bytes from a duplicated raw section-handle value without consuming the handle.
@@ -74,30 +75,29 @@ impl MappedView {
         if base.is_null() {
             return None;
         }
-        Some(MappedView {
+        Some(Self::adopt(base, len))
+    }
+
+    /// Own the fresh view `MapViewOfFile` returned at `base`.
+    fn adopt(base: *mut u8, len: usize) -> MappedView {
+        // SAFETY: `base` is a new page-aligned read/write mapping of `len` bytes. Only `Drop`
+        // unmaps it, after the last access, and no Rust reference points into it.
+        let view = unsafe { SectionView::from_raw(base, len) };
+        MappedView {
             base,
-            len,
+            view,
             access: Mutex::new(()),
-        })
+        }
     }
 
     /// How many bytes this view maps — the gate for tail-extension features (a caller may only
     /// touch offsets `< mapped_len()`; see `ChannelConfig::min_data_size`).
     pub fn mapped_len(&self) -> usize {
-        self.len
+        self.view.len()
     }
 
-    /// Assert `off..off+n` is inside the view and, for atomics, `align`-aligned. The view base is
-    /// page-aligned (`MapViewOfFile`), so field alignment reduces to offset alignment.
-    #[inline]
-    fn check(&self, off: usize, n: usize, align: usize) {
-        assert!(
-            off.is_multiple_of(align) && off.checked_add(n).is_some_and(|end| end <= self.len),
-            "MappedView access out of bounds/alignment (off={off}, n={n}, len={})",
-            self.len
-        );
-    }
-
+    /// Held across every access that goes through a fixed width, so two widths never overlap
+    /// the same bytes at once in this process.
     #[inline]
     fn lock_access(&self) -> std::sync::MutexGuard<'_, ()> {
         self.access
@@ -105,54 +105,39 @@ impl MappedView {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    #[inline]
-    fn byte(&self, off: usize) -> &AtomicU8 {
-        self.check(off, 1, 1);
-        // SAFETY: `check` proved this byte is in the live mapping; `AtomicU8` needs no stronger
-        // alignment, and every bit pattern is valid.
-        unsafe { &*self.base.add(off).cast::<AtomicU8>() }
-    }
-
     /// Load one 4-aligned synchronization word with `order`.
     #[inline]
     pub fn load_u32(&self, off: usize, order: Ordering) -> u32 {
         let _access = self.lock_access();
-        self.check(off, 4, 4);
-        // SAFETY: `off` is in-bounds and aligned, the mapping stays live, and `access` excludes an
-        // overlapping local access of another width. The peer uses the same atomic protocol field.
-        unsafe { (*(self.base.add(off) as *const AtomicU32)).load(order) }
+        self.view.atomic_u32(off).load(order)
     }
 
     /// Atomic `u32` store at `off` (must be 4-aligned).
     #[inline]
     pub fn store_u32(&self, off: usize, v: u32, order: Ordering) {
         let _access = self.lock_access();
-        self.check(off, 4, 4);
-        // SAFETY: as `load_u32` — in-bounds, aligned, live, and locally serialized.
-        unsafe { (*(self.base.add(off) as *const AtomicU32)).store(v, order) }
+        self.view.atomic_u32(off).store(v, order);
     }
 
     /// Atomic `u64` load at `off` (must be 8-aligned).
     #[inline]
     pub fn load_u64(&self, off: usize, order: Ordering) -> u64 {
         let _access = self.lock_access();
-        self.check(off, 8, 8);
-        // SAFETY: as `load_u32`, with 8-byte size/alignment checked and local access serialized.
-        unsafe { (*(self.base.add(off) as *const AtomicU64)).load(order) }
+        self.view.atomic_u64(off).load(order)
     }
 
     /// Read one bulk byte with relaxed atomic semantics.
     #[inline]
     pub fn read_u8(&self, off: usize) -> u8 {
         let _access = self.lock_access();
-        self.byte(off).load(Ordering::Relaxed)
+        self.view.atomic_u8(off).load(Ordering::Relaxed)
     }
 
     /// Write one bulk byte with relaxed atomic semantics.
     #[inline]
     pub fn write_u8(&self, off: usize, v: u8) {
         let _access = self.lock_access();
-        self.byte(off).store(v, Ordering::Relaxed);
+        self.view.atomic_u8(off).store(v, Ordering::Relaxed);
     }
 
     /// Relaxed `u16` load at `off` (must be 2-aligned): one instruction, so a peer's aligned
@@ -160,9 +145,7 @@ impl MappedView {
     #[inline]
     pub fn read_u16(&self, off: usize) -> u16 {
         let _access = self.lock_access();
-        self.check(off, 2, 2);
-        // SAFETY: as `load_u32`, with 2-byte size/alignment checked and local access serialized.
-        unsafe { (*(self.base.add(off) as *const AtomicU16)).load(Ordering::Relaxed) }
+        self.view.atomic_u16(off).load(Ordering::Relaxed)
     }
 
     /// Relaxed `u32` load at `off` (must be 4-aligned); see [`Self::read_u16`].
@@ -186,19 +169,13 @@ impl MappedView {
     /// Load `dst.len()` bulk bytes with relaxed atomic semantics.
     pub fn read_bytes(&self, off: usize, dst: &mut [u8]) {
         let _access = self.lock_access();
-        self.check(off, dst.len(), 1);
-        for (index, byte) in dst.iter_mut().enumerate() {
-            *byte = self.byte(off + index).load(Ordering::Relaxed);
-        }
+        self.view.read_bytes(off, dst);
     }
 
     /// Store `src` as relaxed atomic bulk bytes.
     pub fn write_bytes(&self, off: usize, src: &[u8]) {
         let _access = self.lock_access();
-        self.check(off, src.len(), 1);
-        for (index, byte) in src.iter().copied().enumerate() {
-            self.byte(off + index).store(byte, Ordering::Relaxed);
-        }
+        self.view.write_bytes(off, src);
     }
 
     /// A 4-aligned word as the atomic it is, for a protocol field the caller owns end to end
@@ -206,28 +183,20 @@ impl MappedView {
     /// the local lock, so never mix it with the locked accessors on the same field.
     #[inline]
     pub fn atomic_u32(&self, off: usize) -> &AtomicU32 {
-        self.check(off, 4, 4);
-        // SAFETY: `check` proved the word is in the live mapping and 4-aligned; every bit
-        // pattern is a valid u32.
-        unsafe { &*(self.base.add(off) as *const AtomicU32) }
+        self.view.atomic_u32(off)
     }
 
     /// [`Self::atomic_u32`] for an 8-aligned u64.
     #[inline]
     pub fn atomic_u64(&self, off: usize) -> &AtomicU64 {
-        self.check(off, 8, 8);
-        // SAFETY: as `atomic_u32`, with 8-byte size and alignment checked.
-        unsafe { &*(self.base.add(off) as *const AtomicU64) }
+        self.view.atomic_u64(off)
     }
 
     /// One `memcpy` of `src` into `off..`, for a region with a single writer whose readers only
     /// look after a later Release store names it (the AU heap). Bounds-checked once; the
     /// per-byte atomic path is [`Self::write_bytes`].
     pub fn copy_from_slice(&self, off: usize, src: &[u8]) {
-        self.check(off, src.len(), 1);
-        // SAFETY: `check` proved the range is in the live mapping; the caller's protocol keeps
-        // every reader off it until the publishing store.
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(off), src.len()) }
+        self.view.copy_from_slice(off, src);
     }
 }
 

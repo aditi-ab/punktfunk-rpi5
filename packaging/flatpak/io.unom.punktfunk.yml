@@ -1,0 +1,394 @@
+# Flatpak manifest for the native punktfunk Linux client: the shell (crate
+# punktfunk-client-linux, binary `punktfunk-client`) PLUS the Vulkan session binary (crate
+# punktfunk-client-session, binary `punktfunk-session`) that the shell execs for
+# `--connect`/`--browse` — both must ship or streaming from the Deck breaks (the Decky
+# wrapper launches the shell with those flags and the shell resolves its sibling
+# `punktfunk-session`, see clients/linux/src/spawn.rs). Built into a single-file `.flatpak`
+# bundle and published to Gitea's generic package registry (see .gitea/workflows/flatpak.yml
+# + packaging/flatpak/README.md).
+#
+# Why flatpak for the CLIENT (the host stays an RPM/deb — see packaging/README.md "Why not
+# Flatpak"): on SteamOS the Steam Deck's /usr is read-only and image-based, so a bare
+# `punktfunk-client` binary in ~/.local/bin can't bring its own libadwaita / SDL3 (both
+# MISSING from the SteamOS system) — but flatpak is the Deck's native, update-survivable app
+# path (the user already runs Moonlight + chiaki-ng as flatpaks). Unlike the host, the client
+# is sandbox-friendly: it only needs the GPU render node, the host PipeWire socket, the
+# network, Wayland, hidraw for DualSense, and its config dir — all expressible as finish-args.
+#
+# Runtime: GNOME 50 ships GTK 4.22 and libadwaita 1.9 — both above the crate floors
+# (gtk4 0.11 "v4_20", libadwaita 0.9 "v1_8"). GNOME 50 is built on freedesktop-sdk 25.08, so
+# `org.freedesktop.Sdk.Extension.rust-stable` resolves to //25.08 (rustc 1.96 — the GTK4 dep
+# chain, e.g. pango-sys 0.22, needs >= 1.92, which the older GNOME-48/24.08 rust-stable at 1.89
+# could NOT satisfy). GNOME 50 is also a *supported* runtime (GNOME 48 went EOL in March 2026).
+# The PipeWire client lib is in the freedesktop base; SDL3 is NOT, so it is built
+# from source as a bundled module.
+#
+# HEVC decode needs NOTHING from the runtime since M10 (design/client-native-decode.md §6):
+# the client links no FFmpeg at all. It decodes on the user's own GPU drivers — Vulkan Video
+# through the loader in the GL runtime, or VAAPI through libva, which is dlopen'd and never
+# linked — with openh264 + rav1d (both vendored, both BSD-2) as the CPU floor. Nothing here
+# depends on the base runtime's stripped libavcodec, and nothing depends on
+# `org.freedesktop.Platform.codecs-extra` shadowing it either; that whole arrangement (and the
+# encumbered-codec question it existed to answer) is simply not this app's problem any more.
+#
+# ⚠ The one thing that follows: the CPU floor has no HEVC — no permissively-licensed HEVC
+# decoder exists — so an HEVC session on a box whose GPU cannot decode HEVC reconnects on a
+# codec this client can finish (pf-client-core's `last_rung_verdict`) instead of falling back
+# to software. That is a refusal by design, not a packaging gap.
+id: io.unom.punktfunk
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+# Build-time SDK extensions:
+#  - rust-stable: cargo/rustc 1.96 + the bundled mold linker (/usr/lib/sdk/rust-stable/bin).
+#  - llvm20: provides libclang (/usr/lib/sdk/llvm20/lib), which bindgen needs — sdl3-sys and
+#    pyrowave-sys generate their FFI bindings via bindgen at build time. The base SDK ships no
+#    clang/libclang, so without this the build panics ("Unable to find libclang").
+# Both are added to PATH / LIBCLANG_PATH in build-options below.
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm20
+command: punktfunk-client
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /lib/cmake
+  - /share/aclocal
+  - /man
+  - /share/man
+  - '*.a'
+  - '*.la'
+
+finish-args:
+  # --- display ---
+  - --socket=wayland                 # GTK4 native Wayland window (the client is Wayland-first)
+  - --socket=fallback-x11            # Xwayland fallback when no Wayland socket is exposed
+  - --share=ipc                      # required alongside X11 for shared-memory surfaces
+  # Gaming Mode's overlay signal lives on a DIFFERENT X server than ours: gamescope runs
+  # `--xwayland-count 2`, Steam and the GAMESCOPE_FOCUSED_APP/_GFX atoms on the first, the app
+  # on the second. flatpak binds only the ONE socket DISPLAY names and keeps /tmp/.X11-unix a
+  # private tmpfs, so no --filesystem grant reaches the first. `overlay_focus` dials its
+  # ABSTRACT socket instead, which `--share=network` below leaves open. Do not unshare it.
+  # --- GPU + all input devices ---
+  # --device=all covers the GPU render node, evdev pads and the hidraw char devices SDL's HIDAPI
+  # needs for DualSense touchpad, motion, triggers and lightbar. No narrower device class has
+  # hidraw, and flatpak cannot bind a char device by path. SDL finds pads without udev in a
+  # sandbox: it watches /dev instead.
+  - --device=all
+  # --- audio: playback and the mic speak the native PipeWire protocol, so the sandbox needs the
+  #     real `pipewire-0` socket. The filesystem bind is the form both flatpak-builder and the
+  #     Deck's flatpak 1.16 accept; `--socket=pipewire` is rejected by both. ---
+  - --filesystem=xdg-run/pipewire-0
+  # --- network: QUIC control and media + mDNS discovery (_punktfunk._udp) ---
+  - --share=network
+  # --- the folder older builds kept the pairing in. Read-only: the client copies its client-*
+  #     files into its own config dir under ~/.var/app on first start. ---
+  - --filesystem=~/.config/punktfunk:ro
+  # --- HDR under gamescope (Steam Deck Game Mode) ---
+  # A flatpak's Vulkan loader can't see the host's gamescope WSI layer, so without help the SDL3
+  # surface never offers the HDR10 (ST.2084) colorspace and the presenter silently tone-maps
+  # PQ->SDR — the field-reported "HDR->SDR" badge. The layer is now VENDORED (see the
+  # gamescope-wsi-layer module below), so it is always present and there is no longer any
+  # manual `flatpak install ... VulkanLayer.gamescope` step for the user.
+  # FOUR things are needed. An earlier revision of this block claimed three and was WRONG: the
+  # fourth is the gate that makes the other three moot, so the Deck sat at hdr10_format=None with
+  # all of (1)-(3) in place, which is exactly the field report ("HDR->SDR" in the stats overlay).
+  # (1) the layer's implicit-layer JSON must be on the Vulkan loader's search path — now
+  # automatic, the vendored module installs it to /app/share/vulkan/implicit_layer.d which
+  # XDG_DATA_DIRS already covers. (2) ENABLE_GAMESCOPE_WSI
+  # flips the layer's own `enable_environment` gate. (3) --filesystem=xdg-run/gamescope-0 binds
+  # gamescope's private Wayland socket: the layer must reach the compositor over it to negotiate
+  # HDR10, and the Deck runs games as X11 clients (DISPLAY=:1, no WAYLAND_DISPLAY exported) so
+  # --socket=wayland binds nothing (chiaki-ng does the same). (4) GAMESCOPE_WAYLAND_DISPLAY must be
+  # set INSIDE the sandbox. The layer's `isRunningUnderGamescope()` reads that env var and nothing
+  # else; flatpak does not forward host env, so it arrives unset and the layer's CreateInstance
+  # early-returns before it ever creates a GamescopeInstance. The layer still LOADS and still logs
+  # its generic bits ("Forcing on VK_EXT_swapchain_maintenance1", swapchain destroys), which is why
+  # this reads as working — but no gamescope surface is made, so no HDR10 format is ever appended
+  # and (1)-(3) buy nothing. Measured on a Deck OLED (Galileo, SteamOS 3.8.16) 2026-08-05, client
+  # `--browse`, reading `pf_presenter::vk::setup` "swapchain config":
+  #     unset                    -> no "[Gamescope WSI] Surface state" block at all, hdr10_format=None
+  #     set, hdr_enabled=0       -> "server hdr output enabled: false", hdr10_format=None
+  #     set, hdr_enabled=1       -> "hdr formats exposed to client: true",
+  #                                 hdr10_format=Some(A2B10G10R10_UNORM_PACK32, HDR10_ST2084_EXT)
+  # DXVK_HDR is NOT the gate for us and was ruled out by measurement: the layer forces it OFF for
+  # clients it has already decided to deny, it does not turn HDR on.
+  # Hardcoding `gamescope-0` matches the socket bound just below, and is safe off-Deck both ways:
+  # on a normal Wayland desktop --socket=wayland sets WAYLAND_DISPLAY=wayland-0 inside the sandbox
+  # and the layer bails on the mismatch; on X11-only there is no gamescope socket to connect to, so
+  # it prints one "Bypass layer will be unavailable" line and passes through.
+  # The REMAINING gate is not ours: gamescope's `hdr_enabled` convar (Steam's HDR display setting)
+  # drives the GAMESCOPE_HDR_OUTPUT_FEEDBACK X property the layer reads, and with it off no app on
+  # the Deck gets HDR. See docs — that one is a user/Decky-side step, not a packaging one.
+  - --env=ENABLE_GAMESCOPE_WSI=1
+  # The layer engages only while WAYLAND_DISPLAY is unset or names this socket too. When
+  # gamescope leaves it unset, flatpak binds the desktop's wayland-0 and drops DISPLAY; the
+  # session then restarts with WAYLAND_DISPLAY=gamescope-0 (`gamescope::foreign`).
+  - --env=GAMESCOPE_WAYLAND_DISPLAY=gamescope-0
+  - --filesystem=xdg-run/gamescope-0   # gamescope's Wayland socket: HDR negotiation, the window
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
+  # The rust build resolves gtk4/libadwaita/pipewire via pkg-config: the SDK's own .pc files
+  # from the multiarch /usr dir, plus the bundled SDL3's .pc from /app.
+  env:
+    PKG_CONFIG_PATH: /app/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
+    # bindgen (sdl3-sys, pyrowave-sys) loads libclang from the llvm20 extension.
+    LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
+    # mold (shipped in rust-stable) speeds the ~450-crate link on the Deck APU.
+    RUSTFLAGS: -C link-arg=-fuse-ld=mold
+  # The multiarch directory in PKG_CONFIG_PATH is per-architecture, and flatpak-builder does NOT
+  # shell-expand `env` values — so ${FLATPAK_ARCH} would be taken literally. An `arch` override is
+  # the supported way to vary it; everything else above is inherited. Only the runtime's own
+  # /usr/lib/<triple> changes, so aarch64 differs from x86_64 in exactly this one string.
+  arch:
+    aarch64:
+      env:
+        PKG_CONFIG_PATH: /app/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
+
+modules:
+  # ---------------------------------------------------------------------------------------
+  # SDL3 — NOT provided as a linkable libSDL3.so.0 by org.gnome.Platform/freedesktop-sdk
+  # 25.08, and there is no SDL3 recipe in flathub/shared-modules. Build it from source.
+  # Pinned to 3.4.18 to match the crate exactly: sdl3-sys is `0.7.2+SDL-3.4.18`, i.e. its
+  # bindings target SDL 3.4.18 — building an older SDL risks missing symbols at link time.
+  # HIDAPI is enabled (DualSense touchpad/motion/triggers/lightbar over hidraw).
+  # ---------------------------------------------------------------------------------------
+  - name: sdl3
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DSDL_SHARED=ON
+      - -DSDL_STATIC=OFF
+      - -DSDL_HIDAPI=ON          # DualSense full fidelity over hidraw
+      - -DSDL_TEST_LIBRARY=OFF
+      - -DSDL_EXAMPLES=OFF
+    sources:
+      - type: archive
+        url: https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
+        # `sha256sum SDL3-3.4.18.tar.gz` (verified 2026-10-07). Bump url + sha together.
+        sha256: 9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
+        x-checker-data:
+          type: anitya
+          project-id: 4974
+          stable-only: true
+          url-template: https://github.com/libsdl-org/SDL/releases/download/release-$version/SDL3-$version.tar.gz
+    cleanup:
+      - /bin
+      - /include
+      - /lib/cmake
+      - /lib/pkgconfig
+
+  # ---------------------------------------------------------------------------------------
+  # Vulkan-Headers — build-time `vulkan/vulkan.h` for anything below that compiles against
+  # Vulkan, which the GNOME SDK is not guaranteed to ship dev headers for. Headers only, no
+  # compile, and `cleanup: '*'` so nothing reaches the runtime (the Vulkan LOADER comes from
+  # the GL runtime).
+  #
+  # It was added for the session binary's pf-ffvk crate, which ran bindgen over FFmpeg's
+  # libavutil/hwcontext_vulkan.h. M10 deleted pf-ffvk along with the rest of the client's
+  # FFmpeg (design/client-native-decode.md §6), so that consumer is gone — but the module
+  # stays, because the gamescope WSI layer built two modules below is itself a VULKAN LAYER
+  # and compiles against these headers. Module order is the dependency: this one must build
+  # first. Do not drop it as dead weight; flatpak.yml has no `pull_request:` trigger, so a
+  # manifest break of that kind reaches main invisibly and a tag then ships no Linux flatpak.
+  # The native decoder needs nothing from here — pf-vkdecode reaches Vulkan through `ash`,
+  # which is pure Rust bindings with no bindgen and no C headers.
+  # ---------------------------------------------------------------------------------------
+  - name: vulkan-headers
+    buildsystem: cmake-ninja
+    sources:
+      - type: archive
+        url: https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.313.0.tar.gz
+        # `sha256sum vulkan-sdk-1.4.313.0.tar.gz` (verified 2026-07-07). Bump url + sha together.
+        sha256: 20743c99a96c07290f24377360e7a12bdd2c465ba202e0c7ef2ec25d446cf61d
+    cleanup:
+      - '*'
+
+  # ---------------------------------------------------------------------------------------
+  # gamescope WSI layer — VENDORED, so HDR works from a plain `flatpak install` with no
+  # second step. This is the ONLY route to HDR on a Deck: measured on SteamOS 3.8.16
+  # (gamescope 3.16.23.4), the gamescope-0 socket advertises `gamescope_swapchain_factory_v2`
+  # but NOT `wp_color_manager_v1` (checked with HDR both off and on), so Mesa's Wayland WSI
+  # has no colour-management protocol to negotiate HDR10 through and only this layer can add
+  # the ST.2084 surface formats. Without it: zero `[Gamescope WSI]` lines, hdr10_format=None.
+  #
+  # It used to come from the flathub runtime extension
+  # `org.freedesktop.Platform.VulkanLayer.gamescope`, which every user had to install BY HAND
+  # (documented only in a comment here — so in practice nobody did, and the field report was
+  # "HDR->SDR" in the stats overlay). Vendoring instead of `add-extensions` autodownload,
+  # deliberately: that extension is 94 MB of whole-gamescope to deliver one 4 MB .so, its
+  # layer JSON hardcodes a /usr `library_path` that an app-scoped extension (mounted under
+  # /app) would not satisfy, and it would make flathub a hard install-time dependency of an
+  # app we self-host on flatpak.unom.io.
+  #
+  # Pinned to the SAME gamescope rev as packaging/gamescope/PKGBUILD (`_gsrev`) so the
+  # client's layer and the host's punktfunk-gamescope always come from one tree — bump both
+  # together. `enable_gamescope=false` skips subdir('src') and every compositor dependency
+  # (wlroots, SDL2, libliftoff, ...); only protocol/ and layer/ are built.
+  #
+  # `buildsystem: simple` rather than `meson` because two subprojects need their wrap
+  # `patch_directory` applied by hand: glm and stb ship NO meson.build of their own, and the
+  # one meson would normally inject lives in subprojects/packagefiles/. Cloning them as plain
+  # sources without that copy fails at configure with "Subproject exists but has no
+  # meson.build file". `--wrap-mode=nodownload` then proves the build is genuinely offline.
+  #
+  # The layer JSON is generated by meson from prefix+libdir, so it self-writes
+  # `library_path: /app/lib/libVkLayer_FROG_gamescope_wsi_x86_64.so` and lands in
+  # /app/share/vulkan/implicit_layer.d — already on the loader's search path via
+  # XDG_DATA_DIRS, which is why no VK_ADD_IMPLICIT_LAYER_PATH is needed (and why it was
+  # dropped from finish-args: pointing at the old /usr extension path too would risk
+  # double-loading two layers of the same name).
+  #
+  # Verified on a Deck OLED 2026-08-05: builds offline in org.gnome.Sdk//50, and the
+  # resulting .so drives the Deck's system gamescope to
+  # "hdr formats exposed to client: true" + hdr10_format=Some(...).
+  # ---------------------------------------------------------------------------------------
+  - name: gamescope-wsi-layer
+    buildsystem: simple
+    build-commands:
+      # Apply the wraps' patch_directory by hand (see above) — these supply the meson.build
+      # that glm and stb do not ship themselves.
+      - cp -r subprojects/packagefiles/glm/. subprojects/glm/
+      - cp -r subprojects/packagefiles/stb/. subprojects/stb/
+      - meson setup _build --prefix=/app --libdir=lib --wrap-mode=nodownload
+        -Denable_gamescope=false -Denable_gamescope_wsi_layer=true
+        -Denable_tests=false -Denable_openvr_support=false
+      - ninja -C _build
+      - ninja -C _build install
+    sources:
+      - type: git
+        url: https://github.com/ValveSoftware/gamescope.git
+        # KEEP IN SYNC with `_gsrev` in packaging/gamescope/PKGBUILD.
+        commit: 6867f509874f9bc52e12d6f4c4596cdf0d5be6b4
+        # The layer needs only vkroots, pinned below. CI's --disable-updates never mirrors a
+        # submodule pin that is new to a warm cache, and wlroots is one the layer never builds.
+        disable-submodules: true
+      # vkroots: the submodule commit at that rev (`git ls-tree <rev> subprojects/vkroots`).
+      # Bump it with the gamescope commit.
+      - type: git
+        url: https://github.com/Joshua-Ashton/vkroots
+        commit: 5106d8a0df95de66cc58dc1ea37e69c99afc9540
+        dest: subprojects/vkroots
+      # Wrap pins as of that rev (`subprojects/*.wrap`): meson wraps, not submodules.
+      - type: git
+        url: https://github.com/g-truc/glm.git
+        commit: 0af55ccecd98d4e5a8d1fad7de25ba429d60e863
+        dest: subprojects/glm
+      - type: git
+        url: https://github.com/nothings/stb.git
+        commit: 5736b15f7ea0ffb08dd38af21067c314d6a3aae9
+        dest: subprojects/stb
+    cleanup:
+      # Only the .so and its implicit-layer JSON are runtime. vkroots installs its dev files
+      # from the subproject, and the layer-only install still drops gamescope's display .lua
+      # scripts + LUT .cube files, none of which a client uses.
+      - /include
+      - /lib/pkgconfig
+      - /share/gamescope
+
+  # ---------------------------------------------------------------------------------------
+  # The client. cargo-sources.json is the GENERATED offline crate cache:
+  #   python3 flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources.json
+  # (run from the repo root; the CI step does exactly this). With it present the build is fully
+  # offline (CARGO_NET_OFFLINE). For quick LOCAL iteration WITHOUT regenerating it, drop the
+  # cargo-sources.json source and pass  --build-args=--share=network  to flatpak-builder
+  # (non-reproducible; cargo fetches from crates.io during the build).
+  # ---------------------------------------------------------------------------------------
+  - name: punktfunk-client
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/punktfunk-client/cargo
+        CARGO_NET_OFFLINE: 'true'
+        # The session binary's Skia (pf-console-ui → skia-safe) fetches prebuilt libskia in
+        # its build script — dead in the offline sandbox. skia-bindings accepts a file://
+        # override (read directly, no curl), so we point it at the archive that
+        # flatpak-builder pre-downloaded as a pinned source below. No {tag}/{key}
+        # placeholders needed: a template without them is used verbatim.
+        SKIA_BINARIES_URL: file:///run/build/punktfunk-client/skia-binaries.tar.gz
+    build-commands:
+      # cargo-sources.json leaves out the windows-rs git source (prune-windows-lock.py), but
+      # `cargo --offline` needs a source for every declared dependency, cfg(windows) or not.
+      # The Windows-only members leave the workspace; every Linux-built member that
+      # inherits the pin is pruned in place, so a member that adds the pin is listed here.
+      # No --locked: the lock no longer matches the reduced graph; --offline still pins every
+      # crate to cargo-sources.json.
+      - sed -i '\#"clients/windows",#d' Cargo.toml
+      - sed -i '\#"crates/install/punktfunk-setup-win",#d' Cargo.toml
+      - sed -i '\#"crates/core/pf-fluent",#d' Cargo.toml
+      - python3 packaging/flatpak/prune-windows-toml.py crates/client/pf-client-core/Cargo.toml
+          crates/client/pf-client-video/Cargo.toml crates/client/pf-presenter/Cargo.toml
+      # One cargo invocation for both binaries: the shell and the Vulkan session binary it
+      # execs for --connect/--browse. Building them together keeps skia-bindings' feature
+      # unification identical to a workspace build (the pinned skia-binaries archive's
+      # `ganesh-…-pdf-textlayout-vulkan` key must match the resolved feature set).
+      # packaging/flatpak/VERSION (written by flatpak.yml and build-flatpak.sh) stamps the
+      # package version into --version, About and the log bundle, as the deb/rpm/arch builds
+      # do; without it the crate's own version stands.
+      - PUNKTFUNK_BUILD_VERSION="$(cat packaging/flatpak/VERSION 2>/dev/null || true)"
+          cargo --offline build --release -p punktfunk-client-linux -p punktfunk-client-session
+          -p punktfunk-cli
+      - install -Dm0755 target/release/punktfunk-client ${FLATPAK_DEST}/bin/punktfunk-client
+      - install -Dm0755 target/release/punktfunk-session ${FLATPAK_DEST}/bin/punktfunk-session
+      # The headless CLI (design/client-architecture-split.md §4) — reachable as
+      # `flatpak run --command=punktfunk io.unom.punktfunk …`.
+      - install -Dm0755 target/release/punktfunk ${FLATPAK_DEST}/bin/punktfunk
+      # Desktop entry, shared with the native packages; flatpak's export rewrites its Exec.
+      - install -Dm0644 packaging/linux/io.unom.punktfunk.desktop
+          ${FLATPAK_DEST}/share/applications/io.unom.punktfunk.desktop
+      # Second launcher, straight into the gamepad console (`--browse`) — the couch entry
+      # point. Shared with the deb/rpm/arch (there is nothing sandbox-specific about it);
+      # flatpak's export rewrites Exec into `flatpak run --command=punktfunk-client …`.
+      - install -Dm0644 packaging/linux/io.unom.punktfunk.console.desktop
+          ${FLATPAK_DEST}/share/applications/io.unom.punktfunk.console.desktop
+      # AppStream metainfo (required for a well-formed flatpak / Software listings).
+      - install -Dm0644 packaging/flatpak/io.unom.punktfunk.metainfo.xml
+          ${FLATPAK_DEST}/share/metainfo/io.unom.punktfunk.metainfo.xml
+      # Scalable icon named for the app id (GNOME runtime renders SVG via librsvg).
+      # One icon source for every Linux packaging (it used to live under packaging/flatpak,
+      # which is why the deb/rpm/arch entries shipped a stock `video-display` instead).
+      - install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg
+          ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.unom.punktfunk.svg
+    sources:
+      # The repo checkout. For a Flathub/published build, replace with a pinned git source:
+      #   - type: git
+      #     url: https://git.unom.io/unom/punktfunk
+      #     tag: vX.Y.Z
+      #     commit: <sha>
+      # For ON-DECK / CI builds we build the checked-out working tree in place:
+      - type: dir
+        path: ../..
+      # Generated offline crate cache (see the comment block above). Remove for --share=network.
+      - cargo-sources.json
+      # Prebuilt Skia for skia-bindings 0.153.3 (SKIA_BINARIES_URL above). The key encodes the
+      # crate's pinned skia commit + target + resolved features — when bumping skia-safe, build
+      # the workspace once locally and take the new name from
+      # target/release/build/skia-bindings-*/out/.cache/, then update url + sha256 together.
+      # One entry per architecture, selected by `only-arches`; both land on the SAME
+      # dest-filename, so SKIA_BINARIES_URL above stays a single literal path. The upstream
+      # release publishes the aarch64 archive under the same skia commit hash and the same
+      # resolved-feature key, so the two stay in lockstep on a skia-safe bump — take both new
+      # names and sha256s together.
+      #
+      # ⚠ This pin MUST be bumped in the same commit as the skia-safe version in
+      # crates/client/pf-console-ui/Cargo.toml. `SKIA_BINARIES_URL: file://…` makes skia-bindings
+      # unpack this archive verbatim — INCLUDING its pre-generated bindings.rs — into
+      # target/…/build/skia-bindings-*/out/skia/. A stale archive therefore compiles the NEW
+      # crate's src/defaults.rs against the OLD bindings, and the flatpak leg dies with
+      # `no variant, associated function, or constant named 'Default' found for enum
+      # SkPathFillType` (that const is generated INTO bindings.rs, so it moves with the
+      # archive, not with the crate). Cargo.lock and cargo-sources.json are regenerated
+      # automatically; this file is the one place the skia archive is pinned by hand, which
+      # is exactly how the 0.87 → 0.99 bump (#193) left it behind.
+      - type: file
+        only-arches: [x86_64]
+        url: https://github.com/rust-skia/skia-binaries/releases/download/0.153.3/skia-binaries-b7f043e0b1e2a850e702-x86_64-unknown-linux-gnu-ganesh-jpegd-jpege-pdf-textlayout-vulkan.tar.gz
+        sha256: 1620241c6f2247b6df21c6d201d5668693d2cf214f73dff06d66f40aa40f52b5
+        dest-filename: skia-binaries.tar.gz
+      - type: file
+        only-arches: [aarch64]
+        url: https://github.com/rust-skia/skia-binaries/releases/download/0.153.3/skia-binaries-b7f043e0b1e2a850e702-aarch64-unknown-linux-gnu-ganesh-jpegd-jpege-pdf-textlayout-vulkan.tar.gz
+        sha256: cae319203264a497291c34b66831e0af724acecaaa407e2f45b6635daeca6f64
+        dest-filename: skia-binaries.tar.gz

@@ -9,10 +9,12 @@
 
 import * as fs from "node:fs";
 import type { PluginDef } from "@punktfunk/host";
-import type { GameRef } from "@punktfunk/host/core";
+import type { EventOf, GameRef } from "@punktfunk/host/core";
 import { Duration, Effect, type Schema, Stream } from "effect";
 import {
 	type AccessRequestOutcome,
+	type AccessRequestPath,
+	byPath,
 	requestAccess,
 	unreachable,
 } from "../access.js";
@@ -90,7 +92,9 @@ export interface LibraryPluginDef<S extends Schema.Top> {
 	/** Launcher data dirs to watch, so a newly installed game appears without waiting for a poll. */
 	readonly watchDirs?: (cfg: S["Type"]) => ReadonlyArray<string>;
 	/** Folders the launcher lists dynamically; unusable ones are requested before each scan. */
-	readonly wants?: (cfg: S["Type"]) => ReadonlyArray<string>;
+	readonly wants?: (
+		cfg: S["Type"],
+	) => ReadonlyArray<string | AccessRequestPath>;
 	/** How often to re-scan regardless of watches. Default `Duration.minutes(15)`. */
 	readonly pollInterval?: Duration.Duration;
 	/** Debounce on filesystem events. Default `Duration.seconds(3)`. */
@@ -108,12 +112,14 @@ export interface LibraryPluginDef<S extends Schema.Top> {
 	readonly commands?: Record<string, CliCommand<never>>;
 	/**
 	 * Work before the host starts one of this plugin's titles, like fetching its files. It fires for
-	 * every launch on the host, so check `game.app`. See `serveUi`'s `holds`.
+	 * every launch on the host, so check `game.app`; `event.seat` names a launch on another seat.
+	 * See `serveUi`'s `holds`.
 	 */
 	readonly holds?: {
 		readonly "game.launching"?: (
 			game: GameRef,
 			cfg: S["Type"],
+			event: EventOf<"game.launching">,
 		) => Effect.Effect<void, unknown>;
 	};
 	/** How long the host waits for a hold, 1–120 000 ms. Default 30 000. */
@@ -195,7 +201,7 @@ const logOutcomes = (outcomes: ReadonlyArray<AccessRequestOutcome>) =>
  * the host never answered is asked again on the next scan; it never fails the scan.
  */
 const accessAwareCompute = <Cfg, A, E, R>(
-	wants: ((cfg: Cfg) => ReadonlyArray<string>) | undefined,
+	wants: ((cfg: Cfg) => ReadonlyArray<string | AccessRequestPath>) | undefined,
 	title: string,
 	load: Effect.Effect<Cfg, E, R>,
 	compute: (cfg: Cfg) => Effect.Effect<A, E, R>,
@@ -204,7 +210,7 @@ const accessAwareCompute = <Cfg, A, E, R>(
 	return () =>
 		load.pipe(
 			Effect.flatMap((cfg) => {
-				const dirs = unreachable(wants?.(cfg) ?? []).sort();
+				const dirs = byPath(unreachable(wants?.(cfg) ?? []));
 				const key = JSON.stringify(dirs);
 				if (key === lastAsked) return compute(cfg);
 				if (dirs.length === 0) {
@@ -343,9 +349,12 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 			...(launching
 				? {
 						holds: {
-							"game.launching": (game: GameRef) =>
+							"game.launching": (
+								game: GameRef,
+								event: EventOf<"game.launching">,
+							) =>
 								cfgService.load.pipe(
-									Effect.flatMap((cfg) => launching(game, cfg)),
+									Effect.flatMap((cfg) => launching(game, cfg, event)),
 								),
 						},
 					}

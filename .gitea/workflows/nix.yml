@@ -4,9 +4,9 @@
 # `nix build .#punktfunk-web` was broken for 553 commits before anyone noticed (see the bun-nix job
 # in ci.yml for that story).
 #
-# Three tiers, because a full `nix flake check` builds the whole Rust workspace with crane and would
-# run for an hour on every push — so the two cheap tiers gate every PR and the expensive one runs
-# only where its cost buys something (a published cache):
+# Four tiers, because a full `nix flake check` builds the whole Rust workspace with crane and would
+# run for an hour on every push — so the two cheap tiers gate every PR and the expensive ones run
+# only where their cost buys something (a VM boot, a published cache):
 #
 #   * eval  — `nix flake check --no-build`: instantiates every package, app, check and devShell
 #             without building them. Catches the failures that actually happen to this flake — a
@@ -33,6 +33,9 @@
 #             covers what the ci.yml drift gate cannot, e.g. a tarball the registry no longer
 #             serves, or the codegen going quietly message-less (see packages.nix's inlang note).
 #
+#   * vm    — `checks.<system>.nixos-vm` boots the module with the real packages and checks the
+#             user units run. It builds the host, so it runs on labelled pull requests only.
+#
 #   * cache — builds the Rust packages + gamescope, publishes every punktfunk store path to
 #             https://nix.unom.io, then moves a channel branch to the published commit:
 #               `v*` tag                     → nix-stable
@@ -49,9 +52,9 @@
 #             Only OUR paths are published — see the step for why that is both correct and the
 #             difference between ~300 MB and several GB per publish.
 #
-# The Rust packages and punktfunk-gamescope are still not built on PRs: they are the expensive ones
-# and their inputs are already gated by the `rust` job in ci.yml. Build them on a PR by hand on a
-# Nix box, or with the `build-rust` / `build-gamescope` dispatch inputs below.
+# On a PR only the vm tier builds a Rust package (the host); the client and punktfunk-gamescope are
+# the expensive ones and their inputs are already gated by the `rust` job in ci.yml. Build them on a
+# PR by hand on a Nix box, or with the `build-rust` / `build-gamescope` dispatch inputs below.
 #
 # ⚠ punktfunk-gamescope matters more than it looks: `host.gamescopeHdr` DEFAULTS TRUE, so it is on
 # the critical path of every `services.punktfunk.host.enable = true` build. It patches whatever
@@ -63,7 +66,8 @@
 # ⚠ pull_request is deliberately present. flatpak.yml shipped with push-only triggers and manifest
 # breakage reached main invisibly for weeks — do not "simplify" this workflow by dropping it.
 # ⚠ The two path lists are duplicated on purpose: a YAML anchor would be tidier, but Gitea's
-# workflow parser is not a place to bet on anchor support. Keep them in step by hand.
+# workflow parser is not a place to bet on anchor support. scripts/ci/check-workflow-paths.py
+# fails when they differ, or when a file packaging/nix or flake.nix names is not in them.
 name: nix
 
 # Per event, so a main push cannot cancel the nightly publish mid-build.
@@ -82,7 +86,29 @@ on:
       - "flake.nix"
       - "flake.lock"
       - "packaging/nix/**"
+      - "packaging/bazzite/host.env"
+      - "packaging/kde/host.env"
+      - "packaging/gamescope/build-punktfunk-gamescope.sh"
       - "packaging/linux/restart-user-units.sh"
+      - "packaging/linux/punktfunk-seat*"
+      - "packaging/linux/seat-*"
+      - "packaging/linux/*door*"
+      - "packaging/linux/65-punktfunk-seats.rules"
+      - "packaging/linux/io.unom.punktfunk*.desktop"
+      - "packaging/linux/icons/**"
+      - "scripts/60-punktfunk*"
+      - "scripts/70-punktfunk-client.rules"
+      - "scripts/headless/**"
+      - "scripts/host.env.example"
+      - "scripts/punktfunk-host-desktop-session.conf"
+      - "scripts/punktfunk-host.service"
+      - "scripts/web-init.sh"
+      - "scripts/punktfunk-web.service"
+      - "scripts/punktfunk-web-init.service"
+      - "scripts/punktfunk-scripting.service"
+      - "web/web.env.example"
+      - "web/.npmrc"
+      - "api/openapi.json"
       - "**/bun.lock"
       - "**/bun.nix"
       - "**/package.json"
@@ -96,7 +122,29 @@ on:
       - "flake.nix"
       - "flake.lock"
       - "packaging/nix/**"
+      - "packaging/bazzite/host.env"
+      - "packaging/kde/host.env"
+      - "packaging/gamescope/build-punktfunk-gamescope.sh"
       - "packaging/linux/restart-user-units.sh"
+      - "packaging/linux/punktfunk-seat*"
+      - "packaging/linux/seat-*"
+      - "packaging/linux/*door*"
+      - "packaging/linux/65-punktfunk-seats.rules"
+      - "packaging/linux/io.unom.punktfunk*.desktop"
+      - "packaging/linux/icons/**"
+      - "scripts/60-punktfunk*"
+      - "scripts/70-punktfunk-client.rules"
+      - "scripts/headless/**"
+      - "scripts/host.env.example"
+      - "scripts/punktfunk-host-desktop-session.conf"
+      - "scripts/punktfunk-host.service"
+      - "scripts/web-init.sh"
+      - "scripts/punktfunk-web.service"
+      - "scripts/punktfunk-web-init.service"
+      - "scripts/punktfunk-scripting.service"
+      - "web/web.env.example"
+      - "web/.npmrc"
+      - "api/openapi.json"
       - "**/bun.lock"
       - "**/bun.nix"
       - "**/package.json"
@@ -198,7 +246,7 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils git rsync openssh-client
 
       # Exact action revision and Determinate Nix release; container mode has no daemon.
-      - uses: DeterminateSystems/determinate-nix-action@e9bfc9148566ca239aef4f5cb968674de15c3c20 # v3.5.2
+      - uses: DeterminateSystems/determinate-nix-action@d0c908e6cbe9f89f36ed8205a3ab6f092636916a # v3.23.1
         with:
           init: none
           extra-conf: experimental-features = nix-command flakes
@@ -260,6 +308,15 @@ jobs:
           grep -q 'Bun\.serve' "$web/share/punktfunk-web/.output/server/index.mjs" \
             || { echo "installed console is not a bun bundle" >&2; exit 1; }
           echo "bun packages OK: $web  $scripting"
+
+      # The module booted in a VM with the real packages (packaging/nix/vm-test.nix). It builds the
+      # host, so on a pull request only, which means the `ci:nix-rust` label. `kvm` is declared
+      # even without /dev/kvm in the container: qemu then falls back to TCG, slower but the same test.
+      - name: Boot the NixOS module in a VM
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          "$NIX" build --print-build-logs --option extra-system-features "kvm nixos-test" \
+            .#checks.x86_64-linux.nixos-vm
 
       # ── binary cache (v* tags, nightly, dispatch on main) ─────────────────────────────────────
       #
@@ -332,7 +389,7 @@ jobs:
           build() {
             "$NIX" build --print-build-logs \
               .#punktfunk-host .#punktfunk-client .#punktfunk-tray \
-              .#punktfunk-web .#punktfunk-scripting .#punktfunk-gamescope
+              .#punktfunk-web .#punktfunk-scripting .#punktfunk-seats .#punktfunk-gamescope
           }
           # A bump that does not build (nixpkgs' gamescope moving past our patches) still publishes
           # main on the current lock, unless nix-canary already holds it; the last step then fails.
@@ -364,7 +421,7 @@ jobs:
           # "Illegal option". The two places below where a pipeline's LEFT side must be able to fail
           # the step are written as redirects instead, so nothing depends on pipefail.
           set -eu
-          PKGS=".#punktfunk-host .#punktfunk-client .#punktfunk-tray .#punktfunk-web .#punktfunk-scripting .#punktfunk-gamescope"
+          PKGS=".#punktfunk-host .#punktfunk-client .#punktfunk-tray .#punktfunk-web .#punktfunk-scripting .#punktfunk-seats .#punktfunk-gamescope"
 
           # 1) Pick what to publish. PUBLISH ONLY OUR OWN PATHS — this is the difference between
           #    ~300 MB and several GB per run, and it is not a corner cut: a runtime closure here
@@ -489,7 +546,7 @@ jobs:
       - name: Build the Rust packages (dispatch opt-in)
         if: ${{ github.event.inputs.build-rust == 'true' || github.event.inputs.build-rust == true }}
         run: |
-          "$NIX" build --print-build-logs .#punktfunk-host .#punktfunk-client
+          "$NIX" build --print-build-logs .#punktfunk-host .#punktfunk-client .#punktfunk-seats
 
       # The patched compositor. Separate from build-rust because its failure mode is different: it
       # tracks nixpkgs' gamescope, not our Rust, so it wants a run after a flake.lock bump rather

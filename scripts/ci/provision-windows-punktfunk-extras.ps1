@@ -21,6 +21,9 @@ $rustup = "C:\Users\Public\.cargo\bin\rustup.exe"
 if (Test-Path $rustup) {
   info "rustup target add aarch64-pc-windows-msvc"
   & $rustup target add aarch64-pc-windows-msvc
+  # The x86 build of pf_seat_audio.dll, for 32-bit processes in a seat (pack-host-installer.ps1).
+  info "rustup target add i686-pc-windows-msvc"
+  & $rustup target add i686-pc-windows-msvc
 } else {
   Write-Warning "rustup not found at $rustup - has unom/infra's setup-gitea-runner-base.ps1 run on this box yet?"
 }

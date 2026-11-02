@@ -4,7 +4,7 @@
 //    exact wire semantics of pyrowave_decoder.cpp's push_packet walk + the Phase-4
 //    chunk-aligned framing (4-byte window prefix, FRAG chains, zeroed missing shards).
 //
-// 2. Golden-frame PSNR tests (Metal GPU): host-encoded fixtures (crates/punktfunk-host
+// 2. Golden-frame PSNR tests (Metal GPU): host-encoded fixtures (crates/host/punktfunk-host
 //    encode/linux/pyrowave.rs `pyrowave_dump_golden`, run on a Vulkan box) decoded by the
 //    Metal port and PSNR-matched against upstream's own decoder output. Float wavelet math is
 //    not bit-exact across implementations (upstream ships precision variants), so the gate is
@@ -16,6 +16,19 @@ import Metal
 import XCTest
 
 @testable import PunktfunkKit
+
+extension WaveletBitstream {
+    /// `parse` of a standalone AU: copied into scratch memory whose word 0 is the AU's start,
+    /// with the pool's slack after it.
+    static func parse(au: Data, chunkAligned: Bool, windowSize: Int) -> ParsedWaveletFrame? {
+        var scratch = [UInt8](au) + [UInt8](repeating: 0, count: WaveletAccessUnitPool.slackBytes)
+        return scratch.withUnsafeMutableBufferPointer { raw -> ParsedWaveletFrame? in
+            parse(
+                base: raw.baseAddress!, count: au.count, wordBase: 0,
+                chunkAligned: chunkAligned, windowSize: windowSize)
+        }
+    }
+}
 
 final class PyroWaveParserTests: XCTestCase {
     // 256x144 → aligned 256x160; block space identical to the committed fixtures.
@@ -96,10 +109,12 @@ final class PyroWaveParserTests: XCTestCase {
         XCTAssertEqual(frame.layout.width, width)
         XCTAssertEqual(frame.totalBlocks, 4)
         XCTAssertEqual(frame.decodedBlocks, 3)
-        XCTAssertEqual(frame.offsets[0], 0)
-        XCTAssertEqual(frame.offsets[3], 2) // u32 words: each header-only packet is 2 words
+        // Offsets are where the packets lie: u32 words after the 2-word SOF, each header-only
+        // packet 2 words; the duplicate at word 6 is ignored.
+        XCTAssertEqual(frame.offsets[0], 2)
+        XCTAssertEqual(frame.offsets[3], 4)
+        XCTAssertEqual(frame.offsets[layout.blockCount32 - 1], 8)
         XCTAssertEqual(frame.offsets[1], UInt32.max)
-        XCTAssertEqual(frame.payload.count, 6)
         XCTAssertFalse(frame.bt2020)
         XCTAssertFalse(frame.fullRange) // range bit 1 = LIMITED
     }
@@ -139,9 +154,24 @@ final class PyroWaveParserTests: XCTestCase {
         let frame = try XCTUnwrap(
             WaveletBitstream.parse(au: Data(au), chunkAligned: true, windowSize: size))
         XCTAssertEqual(frame.decodedBlocks, 3)
-        XCTAssertEqual(frame.offsets[0], 0)
-        XCTAssertEqual(frame.offsets[2], 2)
-        XCTAssertEqual(frame.offsets[1], 4)
+        // Packed packets are read where they lie (window prefix 4 B, the SOF 8 B); the FRAG
+        // chain closes up where its first piece lies.
+        XCTAssertEqual(frame.offsets[0], 3)
+        XCTAssertEqual(frame.offsets[1], UInt32(4 * size + 4) / 4)
+        XCTAssertEqual(frame.offsets[2], UInt32(size + 4) / 4)
+    }
+
+    func testOddWindowsSlideIntoTheirPrefix() throws {
+        // 66 is 2 mod 4: the second window's body lies off alignment and moves 2 bytes back.
+        let size = 66
+        var au = window(sof(totalBlocks: 3) + packet(blockIndex: 0), kind: 0, size: size)
+        au += window(packet(blockIndex: 1), kind: 0, size: size)
+        au += window(packet(blockIndex: 2), kind: 0, size: size)
+        let frame = try XCTUnwrap(
+            WaveletBitstream.parse(au: Data(au), chunkAligned: true, windowSize: size))
+        XCTAssertEqual(frame.decodedBlocks, 3)
+        XCTAssertEqual(frame.offsets[1], UInt32(size + 2) / 4)
+        XCTAssertEqual(frame.offsets[2], UInt32(2 * size + 4) / 4)
     }
 
     func testBrokenFragChainIsDiscarded() throws {

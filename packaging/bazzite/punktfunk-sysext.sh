@@ -5,9 +5,9 @@
 # transaction, needs no reboot, and is trivially removable).
 #
 # The image overlays /usr from /var/lib/extensions/punktfunk.raw with the host, tray and web
-# console + their udev/sysctl/systemd-user payload; the RPMs' two /etc files (gamescope
-# session drop-in, tray autostart) ride inside at /usr/share/punktfunk/etc/ and are copied
-# into the real /etc here (a sysext can only carry /usr).
+# console + their udev/sysctl/systemd-user payload; the RPMs' /etc file (the gamescope
+# session drop-in) rides inside at /usr/share/punktfunk/etc/ and is copied into the real /etc
+# here (a sysext can only carry /usr).
 #
 # Bootstrap (the script also ships inside the image as /usr/bin/punktfunk-sysext):
 #   curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh
@@ -33,7 +33,7 @@
 # feed it fetched, or whose SERIAL is below the highest this box has accepted. Without both, anyone
 # who can write the registry WITHOUT the key (a leaked write:package token) copies the canary
 # manifest + images into the stable path, or puts last month's back, and every box verifies it
-# happily. Same two rules the Rust updater enforces (crates/pf-update-check/src/manifest.rs).
+# happily. Same two rules the Rust updater enforces (crates/core/pf-update-check/src/manifest.rs).
 set -euo pipefail
 
 REGISTRY="${PUNKTFUNK_SYSEXT_REGISTRY:-https://git.unom.io/api/packages/unom/generic/punktfunk-sysext}"
@@ -83,7 +83,7 @@ feed_name() {
 feed_url() { echo "$REGISTRY/$(feed_name)"; }
 
 # The highest manifest serial ever accepted for a feed — the anti-rollback floor, persisted the way
-# the Rust updater persists its own per-channel `serial_floor` (crates/punktfunk-host/src/update.rs).
+# the Rust updater persists its own per-channel `serial_floor` (crates/host/punktfunk-host/src/update.rs).
 # Per FEED, never global: serials are publish timestamps, so a canary publish would otherwise raise
 # the floor above the next stable manifest and lock the stable channel out.
 serial_floor() {
@@ -209,13 +209,20 @@ post_merge() {
     echo "!! (an OS release the image doesn't match? 'punktfunk-sysext update' fetches the right one)" >&2
     return 1
   fi
-  # What the RPM scriptlets would have done: pick up the uinput/uhid rule + the UDP buffer
-  # sysctl now, no reboot (both also auto-apply at boot once merged — the files live in /usr/lib).
-  udevadm control --reload 2>/dev/null || :
-  udevadm trigger --subsystem-match=misc 2>/dev/null || :
-  for f in /usr/lib/sysctl.d/99-punktfunk-net.conf /usr/lib/sysctl.d/99-punktfunk-client-net.conf; do
-    [ -f "$f" ] && sysctl -q -p "$f" 2>/dev/null || :
-  done
+  # The host state every package format shares: groups, udev, sysctl, the seat directories, the
+  # ds_inhibit SELinux module, firewall notes. An image older than that helper carries the same
+  # steps in its own copy of this script.
+  if [ -x /usr/libexec/punktfunk/post-install ]; then
+    /usr/libexec/punktfunk/post-install
+  else
+    /usr/bin/punktfunk-sysext reapply || :
+  fi
+  if [ -f /usr/lib/sysctl.d/99-punktfunk-client-net.conf ]; then
+    sysctl -q -p /usr/lib/sysctl.d/99-punktfunk-client-net.conf 2>/dev/null || :
+  fi
+  # polkitd keeps the rules it read at boot and misses a merge swapping /usr under it, so a rule
+  # an update adds (the door switch's) refuses until reboot. Restarting it rereads them.
+  systemctl try-restart polkit.service 2>/dev/null || :
   # vhci-hcd: the usbip transport that makes the virtual Steam Deck pad a real USB device Steam
   # Input adopts. Without it the pad falls back to plain UHID hid-steam, which Steam Input won't
   # promote (Interface: -1) — so on a host in Game Mode the controller never appears and you can't
@@ -231,17 +238,9 @@ post_merge() {
   # (re)apply now, no reboot, for this session.
   install -Dm0644 /usr/lib/modules-load.d/punktfunk.conf /etc/modules-load.d/punktfunk.conf 2>/dev/null || :
   install -Dm0644 /usr/lib/udev/rules.d/60-punktfunk.rules /etc/udev/rules.d/60-punktfunk.rules 2>/dev/null || :
+  # The seats' pad fence, for the same reason: a pad made after boot must meet the rule.
+  install -Dm0644 /usr/lib/udev/rules.d/65-punktfunk-seats.rules /etc/udev/rules.d/65-punktfunk-seats.rules 2>/dev/null || :
   udevadm control --reload 2>/dev/null || :
-  # The (empty) opt-in group for web-console-triggered updates (the sysext ships the pf-update
-  # helper + unit + polkit rule in its /usr; the group can't ride an image) — nobody is auto-added.
-  getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || :
-  # 'punktfunk' owns the vhci attach/detach nodes the rule we just mirrored into /etc chgrp's to.
-  # A group cannot ride an image either (/etc/group is host state), and the deb/rpm scriptlets that
-  # would normally create it never run on an image-based install — so without this the chgrp fails,
-  # attach/detach stay root-only and the virtual Steam Deck pad never attaches. Deliberately NOT
-  # 'input': writing 'attach' materialises an arbitrary emulated USB device (review 2026-08-05 M-4),
-  # so it stays a group users join on purpose — see `ujust add-user-to-input-group` for the other one.
-  getent group punktfunk >/dev/null 2>&1 || groupadd --system punktfunk 2>/dev/null || :
   # Creating the group is necessary but NOT sufficient, and the difference is invisible until a
   # stream fails: `pf-dm-helper` gates on MEMBERSHIP, so a host whose user never joined gets
   # "stopping the display manager needs privilege" on every managed takeover — sddm's autologin
@@ -267,33 +266,15 @@ post_merge() {
   # Re-fire the vhci rule against the (possibly already-present) controller so attach/detach pick up
   # the input-group ownership even when the module's original add event predated the reloaded rule.
   udevadm trigger --subsystem-match=platform --sysname-match='vhci_hcd.*' 2>/dev/null || :
-  # ds_inhibit dontaudit drop-in (Bazzite ships steamos-manager; keyed on its binary): Valve's
-  # ds_inhibit walks /proc/*/fd on every open/close of a hid-playstation hidraw — exactly what the
-  # virtual DualSense is — and SELinux denies steamos_manager_t that walk at ~324 AVCs/sec;
-  # setroubleshootd amplifies the flood into a box-wide stall that starves the stream (gamescope
-  # 0 fps, encode submit ~150 ms/frame). The policy STORE is host state (/var/lib/selinux), so the
-  # image carries only the CIL source and the module must be inserted here. Keyed on the module
-  # NAME for idempotence (a policy rebuild costs seconds every merge otherwise — if the rules ever
-  # change, RENAME the file and every reference so existing installs converge). Rationale and the
-  # dontaudit-vs-allow choice: the .cil header / packaging/bazzite/README.md.
-  if command -v semodule >/dev/null 2>&1 && [ -e /usr/lib/steamos-manager ] \
-     && [ -f /usr/share/punktfunk/selinux/punktfunk-ds-inhibit.cil ] \
-     && ! semodule -l 2>/dev/null | grep -qx punktfunk-ds-inhibit; then
-    echo "installing SELinux drop-in 'punktfunk-ds-inhibit' (silences the steamos-manager ds_inhibit audit flood)…"
-    semodule -i /usr/share/punktfunk/selinux/punktfunk-ds-inhibit.cil \
-      || echo "!! semodule -i failed — the ds_inhibit audit flood stays live; see packaging/bazzite/README.md" >&2
-  fi
   # The /etc payload a sysext can't carry. The gamescope-session drop-in is %config(noreplace):
-  # only seed it, never clobber a local edit. The tray autostart entry is not user config.
+  # only seed it, never clobber a local edit. Older images also copied a global tray autostart
+  # entry; the host now writes a per-user one.
   if [ -f "$ETC_SRC/gamescope-session-plus/sessions.d/steam" ] \
      && [ ! -e /etc/gamescope-session-plus/sessions.d/steam ]; then
     install -Dm0644 "$ETC_SRC/gamescope-session-plus/sessions.d/steam" \
       /etc/gamescope-session-plus/sessions.d/steam
   fi
-  if [ -f "$ETC_SRC/xdg/autostart/io.unom.Punktfunk.Tray.desktop" ]; then
-    install -Dm0644 "$ETC_SRC/xdg/autostart/io.unom.Punktfunk.Tray.desktop" \
-      /etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop
-  fi
+  rm -f /etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop
 }
 
 # do_install VERSION FILENAME SHA256 | do_install --from-file X.raw
@@ -361,9 +342,12 @@ EOF
 }
 
 # A console left running after the merge serves the old build's asset names, which /usr no longer has.
-# SUDO_USER is the person who ran this. The in-console updater runs it from a root unit without one
-# and restarts all three itself once the helper returns. try-restart leaves an opted-out runner off.
+# The door's units restart as the RPM's do. SUDO_USER is the person who ran this. The in-console
+# updater runs it from a root unit without one and restarts all three itself once the helper returns.
+# try-restart leaves an opted-out runner off.
 restart_user_units() {
+  systemctl --no-block try-restart punktfunk-seats.service punktfunk-door.service \
+    punktfunk-web-door.service 2>/dev/null || :
   if [ -n "${SUDO_USER:-}" ] \
      && systemctl --user -M "$SUDO_USER@" try-restart punktfunk-web.service punktfunk-host.service; then
     systemctl --user -M "$SUDO_USER@" try-restart punktfunk-scripting.service 2>/dev/null || true

@@ -1,39 +1,29 @@
-// punktfunk virtual DualSense / DualShock 4 / DualSense Edge — UMDF2 HID minidriver.
-//
-// A Rust port of the WDK `vhidmini2` UMDF2 sample, reconfigured to present a Sony DualSense
-// (VID 054C / PID 0CE6), DualShock 4 (device_type=1), DualSense Edge (device_type=2), Steam Deck
-// (device_type=3), Xbox Wireless Controller (device_type=4, VID 045E / PID 0B13), Xbox One S
-// (device_type=5, 045E / 02FD) or Xbox Elite Wireless Controller Series 2 (device_type=6,
-// 045E / 0B22) using the
-// report descriptors + feature blobs punktfunk already ships in `inject/`. Games see a genuine
-// HID PS controller; the host streams input in / reads output (rumble/lightbar/triggers) back.
-//
-// No WDF object contexts: this is a singleton virtual device, so per-device state lives in statics.
-// The host channel is the **sealed pad channel** (design/gamepad-channel-sealing.md, proto v2): the
-// whole handshake + all shared-memory access lives in `pf_umdf_util` (the audited unsafe layer), so
-// this crate's channel/HID/IOCTL logic is 100% SAFE Rust. The only `unsafe` here is the unavoidable
-// WDF setup FFI in DriverEntry/EvtDeviceAdd/the timer, each with a `// SAFETY:` proof.
+//! punktfunk virtual gamepad — UMDF2 HID minidriver, a port of the WDK `vhidmini2` sample.
+//!
+//! One driver presents the pad the host's `device_type` stamp names, answering from that kind's
+//! row in `pf_driver_proto::pad_kind` and the feature blobs the host's `inject/` ships. The
+//! host streams input in and reads output (rumble, lightbar, triggers) back.
+//!
+//! A singleton virtual device: no WDF object contexts, per-device state lives in statics.
+//! The host channel is the sealed pad channel (design/gamepad-channel-sealing.md); its unsafe
+//! surface lives in `pf_umdf_util`, so the only `unsafe` here is WDF setup FFI.
 
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
-// Every remaining `unsafe {}` (all WDF setup FFI) must carry a `// SAFETY:` proof.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use pf_driver_proto::gamepad::{
-    DEVTYPE_8BITDO_PRO2, DEVTYPE_8BITDO_PRO3, DEVTYPE_8BITDO_ULTIMATE2, DEVTYPE_HORIPAD_STEAM,
-    DEVTYPE_JOYCON_LEFT, DEVTYPE_JOYCON_RIGHT, DEVTYPE_STEAMDECK, PadShm, pad_serial,
+    DEVTYPE_STEAMCONTROLLER, DEVTYPE_STEAMDECK, DEVTYPE_TRITON, PadShm, pad_serial,
 };
-use pf_driver_proto::switch::is_switch;
-use pf_driver_proto::{deck, dualsense, dualshock4};
-use pf_driver_proto::{eightbitdo, hori};
+use pf_driver_proto::pad_kind::{Family, PadKind, pad_kind, served_kind};
+use pf_driver_proto::{deck, dualsense, dualshock4, eightbitdo};
 use pf_umdf_util::channel::{ChannelClient, ChannelConfig};
 use pf_umdf_util::hid::{
     IOCTL_HID_GET_DEVICE_ATTRIBUTES, IOCTL_HID_GET_DEVICE_DESCRIPTOR,
     IOCTL_HID_GET_REPORT_DESCRIPTOR, IOCTL_HID_GET_STRING, IOCTL_HID_READ_REPORT,
     IOCTL_HID_WRITE_REPORT, IOCTL_UMDF_HID_GET_FEATURE, IOCTL_UMDF_HID_GET_INPUT_REPORT,
-    IOCTL_UMDF_HID_SET_FEATURE, IOCTL_UMDF_HID_SET_OUTPUT_REPORT, declared_len, hex_dump,
-    string_request_id,
+    IOCTL_UMDF_HID_SET_FEATURE, IOCTL_UMDF_HID_SET_OUTPUT_REPORT, hex_dump, string_request_id,
 };
 use pf_umdf_util::skeleton::{
     self, STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS,
@@ -46,265 +36,20 @@ use wdk_sys::{
     call_unsafe_wdf_function_binding,
 };
 
-// ---- DualSense identity ----
-const DS_VID: u16 = 0x054C;
-const DS_PID: u16 = 0x0CE6;
-const DS_VER: u16 = 0x0100;
-/// DualShock 4 v2 product id — served (same VID/version) when the host stamps device_type=1.
-const DS4_PID: u16 = 0x09CC;
-/// DualSense Edge product id — served (same VID/version) when the host stamps device_type=2.
-const DS_EDGE_PID: u16 = 0x0DF2;
-/// The Steam Deck controller identity (Valve 28DE:1205), served when the host stamps
-/// device_type=3. Started as the N4 spike (gamepad-new-types §6) answering "does Steam Input on
-/// Windows promote a software-devnode HID Deck?"; it is now a shipping identity — every Steam Deck
-/// CLIENT streaming to a Windows host declares it, and `steam_deck_windows` builds the pad.
-const DECK_VID: u16 = 0x28DE;
-const DECK_PID: u16 = 0x1205;
-/// Steam Controller 2 ("Triton", 28DE:1302 wired), served when the host stamps device_type=7 —
-/// same Valve VID as the Deck.
-const TRITON_PID: u16 = 0x1302;
-/// bcdDevice of the real wired Triton (Phase-0 bench capture). Unlike the Deck we do NOT borrow
-/// `DS_VER` here: 0x0307 is the captured value, and the whole point of this identity is fidelity
-/// to the capture.
-const TRITON_VER: u16 = 0x0307;
-/// Nintendo Switch Pro Controller, wired, served when the host stamps device_type=8. bcdDevice
-/// 2.00, as the Linux UHID pad presents it.
-const SWITCH_VID: u16 = 0x057E;
-const SWITCH_PID: u16 = 0x2009;
-const SWITCH_VER: u16 = 0x0200;
-
-// ---- Xbox identities (device_type = 4 Wireless / 5 One S / 6 Elite Series 2) ----
-//
-// WHY THIS EXISTS (field 2026-08-09, `punktfunk-field-windows-pad-dead-0260`): the OTHER Windows
-// Xbox backend — `pf-xusb` — registers ONLY `GUID_DEVINTERFACE_XUSB` and has no HID collection at
-// all, so it is invisible to Steam's hidapi enumeration, to DirectInput, to `joy.cpl`, and to
-// WGI/GameInput. Only classic `XInputGetState` via xinput1_4's interface walk ever sees it. A
-// reporter spent two weeks on a dead controller for exactly that reason, and switching the client
-// to DualSense — a REAL HID pad through this driver — fixed it instantly. This identity gives the
-// Xbox pad the same HID footing the PlayStation ones have always had.
-//
-// ⚠️⚠️ **The VID/PID is a BLUETOOTH Xbox controller on purpose.** The wired ids the rest of the
-// tree uses (`045E:028E` X-Box 360, `045E:02EA` Xbox One S USB) are vendor-class XUSB/GIP devices —
-// they expose NO HID interface on real hardware, so a HID child claiming one is a device that has
-// never existed and inbox promotion has nothing to match. The Xbox pads that genuinely ARE HID are
-// the Bluetooth ones, which Windows binds through HIDCLASS.
-const XBOX_VID: u16 = 0x045E;
-/// Xbox Wireless Controller (Series X|S), Bluetooth — `device_type = 4`, the default Xbox identity.
-/// Chosen over the Xbox One S BT id `0x02FD` because the host's OS floor is Windows 11 22H2, where
-/// this is the current-generation identity (so glyphs read "Xbox Series") and SDL's mapping
-/// database covers it.
-///
-/// ⭐ It is also the PID Microsoft's own `xinputhid.inf` allow-lists **twice** (once as a
-/// `BTHLEDevice` stage-1 id, once as a plain `HID\…&IG_00` stage-2 id) — measured off `.173`,
-/// 2026-08-09. That is not what promotes OUR pad (a software devnode matches no allow-list entry;
-/// `pfGamepadXbox`'s `AddReg` writes what the matching sections would have written), but it is why
-/// this stays the default of the three.
-const XBOX_PID: u16 = 0x0B13;
-/// Xbox One S controller over Bluetooth — `device_type = 5`.
-///
-/// ⚠️ **`02FD` appears in `xinputhid.inf` only as a `BTHENUM` (classic-BT bus) id — it has NO
-/// stage-2 `HID\…&IG_00` model line.** That killed it as a "try another PID" lever for the
-/// promotion work (handoff §4 B1). It does not block it as an IDENTITY, because our promotion
-/// comes from the INF's own `AddReg` rather than from matching Microsoft's list — but if a future
-/// Windows servicing update makes promotion depend on the allow-list again, this identity is the
-/// one that loses it first. Worth re-measuring on glass before recommending it to anyone.
-const XBOX_PID_ONE_S: u16 = 0x02FD;
-/// Xbox Elite Wireless Controller Series 2 — `device_type = 6`. This is the pad
-/// `tools/hid-descriptor-dump` captured on `.173` (`BTHLE\DEV_686CE647F191`, `REV_0521`), so it is
-/// the one identity here whose real hardware we have measured directly.
-const XBOX_PID_ELITE2: u16 = 0x0B22;
-/// bcdDevice for every Xbox identity.
-///
-/// Deliberately ONE value rather than per-identity: the real Elite reports `REV_0521` (measured on
-/// `.173`) but `create_swdevice` synthesizes the devnode's USB ids with a hardcoded `&REV_0100`
-/// regardless, and SDL folds the version into its joystick GUID — so a version that disagrees with
-/// the devnode buys nothing and risks missing a stock mapping. Revisit only with a measurement
-/// that shows a consumer keying on it.
-const XBOX_VER: u16 = 0x0407;
-
-// DualSense, DualShock 4, Edge and Deck report descriptors and feature blobs:
-// `pf_driver_proto::{dualsense, dualshock4, deck}`, the tables the Linux pads serve too.
-
-// HID descriptor (9 bytes, packed): len, type=0x21, bcdHID=0x0100, country=0, numDesc=1, then
-// {reportType=0x22, wReportLength}. DualSense = 273 (0x0111); DualShock 4 = 507 (0x01FB);
-// DualSense Edge = 389 (0x0185).
-static HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x11, 0x01];
-static DS4_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xFB, 0x01];
-static EDGE_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x85, 0x01];
-static DECK_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x26, 0x00]; // 38 bytes
-// Xbox Series (4) and One S / Elite (5, 6): `pf_driver_proto::xbox`.
-static XBOX_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xF8, 0x00]; // 248 bytes
-static XBOX_NO_SHARE_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xDF, 0x00]; // 223
-// bcdHID 0x0111 (bytes 2-3) is the real capture's value — the other identities declare
-// 0x0100; declared_len never reads it, this is deliberate identity fidelity.
-static TRITON_HID_DESC: [u8; 9] = [0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x74, 0x01]; // 372 bytes
-static SWITCH_HID_DESC: [u8; 9] = [0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0xDD, 0x00]; // 221 bytes
-
-/// `HID_DESCRIPTOR` (bcdHID 0x0100, one report descriptor) for a written descriptor, sized from it.
-const fn hid_desc(rdesc_len: usize) -> [u8; 9] {
-    let len = (rdesc_len as u16).to_le_bytes();
-    [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, len[0], len[1]]
-}
-static EIGHTBITDO_HID_DESC: [u8; 9] = hid_desc(eightbitdo::RDESC_WITH_PROOF.len());
-static EIGHTBITDO_CAPS_HID_DESC: [u8; 9] = hid_desc(eightbitdo::RDESC_CAPS_WITH_PROOF.len());
-static HORI_HID_DESC: [u8; 9] = hid_desc(hori::RDESC_WITH_PROOF.len());
-
-// Each `wReportLength` above restates its descriptor's length. hidclass reads that many bytes and
-// parses what it got, so a mismatch silently enumerates a truncated descriptor or nothing. These
-// asserts stop a descriptor edit from building until its length follows.
-const _: () = assert!(declared_len(&HID_DESC) == dualsense::RDESC.len());
-const _: () = assert!(declared_len(&DS4_HID_DESC) == dualshock4::RDESC.len());
-const _: () = assert!(declared_len(&EDGE_HID_DESC) == dualsense::EDGE_RDESC.len());
-const _: () = assert!(declared_len(&DECK_HID_DESC) == deck::RDESC.len());
-const _: () = assert!(declared_len(&XBOX_HID_DESC) == pf_driver_proto::xbox::SERIES_RDESC.len());
-const _: () =
-    assert!(declared_len(&XBOX_NO_SHARE_HID_DESC) == pf_driver_proto::xbox::NO_SHARE_RDESC.len());
-const _: () = assert!(declared_len(&TRITON_HID_DESC) == pf_driver_proto::triton::RDESC.len());
-const _: () =
-    assert!(declared_len(&SWITCH_HID_DESC) == pf_driver_proto::switch::RDESC_WITH_PROOF.len());
-
-// HID_DEVICE_ATTRIBUTES (32 bytes): Size(u32)=32, VendorID, ProductID, VersionNumber, Reserved[11].
-// VID/PID come from `identity_vid_pid`, the table the host checks the pad against. A section value
-// this build does not know keeps the DualSense answer.
-fn hid_attrs(devtype: u8) -> [u8; 32] {
-    let ver = match devtype {
-        4..=6 => XBOX_VER,
-        7 => TRITON_VER,
-        8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => SWITCH_VER,
-        DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_HORIPAD_STEAM => 0x0100,
-        _ => DS_VER,
-    };
-    let (vid, pid) =
-        pf_driver_proto::gamepad::identity_vid_pid(devtype).unwrap_or((DS_VID, DS_PID));
-    // The identity constants above document each id; the shared table must agree with them.
-    const _: () = {
-        use pf_driver_proto::gamepad::identity_vid_pid as id;
-        assert!(matches!(id(0), Some((DS_VID, DS_PID))));
-        assert!(matches!(id(1), Some((DS_VID, DS4_PID))));
-        assert!(matches!(id(2), Some((DS_VID, DS_EDGE_PID))));
-        assert!(matches!(id(3), Some((DECK_VID, DECK_PID))));
-        assert!(matches!(id(4), Some((XBOX_VID, XBOX_PID))));
-        assert!(matches!(id(5), Some((XBOX_VID, XBOX_PID_ONE_S))));
-        assert!(matches!(id(6), Some((XBOX_VID, XBOX_PID_ELITE2))));
-        assert!(matches!(id(7), Some((DECK_VID, TRITON_PID))));
-        assert!(matches!(id(8), Some((SWITCH_VID, SWITCH_PID))));
-    };
+/// `HID_DEVICE_ATTRIBUTES` (32 bytes): Size, VendorID, ProductID, VersionNumber, Reserved[11].
+fn hid_attrs(kind: &PadKind) -> [u8; 32] {
     let mut a = [0u8; 32];
     a[0..4].copy_from_slice(&32u32.to_le_bytes());
-    a[4..6].copy_from_slice(&vid.to_le_bytes());
-    a[6..8].copy_from_slice(&pid.to_le_bytes());
-    a[8..10].copy_from_slice(&ver.to_le_bytes());
+    a[4..6].copy_from_slice(&kind.vid.to_le_bytes());
+    a[6..8].copy_from_slice(&kind.pid.to_le_bytes());
+    a[8..10].copy_from_slice(&kind.version.to_le_bytes());
     a
-}
-
-/// Bytes to hand a pended `IOCTL_HID_READ_REPORT` or `GET_INPUT_REPORT`: the input length the
-/// identity's descriptor declares, id byte included.
-///
-/// [`Request::copy_to_output`] refuses a source longer than hidclass's buffer rather than
-/// truncating, so serving the 64-byte slot to a shorter report fails every read. PlayStation and
-/// Deck declare 64. Xbox declares 17 (Series) or 16 (One S, Elite). The Triton's `evt_timer` path
-/// trims per report id; this arm only sizes its `GET_INPUT_REPORT`, to the largest report (0x42).
-fn input_report_len(devtype: u8) -> usize {
-    match devtype {
-        4..=6 => pf_driver_proto::xbox::input_len(devtype),
-        // = `triton::input_len(0x42)`, the largest input the 372-byte descriptor declares.
-        7 => 54,
-        DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => eightbitdo::REPORT_LEN,
-        _ => 64,
-    }
-}
-
-// Neutral DualSense input report 0x01 (64 bytes): sticks centered (0x80), triggers 0, dpad neutral (8).
-const NEUTRAL_REPORT: [u8; 64] = {
-    let mut r = [0u8; 64];
-    r[0] = 0x01; // report id
-    r[1] = 0x80; // LX
-    r[2] = 0x80; // LY
-    r[3] = 0x80; // RX
-    r[4] = 0x80; // RY
-    // r[5]=L2, r[6]=R2 = 0; r[7] = seq counter = 0
-    r[8] = 0x08; // buttons[0]: low nibble = dpad hat (8 = neutral), high nibble = face buttons (0)
-    // Touch contacts lifted (bit 7). SDL keys touch on that bit alone, so a zero byte is a
-    // finger held at (0, 0) until the host attaches.
-    r[33] = 0x80;
-    r[37] = 0x80;
-    // The rest of a USB pad at rest, as pf-inject's `serialize_state` writes it: IMU temperature,
-    // no trigger effect (zone 9), charge complete, USB data + power.
-    r[32] = 0x14;
-    r[42] = 0x09;
-    r[43] = 0x09;
-    r[53] = 0x2A;
-    r[54] = 0x18;
-    r
-};
-// Neutral DualShock 4 input report 0x01: sticks centered (0x80); the dpad hat is in byte 5 (low
-// nibble), so a neutral hat (8) lands there instead of byte 8.
-const DS4_NEUTRAL_REPORT: [u8; 64] = {
-    let mut r = [0u8; 64];
-    r[0] = 0x01; // report id
-    r[1] = 0x80; // LX
-    r[2] = 0x80; // LY
-    r[3] = 0x80; // RX
-    r[4] = 0x80; // RY
-    r[5] = 0x08; // buttons[0]: low nibble = dpad hat (8 = neutral), high nibble = face buttons (0)
-    r[30] = 0x1B; // status: cable + battery 11 = wired, full — zero reads as 0 % on battery
-    r[33] = 1; // one touch frame, both contacts lifted (bit 7) — see NEUTRAL_REPORT
-    r[35] = 0x80;
-    r[39] = 0x80;
-    r
-};
-// Neutral Steam Deck input frame (unnumbered): header [0x01, 0x00, ID_CONTROLLER_DECK_STATE=0x09,
-// length 64], everything released. SDL drops a Deck frame whose length byte is not 64.
-const DECK_NEUTRAL_REPORT: [u8; 64] = {
-    let mut r = [0u8; 64];
-    r[0] = 0x01;
-    r[2] = 0x09;
-    r[3] = 0x40;
-    r
-};
-// Neutral Xbox input report 0x01: both sticks centred (0x8000 on a 0..65535 axis), triggers 0,
-// hat 0 (the descriptor's NULL state — the logical range starts at 1), no buttons or Share held.
-// Only the first [`input_report_len`] bytes are ever served.
-const XBOX_NEUTRAL_REPORT: [u8; 64] = {
-    let mut r = [0u8; 64];
-    r[0] = 0x01; // report id
-    r[2] = 0x80; // LX = 0x8000 (little-endian)
-    r[3] = 0xFF; // LY = 0x7FFF — the Y axes are INVERTED (+y is up on the wire, down in HID),
-    r[4] = 0x7F; //   and mirroring an even-sized range centres one unit low. See `xbox_proto`.
-    r[6] = 0x80; // RX = 0x8000
-    r[7] = 0xFF; // RY = 0x7FFF
-    r[8] = 0x7F;
-    r
-};
-// Neutral wired-Triton 0x42 state report: id + an all-zero payload — the same canned shape the
-// host's `neutral_triton_report` (triton_windows.rs) seeds the section with. `static`, not
-// `const` like its siblings, so the timer's completion path can serve
-// `&TRITON_NEUTRAL_REPORT[..54]` as a `'static` slice (a const would borrow a temporary).
-static TRITON_NEUTRAL_REPORT: [u8; 64] = {
-    let mut r = [0u8; 64];
-    r[0] = 0x42; // ID_CONTROLLER_STATE, the wired Triton's input state report
-    r
-};
-fn neutral_report(devtype: u8) -> [u8; 64] {
-    match devtype {
-        1 => DS4_NEUTRAL_REPORT,
-        3 => DECK_NEUTRAL_REPORT,
-        // One S and Elite serve its first 16 bytes; Series adds a zero Share byte.
-        4..=6 => XBOX_NEUTRAL_REPORT,
-        7 => TRITON_NEUTRAL_REPORT,
-        dt @ (8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT) => {
-            pf_driver_proto::switch::neutral_report(dt)
-        }
-        DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => eightbitdo::NEUTRAL_REPORT,
-        DEVTYPE_HORIPAD_STEAM => hori::NEUTRAL_REPORT,
-        _ => NEUTRAL_REPORT, // DualSense and Edge share the report 0x01 shape
-    }
 }
 
 static MANUAL_QUEUE: AtomicPtr<WDFQUEUE__> = AtomicPtr::new(core::ptr::null_mut());
 /// The latest input report the host pushed (report `0x01`) via shared memory; the timer delivers it
 /// to pended game READ_REPORTs. Defaults to neutral until the host connects.
-static INPUT_REPORT: std::sync::Mutex<[u8; 64]> = std::sync::Mutex::new(NEUTRAL_REPORT);
+static INPUT_REPORT: std::sync::Mutex<[u8; 64]> = std::sync::Mutex::new(dualsense::NEUTRAL_REPORT);
 /// Whether [`INPUT_REPORT`] holds a value no pended READ_REPORT has been completed with yet. Set
 /// only when the latch actually CHANGES, cleared only when a request is actually completed, so a
 /// tick that finds no read pended leaves the report undelivered rather than losing it. Consulted
@@ -567,10 +312,8 @@ static RING_PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The sealed-channel client (per-pad: `ProcessSharingDisabled` gives each pad its own WUDFHost, so
 /// this static is per-pad). The handshake/adoption/validation state machine lives in `pf_umdf_util`.
 static CHANNEL: ChannelClient = ChannelClient::new();
-/// The last observed `device_type` (0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge,
-/// 3 = Steam Deck, 4 = Xbox Wireless, 5 = Xbox One S, 6 = Xbox Elite Series 2,
-/// 7 = Steam Controller 2 ("Triton")) — the neutral-report shape when the channel detaches,
-/// and the fallback identity while unattached.
+/// The last observed `device_type`: the neutral-report shape when the channel detaches, and the
+/// fallback identity while unattached.
 static LAST_DEVTYPE: AtomicU32 = AtomicU32::new(0);
 /// The identity resolved from the devnode's PnP hardware ids at `EvtDeviceAdd`
 /// ([`pf_driver_proto::gamepad::devtype_from_hwids`]); `u32::MAX` = not resolved. See
@@ -701,6 +444,21 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         }
     }
 
+    let pnp = pad_kind(PNP_DEVTYPE.load(Ordering::Relaxed) as u8).map(|k| k.family);
+    if matches!(pnp, Some(Family::Triton | Family::SteamController)) {
+        // SAFETY: `device` is the live device just created — the exact contract this fn requires.
+        let blob = unsafe {
+            wdf::query_binary_property(
+                device,
+                pf_driver_proto::triton::IDENTITY_PROPKEY_FMTID,
+                pf_driver_proto::triton::IDENTITY_PROPKEY_PID,
+            )
+        };
+        if let Ok(mut g) = MIRROR_IDENTITY.lock() {
+            *g = blob.unwrap_or_default();
+        }
+    }
+
     // Default parallel queue handling all IOCTLs.
     // SAFETY: `device` is the live device just created.
     if let Err(st) = unsafe { skeleton::create_default_queue(device, Some(evt_io_device_control)) }
@@ -760,50 +518,26 @@ extern "C" fn evt_io_device_control(
     }
 
     let status: NTSTATUS = match ioctl {
-        IOCTL_HID_GET_DEVICE_DESCRIPTOR => request.copy_to_output(match device_type() {
-            1 => &DS4_HID_DESC,
-            2 => &EDGE_HID_DESC,
-            3 => &DECK_HID_DESC,
-            4 => &XBOX_HID_DESC,
-            5 | 6 => &XBOX_NO_SHARE_HID_DESC,
-            7 => &TRITON_HID_DESC,
-            8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => &SWITCH_HID_DESC,
-            DEVTYPE_8BITDO_ULTIMATE2 => &EIGHTBITDO_HID_DESC,
-            DEVTYPE_8BITDO_PRO2 | DEVTYPE_8BITDO_PRO3 => &EIGHTBITDO_CAPS_HID_DESC,
-            DEVTYPE_HORIPAD_STEAM => &HORI_HID_DESC,
-            _ => &HID_DESC,
-        }),
-        IOCTL_HID_GET_DEVICE_ATTRIBUTES => request.copy_to_output(&hid_attrs(device_type())),
-        IOCTL_HID_GET_REPORT_DESCRIPTOR => request.copy_to_output(match device_type() {
-            1 => &dualshock4::RDESC[..],
-            2 => &dualsense::EDGE_RDESC[..],
-            3 => &deck::RDESC[..],
-            dt @ 4..=6 => pf_driver_proto::xbox::rdesc(dt),
-            // The Triton's captured 372-byte descriptor lives in the shared proto crate — the
-            // host and the pf-inject layout tests read the SAME bytes (drift = test failure).
-            7 => &pf_driver_proto::triton::RDESC[..],
-            8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => {
-                &pf_driver_proto::switch::RDESC_WITH_PROOF[..]
-            }
-            dt @ DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => eightbitdo::rdesc(dt, true),
-            DEVTYPE_HORIPAD_STEAM => &hori::RDESC_WITH_PROOF[..],
-            _ => &dualsense::RDESC[..],
-        }),
+        IOCTL_HID_GET_DEVICE_DESCRIPTOR => {
+            request.copy_to_output(&presented_kind().hid_descriptor())
+        }
+        IOCTL_HID_GET_DEVICE_ATTRIBUTES => request.copy_to_output(&hid_attrs(presented_kind())),
+        IOCTL_HID_GET_REPORT_DESCRIPTOR => request.copy_to_output(presented_kind().rdesc),
         IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => {
             on_output_report(&request, ioctl)
         }
         IOCTL_UMDF_HID_SET_FEATURE => on_set_feature(&request),
         IOCTL_UMDF_HID_GET_FEATURE => on_get_feature(&request),
-        // Sliced to the identity's declared report length for the same reason the timer's
-        // completion is (see `input_report_len`): a source longer than the caller's buffer is
-        // refused outright, not truncated. Serves the CURRENT latch, not neutral — a reader that
-        // opens mid-session (Steam restarting during a held input) queries the true state instead
-        // of a fabricated all-zeros one. Does NOT touch `INPUT_DIRTY`: this is an on-demand
-        // query, and consuming the dirty flag here would starve the interrupt pipeline of a
-        // report it still owes. Before any host publish the latch is the neutral default anyway.
+        // Sliced to the kind's input length as in `tick`: a longer source is refused, not
+        // truncated. Serves the current latch, so a reader that opens mid-session sees the true
+        // state, and leaves `INPUT_DIRTY` alone: the interrupt pipeline still owes that report.
         IOCTL_UMDF_HID_GET_INPUT_REPORT => {
             let dt = device_type();
-            let mut report = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
+            let kind = served_kind(dt);
+            let mut report = INPUT_REPORT
+                .lock()
+                .map(|g| *g)
+                .unwrap_or(dualsense::NEUTRAL_REPORT);
             // The pad's clock as of now, not the host's stamp: a poll must agree with the stream.
             // The counter is not advanced — a poll is not a report in the interrupt pipeline.
             pf_driver_proto::gamepad::stamp_report_clock(
@@ -812,15 +546,15 @@ extern "C" fn evt_io_device_control(
                 REPORT_SERIAL.load(Ordering::Relaxed),
                 pad_elapsed_us(),
             );
-            let served: &[u8] = if dt == pf_driver_proto::gamepad::DEVTYPE_TRITON {
+            let served: &[u8] = if kind.family == Family::Triton {
                 // Same per-id trim as the timer's completion: Triton input reports are
                 // variable-length and id-first; an undeclared latched id falls back to neutral.
                 match pf_driver_proto::triton::input_len(report[0]) {
                     Some(len) => &report[..len],
-                    None => &TRITON_NEUTRAL_REPORT[..54],
+                    None => &kind.neutral[..kind.input_len],
                 }
             } else {
-                &report[..input_report_len(dt)]
+                &report[..kind.input_len]
             };
             request.copy_to_output(served)
         }
@@ -858,7 +592,7 @@ fn on_output_report(request: &Request, ioctl: ULONG) -> NTSTATUS {
         hex_dump(&bytes, 48)
     );
 
-    if is_switch(device_type()) {
+    if presented_kind().family == Family::Switch {
         queue_switch_reply(&bytes);
     }
 
@@ -893,7 +627,10 @@ static SWITCH_REPLIES: std::sync::Mutex<std::collections::VecDeque<[u8; 64]>> =
 /// Answer a Switch `0x80` command or `0x01` subcommand as the pad would, on the latched `0x30`
 /// header. The host never sees the handshake; it reads the same report for rumble.
 fn queue_switch_reply(output: &[u8]) {
-    let latched = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
+    let latched = INPUT_REPORT
+        .lock()
+        .map(|g| *g)
+        .unwrap_or(dualsense::NEUTRAL_REPORT);
     let Some(reply) = pf_driver_proto::switch::reply(&latched, output, device_type(), pad_index())
     else {
         return;
@@ -916,7 +653,7 @@ fn serve_switch_reply(queue: WDFQUEUE, now: u64) -> bool {
     let Some(request) = (unsafe { wdf::retrieve_next_request(queue) }) else {
         return false;
     };
-    let mut report = q.pop_front().unwrap_or(NEUTRAL_REPORT);
+    let mut report = q.pop_front().unwrap_or(dualsense::NEUTRAL_REPORT);
     let serial = REPORT_SERIAL.fetch_add(1, Ordering::Relaxed);
     pf_driver_proto::gamepad::stamp_report_clock(device_type(), &mut report, serial, now);
     let st = request.copy_to_output(&report);
@@ -941,6 +678,28 @@ static LAST_SET_FEATURE: std::sync::Mutex<[u8; 64]> = std::sync::Mutex::new([0; 
 /// its own WUDFHost (see [`INPUT_REPORT`]).
 static TRITON_LAST_SET: std::sync::Mutex<([u8; 64], usize)> = std::sync::Mutex::new(([0; 64], 0));
 
+/// The client's identity the host stored on this devnode (`triton::identity_blob`), read at
+/// `EvtDeviceAdd` for a Steam Controller of either generation. Empty when the host set none.
+static MIRROR_IDENTITY: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// The engraved serial of the pad this one mirrors, else the per-index one for `devtype`.
+fn mirror_serial(devtype: u8) -> String {
+    let blob = MIRROR_IDENTITY
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    match pf_driver_proto::triton::Identity::parse(&blob) {
+        Some(id) if !id.serial.is_empty() => id.serial.into(),
+        _ => pad_serial(devtype, pad_index()),
+    }
+}
+
+/// The mirrored pad's own reply to `last_set` (id-first), when its client recorded one.
+fn recorded_reply(last_set: &[u8]) -> Option<[u8; 64]> {
+    let blob = MIRROR_IDENTITY.lock().ok()?;
+    pf_driver_proto::triton::Identity::parse(&blob)?.reply(last_set)
+}
+
 /// Whether a latched Triton SET_FEATURE frame is the host's channel-proof command — the SAME
 /// two-byte [`pf_driver_proto::gamepad::DECK_PROOF_CMD`] the Deck identity answers, riding the
 /// same SET→GET feature contract. The `[0x00, cmd, …]` shape is the Deck/UNNUMBERED-report
@@ -961,8 +720,9 @@ fn triton_proof_requested(frame: &[u8]) -> bool {
 // GET_FEATURE answer, and — the Deck + Triton feedback paths — publish Steam's commands to the
 // host. Per the UMDF marshalling convention the report data is the input buffer.
 fn on_set_feature(request: &Request) -> NTSTATUS {
+    let family = pad_kind(device_type()).map(|k| k.family);
     if let Ok((bytes, _)) = request.input_bytes(64) {
-        if device_type() == pf_driver_proto::gamepad::DEVTYPE_TRITON {
+        if family == Some(Family::Triton) {
             // Latch the WHOLE id-first frame (see TRITON_LAST_SET), then republish it to the
             // host FEATURE-tagged — Steam's SET_REPORT features (lizard-off / IMU-enable /
             // settings) must reach the physical pad, and the tag is how the host's
@@ -998,7 +758,7 @@ fn on_set_feature(request: &Request) -> NTSTATUS {
             // output path uses, re-prefixed with the report-id 0 byte so the host's
             // `parse_steam_output` sees the exact wire shape the Linux UHID path delivers.
             // Untagged: the Deck host expects plain frames.
-            if device_type() == 3
+            if family == Some(Family::SteamDeck)
                 && matches!(src.first(), Some(&0xEB) | Some(&0x8F))
                 && let Some(view) = CHANNEL.data()
             {
@@ -1006,6 +766,17 @@ fn on_set_feature(request: &Request) -> NTSTATUS {
                 let n = src.len().min(63);
                 out[1..1 + n].copy_from_slice(&src[..n]);
                 publish_output(view, &out, false);
+            }
+            // 2015 Steam Controller: every SET but the proof goes to the host FEATURE-tagged,
+            // re-prefixed with report id 0; the host decides which reach the physical pad.
+            if family == Some(Family::SteamController)
+                && !src.starts_with(&pf_driver_proto::gamepad::DECK_PROOF_CMD)
+                && let Some(view) = CHANNEL.data()
+            {
+                let mut out = [0u8; 64];
+                let n = src.len().min(63);
+                out[1..1 + n].copy_from_slice(&src[..n]);
+                publish_output(view, &out, true);
             }
         }
     }
@@ -1024,6 +795,20 @@ fn deck_feature_reply() -> [u8; 64] {
         return proof_reply();
     }
     deck::feature_reply(&last, &pad_serial(DEVTYPE_STEAMDECK, pad_index()))
+}
+
+/// 2015 Steam Controller identity: the Deck's contract and proof, answered as the pad its
+/// client captured where the host stored that pad's identity on the devnode.
+fn sc_feature_answer() -> [u8; 64] {
+    let last = LAST_SET_FEATURE.lock().map(|g| *g).unwrap_or([0u8; 64]);
+    if last.starts_with(&pf_driver_proto::gamepad::DECK_PROOF_CMD) {
+        return proof_reply();
+    }
+    deck::sc_mirror_reply(
+        recorded_reply,
+        &last,
+        &mirror_serial(DEVTYPE_STEAMCONTROLLER),
+    )
 }
 
 /// The channel-proof GET_FEATURE answer both command-driven identities (Deck + Triton) serve:
@@ -1046,20 +831,21 @@ fn proof_reply() -> [u8; 64] {
 // unnumbered; the Triton identity answers its latched command through the shared
 // `triton::feature_reply` machine).
 fn on_get_feature(request: &Request) -> NTSTATUS {
-    if device_type() == pf_driver_proto::gamepad::DEVTYPE_TRITON {
+    let devtype = device_type();
+    let family = pad_kind(devtype).map(|k| k.family);
+    if family == Some(Family::Triton) {
         let (last, len) = TRITON_LAST_SET.lock().map(|g| *g).unwrap_or(([0u8; 64], 0));
         let is_proof = triton_proof_requested(&last[..len]);
         let mut reply = if is_proof {
             proof_reply()
+        } else if let Some(recorded) = recorded_reply(&last[..len]) {
+            recorded
         } else {
             // The query dance (0x83 attributes / 0xAE string / 0xF2 firmware) + echo fallback —
             // and feature report 2 rides the SAME machine (mirror semantics, no special table).
-            let mut serial = [0u8; 13];
-            pf_driver_proto::triton::serial(pad_index(), &mut serial);
             pf_driver_proto::triton::feature_reply(
                 &last[..len],
-                // `triton::serial` writes 13 ASCII bytes, so the conversion is infallible.
-                core::str::from_utf8(&serial).unwrap_or(""),
+                &mirror_serial(DEVTYPE_TRITON),
                 pf_driver_proto::triton::unit_id(pad_index()),
             )
         };
@@ -1084,8 +870,11 @@ fn on_get_feature(request: &Request) -> NTSTATUS {
         let n = request.output_buffer_len().min(64);
         return request.copy_to_output(&reply[..n]);
     }
-    if device_type() == 3 {
+    if family == Some(Family::SteamDeck) {
         return request.copy_to_output(&deck_feature_reply());
+    }
+    if family == Some(Family::SteamController) {
+        return request.copy_to_output(&sc_feature_answer());
     }
     let (bytes, _) = match request.input_bytes(1) {
         Ok(v) => v,
@@ -1116,18 +905,17 @@ fn on_get_feature(request: &Request) -> NTSTATUS {
     // for the Edge PID regardless of the firmware version at 0x20[44..46]); DualShock 4 uses
     // 0x02/0x12/0xa3.
     // The pairing MAC is per pad and ends the GET_STRING serial in `on_get_string`.
-    let devtype = device_type();
     let ds_pairing = dualsense::pairing_reply(devtype, pad_index());
     let ds4_pairing = dualshock4::pairing_reply(pad_index());
     let caps = eightbitdo::caps_reply(devtype, pad_index());
-    let blob: &[u8] = match (devtype, report_id) {
-        (0 | 2, 0x05) => &dualsense::FEATURE_CALIBRATION,
-        (0 | 2, 0x09) => &ds_pairing,
-        (0 | 2, 0x20) => &dualsense::FEATURE_FIRMWARE,
-        (1, 0x02) => &dualshock4::FEATURE_CALIBRATION,
-        (1, 0x12) => &ds4_pairing,
-        (1, 0xA3) => &dualshock4::FEATURE_FIRMWARE,
-        (dt, eightbitdo::FEATURE_CAPS) if eightbitdo::has_caps(dt) => &caps,
+    let blob: &[u8] = match (family, report_id) {
+        (Some(Family::DualSense), 0x05) => &dualsense::FEATURE_CALIBRATION,
+        (Some(Family::DualSense), 0x09) => &ds_pairing,
+        (Some(Family::DualSense), 0x20) => &dualsense::FEATURE_FIRMWARE,
+        (Some(Family::DualShock4), 0x02) => &dualshock4::FEATURE_CALIBRATION,
+        (Some(Family::DualShock4), 0x12) => &ds4_pairing,
+        (Some(Family::DualShock4), 0xA3) => &dualshock4::FEATURE_FIRMWARE,
+        (_, eightbitdo::FEATURE_CAPS) if eightbitdo::has_caps(devtype) => &caps,
         (_, other) => {
             dbglog!("[pf-gamepad] GET_FEATURE unknown report id 0x{other:02x}");
             return STATUS_INVALID_PARAMETER;
@@ -1149,69 +937,26 @@ fn on_get_string(request: &Request) -> NTSTATUS {
     let (id_val, string_id) = string_request_id(&bytes);
     let devtype = device_type();
     dbglog!("[pf-gamepad] GET_STRING id=0x{string_id:04x} (raw 0x{id_val:08x}) devtype={devtype}");
+    let kind = served_kind(devtype);
     let s: String = match string_id {
-        // DualShock 4 v2 (09CC) reports the SIE name too; "Sony Computer" was the v1 (05C4).
-        0 | 0x000e => match devtype {
-            3 | 7 => "Valve Software".into(),
-            4..=6 => "Microsoft".into(),
-            8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => "Nintendo Co., Ltd.".into(),
-            DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => "8BitDo".into(),
-            DEVTYPE_HORIPAD_STEAM => "HORI CO.,LTD.".into(),
-            _ => "Sony Interactive Entertainment".into(),
-        },
+        0 | 0x000e => kind.manufacturer.into(),
         // Per-pad serials: SDL reads this via HidD_GetSerialNumberString and Steam dedups pads
         // by it. The PS serials end in the pairing MAC's low octet (`on_get_feature`); the Deck
         // and Triton serials match their 0xAE answers. Steam reads both.
+        2 | 0x0010 if matches!(kind.family, Family::Triton | Family::SteamController) => {
+            mirror_serial(devtype)
+        }
         2 | 0x0010 => pad_serial(devtype, pad_index()),
-        _ => match devtype {
-            1 => "Wireless Controller".into(),
-            2 => "DualSense Edge Wireless Controller".into(),
-            3 => "Steam Deck Controller".into(),
-            // ⚠️ 4 and 5 share a product string ON PURPOSE — a real Xbox Wireless Controller
-            // (Series X|S, `0B13`) and a real Xbox One S pad (`02FD`) BOTH report exactly
-            // "Xbox Wireless Controller" over Bluetooth. The PID is what tells them apart, and
-            // that is what SDL/Steam/Windows key their stock mappings off. Do not "fix" this by
-            // inventing a distinguishing string; it would make the One S identity a device that
-            // has never existed. (The INF's Device Manager descriptions DO differ — that string
-            // is ours, not the pad's.)
-            4 | 5 => "Xbox Wireless Controller".into(),
-            6 => "Xbox Elite Wireless Controller Series 2".into(),
-            7 => "Steam Controller".into(),
-            8 => "Pro Controller".into(),
-            DEVTYPE_JOYCON_LEFT => "Joy-Con (L)".into(),
-            DEVTYPE_JOYCON_RIGHT => "Joy-Con (R)".into(),
-            DEVTYPE_8BITDO_ULTIMATE2 => "8BitDo Ultimate 2 Wireless".into(),
-            DEVTYPE_8BITDO_PRO2 => "8BitDo Pro 2".into(),
-            DEVTYPE_8BITDO_PRO3 => "8BitDo Pro 3".into(),
-            DEVTYPE_HORIPAD_STEAM => hori::NAME.into(),
-            _ => "DualSense Wireless Controller".into(),
-        },
+        _ => kind.product.into(),
     };
     request.copy_utf16z_to_output(&s)
 }
 
-/// The device-type selector: 0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge, 3 = Steam Deck,
-/// 4 = Xbox Wireless Controller, 5 = Xbox One S, 6 = Xbox Elite Wireless Controller Series 2,
-/// 7 = Steam Controller 2 ("Triton"), 8 = Switch Pro, 9–11 = 8BitDo Ultimate 2 / Pro 2 / Pro 3,
-/// 12 = HORIPAD for Steam. Read fresh on each enumeration query.
-///
-/// ⚠️ **The sealed section cannot answer the enumeration queries.** hidclass asks for
-/// `GET_DEVICE_DESCRIPTOR` / `GET_REPORT_DESCRIPTOR` / `GET_DEVICE_ATTRIBUTES` while it STARTS the
-/// device; the host can only deliver the DATA section over the HID device interface
-/// (`ProofTransport::HidFeatureReport`), which does not exist until those very queries are answered.
-/// So the channel is *structurally* unavailable here, not merely racing — the 1 s wait below always
-/// timed out, and every non-DualSense identity silently enumerated with the DualSense VID/PID **and
-/// the DualSense report descriptor**. For the Deck that meant Windows parsed the 64-byte
-/// `ID_CONTROLLER_DECK_STATE` frame as DualSense report `0x01`: `LX = report[1] = 0x00` (stick hard
-/// left), `LY = report[2] = 0x09` (hard up) and a d-pad hat of 0 (UP held) — the "stuck stick/button"
-/// a Steam Deck client saw on a Windows host.
-///
-/// [`PNP_DEVTYPE`] closes it: the devnode's hardware ids carry the identity and are readable at
-/// `EvtDeviceAdd`, before anything is asked. The section stays authoritative once attached (same
-/// host wrote both). NO in-dispatch wait remains: the old 1 s bounded pump loop could only run
-/// for a devnode whose ids matched nothing, where its own premise above guarantees the timeout —
-/// it burned a second of a WUDFHost dispatch thread mid-enumeration and then fell back to
-/// [`LAST_DEVTYPE`] anyway (which the 8 ms timer keeps fresh whenever the section is attached).
+/// The `device_type` this pad presents. The attached section wins; until it attaches, the kind
+/// the PnP hardware ids named at `EvtDeviceAdd` ([`PNP_DEVTYPE`]). hidclass asks for the
+/// descriptors while it starts the device, before the host can deliver the section over the HID
+/// interface those answers create, so the hardware ids are the only identity there is then.
+/// Server's unfiltered Xbox line names one Xbox kind for all three; the section corrects it.
 fn device_type() -> u8 {
     if let Some(view) = CHANNEL.data() {
         let t = view.read_u8(OFF_DEVICE_TYPE);
@@ -1223,6 +968,56 @@ fn device_type() -> u8 {
         return pnp as u8;
     }
     LAST_DEVTYPE.load(Ordering::Relaxed) as u8
+}
+
+/// The pad kind [`device_type`] names; a value this build does not know answers as a DualSense.
+fn presented_kind() -> &'static PadKind {
+    served_kind(device_type())
+}
+
+/// Latch the host's report when it is one this identity serves and it changed. The dirty
+/// flag means "new state", not "the host published again": an unchanged republish carries
+/// nothing a game can act on, and treating it as fresh would put the Triton path back on
+/// the host's publish rate.
+fn latch_published(view: &pf_umdf_util::section::MappedView) {
+    let mut buf = [0u8; 64];
+    // A torn read (host mid-publish) is dropped and the previous whole report stays. The
+    // id check runs AFTER the read fills `buf`: hoisted, it would test zeros, fail for
+    // every identity and serve neutral forever — the same look as a Steam-claim failure.
+    if read_input_report(view, &mut buf)
+        && pf_driver_proto::gamepad::report_declared(presented_kind(), &buf)
+        && let Ok(mut g) = INPUT_REPORT.lock()
+        && *g != buf
+    {
+        *g = buf;
+        INPUT_DIRTY.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The health marks the host watches, on the ~8 ms cadence. The fallback identity first:
+/// `device_type()`'s last resort (channel detached, no PnP match) reads LAST_DEVTYPE, and this
+/// is the one place that always sees the attached section. Then driver_rev, driver_proto (the
+/// attach signal; Release, so a host that sees it sees the revision) and driver_heartbeat
+/// (+1 per ~8 ms = liveness): tells "driver bound and alive" from "package missing".
+fn mark_health(view: &pf_umdf_util::section::MappedView) {
+    LAST_DEVTYPE.store(view.read_u8(OFF_DEVICE_TYPE) as u32, Ordering::Relaxed);
+    view.write_u32(OFF_DRIVER_REV, pf_driver_proto::gamepad::GAMEPAD_DRIVER_REV);
+    view.store_u32(OFF_DRIVER_PROTO, GAMEPAD_PROTO_VERSION, Ordering::Release);
+    let hb = view.read_u32(OFF_DRIVER_HEARTBEAT).wrapping_add(1);
+    view.write_u32(OFF_DRIVER_HEARTBEAT, hb);
+}
+
+/// Host gone (mailbox name vanished) or channel not attached yet: feed games the neutral
+/// report instead of a frozen last state (matters for the persistent out-of-band devnode,
+/// which outlives host sessions).
+fn latch_neutral() {
+    if let Ok(mut g) = INPUT_REPORT.lock() {
+        let neutral = served_kind(LAST_DEVTYPE.load(Ordering::Relaxed) as u8).neutral;
+        if *g != neutral {
+            *g = neutral;
+            INPUT_DIRTY.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 fn tick(queue: WDFQUEUE) {
@@ -1256,82 +1051,32 @@ fn tick(queue: WDFQUEUE) {
     };
     match view {
         Some(view) => {
-            let mut buf = [0u8; 64];
-            // A torn read is dropped rather than served: `read_input_report` returns false only
-            // when it caught the host mid-publish, and the previous whole report stays in place.
-            // ⚠️ ORDER IS LOAD-BEARING: the report-id check runs AFTER `read_input_report` filled
-            // `buf` (short-circuit). Hoisted before the read it would test a zeroed buffer, fail
-            // for every identity, and every pad would serve neutral forever — indistinguishable
-            // from a Steam-claim failure at the bench.
-            if read_input_report(view, &mut buf)
-                && (match device_type() {
-                    // Triton reports are id-first (0x42 state, 0x43 battery, …). Undeclared ids
-                    // (0x47 BLE timestamp) are dropped — hidclass refuses ids the descriptor
-                    // doesn't declare.
-                    pf_driver_proto::gamepad::DEVTYPE_TRITON => {
-                        pf_driver_proto::triton::input_len(buf[0]).is_some()
-                    }
-                    dt if is_switch(dt) => buf[0] == 0x30,
-                    DEVTYPE_HORIPAD_STEAM => buf[0] == hori::REPORT_ID,
-                    _ => buf[0] == 0x01,
-                })
-                && let Ok(mut g) = INPUT_REPORT.lock()
-            {
-                // Compare before storing: the dirty flag must mean "new state", not "the host
-                // published again". An unchanged republish carries nothing a game can act on, and
-                // treating it as fresh would put the Triton path back on the host's publish rate.
-                if *g != buf {
-                    *g = buf;
-                    INPUT_DIRTY.store(true, Ordering::Relaxed);
-                }
-            }
+            latch_published(view);
             if housekeeping {
-                // Keep the fallback identity fresh: `device_type()`'s last resort (channel
-                // detached, no PnP match) reads LAST_DEVTYPE, and this tick is the one place that
-                // always sees the attached section.
-                LAST_DEVTYPE.store(view.read_u8(OFF_DEVICE_TYPE) as u32, Ordering::Relaxed);
-                // Health marks the host watches: driver_rev, then driver_proto (the attach signal;
-                // Release, so a host that sees it sees the revision) and driver_heartbeat (+1 per
-                // ~8 ms = liveness). Tells "driver bound and alive" from "package missing".
-                view.write_u32(OFF_DRIVER_REV, pf_driver_proto::gamepad::GAMEPAD_DRIVER_REV);
-                view.store_u32(OFF_DRIVER_PROTO, GAMEPAD_PROTO_VERSION, Ordering::Release);
-                let hb = view.read_u32(OFF_DRIVER_HEARTBEAT).wrapping_add(1);
-                view.write_u32(OFF_DRIVER_HEARTBEAT, hb);
+                mark_health(view);
             }
         }
-        None => {
-            // Host gone (mailbox name vanished) or channel not attached yet: feed games the neutral
-            // report instead of a frozen last state (matters for the persistent out-of-band devnode,
-            // which outlives host sessions).
-            if let Ok(mut g) = INPUT_REPORT.lock() {
-                let neutral = neutral_report(LAST_DEVTYPE.load(Ordering::Relaxed) as u8);
-                if *g != neutral {
-                    *g = neutral;
-                    INPUT_DIRTY.store(true, Ordering::Relaxed);
-                }
-            }
-        }
+        None => latch_neutral(),
     }
 
-    // Triton relays the physical pad's own ~66 Hz BLE reports, so it serves only a changed one:
-    // re-serving the latch makes Steam read one report's travel as a flick ~7x too fast, and a
-    // pended read is the NAK real hardware sends. Every other identity streams at its hardware
-    // period, held state included (`pf_driver_proto::gamepad::report_period_us`).
+    // Serve by identity (`serve_tick`): the Switch reply first, since it answers a handshake
+    // rather than the latch.
     let dt = device_type();
+    let pad = served_kind(dt);
     let now = pad_elapsed_us();
-    if is_switch(dt) && serve_switch_reply(queue, now) {
+    if pad.family == Family::Switch && serve_switch_reply(queue, now) {
         return;
     }
-    if dt == pf_driver_proto::gamepad::DEVTYPE_TRITON {
-        if !INPUT_DIRTY.load(Ordering::Relaxed) {
-            return;
-        }
-    } else {
-        let period = pf_driver_proto::gamepad::report_period_us(dt);
-        match pf_driver_proto::gamepad::serve_due(now, SERVE_DUE_US.load(Ordering::Relaxed), period)
-        {
-            Some(next) => SERVE_DUE_US.store(next, Ordering::Relaxed),
-            None => return,
+    match pf_driver_proto::gamepad::serve_tick(
+        pad,
+        INPUT_DIRTY.load(Ordering::Relaxed),
+        now,
+        SERVE_DUE_US.load(Ordering::Relaxed),
+    ) {
+        pf_driver_proto::gamepad::Serve::Skip => return,
+        pf_driver_proto::gamepad::Serve::Now => {}
+        pf_driver_proto::gamepad::Serve::NowThen(next) => {
+            SERVE_DUE_US.store(next, Ordering::Relaxed)
         }
     }
 
@@ -1339,30 +1084,18 @@ fn tick(queue: WDFQUEUE) {
     // SAFETY: `queue` is the manual queue from EvtDeviceAdd, live until the ticker is joined in
     // EvtDeviceSelfManagedIoCleanup — the exact contract `retrieve_next_request` needs.
     if let Some(request) = unsafe { wdf::retrieve_next_request(queue) } {
-        let mut report = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
+        let mut report = INPUT_REPORT
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(dualsense::NEUTRAL_REPORT);
         let serial = REPORT_SERIAL.fetch_add(1, Ordering::Relaxed);
         pf_driver_proto::gamepad::stamp_report_clock(dt, &mut report, serial, now);
-        // Serve exactly what this identity's descriptor declares — `copy_to_output` REFUSES a
-        // source longer than hidclass's buffer instead of truncating, so a 64-byte hand-over for
-        // the Xbox pad's 16-byte report would fail every read and the pad would look dead.
-        // A retrieved request is ALWAYS completed on every path below: `Request` has no Drop
-        // impl and `complete(self, …)` consumes it, so a dequeued-but-uncompleted READ_REPORT
-        // would leak.
-        // Cleared HERE and not at the gate above: a tick that finds nothing pended must leave the
-        // report undelivered, not drop it on the floor.
+        // `served_bytes` is exactly what the descriptor declares: `copy_to_output` refuses a
+        // longer source rather than truncating it. `complete(self, …)` consumes the request on
+        // every path below (no Drop impl, so a dequeued READ_REPORT must not be left). The flag
+        // clears HERE, not at the gate: a tick with nothing pended leaves the report undelivered.
         INPUT_DIRTY.store(false, Ordering::Relaxed);
-        let served: &[u8] = if dt == pf_driver_proto::gamepad::DEVTYPE_TRITON {
-            // Per-id trim: Triton input reports are variable-length and id-first. hidclass's
-            // READ buffer is 54 bytes (0x42, the largest declared input), so every served
-            // length fits; a latched id the descriptor doesn't declare falls back to neutral.
-            match pf_driver_proto::triton::input_len(report[0]) {
-                Some(len) => &report[..len],
-                None => &TRITON_NEUTRAL_REPORT[..54],
-            }
-        } else {
-            &report[..input_report_len(dt)]
-        };
-        let st = request.copy_to_output(served);
+        let st = request.copy_to_output(pf_driver_proto::gamepad::served_bytes(pad, &report));
         request.complete(st);
     }
 }

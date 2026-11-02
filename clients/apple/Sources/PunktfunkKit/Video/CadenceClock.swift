@@ -24,8 +24,9 @@ import os
 /// ⚠ A hand-written port of `punktfunk_core::phase::CadenceTuning`, exactly as `AudioRing` is a
 /// port of `JitterPolicy`: this pipeline is Swift and does not link that Rust type. **Every
 /// constant and rule here must stay in lockstep with it** — `CadenceClockTests` and the Rust
-/// `phase::tests` assert the two against the same synthetic input, and that agreement IS the
-/// contract.
+/// `phase::tests` assert the two against the same synthetic input, and `CadenceVectorTests`
+/// replays the runs `phase::vectors` wrote to `clients/shared/cadence-vectors.json`. That
+/// agreement IS the contract.
 struct CadenceTuning: Equatable {
     /// Proportional gain on the offset estimate: `1 >> offsetShift` of the residual per frame.
     var offsetShift: UInt8

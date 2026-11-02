@@ -1,0 +1,22 @@
+{
+  "$comment": "The phone-gyro mirror's device-to-controller axis remap, run by the Apple DeviceGyroVectorTests and the Android DeviceGyroVectorTest. Sensors report in the natural-portrait frame (+x right edge, +y top, +z out of the screen); the wire wants the frame the player sees (x right, y up, z out of the screen). `pose` is where the device's top points as the player sees it: up is portrait, down is upside down, left and right are the two landscape turns. A rotation rate and an acceleration remap the same way, and z never changes. Each remap row is `input` -> `expect` as [x, y, z]. `wire_units` are the raw counts per rad/s and per g that both clients scale a sample by (compared within 1e-3).",
+  "version": 1,
+  "remap": [
+    { "pose": "top_up", "input": [1, 2, 3], "expect": [1, 2, 3] },
+    { "pose": "top_up", "input": [1, 0, 0], "expect": [1, 0, 0] },
+    { "pose": "top_up", "input": [0, 1, 0], "expect": [0, 1, 0] },
+    { "pose": "top_down", "input": [1, 2, 3], "expect": [-1, -2, 3] },
+    { "pose": "top_down", "input": [1, 0, 0], "expect": [-1, 0, 0] },
+    { "pose": "top_down", "input": [0, 1, 0], "expect": [0, -1, 0] },
+    { "pose": "top_left", "input": [1, 2, 3], "expect": [-2, 1, 3] },
+    { "pose": "top_left", "input": [1, 0, 0], "expect": [0, 1, 0] },
+    { "pose": "top_left", "input": [0, 1, 0], "expect": [-1, 0, 0] },
+    { "pose": "top_right", "input": [1, 2, 3], "expect": [2, -1, 3] },
+    { "pose": "top_right", "input": [1, 0, 0], "expect": [0, -1, 0] },
+    { "pose": "top_right", "input": [0, 1, 0], "expect": [1, 0, 0] }
+  ],
+  "wire_units": {
+    "gyro_lsb_per_rad_s": 1145.9156,
+    "accel_lsb_per_g": 10000
+  }
+}

@@ -8,13 +8,14 @@ import * as path from "node:path";
 import { discoverUnits } from "../src/discover.js";
 import { spawnAgainIfKilled, windowsSddlUnsafeReason } from "../src/file-trust.js";
 import {
-	adoptNestedState,
 	describeFailure,
 	inProcessConnect,
 	runner,
+	runnerExitStatus,
+	SANDBOX_REFUSED_EXIT,
 	superviseUnit,
-	writePluginToken,
 } from "../src/runner.js";
+import { adoptNestedState, writePluginToken } from "../src/runner-linux.js";
 
 const TOKEN = "runner-token";
 // Fixtures live under sdk/ so the generated plugin files can resolve "effect" and the SDK.
@@ -441,6 +442,67 @@ describe("supervision", () => {
 		}
 	});
 
+	test("a plugin with a manifest gets a process of its own when asked (the Windows shape)", async () => {
+		const d = mkdirs("own-process");
+		const pkg = path.join(d.pluginsDir, "node_modules", "punktfunk-plugin-lonely");
+		const counter = path.join(d.dir, "count.txt");
+		write(
+			path.join(pkg, "package.json"),
+			JSON.stringify({
+				name: "punktfunk-plugin-lonely",
+				main: "index.ts",
+				punktfunk: { schema: 1, id: "lonely" },
+			}),
+		);
+		// Each run is a fresh process: a module-level counter would start at zero every time.
+		write(
+			path.join(pkg, "index.ts"),
+			`import * as fs from "node:fs";
+			const n = fs.existsSync(${JSON.stringify(counter)}) ? Number(fs.readFileSync(${JSON.stringify(counter)}, "utf8")) : 0;
+			fs.writeFileSync(${JSON.stringify(counter)}, String(n + 1));
+			console.error("lonely run " + n + " pid " + process.pid);
+			process.exit(3);`,
+		);
+		const logs: string[] = [];
+		// The child re-execs the runner bundle; here that is the CLI source, which bun runs as is.
+		const entry = process.env.PUNKTFUNK_RUNNER_ENTRY;
+		process.env.PUNKTFUNK_RUNNER_ENTRY = path.join(import.meta.dir, "..", "src", "runner-cli.ts");
+		try {
+			const fiber = Effect.runFork(
+				runner({
+					...d,
+					configDir: d.dir,
+					// The Windows shape: no sandbox, a process each. Linux would default to bwrap.
+					sandbox: "off",
+					ownProcess: true,
+					restartBase: "20 millis",
+					log: (l) => logs.push(l),
+				}),
+			);
+			try {
+				await waitFor(() => {
+					try {
+						return Number(fs.readFileSync(counter, "utf8")) >= 2;
+					} catch {
+						return false;
+					}
+				}, 20000);
+			} catch (e) {
+				// The supervisor's own lines say why the child never ran.
+				throw new Error(`${e}\nrunner said:\n${logs.join("\n")}`);
+			}
+			await Effect.runPromise(Fiber.interrupt(fiber));
+		} finally {
+			if (entry === undefined) delete process.env.PUNKTFUNK_RUNNER_ENTRY;
+			else process.env.PUNKTFUNK_RUNNER_ENTRY = entry;
+		}
+		const failed = logs.find((l) => l.includes("[punktfunk-plugin-lonely] failed: "));
+		expect(failed).toContain("plugin process exited with 3");
+		expect(failed).toContain("lonely run 0 pid");
+		expect(logs.some((l) => l.includes("restarting (attempt 2)"))).toBe(true);
+		// Two cold re-execs of the CLI source on a loaded runner outrun the 5 s default.
+	}, 30000);
+
 	test("a grants change restarts only the affected sandboxed plugin", async () => {
 		const d = mkdirs("grant-restart");
 		const packages = ["one", "two"];
@@ -478,6 +540,7 @@ describe("supervision", () => {
 				configDir: d.dir,
 				grantPollInterval: "20 millis",
 				log: (line) => logs.push(line),
+				sandboxProbe: () => ({ ok: true }),
 				sandboxRun: (_unit, manifest) => {
 					const id = manifest.id as "one" | "two";
 					return Effect.scoped(
@@ -545,12 +608,102 @@ describe("supervision", () => {
 			`import * as fs from "node:fs"; fs.writeFileSync(${JSON.stringify(ran)}, "1");`,
 		);
 		const logs: string[] = [];
-		const fiber = Effect.runFork(runner({ ...d, sandbox: "on", log: (l) => logs.push(l) }));
+		const fiber = Effect.runFork(
+			runner({ ...d, configDir: d.dir, sandbox: "on", log: (l) => logs.push(l) }),
+		);
 		await waitFor(() => logs.some((l) => l.includes("not starting punktfunk-plugin-bare")));
 		await new Promise((r) => setTimeout(r, 200)); // would have imported by now
 		await Effect.runPromise(Fiber.interrupt(fiber));
 		expect(logs.some((l) => l.includes("starting punktfunk-plugin-bare ("))).toBe(false);
 		expect(fs.existsSync(ran)).toBe(false);
+	});
+
+	const noSandbox = { ok: false as const, reason: "no user namespaces" };
+
+	test("a box that builds no sandbox ends the runner before a plugin or a script starts", async () => {
+		const d = mkdirs("no-sandbox");
+		const pkg = path.join(d.pluginsDir, "node_modules", "punktfunk-plugin-demo");
+		write(
+			path.join(pkg, "package.json"),
+			JSON.stringify({
+				name: "punktfunk-plugin-demo",
+				main: "index.js",
+				punktfunk: { schema: 1, id: "demo" },
+			}),
+		);
+		write(path.join(pkg, "index.js"), "export default {};");
+		const ran = path.join(d.dir, "ran.txt");
+		write(
+			path.join(d.scriptsDir, "once.ts"),
+			`import * as fs from "node:fs"; fs.writeFileSync(${JSON.stringify(ran)}, "1");`,
+		);
+		let attempts = 0;
+		const logs: string[] = [];
+		const options = {
+			...d,
+			configDir: d.dir,
+			sandbox: "on" as const,
+			log: (l: string) => logs.push(l),
+			sandboxRun: () =>
+				Effect.sync(() => {
+					attempts += 1;
+				}).pipe(Effect.andThen(Effect.never), Effect.as("plugin" as const)),
+		};
+		const ended = await Effect.runPromiseExit(
+			runner({ ...options, sandboxProbe: () => noSandbox }),
+		);
+		expect(runnerExitStatus(ended)).toBe(SANDBOX_REFUSED_EXIT);
+		expect(attempts).toBe(0);
+		expect(fs.existsSync(ran)).toBe(false);
+		const about = (text: string) => logs.filter((l) => l.includes(text));
+		expect(about("can't be sandboxed here: no user namespaces")).toHaveLength(1);
+		expect(about("stopping instead of running punktfunk-plugin-demo")).toHaveLength(1);
+		expect(about("] starting ")).toEqual([]);
+		// What the host's health check reads, until a start gets past the probe.
+		const refusal = path.join(d.dir, "plugin-state", "runner.refused");
+		expect(fs.readFileSync(refusal, "utf8")).toBe("no user namespaces\n");
+		const fiber = Effect.runFork(runner({ ...options, sandboxProbe: () => ({ ok: true }) }));
+		await waitFor(() => attempts === 1);
+		await Effect.runPromise(Fiber.interrupt(fiber));
+		expect(fs.existsSync(refusal)).toBe(false);
+	});
+
+	test("with no plugin installed, a box that builds no sandbox still runs its scripts", async () => {
+		const d = mkdirs("no-sandbox-scripts");
+		write(path.join(d.scriptsDir, "once.ts"), "export {};");
+		const logs: string[] = [];
+		const fiber = Effect.runFork(
+			runner({
+				...d,
+				configDir: d.dir,
+				sandbox: "on",
+				log: (l) => logs.push(l),
+				sandboxProbe: () => noSandbox,
+			}),
+		);
+		await waitFor(() => logs.some((l) => l.includes("[once] script completed")));
+		// Still up: what ends it is the interrupt, which is not a refusal.
+		await Effect.runPromise(Fiber.interrupt(fiber));
+		expect(runnerExitStatus(await Effect.runPromise(Fiber.await(fiber)))).toBe(0);
+		expect(logs.some((l) => l.includes("none would start, so scripts still run"))).toBe(true);
+		expect(fs.existsSync(path.join(d.dir, "plugin-state", "runner.refused"))).toBe(false);
+	});
+
+	test("every supervisor leaves the runner stopped on the refusal status", () => {
+		const repo = path.join(import.meta.dir, "..", "..");
+		const read = (rel: string) => fs.readFileSync(path.join(repo, rel), "utf8");
+		expect(read("scripts/punktfunk-scripting.service")).toContain(
+			`\nRestartPreventExitStatus=${SANDBOX_REFUSED_EXIT}\n`,
+		);
+		// NixOS runs that same unit: the scripting package installs it, and the module's drop-in
+		// leaves the status alone.
+		expect(read("packaging/nix/packages.nix")).toContain(
+			"install -Dm0644 scripts/punktfunk-scripting.service",
+		);
+		expect(read("packaging/nix/nixos-module.nix")).not.toContain("RestartPreventExitStatus");
+		expect(read("scripts/windows/scripting-run.cmd")).toContain(
+			`if %ERRORLEVEL% EQU ${SANDBOX_REFUSED_EXIT} exit /b 0`,
+		);
 	});
 
 	test("shutdown interrupts an Effect plugin STRUCTURALLY — its finalizer runs", async () => {

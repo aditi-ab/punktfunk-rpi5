@@ -1,0 +1,22 @@
+{
+  "$comment": "2015 Steam Controller byte bookkeeping, hand-written. buttons: a state-report button bit (the 24-bit word at bytes 8..11, SDL controller_constants.h) and the punktfunk wire bit it means (punktfunk_core::input gamepad BTN_*); the host fallback (steam_proto::sc_from_gamepad), Swift Sc1Device and Kotlin Sc1Device replay it. Grips are PADDLE2 (left) and PADDLE1 (right); the right-pad click is TOUCHPAD.",
+  "buttons": [
+    {"name": "rb", "sc1": 4, "wire": 512},
+    {"name": "lb", "sc1": 8, "wire": 256},
+    {"name": "y", "sc1": 16, "wire": 32768},
+    {"name": "b", "sc1": 32, "wire": 8192},
+    {"name": "x", "sc1": 64, "wire": 16384},
+    {"name": "a", "sc1": 128, "wire": 4096},
+    {"name": "dpad_up", "sc1": 256, "wire": 1},
+    {"name": "dpad_right", "sc1": 512, "wire": 8},
+    {"name": "dpad_left", "sc1": 1024, "wire": 4},
+    {"name": "dpad_down", "sc1": 2048, "wire": 2},
+    {"name": "back", "sc1": 4096, "wire": 32},
+    {"name": "guide", "sc1": 8192, "wire": 1024},
+    {"name": "start", "sc1": 16384, "wire": 16},
+    {"name": "paddle2", "sc1": 32768, "wire": 131072},
+    {"name": "paddle1", "sc1": 65536, "wire": 65536},
+    {"name": "touchpad", "sc1": 262144, "wire": 1048576},
+    {"name": "ls_click", "sc1": 4194304, "wire": 64}
+  ]
+}

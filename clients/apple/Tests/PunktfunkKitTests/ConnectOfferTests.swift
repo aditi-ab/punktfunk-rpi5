@@ -41,7 +41,7 @@ final class ConnectOfferTests: XCTestCase {
         XCTAssertEqual(o.videoCodecs, PunktfunkConnection.codecH264 | PunktfunkConnection.codecHEVC)
         XCTAssertEqual(o.preferredCodec, 0)
         XCTAssertEqual(o.videoFit, VideoFit.fit.wire)
-        XCTAssertEqual(o.clientCaps, PunktfunkConnection.clientCapPhaseLock)
+        XCTAssertEqual(o.clientCaps, 0)
     }
 
     /// HDR waits for a display that can show it; the depth rides along with it.
@@ -97,8 +97,8 @@ final class ConnectOfferTests: XCTestCase {
     }
 
     /// PyroWave is an opt-in behind the Metal probe: past it the codec is offered and preferred,
-    /// sends Automatic bitrate and takes 4:4:4 without the VideoToolbox probes. A device that fails
-    /// it keeps the user's rate on H.26x.
+    /// carries the stored rate as Fixed (the host ignores its number) and takes 4:4:4 without the
+    /// VideoToolbox probes. A device that fails it keeps the user's rate on H.26x.
     func testPyroWaveIsAnOptInBehindItsProbe() {
         var s = EffectiveSettings()
         s.bitrateKbps = 500_000
@@ -110,7 +110,10 @@ final class ConnectOfferTests: XCTestCase {
 
         s.codec = "pyrowave"
         let passed = offer(s, pyroWave: true)
-        XCTAssertEqual(passed.bitrateKbps, 0)
+        XCTAssertEqual(passed.bitrateKbps, 500_000, "a stored rate is Fixed, never Automatic")
+        s.bitrateKbps = 0
+        XCTAssertEqual(offer(s, pyroWave: true).bitrateKbps, 0, "Automatic stays Automatic")
+        s.bitrateKbps = 500_000
         XCTAssertEqual(passed.preferredCodec, PunktfunkConnection.codecPyroWave)
         XCTAssertEqual(
             passed.videoCodecs & PunktfunkConnection.codecPyroWave, PunktfunkConnection.codecPyroWave)
@@ -122,18 +125,16 @@ final class ConnectOfferTests: XCTestCase {
         XCTAssertEqual(failed.videoCaps, 0)
     }
 
-    /// The Mac draws the host cursor only in the desktop mouse model; iOS and tvOS report the
-    /// latch phase. Keeping host audio is a request on every platform.
+    /// Only the Mac draws the host cursor, and only in the desktop mouse model. Keeping host audio
+    /// is a request on every platform.
     func testClientCapsFollowThePlatform() {
         var s = EffectiveSettings()
         XCTAssertEqual(offer(s, mac: true).clientCaps, 0)
         s.mouseMode = MouseInputMode.desktop.rawValue
         XCTAssertEqual(offer(s, mac: true).clientCaps, PunktfunkConnection.clientCapCursor)
-        XCTAssertEqual(offer(s, mac: false).clientCaps, PunktfunkConnection.clientCapPhaseLock)
+        XCTAssertEqual(offer(s, mac: false).clientCaps, 0)
         s.keepHostAudio = true
-        XCTAssertEqual(
-            offer(s, mac: false).clientCaps,
-            PunktfunkConnection.clientCapPhaseLock | PunktfunkConnection.clientCapKeepHostAudio)
+        XCTAssertEqual(offer(s, mac: false).clientCaps, PunktfunkConnection.clientCapKeepHostAudio)
     }
 
     // MARK: - Failure wording

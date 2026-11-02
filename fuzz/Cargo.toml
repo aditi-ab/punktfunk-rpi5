@@ -1,0 +1,83 @@
+[package]
+name = "punktfunk-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace and lockfile: a target links libFuzzer and builds only under `cargo fuzz`
+# on nightly, which no `--workspace` command in this tree may need.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+anyhow = "1"
+# `quic` for the audio decoders, which sit behind it with libopus.
+punktfunk-core = { path = "../crates/core/punktfunk-core", features = ["quic"] }
+# `test-vectors` for the access-unit splitters the crate's own tests feed the planners with.
+pf-bitstream = { path = "../crates/codec/pf-bitstream", features = ["test-vectors"] }
+# The host's control codec is included by path (`control_wire`); this is its one dependency.
+aes-gcm = "0.11"
+
+# What `cargo fuzz run -a` asks for, here so one crate can differ. `--build-std` gives `std`
+# the same profile, so its own debug assertions run under the fuzzer too.
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+# The vendored parser's unchecked arithmetic wraps in the build that ships. Checked, the
+# fuzzer stops at each wrap and never reaches the bounds check or division behind it, which
+# is what aborts a client's decode thread.
+[profile.release.package.cros-codecs]
+overflow-checks = false
+
+[[bin]]
+name = "core_wire"
+path = "fuzz_targets/core_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bitstream_plan"
+path = "fuzz_targets/bitstream_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtsp"
+path = "fuzz_targets/rtsp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_wire"
+path = "fuzz_targets/control_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audio_plane"
+path = "fuzz_targets/audio_plane.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cursor_shape"
+path = "fuzz_targets/cursor_shape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reassembler"
+path = "fuzz_targets/reassembler.rs"
+test = false
+doc = false
+bench = false

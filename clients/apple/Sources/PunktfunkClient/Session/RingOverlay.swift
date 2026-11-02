@@ -186,6 +186,11 @@ struct RingActions {
     var streamedGame: () -> RunningGame? = { nil }
     /// End that game on the host, then the stream.
     var endGame: () -> Void = {}
+    /// Controller type: the type every forwarded pad declares, whether one is forwarded, and the
+    /// step to the next type (`GamepadType.nextInRing`) for this stream.
+    var padType: () -> PunktfunkConnection.GamepadType = { .auto }
+    var padTypeAvailable: () -> Bool = { false }
+    var cyclePadType: () -> Void = {}
 }
 
 /// The editor's hooks (design §3.3): a tap on a slot picks its action instead of firing it, and
@@ -200,6 +205,8 @@ struct SlotSpec {
     var id: String
     var label: String
     var icon: String? = nil
+    /// A pad outline drawn in place of `icon` (`GamepadType.mark`).
+    var mark: Image? = nil
     /// A shortcut's chord, drawn as a stacked keycap (`ChordKeycap`).
     var keys: [String]? = nil
     var enabled = true
@@ -297,6 +304,18 @@ func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> SlotSpec {
                         reason: a.pointerGranted() ? "No controller is connected"
                             : "This host only allows controller input",
                         toggle: true, state: padMouseState(a.padMouseMode()))
+    case .padType:
+        // Automatic keeps a plain controller; a picked type shows its outline.
+        let type = a.padType()
+        return SlotSpec(id: "pad_type", label: "Controller type", icon: "dpad", mark: type.mark,
+                        enabled: a.padTypeAvailable(), reason: "No controller is connected",
+                        toggle: true, state: type.ringLabel)
+    case .streamMute:
+        return SlotSpec(id: "stream_mute", label: "Mute this stream", icon: "speaker.wave.2",
+                        enabled: false, reason: "Not on this device")
+    case .swapScreens:
+        return SlotSpec(id: "swap_screens", label: "Swap screens", icon: "arrow.up.arrow.down",
+                        enabled: false, reason: "Dual-screen handhelds only")
     case .host(let id):
         let act = a.hostActions().first { $0.id == id }
         // Three power actions, three glyphs — the same icon on all three made them one button.
@@ -341,6 +360,12 @@ struct RingOverlay: View {
     /// Set by the settings editor; nil in-stream.
     var editing: RingEditing? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    #if os(visionOS)
+    /// On the Vision Pro's screen the ring is an attachment over the picture, with no scrim.
+    @Environment(\.inAttachment) private var inAttachment
+    #else
+    private let inAttachment = false
+    #endif
     /// The disc under an editing drag and how far it has been carried.
     @State private var drag: (k: Int, offset: CGSize)?
     /// Editing: which slot each disc is drawn in. Identity except while a swap plays: the two
@@ -406,8 +431,12 @@ struct RingOverlay: View {
                 : min(max(state.centre.y, margin), geo.size.height - margin)
             ZStack {
                 // The scrim: a tap outside closes the ring, and nothing reaches the stream
-                // while it is open. The editor has no stream under it and draws none.
-                Color.black.opacity(editing == nil ? 0.18 * (phase == 1 ? 1 : phase == 0 ? state.progress : 0) : 0)
+                // while it is open. The editor has no stream under it and draws none; an
+                // attachment on the Vision Pro's screen draws none either (a square would show),
+                // the picture closes the ring there.
+                Color.black.opacity(
+                    editing == nil && !inAttachment
+                        ? 0.18 * (phase == 1 ? 1 : phase == 0 ? state.progress : 0) : 0)
                     .contentShape(Rectangle())
                     #if os(iOS) || os(visionOS) || os(macOS)
                     .onTapGesture {
@@ -604,11 +633,12 @@ struct RingOverlay: View {
         case .stats: actions.cycleStats()
         case .mic: actions.toggleMic()
         case .pad: actions.togglePad()
-        case .sendText: break
+        case .sendText, .streamMute, .swapScreens: break
         // The host's own overlay is taking the screen: close first, like End stream.
         case .guide: state.close(); actions.tapPadButton(GamepadWire.guide)
         case .qam: state.close(); actions.tapPadButton(GamepadWire.misc1)
         case .padMouse: actions.cyclePadMouse()
+        case .padType: actions.cyclePadType()
         case .host(let id):
             if let act = actions.hostActions().first(where: { $0.id == id }) {
                 state.close()
@@ -683,6 +713,8 @@ struct RingOverlay: View {
         let face = Group {
             if let keys = s?.keys {
                 ChordKeycap(keys: keys)
+            } else if let mark = s?.mark {
+                mark.resizable().scaledToFit().frame(width: size * 0.5, height: size * 0.5)
             } else {
                 Image(systemName: s?.icon ?? "circle.dashed")
                     .font(.system(size: size * 0.4, weight: .semibold))
@@ -840,6 +872,10 @@ extension RingOverlay {
         let pm = spec(.padMouse, cfg, a)
         rows.append(SheetRowSpec(label: pm.label, value: pm.enabled ? pm.state : pm.reason, enabled: pm.enabled) {
             if pm.enabled { a.cyclePadMouse() }
+        })
+        let pt = spec(.padType, cfg, a)
+        rows.append(SheetRowSpec(label: pt.label, value: pt.enabled ? pt.state : pt.reason, enabled: pt.enabled) {
+            if pt.enabled { a.cyclePadType() }
         })
         rows.append(SheetRowSpec(header: "View", label: "Statistics", value: a.stats().label) { a.cycleStats() })
         let mic = spec(.mic, cfg, a)

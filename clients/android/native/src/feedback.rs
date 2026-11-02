@@ -18,11 +18,11 @@ use std::time::Duration;
 
 /// Short blocking timeout: long enough not to busy-spin, short enough that the Kotlin poll thread
 /// observes its `running=false` flag promptly on teardown.
-const PULL_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const PULL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// A pull with no session (or a closed one) still blocks for [`PULL_TIMEOUT`]: both answers are
 /// instant, and the Kotlin loop spins until `stop()`.
-fn idle_pull<T>(sentinel: T) -> T {
+pub(crate) fn idle_pull<T>(sentinel: T) -> T {
     std::thread::sleep(PULL_TIMEOUT);
     sentinel
 }

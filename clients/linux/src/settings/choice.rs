@@ -9,8 +9,7 @@ use std::rc::Rc;
 /// are xdg_popups, which gamescope never maps for nested apps — a ComboRow's dropdown
 /// flashes the row but no list ever appears. Selection UI must stay inside the toplevel.
 pub fn gamescope_session() -> bool {
-    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.eq_ignore_ascii_case("gamescope"))
-        || pf_client_core::gamescope::under_gamescope()
+    pf_client_core::gamescope::under_gamescope()
 }
 
 type ChangedFn = Rc<RefCell<Vec<Rc<dyn Fn(u32)>>>>;

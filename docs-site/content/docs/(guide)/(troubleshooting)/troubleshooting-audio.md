@@ -31,6 +31,7 @@ warns `capturing an endpoint that …` and names the device.
 - Raise that device's format to 48000 Hz or more in Windows' sound settings.
 - A Bluetooth headset in hands-free mode mixes at 16 kHz mono or less. Switch it to its stereo
   profile.
+- To capture a different device, set `PUNKTFUNK_LOOPBACK_DEVICE` in `host.env` to part of its name.
 
 ## Any host
 

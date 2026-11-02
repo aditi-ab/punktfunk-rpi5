@@ -14,8 +14,8 @@
   CLEAR the FORCE_INTEGRITY PE bit (wdk-build links /INTEGRITYCHECK, which a non-EV cert can't satisfy) ->
   sign the .dll -> stampinf a strictly-increasing DriverVer into the INF -> Inf2Cat the catalog -> sign the
   catalog -> export the public .cer. Output (-Out): pf_vdisplay.{dll,inf,cat} + punktfunk-driver.cer,
-  plus pf_vdisplay_seats.{inf,cat} - the same driver claiming the seat display ids, which the seats
-  add-on installs INSTEAD of nothing and which nobody else should install (see below).
+  plus pf_vdisplay_seats.{inf,cat} - the same driver claiming the seat display ids, which only a
+  box that runs seats installs (see below).
 
   Requires the WDK build env: cargo + the x64 MSVC toolset (its ARM64 cross compiler for -Arch arm64), an LLVM compatible with the driver's bindgen
   (>= 0.72 supports current clang), LIBCLANG_PATH, and the Windows 10/11 WDK (the runner has these). Sets
@@ -40,21 +40,10 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $PSNativeCommandUseErrorActionPreference = $false
 
-# The decoded signing key must not outlive this script. It is a STABLE key now - trusted as a
-# machine root on every box that installs punktfunk - so a .pfx left behind in a build directory is
-# a standing credential on a machine that runs build jobs, not the throwaway it used to be. A
-# script-scope trap covers the failure paths; Remove-SigningPfx is also called on the way out.
-$script:ShredPfx = $null
-function Remove-SigningPfx {
-    if ($script:ShredPfx -and (Test-Path $script:ShredPfx)) {
-        Remove-Item $script:ShredPfx -Force -ErrorAction SilentlyContinue
-        $script:ShredPfx = $null
-    }
-}
-# `break` is for explicitness, not correctness: measured on the runner, a bare trap and
-# trap+break behave identically here (exit 1, no resumption) for `throw` at script scope,
-# `throw` inside a function, and a cmdlet error under EAP=Stop. Kept because it states the
-# intent - shred, then re-throw - instead of relying on a default that is easy to misread.
+# The decoded DRIVER_CERT key is trusted as a machine root on every box that installs punktfunk,
+# so it must not outlive this script: the trap shreds it on any throw, then re-throws, and the
+# normal exit calls Remove-SigningPfx too. signing.ps1 holds the shred; the key stays this script's.
+. (Join-Path $PSScriptRoot 'signing.ps1')
 trap { Remove-SigningPfx; break }
 
 $DriversDir = (Resolve-Path $DriversDir).Path
@@ -88,16 +77,9 @@ if (-not $SkipBuild) {
 if (-not (Test-Path $dll)) { throw "driver not built: $dll" }
 
 # --- 2. WDK sign tools ------------------------------------------------------------------------
-$kits = 'C:\Program Files (x86)\Windows Kits\10\bin'
-function Find-Tool([string]$name, [string]$arch) {
-    (Get-ChildItem "$kits\*\$arch\$name" -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1).FullName
-}
-$signtool = Find-Tool 'signtool.exe' 'x64'
-$stampinf = Find-Tool 'stampinf.exe' 'x64'
-$inf2cat = Find-Tool 'Inf2Cat.exe'  'x86'
-foreach ($t in @($signtool, $stampinf, $inf2cat)) {
-    if (-not $t) { throw 'a WDK tool (signtool/stampinf/Inf2Cat) was not found - install the Windows 10/11 WDK.' }
-}
+$signtool = Find-SdkTool 'signtool.exe'
+$stampinf = Find-SdkTool 'stampinf.exe'
+$inf2cat = Find-SdkTool 'Inf2Cat.exe' 'x86'
 
 # --- 3. signing cert (supplied stable pfx OR fresh self-signed) -------------------------------
 # FAIL CLOSED on a real release, same rule as the host/MSIX pack scripts. The fallback below mints
@@ -142,8 +124,7 @@ Copy-Item $inx $sInf -Force   # stampinf rewrites this copy in place
 
 # The SEATS variant, built from the same .inx and signed with the same key. It exists because
 # claiming `RdpIdd_IndirectDisplay` takes over EVERY RDP session on the machine, so it cannot ride
-# the package everyone installs - but the seats add-on cannot mint it either, having neither the
-# DLL nor the signing key. Two packages, one build, and the installer chooses.
+# the package everyone installs. Two packages, one build, and the operator chooses.
 # It claims ONLY the seat ids, so it never competes for the console `Root\pf_vdisplay` node.
 $sInfSeats = Join-Path $Out 'pf_vdisplay_seats.inf'
 $sCatSeats = Join-Path $Out 'pf_vdisplay_seats.cat'

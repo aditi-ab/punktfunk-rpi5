@@ -78,10 +78,10 @@ pub fn exec_session() -> glib::ExitCode {
         "--preset",
         "--profile",
     ];
-    let mut cmd = std::process::Command::new(crate::app::spawn::session_binary());
+    let mut cmd = crate::app::spawn::session_process();
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
-        if a == "--fullscreen" || a == "--stats" {
+        if a == "--fullscreen" || a == "--stats" || a == "--all-screens" {
             cmd.arg(a);
         } else if forward.contains(&a.as_str()) {
             cmd.arg(&a);
@@ -98,6 +98,24 @@ pub fn exec_session() -> glib::ExitCode {
     let err = cmd.exec(); // only returns on failure
     eprintln!("exec punktfunk-session: {err}");
     glib::ExitCode::FAILURE
+}
+
+/// The saved record `--library` takes its pin and management port from: the one pinned to
+/// `--fp` when given, else the first pinned at the address. Both OS installs of a dual-boot
+/// box sit at one address, each with a pin and a management port of its own. A record is
+/// keyed by its STREAM port, so the address is matched without a port.
+fn library_record<'a>(
+    known: &'a KnownHosts,
+    fp: Option<&str>,
+    addr: &str,
+) -> Option<&'a KnownHost> {
+    match fp {
+        Some(fp) => known.find_by_fp(fp),
+        None => known
+            .hosts
+            .iter()
+            .find(|h| h.addr == addr && !h.fp_hex.is_empty()),
+    }
 }
 
 /// `--library host[:mgmt_port]` — fetch and print the host's game library over the real
@@ -122,15 +140,12 @@ pub fn headless_library(target: &str) -> glib::ExitCode {
             return glib::ExitCode::FAILURE;
         }
     };
-    // The saved record is keyed by its STREAM port, so it is resolved by address alone — a
-    // lookup on the mgmt port never matches, and `fetch_games` reads a `None` pin as "accept
-    // any certificate". A host we cannot pin is refused rather than fetched unpinned.
-    let known = crate::trust::KnownHosts::load();
-    let saved = known
-        .hosts
-        .iter()
-        .find(|h| h.addr == addr && !h.fp_hex.is_empty());
-    let Some(pin) = arg_value("--fp")
+    // `fetch_games` reads a `None` pin as "accept any certificate", so a host we cannot pin
+    // is refused rather than fetched unpinned.
+    let known = KnownHosts::load();
+    let fp = arg_value("--fp");
+    let saved = library_record(&known, fp.as_deref(), &addr);
+    let Some(pin) = fp
         .as_deref()
         .and_then(crate::trust::parse_hex32)
         .or_else(|| saved.and_then(|h| crate::trust::parse_hex32(&h.fp_hex)))
@@ -142,7 +157,8 @@ pub fn headless_library(target: &str) -> glib::ExitCode {
     let port = explicit_port
         .or_else(|| saved.map(|h| h.effective_mgmt_port()))
         .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
-    match pf_client_core::library::fetch_games(&addr, port, &identity, Some(pin)) {
+    let stream_port = saved.map_or(0, |h| h.port);
+    match pf_client_core::library::fetch_games(&addr, port, stream_port, &identity, Some(pin)) {
         Ok(games) => {
             // A fourth column, appended: `game` or `launcher` (design D4). Appended rather than
             // folded into an existing field so anything reading the first three columns is
@@ -195,6 +211,32 @@ impl Selector {
             Selector::Addr(addr, port) => h.addr == *addr && h.port == *port,
         }
     }
+
+    /// The refusal for an address that names two or more pinned hosts: both OS installs of a
+    /// dual-boot box answer at one lease, so the address picks neither. `None` for a
+    /// fingerprint, or an address naming one pinned host and any placeholders.
+    fn shared_address(&self, known: &KnownHosts, verb: &str) -> Option<String> {
+        let Selector::Addr(addr, port) = self else {
+            return None;
+        };
+        let pinned: Vec<&KnownHost> = known
+            .hosts
+            .iter()
+            .filter(|h| self.matches(h) && !h.fp_hex.is_empty())
+            .collect();
+        if pinned.len() < 2 {
+            return None;
+        }
+        let mut why = format!(
+            "Couldn't {verb} {addr}:{port} \u{2014} it names {} saved hosts. \
+             Name one by its fingerprint:",
+            pinned.len()
+        );
+        for h in pinned {
+            why.push_str(&format!("\n  {}  {}", h.fp_hex, h.name));
+        }
+        Some(why)
+    }
 }
 
 /// `--omarchy-menu on|off|sync` — Punktfunk's rows in the Omarchy menu (Super+Space): a root
@@ -236,8 +278,8 @@ fn headless_omarchy_menu(verb: &str) -> glib::ExitCode {
 /// `--set-host <fp|host[:port]> [--host-label NAME] [--addr ADDR] [--port PORT] [--mac LIST]` —
 /// edit a saved host: rename it, re-point its address (remembering the one it leaves), or set
 /// its Wake-on-LAN MACs (`--mac ""` clears them). Identified by fingerprint (survives IP
-/// changes) or current address. Prints `updated <name>`; fails if nothing matched or a value
-/// doesn't parse.
+/// changes) or current address. Prints `updated <name>`; fails if nothing matched, a value
+/// doesn't parse, or the address names two pinned hosts ([`Selector::shared_address`]).
 pub fn headless_set_host(selector: &str) -> glib::ExitCode {
     let fail = |msg: String| {
         eprintln!("set-host: {msg}");
@@ -260,65 +302,57 @@ pub fn headless_set_host(selector: &str) -> glib::ExitCode {
         addr: arg_value("--addr"),
         port,
         macs,
+        fp: None,
     };
     let Some(sel) = parse_selector(selector) else {
         return fail(format!("no usable port in {selector:?}"));
     };
-    let mut known = KnownHosts::load();
-    let Some(h) = known.hosts.iter_mut().find(|h| sel.matches(h)) else {
-        return fail(format!("no saved host matches {selector:?}"));
-    };
-    h.apply_edit(&edit);
-    let label = h.name.clone();
-    match known.save() {
-        Ok(()) => {
+    if let Some(why) = sel.shared_address(&KnownHosts::read(), "edit") {
+        eprintln!("{why}");
+        return glib::ExitCode::FAILURE;
+    }
+    let saved = KnownHosts::update_if(|known| {
+        let h = known.hosts.iter_mut().find(|h| sel.matches(h))?;
+        h.apply_edit(&edit);
+        Some(h.name.clone())
+    });
+    match saved {
+        Ok(Some(label)) => {
             println!("updated {label}");
             glib::ExitCode::SUCCESS
         }
+        Ok(None) => fail(format!("no saved host matches {selector:?}")),
         Err(e) => fail(format!("{e:#}")),
     }
 }
 
 /// `--forget-host <fp|host[:port]>` — remove a saved host, its cached catalog and a default
 /// pointing at it (a later connect must re-pair/trust). Prints `forgot N`; succeeds even if
-/// nothing matched (idempotent).
-///
-/// An address naming two PINNED records is refused: both OS installs of a dual-boot box answer
-/// at one lease, and forgetting a host is not undoable. The fingerprint selects one of them.
+/// nothing matched (idempotent). An address naming two pinned hosts is refused
+/// ([`Selector::shared_address`]); one pinned host and a placeholder there both go.
 pub fn headless_forget_host(selector: &str) -> glib::ExitCode {
     let Some(sel) = parse_selector(selector) else {
         eprintln!("forget-host: no usable port in {selector:?}");
         return glib::ExitCode::FAILURE;
     };
-    let mut known = KnownHosts::load();
-    if let Selector::Addr(addr, port) = &sel {
-        let pinned: Vec<&KnownHost> = known
-            .hosts
-            .iter()
-            .filter(|h| h.addr == *addr && h.port == *port && !h.fp_hex.is_empty())
-            .collect();
-        if pinned.len() > 1 {
-            eprintln!(
-                "Couldn't forget {addr}:{port} — it names {} saved hosts. \
-                 Forget one by its fingerprint:",
-                pinned.len()
-            );
-            for h in pinned {
-                eprintln!("  {}  {}", h.fp_hex, h.name);
+    if let Some(why) = sel.shared_address(&KnownHosts::read(), "forget") {
+        eprintln!("{why}");
+        return glib::ExitCode::FAILURE;
+    }
+    // One record per locked edit, last match first, until none is left.
+    let last_match = |now: &KnownHosts| now.hosts.iter().rposition(|h| sel.matches(h));
+    let mut forgot = 0;
+    loop {
+        match pf_client_core::orchestrate::forget_host(last_match) {
+            Ok(Some(_)) => forgot += 1,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("forget-host: {e:#}");
+                return glib::ExitCode::FAILURE;
             }
-            return glib::ExitCode::FAILURE;
         }
     }
-    let hits: Vec<usize> = (0..known.hosts.len())
-        .filter(|&i| sel.matches(&known.hosts[i]))
-        .collect();
-    for &i in hits.iter().rev() {
-        if let Err(e) = pf_client_core::orchestrate::forget_host(&mut known, i) {
-            eprintln!("forget-host: {e:#}");
-            return glib::ExitCode::FAILURE;
-        }
-    }
-    println!("forgot {}", hits.len());
+    println!("forgot {forgot}");
     glib::ExitCode::SUCCESS
 }
 
@@ -460,4 +494,70 @@ pub fn headless_host_command() -> Option<glib::ExitCode> {
         return Some(headless_apply_update());
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both OS installs of a dual-boot box saved at one address, each with its own pin and
+    /// management port.
+    fn dual_boot() -> (KnownHosts, String, String) {
+        let (windows, linux) = ("aa".repeat(32), "bb".repeat(32));
+        let at = |fp: &str, mgmt: u16| KnownHost {
+            addr: "192.168.1.9".into(),
+            fp_hex: fp.into(),
+            mgmt_port: Some(mgmt),
+            ..Default::default()
+        };
+        let known = KnownHosts {
+            hosts: vec![at(&windows, 47990), at(&linux, 47991)],
+        };
+        (known, windows, linux)
+    }
+
+    /// `--library --fp` reads the record its fingerprint names, not the sibling saved first.
+    #[test]
+    fn library_takes_the_record_its_fingerprint_names() {
+        let (known, windows, linux) = dual_boot();
+        let mgmt = |fp: Option<&str>| {
+            library_record(&known, fp, "192.168.1.9").map(KnownHost::effective_mgmt_port)
+        };
+        assert_eq!(mgmt(Some(&linux)), Some(47991));
+        assert_eq!(mgmt(Some(&windows.to_uppercase())), Some(47990));
+        assert_eq!(mgmt(None), Some(47990), "no --fp: the first pinned there");
+        // A fingerprint nobody is pinned to names no record, whatever the address holds.
+        assert_eq!(mgmt(Some(&"cc".repeat(32))), None);
+    }
+
+    /// A fingerprint selector names one of the two; their address names both, which is what
+    /// `--set-host` and `--forget-host` refuse.
+    #[test]
+    fn a_fingerprint_selects_one_host_at_a_shared_address() {
+        let (known, _, linux) = dual_boot();
+        let hits = |s: &str| {
+            let sel = parse_selector(s).expect("a selector");
+            known.hosts.iter().filter(|h| sel.matches(h)).count()
+        };
+        assert_eq!(hits(&linux), 1);
+        assert_eq!(hits("192.168.1.9:9777"), 2);
+    }
+
+    /// Two pinned hosts at one address refuse it, naming both pins; a fingerprint, or one pin
+    /// beside a placeholder, does not.
+    #[test]
+    fn an_address_naming_two_pinned_hosts_is_refused() {
+        let (mut known, windows, linux) = dual_boot();
+        let refusal = |known: &KnownHosts, s: &str| {
+            parse_selector(s)
+                .expect("a selector")
+                .shared_address(known, "edit")
+        };
+        let why = refusal(&known, "192.168.1.9:9777").expect("two pins refuse the address");
+        assert!(why.starts_with("Couldn't edit 192.168.1.9:9777"), "{why}");
+        assert!(why.contains(&windows) && why.contains(&linux), "{why}");
+        assert_eq!(refusal(&known, &linux), None);
+        known.hosts[1].fp_hex.clear();
+        assert_eq!(refusal(&known, "192.168.1.9:9777"), None);
+    }
 }

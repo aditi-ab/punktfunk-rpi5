@@ -14,7 +14,7 @@ haptics and its built-in speaker. Nothing is sent while the pad is quiet.
   speaker** is on by default on Linux and Windows, off on Android
   ([client settings](/docs/client-settings#input)). On Android both also need **DualSense /
   DualShock passthrough (USB)** on. The Apple clients play neither.
-- **Controller speaker** on for the host, in the web console under **Host → Settings → Audio**. It
+- **Controller speaker** on for the host, in the web console under **Host → Audio**. It
   is on by default and covers the haptics too.
 - **On a Linux host**, a game running under **GE-Proton 11-5 or newer**. Stock Proton doesn't
   route controller audio.
@@ -109,7 +109,7 @@ the game. Add `--speaker` to test the speaker instead, `--seconds N` to run long
 In a Flatpak install, including the Steam Deck:
 
 ```sh
-flatpak run --command=punktfunk-session io.unom.Punktfunk --pad-audio-test
+flatpak run --command=punktfunk-session io.unom.punktfunk --pad-audio-test
 ```
 
 ## Known limits

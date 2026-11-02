@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import android.app.Activity
 import android.widget.Toast
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
@@ -172,6 +173,7 @@ internal fun SessionWatchEffect(
     initialAccess: IntArray?,
     ui: StreamUi,
     peripherals: StreamPeripherals,
+    wakeRedial: () -> Boolean,
     onSessionEnded: (SessionEndReason) -> Unit,
 ) {
     val context = LocalContext.current
@@ -216,6 +218,8 @@ internal fun SessionWatchEffect(
                 // died says the host may be asleep. A quit game or a deliberate host end is not
                 // a failure, and must not read like one.
                 val reason = SessionEndReason.fromNative(NativeBridge.nativeEndReason(handle))
+                // A woken host that refused before streaming is dialed again; that dial says why.
+                if (reason == SessionEndReason.HOST_ERROR && wakeRedial()) return@LaunchedEffect
                 when {
                     // Dying inside the countdown's final stretch IS the typed expiry close,
                     // recognized off the countdown because the end-reason byte has no expiry code.
@@ -225,12 +229,9 @@ internal fun SessionWatchEffect(
                             "Your access to this host has expired.",
                             Toast.LENGTH_LONG,
                         ).show()
+                    // The redial says what happens next; this only says why the picture went.
                     reason == SessionEndReason.LOST ->
-                        Toast.makeText(
-                            context,
-                            "Connection lost — the host may be asleep. Wake it to reconnect.",
-                            Toast.LENGTH_LONG,
-                        ).show()
+                        Toast.makeText(context, "Lost the connection — reconnecting.", Toast.LENGTH_SHORT).show()
                     reason == SessionEndReason.HOST_ERROR ->
                         Toast.makeText(
                             context,
@@ -265,7 +266,7 @@ internal fun rememberHostActions(handle: Long, host: KnownHost?): State<List<Hos
         } ?: return@LaunchedEffect
         while (true) {
             actions.value = withContext(Dispatchers.IO) {
-                HostActions.list(identity, kh.address, kh.effectiveMgmtPort, kh.fpHex)
+                HostActions.list(identity, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.port)
             }
             delay(300_000)
         }
@@ -289,7 +290,7 @@ internal fun rememberStreamedGame(handle: Long, host: KnownHost?, ringOpen: Bool
         } ?: return@LaunchedEffect
         game.value = withContext(Dispatchers.IO) {
             LibraryClient.fetchRunning(
-                kh.address, kh.effectiveMgmtPort, identity.certPem, identity.privateKeyPem, kh.fpHex,
+                kh.address, kh.effectiveMgmtPort, identity.certPem, identity.privateKeyPem, kh.fpHex, kh.port,
             )
         }.firstOrNull { it.streamedHere }
     }
@@ -345,15 +346,18 @@ internal fun KeepAliveEffects(
         }
     }
 
-    // Leaving the app (Home, task switch, screen off). Android does not suspend a backgrounded
-    // process, so without the keep-alive this must end the session or the host holds it for
-    // nobody. `onSessionEnded` runs the one real teardown; not a quit, so the host lingers the
-    // display and coming straight back is a fast reconnect.
+    // Leaving the app (Home, task switch, screen off). Without the keep-alive this ends the session,
+    // or the host holds it for nobody; not a quit, so the host lingers the display. A stop on the
+    // way to a recreated activity is not leaving: the new one attaches to the same session.
     DisposableEffect(handle, keepAlive) {
         val lifecycle = (context as? LifecycleOwner)?.lifecycle
         val obs = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_STOP -> if (keepAlive) away = true else onSessionEnded(SessionEndReason.LOCAL)
+                Lifecycle.Event.ON_STOP -> when {
+                    (context as? Activity)?.isChangingConfigurations == true -> {}
+                    keepAlive -> away = true
+                    else -> onSessionEnded(SessionEndReason.LOCAL)
+                }
                 Lifecycle.Event.ON_START -> away = false
                 else -> {}
             }

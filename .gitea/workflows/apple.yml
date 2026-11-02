@@ -94,11 +94,11 @@ on:
     # per-step gates). Heavy on the shared mac-mini runner, hence the tight paths filter.
     branches: [main]
     paths:
-      - 'crates/punktfunk-core/**'
-      - 'crates/punktfunk-ffi/**'
-      - 'crates/pf-console-ui/**'
-      - 'crates/pf-client-core/**'
-      - 'crates/pf-bitstream/**'
+      - 'crates/client/pf-client-core/**'
+      - 'crates/client/pf-console-ui/**'
+      - 'crates/client/punktfunk-ffi/**'
+      - 'crates/codec/pf-bitstream/**'
+      - 'crates/core/punktfunk-core/**'
       - 'clients/apple/**'
       - 'clients/shared/**'
       - 'scripts/build-xcframework.sh'
@@ -117,11 +117,11 @@ on:
     tags: ['v*']
   pull_request:
     paths:
-      - 'crates/punktfunk-core/**'
-      - 'crates/punktfunk-ffi/**'
-      - 'crates/pf-console-ui/**'
-      - 'crates/pf-client-core/**'
-      - 'crates/pf-bitstream/**'
+      - 'crates/client/pf-client-core/**'
+      - 'crates/client/pf-console-ui/**'
+      - 'crates/client/punktfunk-ffi/**'
+      - 'crates/codec/pf-bitstream/**'
+      - 'crates/core/punktfunk-core/**'
       - 'clients/apple/**'
       - 'clients/shared/**'
       - 'scripts/build-xcframework.sh'
@@ -144,6 +144,10 @@ on:
         description: "Notarize the macOS DMG and publish it to the registry's canary/ path (true/false)"
         required: false
         default: "false"
+      version:
+        description: "Marketing version X.Y.Z, to rebuild a released version's App Store binaries off main (empty: the canary version)"
+        required: false
+        default: ""
 
 # Shared compile cache: sccache -> RustFS S3 (storage.unom.io — the mini resolves it via
 # the router, i.e. the hairpin path whose TLS always validated). Covers every cargo/rustc
@@ -216,7 +220,7 @@ jobs:
           fi
           RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
           dirname "$RUSTUP" >> "$GITHUB_PATH"
-          "$RUSTUP" target add aarch64-apple-darwin
+          "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin
           # The iOS/tvOS simulator slices the two scheme builds below link against.
           "$RUSTUP" target add aarch64-apple-ios aarch64-apple-ios-sim
           # tvOS and visionOS are tier-3 (no prebuilt std) — build-xcframework.sh compiles them with
@@ -231,24 +235,19 @@ jobs:
       - name: sccache (self-healing install)
         run: sh scripts/ci/ensure-sccache.sh
 
-      # `punktfunk-core` now decodes Opus in-core for the Apple client (surround), pulling
-      # `audiopus_sys`, which builds a vendored static libopus via CMake when pkg-config can't find a
-      # system Opus — so the xcframework is self-contained (no runtime libopus.dylib on end-user Macs).
-      # CMake must be on PATH; install it self-healing on a fresh runner.
-      - name: CMake (for the vendored libopus audiopus_sys builds)
+      # `punktfunk-core` decodes Opus in-core for the Apple client (surround), pulling `opusic-sys`,
+      # which always builds a static libopus via CMake — so the xcframework is self-contained (no
+      # runtime libopus.dylib on end-user Macs). CMake must be on PATH; install it self-healing.
+      - name: CMake (for the vendored libopus builds)
         run: |
           # Runner steps run with `bash --noprofile --norc`, so Homebrew's bin dir isn't on PATH —
           # locate brew explicitly, install cmake if missing, and export its bin dir to GITHUB_PATH so
-          # the xcframework build step (audiopus_sys → vendored libopus) finds `cmake`.
+          # the xcframework build step (opusic-sys → vendored libopus) finds `cmake`.
           for B in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$B" ] && BREW="$B" && break; done
           if [ -z "$BREW" ]; then echo "::error::Homebrew not found on the runner"; exit 1; fi
           BREW_BIN="$(dirname "$BREW")"; export PATH="$BREW_BIN:$PATH"
           command -v cmake >/dev/null || "$BREW" install cmake
           echo "$BREW_BIN" >> "$GITHUB_PATH"
-          # Homebrew's CMake 4 dropped compatibility with the vendored libopus's pre-3.5
-          # `cmake_minimum_required`; treat 3.5 as the policy minimum (the cmake crate's child cmake
-          # inherits this from the env during the xcframework build).
-          echo "CMAKE_POLICY_VERSION_MINIMUM=3.5" >> "$GITHUB_ENV"
 
       - name: Build PunktfunkCore.xcframework (mac + iOS + tvOS + visionOS slices)
         # iOS, tvOS and visionOS slices on purpose: the scheme builds below need them. A rebuild replaces
@@ -294,6 +293,20 @@ jobs:
             -destination 'generic/platform=tvOS Simulator' \
             -skipMacroValidation -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO build
+
+      # App Store export refuses SpatialGamepad on iOS, macOS and tvOS, so visionOS has its own plist.
+      - name: Info plists differ by the visionOS controller profile alone
+        working-directory: clients/apple/Config
+        run: |
+          python3 - <<'EOF'
+          import plistlib
+          base = plistlib.load(open("Info.plist", "rb"))
+          vision = plistlib.load(open("Info-visionOS.plist", "rb"))
+          pads = vision["GCSupportedGameControllers"]
+          vision["GCSupportedGameControllers"] = [p for p in pads if p["ProfileName"] != "SpatialGamepad"]
+          if base != vision or len(pads) == len(vision["GCSupportedGameControllers"]):
+              raise SystemExit("Info.plist and Info-visionOS.plist must differ by SpatialGamepad alone")
+          EOF
 
       # visionOS is a destination of the iOS scheme; its SDK ships with Xcode, no runtime needed.
       - name: Build the visionOS app (type-check the os(visionOS) regions)
@@ -343,12 +356,17 @@ jobs:
           DEVELOPER_DIR="$DEV_DIR" xcodebuild -version
 
       - name: Version from tag
+        env:
+          # Data, never interpolated into the script: a dispatch input is free text.
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE, PF_CHANNEL, PF_STABLE_TAG (single source of truth)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; V="${V%%-*}" ;;  # App Store marketing version is numeric X.Y.Z (drop -rc)
-            *)            V="$PF_BASE" ;;                             # canary marketing version = one minor ahead of the latest stable tag; the build number disambiguates
+            *)            V="${INPUT_VERSION:-$PF_BASE}" ;;           # canary marketing version = one minor ahead of the latest stable tag; the build number disambiguates
           esac
+          printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::marketing version must be X.Y.Z, got '$V'"; exit 1; }
           echo "VERSION=$V" >> "$GITHUB_ENV"
           # GITHUB_RUN_NUMBER is REPO-WIDE in Gitea (not per-workflow as on GitHub): consecutive runs
           # of different workflows get consecutive numbers. That is why folding the old release.yml
@@ -362,7 +380,7 @@ jobs:
         run: |
           RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
           dirname "$RUSTUP" >> "$GITHUB_PATH"
-          "$RUSTUP" target add aarch64-apple-darwin \
+          "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin \
             aarch64-apple-ios aarch64-apple-ios-sim
           # tvOS targets are tier-3 (no prebuilt std) — build-xcframework.sh compiles them with a
           # PINNED nightly + -Zbuild-std. Read the date from the script so it lives in one place.
@@ -370,22 +388,18 @@ jobs:
           "$RUSTUP" toolchain install "$NIGHTLY" --profile minimal
           "$RUSTUP" component add rust-src --toolchain "$NIGHTLY"
 
-      # The in-core Opus decode (surround) pulls audiopus_sys, which builds a vendored static libopus
+      # The in-core Opus decode (surround) pulls opusic-sys, which builds a vendored static libopus
       # via CMake — keep the xcframework self-contained (no runtime libopus.dylib on end-user devices).
-      - name: CMake (for the vendored libopus audiopus_sys builds)
+      - name: CMake (for the vendored libopus builds)
         run: |
           # Runner steps run with `bash --noprofile --norc`, so Homebrew's bin dir isn't on PATH —
           # locate brew explicitly, install cmake if missing, and export its bin dir to GITHUB_PATH so
-          # the xcframework build step (audiopus_sys → vendored libopus) finds `cmake`.
+          # the xcframework build step (opusic-sys → vendored libopus) finds `cmake`.
           for B in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$B" ] && BREW="$B" && break; done
           if [ -z "$BREW" ]; then echo "::error::Homebrew not found on the runner"; exit 1; fi
           BREW_BIN="$(dirname "$BREW")"; export PATH="$BREW_BIN:$PATH"
           command -v cmake >/dev/null || "$BREW" install cmake
           echo "$BREW_BIN" >> "$GITHUB_PATH"
-          # Homebrew's CMake 4 dropped compatibility with the vendored libopus's pre-3.5
-          # `cmake_minimum_required`; treat 3.5 as the policy minimum (the cmake crate's child cmake
-          # inherits this from the env during the xcframework build).
-          echo "CMAKE_POLICY_VERSION_MINIMUM=3.5" >> "$GITHUB_ENV"
 
       # Shared compile cache. The script handles the macOS side — see scripts/ci/ensure-sccache.sh.
       - name: sccache (self-healing install)
@@ -889,7 +903,7 @@ jobs:
           fi
           RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
           dirname "$RUSTUP" >> "$GITHUB_PATH"
-          "$RUSTUP" target add aarch64-apple-darwin \
+          "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin \
             aarch64-apple-ios aarch64-apple-ios-sim
           # tvOS targets are tier-3 (no prebuilt std) — build-xcframework.sh compiles them with a
           # PINNED nightly + -Zbuild-std; the date comes from the script (see the swift job).
@@ -902,21 +916,17 @@ jobs:
       - name: sccache (self-healing install)
         run: sh scripts/ci/ensure-sccache.sh
 
-      # See the swift job: audiopus_sys (via the in-core Opus decode) builds vendored libopus with CMake.
-      - name: CMake (for the vendored libopus audiopus_sys builds)
+      # See the swift job: opusic-sys (via the in-core Opus decode) builds vendored libopus with CMake.
+      - name: CMake (for the vendored libopus builds)
         run: |
           # Runner steps run with `bash --noprofile --norc`, so Homebrew's bin dir isn't on PATH —
           # locate brew explicitly, install cmake if missing, and export its bin dir to GITHUB_PATH so
-          # the xcframework build step (audiopus_sys → vendored libopus) finds `cmake`.
+          # the xcframework build step (opusic-sys → vendored libopus) finds `cmake`.
           for B in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$B" ] && BREW="$B" && break; done
           if [ -z "$BREW" ]; then echo "::error::Homebrew not found on the runner"; exit 1; fi
           BREW_BIN="$(dirname "$BREW")"; export PATH="$BREW_BIN:$PATH"
           command -v cmake >/dev/null || "$BREW" install cmake
           echo "$BREW_BIN" >> "$GITHUB_PATH"
-          # Homebrew's CMake 4 dropped compatibility with the vendored libopus's pre-3.5
-          # `cmake_minimum_required`; treat 3.5 as the policy minimum (the cmake crate's child cmake
-          # inherits this from the env during the xcframework build).
-          echo "CMAKE_POLICY_VERSION_MINIMUM=3.5" >> "$GITHUB_ENV"
 
       - name: Pin + prune DerivedData (same disease the distribute job already cures)
         # screenshots.sh builds into a throwaway mktemp DerivedData per invocation — two

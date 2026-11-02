@@ -1,0 +1,399 @@
+//! The client worker: QUIC handshake + control/input/datagram tasks + the blocking data-plane pump.
+
+use super::frame_channel::{
+    JumpToLive, Shed, StandingLatAction, StandingLatency, CLOCK_RESYNC_INTERVAL, PIN_SHEDS_TO_WARN,
+};
+use super::worker::reject_from_close;
+use super::*;
+use crate::config::Role;
+use crate::packet::FLAG_PROBE;
+use crate::quic::{
+    wall_clock_ns, BitrateChanged, ClipState, ClockEcho, ClockResync, Hello, ProbeResult,
+    Reconfigure, Reconfigured, ResyncAdmit, ResyncGuard, ResyncStep, SetBitrate, SkewModel,
+};
+use crate::session::Session;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+
+pub(crate) mod anchor;
+mod control_task;
+mod data;
+mod datagram_task;
+mod handshake;
+mod input_task;
+mod rx_gap;
+
+/// What the control task tells the data pump, in arrival order. The pump drains the channel
+/// once per iteration.
+#[derive(Debug, PartialEq)]
+enum PumpEvent {
+    /// A mid-stream clock re-sync moved [`ClientShared::clock_offset`].
+    ClockResynced,
+    /// A completed re-sync batch failed the congestion guard; the offset did not move.
+    ClockResyncRejected,
+    /// A host `BitrateChanged`, with its reason (`None` from a host that does not name its
+    /// limits).
+    BitrateAck(u32, Option<crate::quic::AckReason>),
+    /// The host rebuilt its pipeline (gap in ms): the report window in flight is discarded.
+    PipelineGap(u32),
+    /// The host now delivers this mode.
+    Mode(crate::config::Mode),
+}
+
+type PumpTx = std::sync::mpsc::Sender<PumpEvent>;
+
+/// The control stream's write half.
+pub(super) type CtlSend = quinn::SendStream;
+/// The control stream's frames, read cancel-safe under `select!`.
+pub(super) type CtlRecv = crate::quic::v2::io::FrameReader<quinn::RecvStream>;
+
+/// The client's connection. A datagram carries its kind; this adds and strips it, so every
+/// task keeps sending and reading the datagrams it always did. Everything else is the quinn
+/// connection underneath.
+#[derive(Clone)]
+pub(super) struct ClientConn {
+    conn: quinn::Connection,
+}
+
+impl ClientConn {
+    pub(super) fn new(conn: quinn::Connection) -> ClientConn {
+        ClientConn { conn }
+    }
+
+    pub(super) fn send_datagram(
+        &self,
+        data: Vec<u8>,
+    ) -> std::result::Result<(), quinn::SendDatagramError> {
+        // Every datagram the client sends has a kind; one without is dropped here.
+        match crate::quic::v2::dgram::wrap(&data) {
+            Some(w) => self.conn.send_datagram(w.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// One feedback datagram. A send that fails is lost like any datagram; the next one
+    /// repeats its window, the ask's next copy its ask.
+    pub(super) fn send_feedback(&self, fb: &crate::quic::v2::dgram::Feedback) {
+        if let Err(e) = self.conn.send_datagram(fb.encode().into()) {
+            tracing::debug!(error = %e, "feedback datagram not sent");
+        }
+    }
+
+    /// The next datagram the session logic reads; a kind it takes nothing from is skipped.
+    pub(super) async fn read_datagram(
+        &self,
+    ) -> std::result::Result<Vec<u8>, quinn::ConnectionError> {
+        loop {
+            let b = self.conn.read_datagram().await?;
+            if let Some(p) = crate::quic::v2::dgram::client_payload(&b) {
+                return Ok(p.to_vec());
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for ClientConn {
+    type Target = quinn::Connection;
+    fn deref(&self) -> &quinn::Connection {
+        &self.conn
+    }
+}
+
+pub(super) async fn run_pump(args: WorkerArgs) {
+    let hs = match handshake::connect_and_handshake(&args).await {
+        Ok(hs) => hs,
+        Err(e) => {
+            let _ = args.ready_tx.send(Err(e));
+            return;
+        }
+    };
+    let handshake::HandshakeOut {
+        conn,
+        ep,
+        session,
+        ctrl_send,
+        ctrl_recv,
+        negotiated,
+        landed_at,
+    } = hs;
+    let welcome = negotiated.welcome;
+    let host_caps = welcome.host_caps;
+    let WorkerArgs {
+        params,
+        shared,
+        planes,
+        input_rx,
+        mut mic_rx,
+        mut rich_input_rx,
+        pad_touch_rx,
+        ctrl_rx,
+        ctrl_tx,
+        clip_cmd_rx,
+        ready_tx,
+    } = args;
+    let negotiated_codec = welcome.codec;
+    let bitrate_kbps = crate::quic::session_bitrate_kbps(
+        params.bitrate_kbps,
+        params.preferred_codec,
+        params.video_codecs,
+        negotiated_codec,
+    );
+    let clock_rtt_ns = negotiated.clock_rtt_ns;
+    let resolved_bitrate_kbps = welcome.bitrate_kbps;
+    // Host marks idle-keepalive repeats (`USER_FLAG_REPEAT`). Only then is an
+    // unflagged AU new content; older hosts keep the legacy window arithmetic.
+    let marks_repeats = welcome.host_caps2 & crate::quic::HOST_CAP2_REPEAT_MARK != 0;
+    // Host serves probe requests during its own bring-up: measure the link
+    // before the first frame instead of bursting beside it.
+    let serves_ramp = welcome.host_caps2 & crate::quic::HOST_CAP2_RAMP != 0;
+    // Wire budgets: `actual` is wire bytes plus this audio reservation, spent
+    // whether video flows or not. PCM and bitstream are exact; Opus uses the default-tier
+    // ladder (a pinned tier skews a few hundred kbps, inside the ¾ utilization gate).
+    let audio_reserved_kbps = if crate::audio::bitstream::is_bitstream(welcome.audio_codec) {
+        crate::audio::bitstream::bitrate_kbps(welcome.audio_codec, welcome.audio_channels)
+    } else if welcome.audio_codec == crate::quic::AUDIO_CODEC_PCM {
+        crate::audio::pcm::bitrate_kbps(
+            welcome.audio_rate_hz,
+            welcome.audio_bits,
+            welcome.audio_channels,
+        )
+    } else {
+        crate::audio::plan_audio_budget(
+            welcome.bitrate_kbps,
+            welcome.audio_channels,
+            crate::audio::AudioLayout::from_wire(welcome.audio_layout).unwrap_or_default(),
+            crate::audio::AudioTier::default(),
+            host_caps & crate::quic::HOST_CAP_AUDIO_RED != 0,
+        )
+        .kbps
+    };
+    // Unchanged across a mode switch; the pump recomputes the stream-shape cap from them.
+    let bit_depth = welcome.bit_depth;
+    let chroma_format = welcome.chroma_format;
+    // ABR holds the probe-measured link ceiling to this. Computed here (Welcome
+    // geometry); the data pump stays codec-agnostic. PyroWave's is the host's pin,
+    // and its floor the same rule at `BPP_FLOOR`.
+    let pyrowave = welcome.codec == crate::quic::CODEC_PYROWAVE;
+    let stream_cap_kbps = if pyrowave {
+        resolved_bitrate_kbps
+    } else {
+        crate::abr::stream_ceiling_kbps(
+            welcome.mode.width,
+            welcome.mode.height,
+            welcome.mode.refresh_hz,
+            welcome.codec,
+            welcome.bit_depth,
+            welcome.chroma_format,
+        )
+    };
+    let pyrowave_floor_kbps = pyrowave.then(|| {
+        crate::pyrowave::kbps_for(
+            &welcome.mode,
+            welcome.chroma_format == crate::quic::CHROMA_IDC_444,
+            welcome.bit_depth,
+            crate::pyrowave::BPP_FLOOR,
+        )
+        .min(stream_cap_kbps)
+    });
+    // ABR encode-threshold unit ([`BitrateController::encode_thresholds`]). Negotiated
+    // refresh, not the request still sitting in `shared.mode` (60-for-120 must score at 60).
+    let refresh_hz = welcome.mode.refresh_hz;
+    // Feedback datagrams leave on this connection from any thread that asks.
+    shared.feedback.lock().unwrap().set_refresh(refresh_hz);
+    {
+        let conn = conn.clone();
+        let _ = shared
+            .feedback_tx
+            .set(Box::new(move |fb| conn.send_feedback(fb)));
+    }
+    // Seed before `ready_tx`: `clock_offset_now_ns` must not read a pre-handshake 0.
+    shared
+        .clock_offset
+        .store(negotiated.clock_offset_ns, Ordering::Relaxed);
+    // Welcome is the starting encoder target (0 if the host reports none).
+    shared
+        .live_bitrate_kbps
+        .store(welcome.bitrate_kbps, Ordering::Relaxed);
+    // Seed before the embedder observes us, so `access_grants()` never reads
+    // GRANT_ALL on a limited session. Deadline is client wall clock: the wire
+    // carries relative `expires_in_secs`, so skew does not move the countdown.
+    shared
+        .access_grants
+        .store(welcome.grants, Ordering::Relaxed);
+    shared.access_deadline_unix.store(
+        access_deadline_from(wall_clock_ns(), welcome.expires_in_secs),
+        Ordering::Relaxed,
+    );
+    // Normalized scroll only toward HOST_CAP2_SCROLL; an older host gets each
+    // event converted once at the outbound seam instead.
+    let normalized_scroll = welcome.host_caps2 & crate::quic::HOST_CAP2_SCROLL != 0;
+    let scroll_axis_units = negotiated.scroll_axis_units;
+    let _ = ready_tx.send(Ok(negotiated));
+
+    // Snapshots only toward GAMEPAD_STATE. Flags 8/9 only toward PAD_AUDIO — an
+    // older host reads the whole flags word as the pad index.
+    let gamepad_snapshots = host_caps & crate::quic::HOST_CAP_GAMEPAD_STATE != 0;
+    let pad_audio_arrivals = host_caps & crate::quic::HOST_CAP_PAD_AUDIO != 0;
+    // Key and mouse-button edges ride the control stream toward a host that reads them there,
+    // so a lost release cannot hold one down; an older host gets every event as a datagram.
+    let reliable_edges = welcome.host_caps2 & crate::quic::HOST_CAP2_INPUT_EDGES != 0;
+    tokio::spawn(input_task::run(
+        conn.clone(),
+        input_rx,
+        pad_touch_rx,
+        gamepad_snapshots,
+        pad_audio_arrivals,
+        input_task::MouseArgs {
+            client: shared.clone(),
+            normalized_scroll,
+            scroll_axis_units,
+            edges: reliable_edges.then(|| ctrl_tx.clone()),
+        },
+    ));
+
+    // Smoothed path round trip for the overlay, sampled while the connection lives.
+    let rtt_conn = conn.clone();
+    let rtt_shared = shared.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let us = rtt_conn.rtt().as_micros().min(u128::from(u32::MAX)) as u32;
+                    rtt_shared.rtt_us.store(us, Ordering::Relaxed);
+                }
+                _ = rtt_conn.closed() => break,
+            }
+        }
+    });
+
+    // 0xCB mic uplink. A frame with more than [`MIC_BACKLOG_MAX`] successors is
+    // shed: a stall costs a dropout, not session-long lag ([`MIC_QUEUE`]).
+    let mic_conn = conn.clone();
+    let mic_shared = shared.clone();
+    tokio::spawn(async move {
+        let stats = &mic_shared.mic_stats;
+        while let Some((seq, pts_ns, opus)) = mic_rx.recv().await {
+            if mic_rx.len() > MIC_BACKLOG_MAX {
+                stats.dropped_stale.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let d = crate::quic::encode_mic_datagram(seq, pts_ns, &opus);
+            let _ = mic_conn.send_datagram(d);
+            stats.sent.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    // Pre-encoded 0xCC uplink. Encoded at NativeClient so new plane kinds never touch the pump.
+    let rich_conn = conn.clone();
+    tokio::spawn(async move {
+        while let Some(d) = rich_input_rx.recv().await {
+            let _ = rich_conn.send_datagram(d);
+        }
+    });
+
+    // ABR encode signal ([`EncodeLatAcc`]): datagram task samples 0xCF; pump drains a window mean.
+    let encode_lat = Arc::new(Mutex::new(super::frame_channel::EncodeLatAcc::default()));
+    let (events_tx, events) = std::sync::mpsc::channel();
+
+    // Handshake stream stays open ([`control_task`]); what it hears for the pump arrives as
+    // [`PumpEvent`]s.
+    tokio::spawn(
+        control_task::ControlTask {
+            ctrl_rx,
+            ctrl_send,
+            ctrl_recv,
+            clock_rtt_ns,
+            shared: shared.clone(),
+            events: events_tx.clone(),
+            clip_event_tx: planes.clip_event.clone(),
+            cursor_shape_tx: planes.cursor_shape,
+            access_tx: planes.access,
+            hidout_tx: planes.datagram.hidout.clone(),
+        }
+        .run(),
+    );
+
+    tokio::spawn(datagram_task::run(
+        conn.clone(),
+        planes.datagram,
+        encode_lat.clone(),
+        shared.clone(),
+    ));
+
+    // Bulk clip bytes only; metadata rides the control task. Always spawned: a
+    // host without HOST_CAP_CLIPBOARD never opens a clip stream, and offers miss.
+    tokio::spawn(crate::clipboard::run(
+        (*conn).clone(),
+        planes.clip_event,
+        clip_cmd_rx,
+    ));
+
+    // Connection close: classify, then shutdown. A lost `punktfunk/2` session is kept for the
+    // next dial's resume, under the host that ran it.
+    {
+        let shared = shared.clone();
+        let conn = conn.clone();
+        let (host, port) = landed_at;
+        tokio::spawn(async move {
+            let why = conn.closed().await;
+            // Reason before `shutdown`: different threads observe the two; the flag must not win.
+            let reason = crate::client::PunktfunkEndReason::from(&why);
+            let lost_v2 = *shared.v2_session.lock().unwrap_or_else(|e| e.into_inner());
+            if let (crate::client::PunktfunkEndReason::Lost, Some(id)) = (reason, lost_v2) {
+                crate::client::resume::note_lost(&host, port, id);
+            }
+            // Mid-session typed close (access expiry, …) beside the coarse reason, same order.
+            // The host's sentence lands before the code: a reader that sees the code must
+            // not find the text still missing.
+            if let Some((r, said)) = reject_from_close(&conn) {
+                if !said.is_empty() {
+                    let _ = shared.end_reject_said.set(said);
+                }
+                shared
+                    .end_reject_code
+                    .store(r.close_code(), Ordering::SeqCst);
+            }
+            shared.end_reason.store(reason as u8, Ordering::SeqCst);
+            shared.shutdown.store(true, Ordering::SeqCst);
+        });
+    }
+
+    let pump = data::DataPump {
+        session,
+        shared: shared.clone(),
+        ctrl_tx,
+        events,
+        events_tx,
+        encode_lat,
+        bitrate_kbps,
+        resolved_bitrate_kbps,
+        negotiated_codec,
+        bit_depth,
+        chroma_format,
+        marks_repeats,
+        serves_ramp,
+        audio_reserved_kbps,
+        stream_cap_kbps,
+        pyrowave_floor_kbps,
+        refresh_hz,
+        nack: !params.frame_parts,
+        on_anchors: false,
+        partial_wait: Vec::new(),
+        held: std::collections::VecDeque::new(),
+        held_since: None,
+    };
+    let _ = tokio::task::spawn_blocking(move || pump.run()).await;
+
+    // Quit code: host skips keep-alive linger. Close 0: host lingers for reconnect.
+    let close_code = if shared.quit.load(Ordering::SeqCst) {
+        crate::quic::QUIT_CLOSE_CODE
+    } else {
+        0
+    };
+    conn.close(close_code.into(), b"client closed");
+    // `close` only queues; this `block_on` drops the runtime on return, so flush
+    // or the driver never runs and a quit is silence. Bounded so a gone host
+    // does not delay exit.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), ep.wait_idle()).await;
+}

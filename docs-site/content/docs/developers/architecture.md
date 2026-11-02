@@ -9,11 +9,11 @@ must keep. The user-level version is [How it works](/docs/how-it-works).
 ## A frame, host to glass
 
 1. **Mode.** The client's Hello names `WxH@Hz`. The `pf-vdisplay` crate creates a virtual output at
-   that mode through the compositor's backend (KWin, Mutter, Hyprland, wlroots, gamescope) or, on
+   that mode through the compositor's backend (KWin, Mutter, Hyprland, niri, Umbriel, wlroots, gamescope) or, on
    Windows, through the IddCx driver of the same name.
 2. **Capture.** On Linux, `pf-capture` takes dmabufs straight from the compositor over
    `ext-image-copy-capture-v1` where it can, and otherwise over PipeWire (the ScreenCast portal, or
-   KWin's own screencast). `pf-zerocopy` imports them into CUDA or Vulkan without a CPU copy.
+   KWin's or niri's own screencast). `pf-zerocopy` imports them into CUDA or Vulkan without a CPU copy.
 3. **Encode.** On Linux, `pf-encode` opens one backend: NVENC, Vulkan Video, VAAPI, PyroWave or
    software openh264 (`PUNKTFUNK_ENCODER` pins one). On Windows the driver encodes inside
    WUDFHost with `pf-encode-win` (NVENC, AMF, QSV, Media Foundation, PyroWave) and hands access
@@ -22,9 +22,9 @@ must keep. The user-level version is [How it works](/docs/how-it-works).
    AES-GCM (ChaCha20-Poly1305 for clients without hardware AES), and the host paces them out over
    UDP on native threads.
 5. **Decode.** The client's session pump (`pf-client-core`) reassembles and decrypts, then walks the
-   decode ladder: `pf-vkdecode` (Vulkan Video), `pf-vaapi` (Linux) or `pf-dxvadec` (Windows) over
-   `pf-bitstream`'s access-unit plans, then CPU openh264 or rav1d. PyroWave decodes in Vulkan
-   compute.
+   decode ladder (`pf-client-video`): `pf-vkdecode` (Vulkan Video), `pf-vaapi` (Linux) or
+   `pf-dxvadec` (Windows) over `pf-bitstream`'s access-unit plans, then CPU openh264 or rav1d.
+   PyroWave decodes in Vulkan compute.
 6. **Present.** `pf-presenter` draws the picture into an SDL3 window through an ash swapchain, and
    `pf-console-ui` composites the Skia overlay on top. Apple decodes with VideoToolbox and draws
    with Metal; Android uses `AMediaCodec`. Both link `punktfunk-core`.
@@ -47,12 +47,12 @@ comes back.
 
 Both run in one `punktfunk-host serve` process.
 
-| | `punktfunk/1` | GameStream |
+| | `punktfunk/2` | GameStream |
 |---|---|---|
 | Clients | The native clients | Moonlight |
 | On | Always | `serve --gamestream` (trusted LAN only) |
 | Control | QUIC: SPAKE2 pairing, mode changes, clock sync, adaptive bitrate, clipboard | HTTPS pairing (nvhttp), RTSP, ENet |
-| Data | UDP, GF(2¹⁶) Leopard FEC, AES-GCM | UDP, GF(2⁸) Reed–Solomon FEC |
+| Data | The QUIC port's UDP path, GF(2¹⁶) Leopard FEC, keys from the TLS exporter | UDP, GF(2⁸) Reed–Solomon FEC |
 | Discovery | mDNS `_punktfunk._udp` | mDNS `_nvstream._tcp` |
 | Code | `punktfunk-core`, `punktfunk-host/src/native*` | `punktfunk-host/src/gamestream` |
 
@@ -60,14 +60,14 @@ Both run in one `punktfunk-host serve` process.
 plane, WebTransport for the browser client, is off unless `--webtransport` is passed. Port numbers:
 [Ports](/docs/ports).
 
-`punktfunk/2` is the native protocol's successor, a preview the host answers under
-`PUNKTFUNK_PROTOCOL=2` (ALPN `pkf2`, beside `pkf1`). Control and media share the QUIC port, media
-keys come from the TLS exporter, and timestamps run on a per-session clock. Native clients offer
-it on every dial; the browser plane serves it at `/pf2` under the same opt-in.
+`punktfunk/2` is ALPN `pkf2`. Control and media share the QUIC port, media keys come from the
+TLS exporter, and timestamps run on a per-session clock. The browser plane serves it at `/pf2`. A
+client that offers only `pkf1` is closed with the wire-version code, which it shows as "update
+both".
 
 ## Control plane and management API
 
-The management API (`crates/punktfunk-host/src/mgmt`) is axum over HTTPS on the host's identity
+The management API (`crates/host/punktfunk-host/src/mgmt`) is axum over HTTPS on the host's identity
 certificate, versioned under `/api/v1`. It takes two credentials:
 
 - a paired client's certificate, for the read-only LAN surface (status, the game library);
@@ -109,42 +109,53 @@ authoring kit; plugins add game-library sources and automation. Writing one:
 | `pf-mouse` | Resident virtual HID mouse, so Windows draws a cursor on a headless host. |
 | `wdk-iddcx`, `pf-umdf-util` | IddCx bindings and the safe UMDF layer the drivers share. |
 
-`crates/pf-driver-proto` is the host↔driver contract, a path dependency of both workspaces. The
+`crates/host/pf-driver-proto` is the host↔driver contract, a path dependency of both workspaces. The
 host refuses a driver older than `MIN_DRIVER_PROTOCOL_VERSION`, so the installer ships host and
 driver together. `packaging/windows/pf-vkhdr-layer` is a Vulkan layer that lets Vulkan games turn on
 HDR over the virtual display.
 
 ## Where the code lives
 
+Rust crates sit in `crates/<group>/`. `core` and `codec` serve both sides. `client` and `host`
+never depend on each other; `scripts/ci/check-crate-groups.py` fails CI if one does. `install`
+holds the installers, the tray and the update helper.
+
 | Path | What |
 |---|---|
-| `crates/punktfunk-core` | Wire format, FEC, crypto, pacing and the QUIC control plane (`quic` feature) |
-| `crates/punktfunk-ffi` | The C ABI over the core, and the demo-mode loopback host |
-| `crates/punktfunk-host` | The host: sessions, both protocol planes, management API, game library, CLI |
-| `crates/pf-vdisplay` | Virtual outputs, one backend per compositor plus the Windows driver backend |
-| `crates/pf-capture` | PipeWire portal capture (Linux) and driver push (Windows) behind `Capturer` |
-| `crates/pf-encode-core` | The `Encoder` trait and the policy every backend shares |
-| `crates/pf-encode`, `pf-encode-win` | Encoder backends on Linux and Windows |
-| `crates/punktfunk-encode-worker` | Separate binary that runs PyroWave at raised GPU priority |
-| `crates/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import (Linux) |
-| `crates/pf-dmabuf` | dmabuf fence wait and read-only mapping, shared by host and clients (Linux) |
-| `crates/pf-inject` | Keyboard, mouse, pen and virtual-gamepad injection |
-| `crates/pf-portal` | The one tokio runtime every portal call runs on (Linux) |
-| `crates/pf-clipboard` | Shared clipboard backends and the clipboard plane |
-| `crates/pf-audio` | Desktop audio capture, the virtual microphone, pad audio and the Windows wiring plan |
-| `crates/pf-frame`, `pf-gpu`, `pf-win-display` | Frame vocabulary; GPU selection; Windows display topology |
-| `crates/pf-host-config` | The settings registry, its store and the env knobs |
-| `crates/pf-paths`, `pf-paths-win` | Config directory and owner-private files; Windows DACL checks |
-| `crates/pf-update`, `pf-update-check` | Root helper for console-started updates; signed update manifest |
-| `crates/pf-driver-proto` | Host↔driver contract |
-| `crates/pyrowave-sys`, `libvpl-sys` | Vendored PyroWave and Intel VPL, built from source |
-| `crates/punktfunk-tray` | Tray status icon |
-| `crates/punktfunk-setup`, `punktfunk-setup-win` | Guided Linux installer (`install.sh` fetches it); Windows installer wizard |
-| `crates/pf-client-core` | Client plumbing: session pump, decode ladder, audio, gamepads, trust, discovery |
-| `crates/pf-bitstream` | Access-unit parsing and decode plans for H.264, HEVC and AV1 |
-| `crates/pf-vkdecode`, `pf-vaapi`, `pf-dxvadec`, `pf-libva` | Native decode rungs and the dlopen'd libva |
-| `crates/pf-presenter` | SDL3 window, Vulkan swapchain, input capture |
-| `crates/pf-console-ui` | Skia console: stats overlay, gamepad home, library, settings |
+| `crates/core/punktfunk-core` | Wire format, FEC, crypto, pacing and the QUIC control plane (`quic` feature) |
+| `crates/core/pf-dmabuf` | dmabuf fence wait and read-only mapping, shared by host and clients (Linux) |
+| `crates/core/pf-update-check` | Signed update manifest, shared by the host, the update helper and the clients |
+| `crates/codec/pf-bitstream` | Access-unit parsing and decode plans for H.264, HEVC and AV1 |
+| `crates/codec/pf-vkdecode`, `pf-vaapi`, `pf-dxvadec` | Native decode rungs: Vulkan Video, VAAPI buffers, D3D11VA |
+| `crates/codec/pf-libva` | The dlopen'd libva the VAAPI decoder and encoder share |
+| `crates/codec/pf-v4l2`, `pf-v4l2dec` | V4L2 decode: the ioctl half; the uAPI and decoder flows, CPU-testable |
+| `crates/codec/pyrowave-sys`, `libvpl-sys` | Vendored PyroWave and Intel VPL, built from source |
+| `crates/client/punktfunk-ffi` | The C ABI over the core, and the demo-mode loopback host |
+| `crates/client/pf-client-core` | Client plumbing: session pump, audio, gamepads, trust, discovery |
+| `crates/client/pf-client-video` | Decode ladder, Vulkan device handoff, colour maths and PyroWave decode |
+| `crates/client/pf-presenter` | SDL3 window, Vulkan swapchain, input capture |
+| `crates/client/pf-console-ui` | Skia console: stats overlay, gamepad home, library, settings |
+| `crates/host/punktfunk-host` | The host: sessions, both protocol planes, management API, game library, CLI |
+| `crates/host/punktfunk-encode-worker` | Separate binary that runs PyroWave and the NVIDIA frame convert at raised GPU priority |
+| `crates/host/punktfunk-capture-worker` | Windows Graphics Capture and the encoder for a mirror or shared-screen session, as the signed-in user |
+| `crates/host/pf-vdisplay` | Virtual outputs, one backend per compositor plus the Windows driver backend |
+| `crates/host/pf-capture` | PipeWire portal capture (Linux) and driver push (Windows) behind `Capturer` |
+| `crates/host/pf-encode-core` | The `Encoder` trait and the policy every backend shares |
+| `crates/host/pf-encode`, `pf-encode-win` | Encoder backends on Linux and Windows |
+| `crates/host/pf-encode-session` | Windows pool slot to encoder to access-unit section, shared by the display driver and the capture worker |
+| `crates/host/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import (Linux) |
+| `crates/host/pf-inject` | Keyboard, mouse, pen and virtual-gamepad injection |
+| `crates/host/pf-portal` | The one tokio runtime every portal call runs on (Linux) |
+| `crates/host/pf-clipboard` | Shared clipboard backends and the clipboard plane |
+| `crates/host/pf-audio` | Desktop audio capture, the virtual microphone, pad audio and the Windows wiring plan |
+| `crates/host/pf-frame`, `pf-gpu`, `pf-win-display` | Frame vocabulary; GPU selection; Windows display topology |
+| `crates/host/pf-host-config` | The settings registry, its store and the env knobs |
+| `crates/host/pf-paths`, `pf-paths-win` | Config directory and owner-private files; Windows DACL checks |
+| `crates/host/pf-driver-proto` | Host↔driver contract |
+| `crates/host/pf-seats`, `pf-seat-keeper` | Windows seat supervisor, run inside the service; the RDP keeper, its own workspace for IronRDP's lockfile |
+| `crates/install/punktfunk-setup`, `punktfunk-setup-win` | Guided Linux installer (`install.sh` fetches it); Windows installer wizard |
+| `crates/install/punktfunk-tray` | Tray status icon |
+| `crates/install/pf-update` | Root helper for console-started updates |
 | `clients/session` | `punktfunk-session`, the Vulkan stream every desktop front-end spawns |
 | `clients/linux`, `clients/windows` | GTK4 and WinUI 3 shells (`punktfunk-client`) |
 | `clients/cli` | `punktfunk`, the headless CLI |
@@ -174,7 +185,7 @@ git dependencies.
   `WxH@Hz`; every compositor keeps its own backend behind the `VirtualDisplay` trait. Scaling
   happens in the client's presenter.
 - **FEC sized to the protocol.** GF(2⁸) (at most 255 shards a block) for Moonlight; GF(2¹⁶) (up
-  to 65535 shards, O(n log n)) for `punktfunk/1`.
+  to 65535 shards, O(n log n)) for `punktfunk/2`.
 - **Each version moves alone.** `WIRE_VERSION` changes only when the handshake or a plane breaks,
   and hosts equality-check it. `ABI_VERSION` tracks the C surface; `PROTOCOL_VERSION` in
   `pf-driver-proto` tracks the driver. Never ride one bump on another.

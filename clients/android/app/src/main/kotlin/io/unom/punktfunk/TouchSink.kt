@@ -33,9 +33,16 @@ internal object DroppedTouchSink : TouchSink {
     override fun touch(id: Int, kind: Int, x: Int, y: Int, w: Int, h: Int) = Unit
 }
 
-internal class NativeTouchSink(private val handle: Long) : TouchSink {
-    override fun pointerMove(dx: Int, dy: Int) = NativeBridge.nativeSendPointerMove(handle, dx, dy)
-    override fun pointerAbs(x: Int, y: Int, w: Int, h: Int) = NativeBridge.nativeSendPointerAbs(handle, x, y, w, h)
+/** [onPointer] hears every pointer move, so a client-drawn host cursor hands back at once. */
+internal class NativeTouchSink(private val handle: Long, private val onPointer: () -> Unit = {}) : TouchSink {
+    override fun pointerMove(dx: Int, dy: Int) {
+        onPointer()
+        NativeBridge.nativeSendPointerMove(handle, dx, dy)
+    }
+    override fun pointerAbs(x: Int, y: Int, w: Int, h: Int) {
+        onPointer()
+        NativeBridge.nativeSendPointerAbs(handle, x, y, w, h)
+    }
     override fun button(button: Int, down: Boolean) = NativeBridge.nativeSendPointerButton(handle, button, down)
     override fun scroll(axis: Int, delta: Int, source: Int, phase: Int) =
         NativeBridge.nativeSendNormalizedScroll(handle, axis, delta, source, phase)

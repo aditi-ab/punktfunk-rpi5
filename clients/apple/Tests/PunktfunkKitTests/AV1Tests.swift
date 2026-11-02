@@ -163,6 +163,31 @@ final class AV1Tests: XCTestCase {
         XCTAssertEqual(pts.timescale, 1_000_000_000)
     }
 
+    /// A temporal unit the core assembled in a pool slot is the sample itself, from just past
+    /// the temporal delimiter: no block of its own, the same bytes the repack produces.
+    func testSampleOverTheSlotSkipsTheDelimiter() throws {
+        let format = try XCTUnwrap(AV1.formatDescription(fromKeyframe: Data(Self.keyframeTU)))
+        let tu = Self.keyframeTU
+        let pool = AccessUnitSlotPool(capacity: 4096)
+        let slot = try XCTUnwrap(pool.take(tu.count))
+        tu.withUnsafeBytes { slot.base.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+        let at = try XCTUnwrap(pool.locate(UnsafeRawPointer(slot.base)))
+        let au = AccessUnit(
+            data: Data(bytesNoCopy: slot.base, count: tu.count, deallocator: .none),
+            ptsNs: 7, frameIndex: 0, flags: 0, receivedNs: 0,
+            inPlace: AccessUnit.InPlace(token: at.token, offset: at.offset, count: tu.count))
+        let sample = try XCTUnwrap(AV1.sampleBuffer(au: au, format: format, in: pool))
+        let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+        var length = 0
+        var ptr: UnsafeMutablePointer<CChar>?
+        XCTAssertEqual(CMBlockBufferGetDataPointer(
+            block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length,
+            dataPointerOut: &ptr), noErr)
+        XCTAssertEqual(UnsafeMutableRawPointer(try XCTUnwrap(ptr)), slot.base + 2)
+        XCTAssertEqual([UInt8](UnsafeRawBufferPointer(start: ptr, count: length)), [UInt8](tu[2...]))
+        XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(sample).value, 7)
+    }
+
     func testSampleRepackDelimiterOnlyIsDropped() throws {
         let format = try XCTUnwrap(AV1.formatDescription(fromKeyframe: Data(Self.keyframeTU)))
         let au = AccessUnit(

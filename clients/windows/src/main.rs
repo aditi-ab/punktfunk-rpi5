@@ -14,7 +14,6 @@
 //!   punktfunk-client --headless --speed-test --connect host[:port]
 //!                    (measure the path: probe burst → goodput / loss / recommended bitrate)
 
-// Unsafe-proof program: every `unsafe {}` in this client carries a `// SAFETY:` proof.
 // Link as a GUI (windows) subsystem binary so the default windowed launch (MSIX / double-click)
 // does NOT pop a console window. The CLI paths (--headless/--discover) reattach to the launching
 // terminal's console at startup (see main), so their output is still visible when run from a shell.
@@ -113,17 +112,13 @@ fn main() {
         couch::run_browse();
     }
 
-    // Windowed (default): the WinUI 3 app owns host selection, settings, and pairing.
-    // Framework-dependent deployment: initialize the Windows App SDK runtime before any WinUI
-    // call (build.rs stages the bootstrap DLL via windows-reactor-setup).
-    if let Err(e) = windows_reactor::bootstrap() {
-        tracing::error!(error = %e, "Windows App SDK bootstrap failed");
-        std::process::exit(1);
-    }
+    // Windowed (default): the WinUI 3 app owns host selection, settings, and pairing. The app
+    // resolves the installed Windows App Runtime itself and offers its download when missing.
+
     // The shared SDL gamepad service (pf-client-core). The shell only enumerates pads (Settings
     // list) and persists the pin; the spawned punktfunk-session runs the SAME service and does the
     // actual forwarding — so, unlike the old shell fork, we never `attach()` here. Idle it stays
-    // hands-off the hardware (id-getter metadata, no device open, Valve HIDAPI drivers off).
+    // hands-off the hardware (id-getter metadata, no device open, the Deck HIDAPI driver off).
     let gamepad = pf_client_core::gamepad::GamepadService::start();
     // From here this process IS the shell: queue the link it was launched with (the router
     // picks it up once the window is live) and start listening for links from later instances.
@@ -159,7 +154,8 @@ fn set_app_user_model_id() {
     // SAFETY: `SetCurrentProcessExplicitAppUserModelID` takes a static wide literal.
     unsafe {
         // Must stay in sync with pf-presenter's win32.rs, or the windows stop grouping.
-        let _ = SetCurrentProcessExplicitAppUserModelID(windows::core::w!("unom.punktfunk.client"));
+        let _ =
+            SetCurrentProcessExplicitAppUserModelID(windows::core::w!("io.unom.punktfunk.client"));
     }
 }
 

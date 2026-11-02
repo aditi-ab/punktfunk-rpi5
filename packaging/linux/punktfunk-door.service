@@ -1,0 +1,44 @@
+# punktfunk door: the box's host as a system service, reachable without anyone logged in.
+#
+# It advertises, pairs, serves the console's API and places every connect on a seat of the box
+# (punktfunk-seats), the owner's included. It never opens a display or captures: the box's files
+# live in /var/lib/punktfunk, owned by the punktfunk user. Turned on and off with
+# `door-helper on|off <user>` (punktfunk-door-on@.service); not enabled by the package.
+[Unit]
+Description=punktfunk door (the box's host, reachable without logging in)
+After=network-online.target punktfunk-seats.service
+Wants=network-online.target punktfunk-seats.service
+# Off without the owner record, however the unit was enabled: door-helper writes it before the
+# first start and removes it after the last stop.
+ConditionPathExists=/var/lib/punktfunk-seats/owner
+# The box's only way in keeps trying: a binary that won't load until a rebuild lands is back
+# within RestartSec of it.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=punktfunk
+# Its own group: `punktfunk` owns the usbip attach nodes, which the door never opens.
+Group=punktfunk-door
+Environment=PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk
+# The box's library: the seat supervisor's copy of the owner's, which every client reads here.
+Environment=PUNKTFUNK_LIBRARY_DIR=/var/lib/punktfunk-seats/library
+# The ports the owner moved in their host.env: door-helper copies them here before each start,
+# so an update or a later edit reaches the door. `+` runs it as root, to read the owner's file
+# and keep the door's account in `punktfunk-door`.
+ExecStartPre=+-/usr/libexec/punktfunk/door-helper ports
+EnvironmentFile=-/var/lib/punktfunk/host.env
+ExecStart=/usr/bin/punktfunk-host serve --door
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

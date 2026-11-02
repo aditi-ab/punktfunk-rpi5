@@ -1,25 +1,19 @@
-// CoreBluetooth transport for a Steam Controller 2 paired directly with this device — the thin
-// hardware shim under `Sc2Capture`, and the ONLY file here that imports CoreBluetooth (every
-// table/framing rule it applies lives device-free in `Sc2Device`, where tests reach it). The
-// acquisition, subscription and write paths are the ones proven against real hardware on the
-// bench (2026-06-08/09): OS-paired acquisition via the connected set, the per-report output
-// characteristics, and feature writes on 100F6C34.
+// CoreBluetooth transport for a Steam Controller paired directly with this device, under
+// `Sc2Capture`. The only file here that imports CoreBluetooth: its framing rules live
+// device-free in `Sc2Device` and `Sc1Device`, where tests reach them.
 //
-// OS-paired is FINE: the controller is normally connected via the system Settings, holding the
-// standard HID (0x1812) binding — we open our own handle to the CUSTOM Valve service, which
-// coexists with it (exactly what Steam Link does). "Lizard mode" is just the controller's
-// default reporting, cleared by the disable-lizard write — not a barrier to the vendor service.
+// OS-paired is fine: the system keeps the standard HID (0x1812) binding and this opens the Valve
+// service beside it, as Steam Link does. Lizard mode is the pad's default reporting, cleared by
+// a settings write. Simulator has no BLE radio.
 //
-// Simulator has no BLE radio — physical device only.
+// CoreBluetooth negotiates MTU and connection interval itself, unlike Android's `Sc2BleLink.kt`.
+// A Steam Controller 2 falls back to lizard mode after ~3 s without DISABLE_LIZARD, so the link
+// sends it on ready and every 3 s, until Steam's own writes take over. `stop()` writes lizard
+// mode back on before it disconnects. The client never enables the gyro; Steam's write does.
 //
-// ⚠ DIFFER from Android's `Sc2BleLink.kt`: no `requestMtu(100)` / connection-priority-HIGH
-// equivalents — CoreBluetooth negotiates MTU and connection interval itself; the
-// `maximumWriteValueLength` census line is a sanity log only. The link itself sends
-// DISABLE_LIZARD on ready and re-sends it every ~3 s (Android's cadence — SDL's): the host's
-// virtual pad only relays what Steam sends AFTER it claims the pad, so until then nothing else
-// would feed the firmware watchdog and the controller would fall back to lizard mode. `stop()`
-// writes lizard back ON before it disconnects, so the pad drives the OS again at once. The client
-// NEVER self-enables the gyro — Steam's own forwarded write drives `Sc2ImuGate`.
+// A 2015 pad (`isClassic`) notifies segments on `Sc1Device.bleInputCharUUID` and takes and
+// answers features in segments on 100F6C34; core turns its input into wired frames, which
+// `onReport` carries. It has no watchdog: lizard-off goes once per connection.
 
 import CoreBluetooth
 import Foundation
@@ -38,6 +32,7 @@ final class Sc2BleLink: NSObject {
     private let serviceCB = CBUUID(string: Sc2Device.serviceUUID)
     private let inputCB = CBUUID(string: Sc2Device.inputCharUUID)
     private let reportCB = CBUUID(string: Sc2Device.reportCharUUID)
+    private let classicInputCB = CBUUID(string: Sc1Device.bleInputCharUUID)
     /// Report 0x47's characteristic. Never subscribed (see `Sc2Device.timestampCharUUID`); held
     /// here only so the sweep can exclude a known-purpose characteristic by UUID.
     private let timestampCB = CBUUID(string: Sc2Device.timestampCharUUID)
@@ -55,7 +50,41 @@ final class Sc2BleLink: NSObject {
     /// re-acquiring by itself; this only tells the capture to release its slot.
     private let onClosed: () -> Void
 
+    /// One identity read in flight (`readIdentity`): the queries, where it is, what answered.
+    private final class IdentityJob {
+        let requests: [[UInt8]]
+        let done: (PunktfunkConnection.PadIdentity?) -> Void
+        var index = 0
+        var attempts = 0
+        var awaitingRead = false
+        var replies: [PunktfunkConnection.PadIdentity.Reply] = []
+        var timeout: DispatchWorkItem?
+        /// A 2015 pad's query: acks still owed for its segments, and the reply's segments so far.
+        var acksOwed = 0
+        var segments: [UInt8] = []
+
+        init(requests: [[UInt8]], done: @escaping (PunktfunkConnection.PadIdentity?) -> Void) {
+            self.requests = requests
+            self.done = done
+        }
+    }
+
+    /// Whether the connected pad is a 2015 Steam Controller. Set at discovery, read from any thread.
+    var isClassic: Bool {
+        classicLock.lock()
+        defer { classicLock.unlock() }
+        return classic
+    }
+    private let classicLock = NSLock()
+    private var classic = false
+
     // All state below is touched ONLY on `queue`.
+    /// Core's state for the 2015 pad's input.
+    private var classicState: [UInt8] = []
+    private var identityJob: IdentityJob?
+    /// The newest unacked write per characteristic that found the radio's buffer full, sent when
+    /// it drains. Rumble resends every ~40 ms, so only the latest matters.
+    private var pendingWrites: [CBUUID: (CBCharacteristic, Data)] = [:]
     private var central: CBCentralManager?
     private var controller: CBPeripheral?
     private var inputChar: CBCharacteristic?
@@ -123,9 +152,13 @@ final class Sc2BleLink: NSObject {
                 return
             }
             pendingStop = true
-            let type: CBCharacteristicWriteType =
-                reportChar.properties.contains(.write) ? .withResponse : .withoutResponse
-            controller.writeValue(Data(payload), for: reportChar, type: type)
+            if isClassic {
+                Sc1Device.lizardOn.forEach { writeClassic($0) }
+            } else {
+                let type: CBCharacteristicWriteType =
+                    reportChar.properties.contains(.write) ? .withResponse : .withoutResponse
+                controller.writeValue(Data(payload), for: reportChar, type: type)
+            }
             // 150 ms ≈ several BLE connection intervals. A pad that went out of range mid-write
             // never acks, so the wait has to end on its own. `pendingStop` is what a `start()`
             // in the meantime clears — this must not tear down the central it built.
@@ -157,12 +190,35 @@ final class Sc2BleLink: NSObject {
         controller = nil
         inputChar = nil
         reportChar = nil
+        setClassic(false)
         allChars.removeAll()
         candidateChars.removeAll()
+        pendingWrites.removeAll()
         scanning = false
         polling = false
         ready = false
         central = nil
+    }
+
+    private func setClassic(_ on: Bool) {
+        classicLock.lock()
+        classic = on
+        classicLock.unlock()
+        classicState = on ? PunktfunkConnection.sc1BleState() : []
+    }
+
+    /// One wired feature frame to the 2015 pad: its segments, each without the report id, acked.
+    /// Returns how many went out. On `queue`.
+    @discardableResult
+    private func writeClassic(_ frame: [UInt8]) -> Int {
+        guard let controller, let reportChar else { return 0 }
+        let segments = PunktfunkConnection.sc1BleSegments(frame: frame)
+        let type: CBCharacteristicWriteType =
+            reportChar.properties.contains(.write) ? .withResponse : .withoutResponse
+        for segment in segments {
+            controller.writeValue(Data(segment.dropFirst()), for: reportChar, type: type)
+        }
+        return segments.count
     }
 
     /// Replay one raw host report on the physical controller. `kind` is the C ABI's
@@ -172,6 +228,10 @@ final class Sc2BleLink: NSObject {
     func writeRaw(kind: UInt8, frame: [UInt8]) {
         queue.async { [self] in
             guard let controller else { return }
+            if isClassic {
+                if kind == 1 { writeClassic(frame) }
+                return
+            }
             let target: CBCharacteristic?
             let payload: [UInt8]
             if kind == 0 {
@@ -212,8 +272,93 @@ final class Sc2BleLink: NSObject {
             } else {
                 type = target.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
             }
+            // A full buffer drops an unacked write without a word: hold it for the drain.
+            if type == .withoutResponse, !controller.canSendWriteWithoutResponse {
+                pendingWrites[target.uuid] = (target, Data(payload))
+                return
+            }
             controller.writeValue(Data(payload), for: target, type: type)
         }
+    }
+
+    /// Read the pad's identity for the host: each of core's feature queries written to the
+    /// report characteristic and read back, as SDL reads a feature over GATT. The serial is the
+    /// engraved one (`0xAE` attribute 1), which a cable shows as the USB serial. `done` runs on
+    /// `queue`; nil when the link is down.
+    func readIdentity(_ done: @escaping (PunktfunkConnection.PadIdentity?) -> Void) {
+        queue.async { [self] in
+            guard controller != nil, reportChar != nil, identityJob == nil else {
+                done(nil)
+                return
+            }
+            let requests = isClassic
+                ? PunktfunkConnection.sc1IdentityRequests()
+                : PunktfunkConnection.sc2IdentityRequests(puck: false)
+            identityJob = IdentityJob(requests: requests, done: done)
+            sendIdentityQuery()
+        }
+    }
+
+    /// Write the current query; its reply is read once the write is acknowledged. A query that
+    /// gets no echo within a second is skipped. On `queue`.
+    private func sendIdentityQuery() {
+        guard let job = identityJob else { return }
+        guard job.index < job.requests.count, let controller, let reportChar else {
+            finishIdentity()
+            return
+        }
+        let request = job.requests[job.index]
+        if isClassic {
+            sendClassicQuery(job, request)
+            return
+        }
+        let frame = request + [UInt8](repeating: 0, count: max(0, 64 - request.count))
+        guard let payload = Sc2Device.featurePayload(frame: frame) else {
+            nextIdentityQuery()
+            return
+        }
+        job.awaitingRead = false
+        job.timeout?.cancel()
+        let timeout = DispatchWorkItem { [weak self] in self?.nextIdentityQuery() }
+        job.timeout = timeout
+        queue.asyncAfter(deadline: .now() + 1, execute: timeout)
+        let type: CBCharacteristicWriteType =
+            reportChar.properties.contains(.write) ? .withResponse : .withoutResponse
+        controller.writeValue(Data(payload), for: reportChar, type: type)
+        if type == .withoutResponse {
+            job.awaitingRead = true
+            controller.readValue(for: reportChar)
+        }
+    }
+
+    /// A 2015 pad's query: its segments out, and the reply read once the last is acknowledged.
+    private func sendClassicQuery(_ job: IdentityJob, _ request: [UInt8]) {
+        job.awaitingRead = false
+        job.segments = []
+        job.timeout?.cancel()
+        let timeout = DispatchWorkItem { [weak self] in self?.nextIdentityQuery() }
+        job.timeout = timeout
+        queue.asyncAfter(deadline: .now() + 1, execute: timeout)
+        job.acksOwed = writeClassic(request + [UInt8](repeating: 0, count: max(0, 65 - request.count)))
+        if job.acksOwed == 0 { nextIdentityQuery() }
+    }
+
+    private func nextIdentityQuery() {
+        guard let job = identityJob else { return }
+        job.timeout?.cancel()
+        job.index += 1
+        job.attempts = 0
+        sendIdentityQuery()
+    }
+
+    private func finishIdentity() {
+        guard let job = identityJob else { return }
+        job.timeout?.cancel()
+        identityJob = nil
+        let unit = job.replies.first { $0.request.dropFirst() == [0xAE, 0x15, 0x01] }?.reply ?? []
+        let serial = String(decoding: unit.dropFirst(4).prefix { $0 != 0 }, as: UTF8.self)
+        log.info("SC2: identity \(serial, privacy: .public), \(job.replies.count)/\(job.requests.count) replies")
+        job.done(.init(serial: serial, replies: job.replies))
     }
 
     /// Firmware without a per-report characteristic at id+0x35: rotate through the writable
@@ -369,9 +514,11 @@ extension Sc2BleLink: CBCentralManagerDelegate {
         controller = nil
         inputChar = nil
         reportChar = nil
+        setClassic(false)
         allChars.removeAll()
         candidateChars.removeAll()
-        onClosed() // the capture releases its wire slot + re-arms the IMU gate
+        pendingWrites.removeAll()
+        onClosed() // the capture releases its wire slot
         if central.state == .poweredOn {
             acquire() // pads power-cycle many times per session — keep polling
         }
@@ -403,7 +550,7 @@ extension Sc2BleLink: CBPeripheralDelegate {
                 // (`0x87` = write register/value, the lizard-off and gyro-enable path), so an
                 // output payload swept onto it can persist an arbitrary firmware setting on the
                 // user's own controller. Counted in the census, excluded from the rotation.
-                if ch.uuid != reportCB && ch.uuid != inputCB && ch.uuid != timestampCB {
+                if ![reportCB, inputCB, timestampCB, classicInputCB].contains(ch.uuid) {
                     candidateChars.append(ch)
                 }
             }
@@ -413,6 +560,10 @@ extension Sc2BleLink: CBPeripheralDelegate {
             }
             if ch.uuid == inputCB {
                 inputChar = ch
+                peripheral.setNotifyValue(true, for: ch)
+            } else if ch.uuid == classicInputCB {
+                inputChar = ch
+                setClassic(true)
                 peripheral.setNotifyValue(true, for: ch)
             } else if ch.uuid == reportCB {
                 reportChar = ch
@@ -428,11 +579,32 @@ extension Sc2BleLink: CBPeripheralDelegate {
         let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
         log.info(
             "SC2 GATT census: \(allChars.count) chars (\(writable) writable, \(notifying) notify), maxWriteNoRsp=\(mtu)B — input=\(inputChar != nil) report=\(reportChar != nil)")
-        if reportChar != nil {
+        if reportChar != nil, isClassic {
+            Sc1Device.lizardOff.forEach { writeClassic($0) }
+        } else if reportChar != nil {
             // READY enough to keep the firmware out of lizard mode; input flows once the
             // subscribe completes.
             startLizardTimer()
         }
+    }
+
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        while peripheral.canSendWriteWithoutResponse, let (uuid, (ch, data)) = pendingWrites.first {
+            pendingWrites.removeValue(forKey: uuid)
+            peripheral.writeValue(data, for: ch, type: .withoutResponse)
+        }
+    }
+
+    func peripheral(
+        _ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?
+    ) {
+        guard characteristic.uuid == reportCB, let job = identityJob, !job.awaitingRead else { return }
+        if isClassic {
+            job.acksOwed -= 1
+            guard job.acksOwed <= 0 else { return }
+        }
+        job.awaitingRead = true
+        peripheral.readValue(for: characteristic)
     }
 
     func peripheral(
@@ -449,7 +621,16 @@ extension Sc2BleLink: CBPeripheralDelegate {
         error: Error?
     ) {
         guard error == nil, let data = characteristic.value, !data.isEmpty else { return }
-        if characteristic.uuid == inputCB {
+        if characteristic.uuid == classicInputCB {
+            guard let frame = PunktfunkConnection.sc1BleInput(
+                state: &classicState, segment: [Sc1Device.bleReport] + [UInt8](data))
+            else { return }
+            if !ready {
+                ready = true
+                log.info("SC2: first 2015 pad report — device live")
+            }
+            onReport(frame)
+        } else if characteristic.uuid == inputCB {
             let framed = Sc2Device.frameIncoming([UInt8](data))
             inCounter += 1
             if !ready {
@@ -462,10 +643,34 @@ extension Sc2BleLink: CBPeripheralDelegate {
             }
             onReport(framed)
         } else if characteristic.uuid == reportCB {
-            // A feature reply. The HOST's virtual pad answers Steam's feature reads, and no
-            // client→host reply plane exists — log and drop. (A stack whose synthetic pad lives
-            // client-side would instead round-trip these to its own GET_FEATURE handler.)
-            log.info("SC2: feature reply (\(data.count) B) — dropped (host answers Steam)")
+            // A feature reply: the identity read's, or one the host's virtual pad already
+            // answered for Steam. A reply that does not echo the query (a keep-alive's slipped in)
+            // asks again, twice at most.
+            guard let job = identityJob, job.awaitingRead, job.index < job.requests.count else { return }
+            let request = job.requests[job.index]
+            if isClassic {
+                // One segment per read, until the reply's last.
+                job.segments += [Sc1Device.bleReport] + [UInt8](data)
+                guard let reply = PunktfunkConnection.sc1BleReply(segments: job.segments) else {
+                    if job.segments.count < 8 * 20 { peripheral.readValue(for: characteristic) }
+                    return
+                }
+                if reply.count > 1, reply[1] == request[1] {
+                    job.replies.append(.init(request: request, reply: reply))
+                }
+                nextIdentityQuery()
+                return
+            }
+            let reply = [request[0]] + [UInt8](data)
+            if reply.count > 1, reply[1] == request[1] {
+                job.replies.append(.init(request: request, reply: reply))
+                nextIdentityQuery()
+            } else if job.attempts < 2 {
+                job.attempts += 1
+                sendIdentityQuery()
+            } else {
+                nextIdentityQuery()
+            }
         }
     }
 }

@@ -1,5 +1,5 @@
 {
-  "$comment": "Render scale → host Mode, pinned by punktfunk-core render_scale, the Swift RenderScale and the Kotlin RenderScale tests; pf-encode-core checks max_dimension against its Codec walls. A null scale is NaN. `apply` rows take their ceiling from max_dimension(codec).",
+  "$comment": "Render scale → host Mode, pinned by punktfunk-core render_scale, the Swift RenderScale and the Kotlin RenderScale tests; pf-encode-core checks max_dimension against its Codec walls. A null scale is NaN. `apply` rows take their ceiling from max_dimension(codec). `percent` rows are a typed percent, the scale it stores and the percent that scale reads back as. `preset` rows name the picker stop a stored scale is, null for a typed one; stops are 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 3, 4.",
   "max_dimension": [
     {"codec": "h264", "max": 4096},
     {"codec": "hevc", "max": 8192},
@@ -16,6 +16,26 @@
     {"raw": 1.5, "want": 1.5},
     {"raw": 4.0, "want": 4.0},
     {"raw": 9.0, "want": 4.0}
+  ],
+  "percent": [
+    {"typed": 110, "want": 1.1, "reads": 110},
+    {"typed": 100, "want": 1.0, "reads": 100},
+    {"typed": 67, "want": 0.67, "reads": 67},
+    {"typed": 133, "want": 1.33, "reads": 133},
+    {"typed": 50, "want": 0.5, "reads": 50},
+    {"typed": 40, "want": 0.5, "reads": 50},
+    {"typed": 400, "want": 4.0, "reads": 400},
+    {"typed": 999, "want": 4.0, "reads": 400},
+    {"typed": 0, "want": 1.0, "reads": 100}
+  ],
+  "preset": [
+    {"scale": 1.0, "index": 3},
+    {"scale": 0.67, "index": 1},
+    {"scale": 0.6700000166893005, "index": 1},
+    {"scale": 4.0, "index": 8},
+    {"scale": 1.1, "index": null},
+    {"scale": 0.66, "index": null},
+    {"scale": 1.26, "index": null}
   ],
   "apply": [
     {"name": "native", "base": [1920, 1080], "scale": 1.0, "codec": "hevc", "want": [1920, 1080]},

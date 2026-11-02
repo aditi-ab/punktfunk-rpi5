@@ -9,7 +9,7 @@ import org.json.JSONObject
 /**
  * Client settings presets — named bundles of setting overrides applied on top of the global
  * [Settings] (design/client-settings-profiles.md §4). The Kotlin mirror of
- * `crates/pf-client-core/src/presets.rs`; the model is the same on every client, so get it right
+ * `crates/client/pf-client-core/src/presets.rs`; the model is the same on every client, so get it right
  * here rather than re-deciding it.
  *
  * A preset overrides only the fields the user touched; everything else keeps following the global
@@ -33,6 +33,7 @@ data class SettingsOverlay(
     val height: Int? = null,
     val hz: Int? = null,
     val bitrateKbps: Int? = null,
+    val pyrowaveBpp: Double? = null,
     val renderScale: Double? = null,
     val videoFit: String? = null,
     /** Android's second screen (a dual-screen handheld's lower panel): off for a preset that
@@ -83,29 +84,16 @@ data class SettingsOverlay(
         SettingsFields.PRESET.fold(base) { s, f -> f.applyOverlay(this, s) }
 
     /**
-     * Record, as overrides, every tier-P field that differs between two settings snapshots.
-     *
-     * The settings UI commits a whole `Settings` per control (`update(s.copy(codec = …))`), so it
-     * can't hand over a list of touched fields — it hands over "what the control was showing" and
-     * "what it shows now", and the only field that can differ is the one the user just touched.
-     *
-     * This is NOT the diff-on-save the design rejects: the comparison is against the EFFECTIVE
-     * settings the control was displaying, not against the globals, so setting a value back to
-     * whatever the global happens to be still records an override — the pin. It only ever adds
-     * overrides; removing one is [clear], a different, explicit operation.
+     * Record one control's value in [from] as its override — even one equal to today's global,
+     * which is the pin. [FIELD_RESOLUTION] is the one alias, covering the width/height pair a single
+     * control drives. An unknown name is a no-op. Removing an override is [clear].
      */
-    fun absorb(before: Settings, after: Settings): SettingsOverlay =
-        SettingsFields.PRESET.fold(this) { o, f -> f.absorb(o, before, after) }
+    fun pin(field: String, from: Settings): SettingsOverlay =
+        SettingsFields.controlRows(field).fold(this) { o, f -> f.pin(o, from) }
 
-    /**
-     * Drop one override by its field name, putting the row back to inheriting. [FIELD_RESOLUTION]
-     * is the one alias, covering the width/height pair a single control drives. An unknown name is
-     * a no-op.
-     */
-    fun clear(field: String): SettingsOverlay = when (field) {
-        FIELD_RESOLUTION -> copy(width = null, height = null)
-        else -> SettingsFields.PRESET.firstOrNull { it.key == field }?.clear(this) ?: this
-    }
+    /** Drop one control's override, putting the row back to inheriting. Same names as [pin]. */
+    fun clear(field: String): SettingsOverlay =
+        SettingsFields.controlRows(field).fold(this) { o, f -> f.clear(o) }
 
     /** The field names this overlay overrides — what the settings rows draw their markers from. */
     fun overridden(): Set<String> = SettingsFields.PRESET

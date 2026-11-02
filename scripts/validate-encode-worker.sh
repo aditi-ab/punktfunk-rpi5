@@ -300,7 +300,7 @@ find_desktop() {
   for d in "${XDG_DATA_HOME:-$HOME/.local/share}/applications" \
            /usr/share/applications /usr/local/share/applications \
            /var/lib/flatpak/exports/share/applications; do
-    f="$d/io.unom.Punktfunk.Host.desktop"
+    f="$d/io.unom.punktfunk.host.desktop"
     if [ -r "$f" ]; then
       DESKTOP_FILE="$f"
       DESKTOP_EXEC="$(sed -n 's/^Exec=//p' "$f" | head -1 | awk '{print $1}')"
@@ -726,7 +726,7 @@ leg_inspect() {
 
   # --- I6 the KWin .desktop grant -------------------------------------------------------------------
   if [ -z "$DESKTOP_FILE" ]; then
-    skip I6 "no io.unom.Punktfunk.Host.desktop installed — KWin has nothing to match the host"
+    skip I6 "no io.unom.punktfunk.host.desktop installed — KWin has nothing to match the host"
     info  "against, so zkde_screencast_unstable_v1 is never advertised however clean the capability"
     info  "state is. On the Deck this file is written by scripts/steamdeck/install.sh; packaged"
     info  "installs ship it. This is a MISSING PRECONDITION, not the capability regression."
@@ -757,7 +757,7 @@ leg_v1() {
     return 0
   fi
   if [ -z "$DESKTOP_FILE" ]; then
-    skip V1 "precondition missing: no io.unom.Punktfunk.Host.desktop (run scripts/steamdeck/install.sh"
+    skip V1 "precondition missing: no io.unom.punktfunk.host.desktop (run scripts/steamdeck/install.sh"
     info  "on the Deck, or install a package). Without it KWin cannot advertise the screencast"
     info  "global for any reason, which would mask the capability question this leg exists to ask."
     return 0
@@ -1390,7 +1390,7 @@ install is home-scoped under ~/punktfunk, and file capabilities do NOT survive a
 is a new inode).
 
   1. PRIVILEGED, run by a human — sudo on the Deck needs the `deck` password, it is NOT passwordless.
-     This also writes ~/.local/share/applications/io.unom.Punktfunk.Host.desktop, which V1 needs and
+     This also writes ~/.local/share/applications/io.unom.punktfunk.host.desktop, which V1 needs and
      which is NOT currently present on that box:
 
          cd ~/punktfunk && scripts/steamdeck/install.sh

@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -56,6 +57,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.VerticalDivider
@@ -76,6 +78,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -159,20 +162,24 @@ fun SettingsScreen(
      */
     fun scopePreset(): StreamPreset? = scopeId?.let { id -> presets.firstOrNull { it.id == id } }
 
-    fun update(next: Settings) {
+    /**
+     * One control commits [next], naming its own [field]. In preset scope it pins that field when
+     * the value it showed changed — to today's global value too, which is the pin; re-picking what
+     * it shows writes nothing, and a field no preset carries changes nothing.
+     */
+    fun update(field: String, next: Settings) {
         val preset = scopePreset()
         if (preset == null) {
             globals = next
             onChange(next)
-        } else {
-            // `absorb` against what the control was SHOWING, so picking today's global value is
-            // still recorded as an override (the pin) — see [SettingsOverlay.absorb]. A skipped row
-            // shows what a fresh one would (that is WHY it skipped), so the effective settings
-            // recomputed here are the same ones it rendered.
-            val shown = globals.effectiveFor(preset)
-            presetStore.save(preset.copy(overrides = preset.overrides.absorb(shown, next)))
-            presets = presetStore.all()
+            return
         }
+        // A skipped row shows what a fresh one would (that is WHY it skipped), so the effective
+        // settings recomputed here are the ones it rendered.
+        val shown = globals.effectiveFor(preset)
+        if (SettingsFields.controlRows(field).all { it.get(shown) == it.get(next) }) return
+        presetStore.save(preset.copy(overrides = preset.overrides.pin(field, next)))
+        presets = presetStore.all()
     }
 
     fun resetField(field: String) {
@@ -184,12 +191,12 @@ fun SettingsScreen(
     // Mic uplink — turning it on requests RECORD_AUDIO; if denied, the toggle stays off.
     val micLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
-    ) { granted -> update(s.copy(micEnabled = granted)) }
+    ) { granted -> update("mic_enabled", s.copy(micEnabled = granted)) }
     val onMicChange: (Boolean) -> Unit = { on ->
         when {
-            !on -> update(s.copy(micEnabled = false))
+            !on -> update("mic_enabled", s.copy(micEnabled = false))
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                PackageManager.PERMISSION_GRANTED -> update(s.copy(micEnabled = true))
+                PackageManager.PERMISSION_GRANTED -> update("mic_enabled", s.copy(micEnabled = true))
             else -> micLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
@@ -210,11 +217,15 @@ fun SettingsScreen(
     if (showQuickActions) {
         QuickActionsScreen(
             blob = s.overlayActions,
-            onChange = { update(s.copy(overlayActions = it)) },
+            onChange = { update("overlay_actions", s.copy(overlayActions = it)) },
             // Reset drops the override in preset scope (design §3.3) and clears the global
             // otherwise; an empty blob is the platform default.
             onReset = {
-                if (active != null) resetField("overlay_actions") else update(s.copy(overlayActions = ""))
+                if (active != null) {
+                    resetField("overlay_actions")
+                } else {
+                    update("overlay_actions", s.copy(overlayActions = ""))
+                }
             },
             onBack = { showQuickActions = false },
             overridden = active?.overrides?.overridden()?.contains("overlay_actions") == true,
@@ -618,7 +629,7 @@ private fun CategoryList(
 private fun CategoryDetail(
     category: SettingsCategory,
     settings: Settings,
-    onChange: (Settings) -> Unit,
+    onChange: (String, Settings) -> Unit,
     context: android.content.Context,
     onMicChange: (Boolean) -> Unit,
     onOpenControllers: () -> Unit,
@@ -654,7 +665,7 @@ private fun CategoryDetail(
 }
 
 @Composable
-private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
+private fun GeneralSettings(s: Settings, update: (String, Settings) -> Unit) {
     val context = LocalContext.current
     // Turning the keep-alive on asks for notifications, because the ongoing notification is how
     // the session announces itself and the only way to end it from outside the app. A refusal
@@ -669,7 +680,7 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
                 subtitle = "Wake a sleeping saved host before connecting. Turn off if hosts " +
                     "behind a VPN look offline when they aren't.",
                 checked = s.autoWakeEnabled,
-                onCheckedChange = { on -> update(s.copy(autoWakeEnabled = on)) },
+                onCheckedChange = { on -> update("auto_wake", s.copy(autoWakeEnabled = on)) },
             )
             // Hidden on a TV, where the notification the End button lives on has nowhere to
             // appear: a session left running would be one nobody outside the app can stop.
@@ -684,7 +695,7 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
                         if (on && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                             noteLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                         }
-                        update(s.copy(backgroundKeepAlive = on))
+                        update("background_keep_alive", s.copy(backgroundKeepAlive = on))
                     },
                 )
                 // Only decides anything while the switch above is on, so it is hidden rather than
@@ -697,7 +708,7 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
                         caption = "A host cannot tell someone who walked away from someone who " +
                             "is watching, so a session nobody comes back to disconnects itself. " +
                             "Returning later reconnects.",
-                    ) { v -> update(s.copy(backgroundTimeoutMinutes = v)) }
+                    ) { v -> update("background_timeout_minutes", s.copy(backgroundTimeoutMinutes = v)) }
                 }
             }
         }
@@ -710,7 +721,7 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
             field = "stats_verbosity",
             caption = "Compact is one line; Detailed adds the decoder and latency breakdown. " +
                 "A 3-finger tap, or Select + X on a pad, cycles the tiers in-stream.",
-        ) { v -> update(s.copy(statsVerbosity = v)) }
+        ) { v -> update("stats_verbosity", s.copy(statsVerbosity = v)) }
         DeviceScopeOnly {
             ClickableRow(title = "What each number means", subtitle = "docs.punktfunk.unom.io/docs/stats") {
                 runCatching {
@@ -731,7 +742,7 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
                 options = START_IN_OPTIONS,
                 selected = StartIn.parse(s.startIn).stored,
                 caption = startInCaption(s, LocalContext.current),
-            ) { v -> update(s.copy(startIn = v)) }
+            ) { v -> update("start_in", s.copy(startIn = v)) }
         }
         // The footer is null on every device where the console works, so it costs nothing there —
         // and on the ones where it doesn't, it is the only place the app admits that this switch
@@ -742,7 +753,7 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
                 subtitle = "Swap the touch home for the console home — the host carousel and " +
                     "gamepad chrome. A TV always uses it.",
                 checked = s.gamepadUiEnabled,
-                onCheckedChange = { on -> update(s.copy(gamepadUiEnabled = on)) },
+                onCheckedChange = { on -> update("gamepad_ui_enabled", s.copy(gamepadUiEnabled = on)) },
             )
             // Only decides anything while the switch above is on, so it is HIDDEN rather than
             // dimmed when it isn't — a picker whose every option changes nothing is worse than
@@ -755,7 +766,7 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
                     caption = "With a controller: the touch home comes back when the last one " +
                         "disconnects. Always keeps the console home either way — for a device " +
                         "that lives docked to a TV.",
-                ) { v -> update(s.copy(gamepadUiMode = v)) }
+                ) { v -> update("gamepad_ui_mode", s.copy(gamepadUiMode = v)) }
             }
         }
     }
@@ -786,25 +797,25 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
                 subtitle = "Off shows the figures Moonlight's overlay also shows. On shows " +
                     "capture to glass as p50/p95 and every stage between.",
                 checked = s.advancedStats,
-                onCheckedChange = { on -> update(s.copy(advancedStats = on)) },
+                onCheckedChange = { on -> update("advanced_stats", s.copy(advancedStats = on)) },
             )
             SettingDropdown(
                 label = "Statistics position",
                 options = HUD_PLACEMENT_OPTIONS,
                 selected = corner,
                 caption = "The corner the statistics overlay sits in.",
-            ) { v -> update(s.copy(hudPlacement = v)) }
+            ) { v -> update("hud_placement", s.copy(hudPlacement = v)) }
             SettingDropdown(
                 label = "Statistics size",
                 options = STATS_SCALE_OPTIONS,
                 selected = s.statsScalePct.coerceIn(75, 200),
                 caption = "The overlay's size, on top of the system display size.",
-            ) { v -> update(s.copy(statsScalePct = v)) }
+            ) { v -> update("stats_scale_pct", s.copy(statsScalePct = v)) }
             ToggleRow(
                 title = "Exit hint",
                 subtitle = "Shows how to leave for a few seconds when a stream starts.",
                 checked = s.exitHint,
-                onCheckedChange = { on -> update(s.copy(exitHint = on)) },
+                onCheckedChange = { on -> update("exit_hint", s.copy(exitHint = on)) },
             )
         }
     }
@@ -812,7 +823,7 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: android.content.Context) {
+private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, context: android.content.Context) {
     val (nw, nh, nhz) = nativeDisplayMode(context, secondScreen = s.secondScreen)
     // The safe-area row carries its resolved size the same way the native row does. On a display with
     // no cutout this equals the native mode — the row stays, honestly showing that it changes nothing
@@ -826,6 +837,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
     val families = remember(panel, panelSafe) { Resolutions.families(panel, panelSafe) }
     val showCustom = customPicked || s.isCustomResolution(families)
     var customBitratePicked by remember { mutableStateOf(false) }
+    var customScalePicked by remember { mutableStateOf(false) }
     SettingsGroup("Resolution") {
         // The family the dropdown lists. A chip writes that family's size nearest the current
         // height, so the dropdown always holds a row of the family it shows.
@@ -843,7 +855,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                     onClick = {
                         customPicked = false
                         val (w, h) = Resolutions.nearestIn(a, s.height)
-                        update(s.copy(width = w, height = h))
+                        update(SettingsOverlay.FIELD_RESOLUTION, s.copy(width = w, height = h))
                     },
                     label = { Text(a.label) },
                 )
@@ -873,21 +885,24 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                 // Seed from the current *effective* size so the fields start from something
                 // sensible (the resolved native mode, not the 0 × 0 placeholder).
                 customPicked = true
-                update(s.copy(width = if (s.width > 0) s.width else nw, height = if (s.height > 0) s.height else nh))
+                update(
+                    SettingsOverlay.FIELD_RESOLUTION,
+                    s.copy(width = if (s.width > 0) s.width else nw, height = if (s.height > 0) s.height else nh),
+                )
             } else {
                 customPicked = false
-                update(s.copy(width = w, height = h))
+                update(SettingsOverlay.FIELD_RESOLUTION, s.copy(width = w, height = h))
             }
         }
         if (showCustom) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 ResolutionField(label = "Width", value = s.width, modifier = Modifier.weight(1f)) { w ->
                     val (cw, ch) = Resolutions.custom(w, s.height, s.codec)
-                    update(s.copy(width = cw, height = ch))
+                    update(SettingsOverlay.FIELD_RESOLUTION, s.copy(width = cw, height = ch))
                 }
                 ResolutionField(label = "Height", value = s.height, modifier = Modifier.weight(1f)) { h ->
                     val (cw, ch) = Resolutions.custom(s.width, h, s.codec)
-                    update(s.copy(width = cw, height = ch))
+                    update(SettingsOverlay.FIELD_RESOLUTION, s.copy(width = cw, height = ch))
                 }
             }
         }
@@ -897,11 +912,14 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             selected = s.hz,
             field = "refresh_hz",
             caption = "Native follows this device's refresh rate.",
-        ) { hz -> update(s.copy(hz = hz)) }
+        ) { hz -> update("refresh_hz", s.copy(hz = hz)) }
     }
 
     // The GPU probe, not a MediaCodec one — PyroWave decodes as Vulkan compute.
     val pyrowaveCapable = remember { VideoDecoders.pyrowaveCapable() }
+    // PyroWave sets its own rate: its quality, after the codec row, stands in for Bitrate's, and
+    // Bitrate offers Automatic or Fixed. The stored rate is kept for the other codecs.
+    val pyrowaveOn = s.codec == "pyrowave" && pyrowaveCapable
     // HDR is only meaningful on a panel that can present HDR10; on an SDR display the toggle is
     // disabled (and HDR is never advertised) so the host doesn't send PQ the panel mis-tone-maps.
     val hdrCapable = remember { displaySupportsHdr(context) }
@@ -915,36 +933,37 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             caption = "When the stream's shape differs from this screen. Fit shows the whole " +
                 "picture with black bars, Crop to fill cuts the edges off, Stretch to fill " +
                 "distorts it.",
-        ) { fit -> update(s.copy(videoFit = fit)) }
+        ) { fit -> update("video_fit", s.copy(videoFit = fit)) }
 
-        // PyroWave takes its rate from the host, so the row reads Automatic and locks; the stored
-        // rate is kept for the other codecs.
-        val pyrowaveOn = s.codec == "pyrowave" && pyrowaveCapable
         // Custom is read from the stored rate, like the resolution above; the flag only keeps the
         // field open between picking "Custom…" and typing a number.
         val showCustomBitrate = !pyrowaveOn && (customBitratePicked || s.isCustomBitrate())
-        SettingDropdown(
-            label = "Bitrate",
-            options = BITRATE_OPTIONS + (CUSTOM_BITRATE to
-                if (s.isCustomBitrate()) "Custom (${bitrateLabel(s.bitrateKbps)})" else "Custom…"),
-            selected = when {
-                pyrowaveOn -> 0
-                showCustomBitrate -> CUSTOM_BITRATE
-                else -> s.bitrateKbps
-            },
-            field = "bitrate_kbps",
-            caption = if (pyrowaveOn) {
-                "PyroWave sets its own rate from the stream mode."
-            } else {
-                "Automatic lets the host decide."
-            },
-            enabled = !pyrowaveOn,
-        ) { kbps ->
-            customBitratePicked = kbps == CUSTOM_BITRATE
-            if (kbps != CUSTOM_BITRATE) update(s.copy(bitrateKbps = kbps))
+        if (pyrowaveOn) {
+            val fixed = PyroWaveQuality.FIXED_KBPS
+            SettingDropdown(
+                label = "Bitrate",
+                options = listOf(0 to "Automatic", fixed to "Fixed"),
+                selected = if (s.bitrateKbps == 0) 0 else fixed,
+                field = "bitrate_kbps",
+                caption = PyroWaveQuality.BITRATE_HINT,
+            ) { kbps ->
+                if ((kbps == 0) != (s.bitrateKbps == 0)) update("bitrate_kbps", s.copy(bitrateKbps = kbps))
+            }
+        } else {
+            SettingDropdown(
+                label = "Bitrate",
+                options = BITRATE_OPTIONS + (CUSTOM_BITRATE to
+                    if (s.isCustomBitrate()) "Custom (${bitrateLabel(s.bitrateKbps)})" else "Custom…"),
+                selected = if (showCustomBitrate) CUSTOM_BITRATE else s.bitrateKbps,
+                field = "bitrate_kbps",
+                caption = "Automatic lets the host decide.",
+            ) { kbps ->
+                customBitratePicked = kbps == CUSTOM_BITRATE
+                if (kbps != CUSTOM_BITRATE) update("bitrate_kbps", s.copy(bitrateKbps = kbps))
+            }
         }
         if (showCustomBitrate) {
-            BitrateField(s.bitrateKbps) { kbps -> update(s.copy(bitrateKbps = kbps)) }
+            BitrateField(s.bitrateKbps) { kbps -> update("bitrate_kbps", s.copy(bitrateKbps = kbps)) }
         }
 
         ToggleRow(
@@ -957,7 +976,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             checked = hdrOn,
             enabled = hdrCapable,
             field = "hdr_enabled",
-            onCheckedChange = { on -> update(s.copy(hdrEnabled = on)) },
+            onCheckedChange = { on -> update("hdr_enabled", s.copy(hdrEnabled = on)) },
         )
         // The timeline presenter's intent — the Apple client's "Prioritize" pair, same stored
         // values, so a preset written on one platform means the same thing here.
@@ -968,57 +987,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             field = "present_priority",
             caption = "Lowest latency shows each frame the moment it can reach the panel; " +
                 "Smoothness buffers a little to absorb network jitter.",
-        ) { v -> update(s.copy(presentPriority = v)) }
-    }
-
-    SettingsGroup("Second screen") {
-        ToggleRow(
-            title = "Second screen",
-            subtitle = "A smaller second screen — a dual-screen handheld's lower panel, a foldable " +
-                "half open — shows the companion panel, or the picture with Screens. Off leaves it " +
-                "to the system: for a phone on a TV.",
-            checked = s.secondScreen,
-            field = "android.second_screen",
-            onCheckedChange = { on -> update(s.copy(secondScreen = on)) },
-        )
-    }
-
-    val d = Settings()
-    val smoothing = s.presentPriority == "smooth"
-    AdvancedGroup(
-        changed = changedCount(
-            smoothing && s.smoothBuffer != d.smoothBuffer,
-            s.renderScale != d.renderScale,
-            s.codec != d.codec,
-            s.tenBitSdr != d.tenBitSdr,
-            s.lowLatencyMode != d.lowLatencyMode,
-            s.compositor != d.compositor,
-        ),
-        fields = setOf(
-            "smooth_buffer", "render_scale", "codec", "ten_bit_sdr", "low_latency_mode", "compositor",
-        ),
-    ) {
-        if (smoothing) {
-            SettingDropdown(
-                label = "Smoothness buffer",
-                options = smoothBufferOptions(if (s.hz > 0) s.hz else nhz),
-                selected = if (s.smoothBuffer in 1..3) s.smoothBuffer else 0,
-                field = "smooth_buffer",
-                caption = "Each buffered frame absorbs one refresh of jitter and adds one of " +
-                    "display latency — the cost shown is at the session's refresh rate.",
-            ) { v -> update(s.copy(smoothBuffer = v)) }
-        }
-        SettingDropdown(
-            label = "Render scale",
-            options = RENDER_SCALE_OPTIONS,
-            // Snap the stored value (a Float round-tripped to Double) to the nearest preset so the
-            // exact Double keys match.
-            selected = RenderScale.PRESETS.minByOrNull { kotlin.math.abs(it - s.renderScale) } ?: 1.0,
-            field = "render_scale",
-            caption = "Above native is sharper but costs bandwidth and decode; below is " +
-                "lighter on the host.",
-        ) { scale -> update(s.copy(renderScale = scale)) }
-
+        ) { v -> update("present_priority", s.copy(presentPriority = v)) }
         // Only codecs this device can actually decode are offered — a preference the client never
         // advertises would be a dead setting (see [codecOptionsFor]).
         val av1Capable = remember { VideoDecoders.pickDecoder("video/av01") != null }
@@ -1038,7 +1007,67 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             } else {
                 "A preference — the host falls back if it can't encode this one."
             },
-        ) { c -> update(s.copy(codec = c)) }
+        ) { c -> update("codec", s.copy(codec = c)) }
+        if (pyrowaveOn) PyroWaveQualityRow(s, update)
+    }
+
+    SettingsGroup("Second screen") {
+        ToggleRow(
+            title = "Second screen",
+            subtitle = "A smaller second screen — a dual-screen handheld's lower panel, a foldable " +
+                "half open — shows the companion panel, or the picture with Screens. Off leaves it " +
+                "to the system: for a phone on a TV.",
+            checked = s.secondScreen,
+            field = "android.second_screen",
+            onCheckedChange = { on -> update("android.second_screen", s.copy(secondScreen = on)) },
+        )
+    }
+
+    val d = Settings()
+    val smoothing = s.presentPriority == "smooth"
+    AdvancedGroup(
+        changed = changedCount(
+            smoothing && s.smoothBuffer != d.smoothBuffer,
+            s.renderScale != d.renderScale,
+            s.tenBitSdr != d.tenBitSdr,
+            s.lowLatencyMode != d.lowLatencyMode,
+            s.keepAwake != d.keepAwake,
+            s.compositor != d.compositor,
+        ),
+        fields = setOf(
+            "smooth_buffer", "render_scale", "ten_bit_sdr", "low_latency_mode", "compositor",
+        ),
+    ) {
+        if (smoothing) {
+            SettingDropdown(
+                label = "Smoothness buffer",
+                options = smoothBufferOptions(if (s.hz > 0) s.hz else nhz),
+                selected = if (s.smoothBuffer in 1..3) s.smoothBuffer else 0,
+                field = "smooth_buffer",
+                caption = "Each buffered frame absorbs one refresh of jitter and adds one of " +
+                    "display latency — the cost shown is at the session's refresh rate.",
+            ) { v -> update("smooth_buffer", s.copy(smoothBuffer = v)) }
+        }
+        // Custom is read from the stored scale, like the bitrate above; the flag only keeps the
+        // field open between picking "Custom…" and typing a percent. A stop is matched in
+        // hundredths, so the stored Float still selects its exact Double key.
+        val scaleStop = RenderScale.presetIndex(s.renderScale)
+        val showCustomScale = customScalePicked || scaleStop == null
+        SettingDropdown(
+            label = "Render scale",
+            options = RENDER_SCALE_OPTIONS + (CUSTOM_RENDER_SCALE to
+                if (scaleStop == null) "Custom (${RenderScale.percent(s.renderScale)} %)" else "Custom…"),
+            selected = if (showCustomScale) CUSTOM_RENDER_SCALE else RenderScale.PRESETS[scaleStop],
+            field = "render_scale",
+            caption = "Above native is sharper but costs bandwidth and decode; below is " +
+                "lighter on the host.",
+        ) { scale ->
+            customScalePicked = scale == CUSTOM_RENDER_SCALE
+            if (scale != CUSTOM_RENDER_SCALE) update("render_scale", s.copy(renderScale = scale))
+        }
+        if (showCustomScale) {
+            RenderScaleField(s.renderScale) { scale -> update("render_scale", s.copy(renderScale = scale)) }
+        }
 
         // Asks nothing of the panel, so no capability gate: an 8-bit display shows a dithered
         // Main10 stream, and the gain is gradients that do not band. Inert while HDR is on
@@ -1053,7 +1082,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             checked = s.tenBitSdr && !hdrOn,
             enabled = !hdrOn,
             field = "ten_bit_sdr",
-            onCheckedChange = { on -> update(s.copy(tenBitSdr = on)) },
+            onCheckedChange = { on -> update("ten_bit_sdr", s.copy(tenBitSdr = on)) },
         )
         // Android has no decoder or GPU picker (MediaCodec resolves both); this one knob is worth
         // varying per host, since a marginal link is where the plain decode path helps.
@@ -1063,20 +1092,30 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                 "glitches on this device.",
             checked = s.lowLatencyMode,
             field = "low_latency_mode",
-            onCheckedChange = { on -> update(s.copy(lowLatencyMode = on)) },
+            onCheckedChange = { on -> update("low_latency_mode", s.copy(lowLatencyMode = on)) },
         )
+        // This device's screen, so never a preset's.
+        DeviceScopeOnly {
+            ToggleRow(
+                title = "Keep screen awake",
+                subtitle = "Off, a stream keeps the screen awake only while you play. Left alone " +
+                    "for five minutes, it lets this device's own screen timeout take over.",
+                checked = s.keepAwake,
+                onCheckedChange = { on -> update("keep_awake", s.copy(keepAwake = on)) },
+            )
+        }
         SettingDropdown(
             label = "Host compositor",
             options = COMPOSITOR_OPTIONS,
             selected = s.compositor,
             field = "compositor",
             caption = "Linux hosts only; falls back to auto-detection when unavailable.",
-        ) { c -> update(s.copy(compositor = c)) }
+        ) { c -> update("compositor", s.copy(compositor = c)) }
     }
 }
 
 @Composable
-private fun InputSettings(s: Settings, update: (Settings) -> Unit, onOpenQuickActions: () -> Unit) {
+private fun InputSettings(s: Settings, update: (String, Settings) -> Unit, onOpenQuickActions: () -> Unit) {
     SettingsGroup("Touch & pointer") {
         SettingDropdown(
             label = "Touch input",
@@ -1085,7 +1124,7 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit, onOpenQuickAc
             field = "touch_mode",
             caption = "Trackpad moves the cursor by relative swipes; Direct pointer jumps it " +
                 "to your finger; Passthrough sends real multi-touch; Off ignores touches on the picture.",
-        ) { mode -> update(s.copy(touchMode = mode)) }
+        ) { mode -> update("touch_mode", s.copy(touchMode = mode)) }
         Column {
             OverrideBadge("overlay_actions")
             ClickableRow(
@@ -1104,7 +1143,7 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit, onOpenQuickAc
                 subtitle = "Off, Back does nothing mid-stream. It still opens them when no twist, " +
                     "keyboard or pad can",
                 checked = s.backOpensRing,
-                onCheckedChange = { on -> update(s.copy(backOpensRing = on)) },
+                onCheckedChange = { on -> update("android.back_opens_ring", s.copy(backOpensRing = on)) },
             )
         }
     }
@@ -1116,13 +1155,13 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit, onOpenQuickAc
             field = "mouse_mode",
             caption = "Capture locks the pointer to the stream for mouse-look; Desktop leaves " +
                 "it free. Ctrl+Alt+Shift+Q flips it live.",
-        ) { mode -> update(s.copy(mouseMode = mode)) }
+        ) { mode -> update("mouse_mode", s.copy(mouseMode = mode)) }
         ToggleRow(
             title = "Invert scroll direction",
             subtitle = "Reverses wheel and two-finger scrolling",
             checked = s.invertScroll,
             field = "invert_scroll",
-            onCheckedChange = { on -> update(s.copy(invertScroll = on)) },
+            onCheckedChange = { on -> update("invert_scroll", s.copy(invertScroll = on)) },
         )
         // Alt+Tab, the Meta chords and the Language key never reach an app; the key service
         // filters them ahead of Android. It is enabled under Accessibility, which we can only
@@ -1146,7 +1185,7 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit, onOpenQuickAc
 }
 
 @Composable
-private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: (Boolean) -> Unit) {
+private fun AudioSettings(s: Settings, update: (String, Settings) -> Unit, onMicChange: (Boolean) -> Unit) {
     SettingsGroup(footer = "Applies from the next session.") {
         SettingDropdown(
             label = "Audio channels",
@@ -1154,7 +1193,7 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
             selected = s.audioChannels,
             field = "audio_channels",
             caption = "Requested from the host; it downmixes if it has fewer.",
-        ) { ch -> update(s.copy(audioChannels = ch)) }
+        ) { ch -> update("audio_channels", s.copy(audioChannels = ch)) }
         ToggleRow(
             title = "Stream microphone",
             subtitle = "Feeds this device's microphone to the host",
@@ -1184,13 +1223,13 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
                 "surround especially. The host has its own switch and both must be on; " +
                 "otherwise the session stays on Opus, which is already effectively " +
                 "transparent. The overlay shows what a session actually got.",
-        ) { f -> update(s.copy(audioFormat = f)) }
+        ) { f -> update("audio_format", s.copy(audioFormat = f)) }
         ToggleRow(
             title = "Keep host audio playing",
             subtitle = "The host's speakers or headphones keep playing while you stream",
             checked = s.keepHostAudio,
             field = "keep_host_audio",
-            onCheckedChange = { on -> update(s.copy(keepHostAudio = on)) },
+            onCheckedChange = { on -> update("keep_host_audio", s.copy(keepHostAudio = on)) },
         )
         ToggleRow(
             title = "Echo cancellation",
@@ -1198,13 +1237,13 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
             checked = s.echoCancel,
             enabled = s.micEnabled,
             field = "echo_cancel",
-            onCheckedChange = { on -> update(s.copy(echoCancel = on)) },
+            onCheckedChange = { on -> update("echo_cancel", s.copy(echoCancel = on)) },
         )
     }
 }
 
 @Composable
-private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenControllers: () -> Unit) {
+private fun ControllerSettings(s: Settings, update: (String, Settings) -> Unit, onOpenControllers: () -> Unit) {
     SettingsGroup(footer = "Applies from the next session.") {
         SettingDropdown(
             label = "Controller type",
@@ -1215,14 +1254,14 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             caption = "The virtual pad the host creates. Automatic matches your controller; " +
                 "every connected one is forwarded as its own player. An X-Box type has no " +
                 "gyroscope, so pick a DualSense-class one if you want motion.",
-        ) { g -> update(s.copy(gamepad = g)) }
+        ) { g -> update("gamepad", s.copy(gamepad = g)) }
         DeviceScopeOnly {
             ToggleRow(
                 title = "Controller rumble",
                 subtitle = "Off, controllers don't vibrate from the stream or in the menus, whatever the game sends",
                 checked = s.padRumble,
                 enabled = s.gamepadForwarding,
-                onCheckedChange = { on -> update(s.copy(padRumble = on)) },
+                onCheckedChange = { on -> update("pad_rumble", s.copy(padRumble = on)) },
             )
             ClickableRow(
                 title = "Connected controllers",
@@ -1240,7 +1279,7 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                     title = "Rumble on this phone",
                     subtitle = "Also play controller 1's rumble on this phone's motor",
                     checked = s.rumbleOnPhone,
-                    onCheckedChange = { on -> update(s.copy(rumbleOnPhone = on)) },
+                    onCheckedChange = { on -> update("android.rumble_on_phone", s.copy(rumbleOnPhone = on)) },
                 )
             }
             // The rumble mirror's sibling, data flowing the other way: needs a gyroscope to
@@ -1252,7 +1291,7 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                     subtitle = "When the controller has no gyro, send this phone's motion " +
                         "sensors as controller 1's",
                     checked = s.gyroOnPhone,
-                    onCheckedChange = { on -> update(s.copy(gyroOnPhone = on)) },
+                    onCheckedChange = { on -> update("android.gyro_on_phone", s.copy(gyroOnPhone = on)) },
                 )
             }
         }
@@ -1263,7 +1302,6 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             s.gamepadForwarding != d.gamepadForwarding,
             s.systemButtons != d.systemButtons,
             s.guideGesture != d.guideGesture,
-            s.sc2Capture != d.sc2Capture,
             s.dsCapture != d.dsCapture,
             s.padHaptics != d.padHaptics,
             s.padSpeaker != d.padSpeaker,
@@ -1279,7 +1317,7 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                 "VirtualHere, or a pad plugged into the host — so games don't see two of them",
             checked = s.gamepadForwarding,
             field = "gamepad_forwarding",
-            onCheckedChange = { on -> update(s.copy(gamepadForwarding = on)) },
+            onCheckedChange = { on -> update("gamepad_forwarding", s.copy(gamepadForwarding = on)) },
         )
         SettingDropdown(
             label = "Guide button",
@@ -1289,7 +1327,7 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             enabled = s.gamepadForwarding,
             caption = "Where the guide (Xbox/PS) and share presses go while streaming. " +
                 "Automatic sends them to the host whenever this device delivers them.",
-        ) { v -> update(s.copy(systemButtons = v)) }
+        ) { v -> update("system_buttons", s.copy(systemButtons = v)) }
         SettingDropdown(
             label = "Hold Select for guide",
             options = GUIDE_GESTURE_OPTIONS,
@@ -1299,26 +1337,16 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             caption = "Hold Select alone to press the host's guide button — keep holding for a " +
                 "Gaming-Mode host's quick-access menu. A Select tap still goes through, " +
                 "slightly delayed. For devices that intercept the real guide button.",
-        ) { v -> update(s.copy(guideGesture = v)) }
+        ) { v -> update("guide_gesture", s.copy(guideGesture = v)) }
         DeviceScopeOnly {
-            // NOT gated on the vibrator: SC2 passthrough is a USB/BLE capture, and TV boxes are
-            // where a Steam Controller 2 is the whole input story.
-            ToggleRow(
-                title = "Steam Controller 2 passthrough",
-                subtitle = "Stream a Steam Controller 2 as-is — Steam on the host drives its " +
-                    "trackpads, gyro and haptics directly",
-                checked = s.sc2Capture,
-                enabled = s.gamepadForwarding,
-                onCheckedChange = { on -> update(s.copy(sc2Capture = on)) },
-            )
-            // Feedback lands on the CONTROLLER's own motors and LEDs, so no vibrator gate either.
+            // Feedback lands on the CONTROLLER's own motors and LEDs, so no vibrator gate.
             ToggleRow(
                 title = "DualSense over USB",
                 subtitle = "Drive a USB-connected Sony pad directly — rumble on any phone, " +
                     "plus adaptive triggers, lightbar and gyro",
                 checked = s.dsCapture,
                 enabled = s.gamepadForwarding,
-                onCheckedChange = { on -> update(s.copy(dsCapture = on)) },
+                onCheckedChange = { on -> update("android.ds_capture", s.copy(dsCapture = on)) },
             )
             // Both only ever apply to a captured pad, so they follow that row and gate on it.
             ToggleRow(
@@ -1327,7 +1355,7 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                     "the pad keeps ordinary rumble for games that don't send them",
                 checked = s.padHaptics,
                 enabled = s.gamepadForwarding && s.dsCapture,
-                onCheckedChange = { on -> update(s.copy(padHaptics = on)) },
+                onCheckedChange = { on -> update("pad_haptics", s.copy(padHaptics = on)) },
             )
             // Off by default (see Settings.padSpeaker), and a silent pad speaker looks exactly like
             // broken hardware, so the subtitle says the default out loud.
@@ -1337,7 +1365,7 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                     "off by default, so the pad's speaker stays silent until you turn this on",
                 checked = s.padSpeaker,
                 enabled = s.gamepadForwarding && s.dsCapture,
-                onCheckedChange = { on -> update(s.copy(padSpeaker = on)) },
+                onCheckedChange = { on -> update("pad_speaker", s.copy(padSpeaker = on)) },
             )
         }
     }
@@ -1455,6 +1483,45 @@ private fun ToggleRow(
                 )
             }
             Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
+        }
+    }
+}
+
+/**
+ * PyroWave quality in Bitrate's place: 0.5 to 2 by tenths, never shown as bits per pixel. The
+ * caption is the rate it needs at the mode a connect would ask; the warning follows while this
+ * device's link is short of it.
+ */
+@Composable
+private fun PyroWaveQualityRow(s: Settings, update: (String, Settings) -> Unit) {
+    val context = LocalContext.current
+    val link = remember { PyroWaveQuality.link(context) }
+    val (caption, warning) = PyroWaveQuality.lines(s, s.effectiveMode(context), link)
+    val at = PyroWaveQuality.snapped(s.pyrowaveBpp)
+    Column {
+        OverrideBadge("pyrowave_bpp")
+        Text("PyroWave quality", style = MaterialTheme.typography.bodyLarge)
+        Slider(
+            value = at.toFloat(),
+            onValueChange = { v ->
+                val bpp = PyroWaveQuality.snapped(v.toDouble())
+                if (bpp != at) update("pyrowave_bpp", s.copy(pyrowaveBpp = bpp))
+            },
+            valueRange = PyroWaveQuality.RANGE,
+            steps = PyroWaveQuality.STEPS,
+        )
+        Text(
+            caption,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (warning != null) {
+            Text(
+                warning,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 4.dp),
+            )
         }
     }
 }
@@ -1590,6 +1657,28 @@ private fun BitrateField(kbps: Int, onCommit: (Int) -> Unit) {
         singleLine = true,
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
         modifier = Modifier.fillMaxWidth().onFocusChanged { if (!it.isFocused) text = shown },
+    )
+}
+
+/** A render scale as a whole percent. Digits only; the scale is stored when the field loses
+ * focus or the keyboard's Done is pressed, so a half-typed "1" is never clamped to 50 under the
+ * thumb. Empty or `0` stores nothing. */
+@Composable
+private fun RenderScaleField(scale: Double, onCommit: (Double) -> Unit) {
+    val shown = RenderScale.percent(scale).toString()
+    var text by remember(shown) { mutableStateOf(shown) }
+    val commit = {
+        val percent = text.toIntOrNull() ?: 0
+        if (percent > 0) onCommit(RenderScale.fromPercent(percent)) else text = shown
+    }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { raw -> text = raw.filter { it.isDigit() }.take(3) },
+        label = { Text("Render scale (percent, 50 to 400)") },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(onDone = { commit() }),
+        modifier = Modifier.fillMaxWidth().onFocusChanged { if (!it.isFocused) commit() },
     )
 }
 

@@ -2,19 +2,18 @@ package io.unom.punktfunk
 
 import android.content.Context
 import android.util.Log
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.ConnectRequest
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.VideoDecoders
-import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -30,7 +29,10 @@ const val CONNECT_TIMEOUT_MS = 10_000
  */
 const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
 
-/** What every shell does once [connectToHost] hands back a session handle. */
+/** How often a dial in flight checks whether the host parked it for its operator. */
+const val PENDING_POLL_MS = 250L
+
+/** The session [HostServices.dial] hands every shell once a dial lands. */
 object SessionFactory {
     /**
      * The session a dial opened, for the stream screen. [settings] is what the dial used. The
@@ -45,7 +47,8 @@ object SessionFactory {
         settings: Settings,
         preset: StreamPreset?,
         store: KnownHostStore,
-        mgmtPort: Int = NativeBridge.nativeHostMgmtPort(handle),
+        mgmtPort: Int,
+        redial: DialSpec? = null,
     ): ActiveSession {
         if (record != null) store.learnMgmtPort(record, mgmtPort)
         return ActiveSession(
@@ -54,41 +57,33 @@ object SessionFactory {
             clipboardSync = record?.clipboardSync ?: false,
             presetName = preset?.name,
             hostId = record?.id,
+            redial = redial,
         )
     }
 
-    /** Save the identity the host on [handle] presented; `null` when it presented none. */
-    fun pinPresented(
-        handle: Long,
-        host: String,
-        port: Int,
-        name: String,
-        paired: Boolean,
-        store: KnownHostStore,
-    ): KnownHost? =
-        NativeBridge.nativeHostFingerprint(handle).takeIf { it.isNotEmpty() }
-            ?.let { store.trust(host, port, name, it, paired) }
 }
 
 /**
  * The one session this process owns, and the one dial allowed to be in flight.
  *
- * Process-wide (null = not streaming), published by the composition that owns the stream.
- * `launchMode` is `standard`, so a `punktfunk://` link arrives as a second activity instance that
- * knows nothing about the first; static state is what crosses that gap, and the process dying
- * resets it.
+ * [owner] holds the session for the process: an activity recreated mid-stream attaches to it
+ * again, and the process dying ends it. `launchMode` is `standard`, so a `punktfunk://` link
+ * arrives as a second activity instance that knows nothing about the first; static state is what
+ * crosses that gap.
  *
- * It also gates [connectToHost]. The console's native shell and its event pump outlive the screen
- * that raised them, so a `Launch` behind a live stream still reaches the dial: the host admits it
- * by `mode-conflict: JOIN` at the owner's mode and this side neither shows nor closes it. One
- * launch, one session.
+ * It also gates [HostServices.open]. The console's native shell and its event pump outlive the
+ * screen that raised them, so a `Launch` behind a live stream still reaches the dial: the host
+ * admits it by `mode-conflict: JOIN` at the owner's mode and this side neither shows nor closes
+ * it. One launch, one session.
  */
 object SessionGate {
     /** The host a live stream is on. */
     data class Live(val hostId: String?)
 
-    @Volatile
-    var live: Live? = null
+    val owner = SessionOwner(::close)
+
+    /** Null when not streaming. Read off the main thread by [take]. */
+    val live: Live? get() = owner.session?.let { Live(it.hostId) }
 
     private val dialing = AtomicBoolean(false)
 
@@ -114,60 +109,47 @@ object SessionGate {
 }
 
 /**
- * The one place [NativeBridge.nativeConnect] is assembled — shared by [ConnectScreen], the library
- * launcher ([LibraryScreen]) and the console shell. Derives the mode / HDR / gamepad settings the
- * host needs from [settings]. [pinHex] is the pinned fingerprint (empty ⇒ TOFU). [launch] is a
- * store-qualified library id (`steam:<appid>` / `custom:<id>`) to boot straight into a game, or
- * `null` for the desktop. [dialer] names the shell and path that asked, for the log and the wire.
- *
- * Gated by [SessionGate]: a dial behind a live session, or beside one already in flight, returns
- * `0` without touching the host. Returns the session handle, or `0` on failure. Call off the main
- * thread.
+ * The open session, held outside any composition. It ends on [end] alone: the player ends it, the
+ * host closes it, or the process dies with it. A stream screen [attach]es while it shows the
+ * session and [detach]es when its composition goes; the last screen off an ended session closes
+ * the handle, after its planes stopped. With no screen on it, [end] closes at once. Main thread.
  */
-suspend fun connectToHost(
-    context: Context,
-    settings: Settings,
-    identity: ClientIdentity,
-    host: String,
-    port: Int,
-    pinHex: String,
-    launch: String?,
-    dialer: String,
-    timeoutMs: Int = CONNECT_TIMEOUT_MS,
-    preset: StreamPreset? = null,
-    // What a network check asks besides the profile on the host's record ([DELIVERY_FACTS],
-    // [DELIVERY_PROBE_ONLY]); a plain connect asks nothing besides.
-    deliveryFlags: Int = 0,
-): Long {
-    // One launch, one session: every shell's connect lands here, so the refusal lives here too.
-    if (!SessionGate.take()) {
-        Log.w("punktfunk", "dial refused ($dialer): this device already has a session or a dial in hand")
-        return 0L
+class SessionOwner(private val close: (Long) -> Unit) {
+    /** Null when not streaming. Compose state: the shells follow it. */
+    var session by mutableStateOf<ActiveSession?>(null)
+        private set
+
+    // One entry per screen on a handle: a second activity instance can show the same one.
+    private val screens = mutableListOf<Long>()
+
+    fun open(session: ActiveSession) {
+        this.session = session
     }
-    try {
-        return dial(
-            context, settings, identity, host, port, pinHex, launch, dialer, timeoutMs, preset,
-            deliveryFlags,
-        )
-    } finally {
-        SessionGate.release()
+
+    fun attach(handle: Long) {
+        screens += handle
+    }
+
+    fun detach(handle: Long) {
+        screens -= handle
+        if (session?.handle != handle && handle !in screens) close(handle)
+    }
+
+    fun end(handle: Long) {
+        if (session?.handle != handle) return
+        session = null
+        if (handle !in screens) close(handle)
     }
 }
 
-/** [connectToHost] with the gate already taken. */
-private suspend fun dial(
-    context: Context,
-    settings: Settings,
-    identity: ClientIdentity,
-    host: String,
-    port: Int,
-    pinHex: String,
-    launch: String?,
-    dialer: String,
-    timeoutMs: Int,
-    preset: StreamPreset?,
-    deliveryFlags: Int,
-): Long {
+/**
+ * The one place [NativeBridge.nativeConnect] is assembled, for [JniHostNative]. Derives the mode,
+ * HDR and gamepad settings the host needs from [spec]'s settings, waits for the last session's
+ * close, and dials off the main thread. The dial cannot be interrupted, so it runs
+ * `NonCancellable`. Returns the session handle, or `0` on failure.
+ */
+suspend fun connectToHost(context: Context, spec: DialSpec): Long {
+    val settings = spec.settings
     // Advertise HDR only when the user enabled it AND this device's display can present it (else the
     // host sends a proper SDR stream rather than PQ the panel would mis-tone-map).
     val (baseW, baseH, hz) = settings.effectiveMode(context)
@@ -196,12 +178,13 @@ private suspend fun dial(
     val (audioRateHz, audioBits) = settings.audioFormatWire()
     // NonCancellable: a cancelled withContext drops its result, and the dial cannot be
     // interrupted — the session would open with nobody to close it.
-    val handle = withContext(Dispatchers.IO + NonCancellable) {
+    return withContext(Dispatchers.IO + NonCancellable) {
         SessionGate.awaitClosed() // the last stream's close, which its screen handed off
         // Transport-level half of "Low-latency mode (experimental)" (DSCP marking on the media
         // sockets) — must be applied before connect, since sockets are tagged at creation.
         NativeBridge.nativeSetLowLatencyMode(settings.lowLatencyMode)
         val multiSlice = VideoDecoders.multiSliceTolerant()
+        val studioRange = VideoDecoders.showsFullRangeAsStudio()
         val partialFrame = VideoDecoders.partialFrameCapable()
         // Slice-progressive delivery: decoder truth AND the low-latency toggle — parts are part of
         // the fast pipeline, and the toggle's "off" is the conservative configuration throughout.
@@ -216,25 +199,24 @@ private suspend fun dial(
         // still resolves HEVC. An explicit user choice always wins unchanged.
         val preferredCodec = settings.preferredCodec().takeIf { it != 0 }
             ?: if (codecBits and 4 != 0 && !partialFrame) 4 else 0
-        // PyroWave takes its rate from the host's bits per pixel. Asking Automatic (0) is what
-        // lets the host fit that rate to the link before the first frame; a stored fixed rate
-        // is kept for the other codecs.
-        val pyrowave = preferredCodec == 8 && codecBits and 8 != 0
         // The connect-time capability readout (`adb logcat -s pf.caps`): the P2 slice pipeline
         // is client-inert unless BOTH probes pass — this line says which decoder failed one.
         Log.i(
             "pf.caps",
             VideoDecoders.capsReport() +
-                " → multiSlice=$multiSlice parts=$frameParts prefer=$preferredCodec" +
+                " → multiSlice=$multiSlice parts=$frameParts studioRange=$studioRange" +
+                " prefer=$preferredCodec" +
                 " (lowLatency=${settings.lowLatencyMode})",
         )
         val request = ConnectRequest(
-            host = host, port = port, width = w, height = h, refreshHz = hz,
-            certPem = identity.certPem, keyPem = identity.privateKeyPem, pinHex = pinHex,
-            bitrateKbps = if (pyrowave) 0 else settings.bitrateKbps, compositorPref = settings.compositor,
-            gamepadPref = gamepadPref,
+            host = spec.host, port = spec.port, width = w, height = h, refreshHz = hz,
+            certPem = spec.identity.certPem, keyPem = spec.identity.privateKeyPem, pinHex = spec.pinHex,
+            // Zero is Automatic. Under PyroWave any other value is Fixed: the host ignores the
+            // number and pins the player's quality.
+            bitrateKbps = settings.bitrateKbps, compositorPref = settings.compositor,
+            pyrowaveBppX100 = settings.pyrowaveBppX100(), gamepadPref = gamepadPref,
             hdrEnabled = hdrEnabled, tenBitSdr = tenBitSdr, multiSliceOk = multiSlice,
-            framePartsOk = frameParts,
+            framePartsOk = frameParts, studioRange = studioRange,
             audioChannels = settings.audioChannels,
             // The audio format this session asks for. Only ever a request: the host's own gate
             // may resolve it back to Opus, and the native side downgrades it first if AAudio on
@@ -244,8 +226,8 @@ private suspend fun dial(
             // What this device can decode (H.264 always; HEVC and AV1 when a real decoder exists) +
             // the soft codec preference (user choice, or the Automatic AV1 rule above) — the
             // host resolves the emitted codec from both.
-            videoCodecs = codecBits, preferredCodec = preferredCodec, timeoutMs = timeoutMs,
-            launch = launch,
+            videoCodecs = codecBits, preferredCodec = preferredCodec, timeoutMs = spec.timeoutMs,
+            launch = spec.launch,
             // The host's approval-list / trust-store label for this device — the same
             // user-set device name the pairing dialogs offer for nativePair.
             deviceName = deviceName(context),
@@ -255,22 +237,18 @@ private suspend fun dial(
             // "Keep host audio playing": the host taps its own default output rather than
             // silencing it for the session. Free to ask for — an older host just ignores it.
             keepHostAudio = settings.keepHostAudio,
+            // Only a mouse wears the host's pointer; without one the channel costs a Linux host
+            // an encoder blend for nothing.
+            clientCursor = settings.mouseMode == MouseMode.DESKTOP && hasPhysicalMouse(),
             videoFit = settings.videoFit,
             // Which build, and which shell and path, opened this session — the host's
             // `handshake complete` `client=` field.
-            dialer = "android ${appVersion(context)} $dialer",
-            presetId = preset?.id,
-            presetName = preset?.name,
-            // The profile a network check left on this host's record; a host that does not read
-            // the ask streams as it always has.
-            deliveryProfile = if (pinHex.isEmpty()) 0 else KnownHostStore(context).getByFp(pinHex)?.delivery ?: 0,
-            deliveryFlags = deliveryFlags,
+            dialer = "android ${appVersion(context)} ${spec.dialer}",
+            presetId = spec.preset?.id,
+            presetName = spec.preset?.name,
+            deliveryFlags = spec.deliveryFlags,
+            profile = spec.profile,
         )
         NativeBridge.nativeConnect(request.toJson())
     }
-    if (handle != 0L && !currentCoroutineContext().isActive) {
-        withContext(Dispatchers.IO + NonCancellable) { NativeBridge.nativeClose(handle) }
-    }
-    currentCoroutineContext().ensureActive()
-    return handle
 }

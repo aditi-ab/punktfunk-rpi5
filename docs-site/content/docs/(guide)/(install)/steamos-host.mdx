@@ -39,7 +39,8 @@ runs the same two lines and also asks about Moonlight compatibility and the shar
 The script asks for your `sudo` password first, then builds; it is safe to re-run. It builds the
 host, the web console and the plugin runner, sets up gamepad access, UDP buffers and the `input`
 and `punktfunk` groups so they survive SteamOS updates, and starts the `punktfunk-host` and
-`punktfunk-web` user services, which run without anyone logged in.
+`punktfunk-web` user services, which run without anyone logged in. It also sets up
+[Reachable without logging in](/docs/profiles#on-linux), off until you tick it under **Profiles**.
 
 | Flag | Effect |
 | --- | --- |
@@ -95,9 +96,19 @@ Press **Update now** on the console's **Updates** card, or run:
 bash ~/punktfunk/scripts/steamdeck/update.sh --pull
 ```
 
-Both rebuild on the device and keep your config and pairings. The checkout follows the `stable`
+Both rebuild on the device and keep your config and pairings. While Reachable without logging in
+is on, the console's Updates card can't see the checkout: run `update.sh --pull` in Konsole, which
+asks for your password to update the switch too. The checkout follows the `stable`
 branch, which moves to each release when it is announced. To follow `main`, the
-[canary channel](/docs/channels), install or re-run with `--channel canary`. More in
+[canary channel](/docs/channels), switch the branch and rebuild:
+
+```sh
+git -C ~/punktfunk fetch && git -C ~/punktfunk switch main
+bash ~/punktfunk/scripts/steamdeck/update.sh --pull
+```
+
+`switch stable` goes back. `update.sh` takes no `--channel`; that flag belongs to the
+[guided installer](/docs/install#guided-install-preview), which makes the same switch. More in
 [Updating](/docs/updating).
 
 ## Good to know
@@ -105,6 +116,9 @@ branch, which moves to each release when it is announced. To follow `main`, the
 - **SteamOS updates.** The system tuning is on SteamOS's atomic-update keep list, and
   `punktfunk-rebuild-check` rebuilds the host at boot only if an update broke it. That first start
   takes a few minutes longer.
+- **Profiles with a desktop of their own.** Reachable without logging in runs from `/opt/punktfunk`
+  and keeps its files and every seat's home in `/home/.steamos/offload/var/lib`, so SteamOS updates
+  keep both. The boot rebuild refreshes it with the host.
 - **Encoder.** Picked automatically: Vulkan Video on the Deck's AMD GPU with VAAPI as fallback,
   NVENC on NVIDIA. The installer writes `RADV_PERFTEST=video_encode` to `host.env`; without it the
   Deck uses VAAPI. `PUNKTFUNK_VULKAN_ENCODE=0` forces VAAPI.
@@ -119,6 +133,7 @@ branch, which moves to each release when it is announced. To follow `main`, the
   session.
 - **Plugins.** The runner is installed but off. Turn it on with
   `systemctl --user enable --now punktfunk-scripting` when you use [plugins](/docs/plugins).
+  A profile with a desktop of its own turns its runner on from its own **Plugins** page.
 
 ## Uninstalling
 

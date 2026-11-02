@@ -27,8 +27,8 @@ These links are the **stable** channel. For builds of `main`, see [Release Chann
 Works on any distro with Flatpak:
 
 ```sh
-flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
-flatpak run io.unom.Punktfunk
+flatpak install --user https://flatpak.unom.io/io.unom.punktfunk.flatpakref
+flatpak run io.unom.punktfunk
 ```
 
 Update with `flatpak update`, **without `sudo`**: `sudo` only updates system installs and skips this
@@ -55,7 +55,7 @@ For Gaming Mode, install the [Decky plugin](/docs/steam-deck). It uses the Flatp
 install that too, in Desktop Mode:
 
 ```sh
-flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
+flatpak install --user https://flatpak.unom.io/io.unom.punktfunk.flatpakref
 ```
 
 ## Windows
@@ -136,7 +136,7 @@ A client and a host don't need the same version. To update the host, see [Updati
 | apt, dnf, pacman | Your normal system upgrade, or [`punktfunk-client --apply-update`](#the-linux-client-can-update-itself) |
 | Fedora Atomic, layered | See below |
 | Windows installer | Run the newer installer. Hosts and pairing are kept. |
-| Windows MSIX or portable | Add the newer `.msix`, or unzip the newer build over the old one |
+| Windows MSIX or portable | Add the newer `.msix`, or unzip the newer build over the old one. An MSIX named `unom.Punktfunk` is the older package and doesn't upgrade: remove it as below first. |
 | macOS `.dmg` | Drag the newer app over the old one |
 | iPhone, iPad, Apple TV | App Store, or TestFlight for the beta |
 | Android | Google Play. For the APK, install the newer one over it. |
@@ -155,7 +155,7 @@ sudo rpm-ostree update --uninstall punktfunk-client --install punktfunk-client
 takes its saved hosts and pairing with it, so pair again once:
 
 ```powershell
-Get-AppxPackage unom.Punktfunk | Remove-AppxPackage
+Get-AppxPackage *unom.punktfunk | Remove-AppxPackage
 ```
 
 ### The Linux client can update itself

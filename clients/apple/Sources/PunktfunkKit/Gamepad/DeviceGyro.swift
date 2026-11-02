@@ -24,17 +24,16 @@
 // sample is rotated by the current interface orientation — a phone clipped landscape must yaw
 // when the player yaws, not roll.
 
-#if os(iOS)
-import CoreMotion
 import Foundation
-import UIKit
 
 /// Device-frame → controller-frame axis remap for one interface orientation. CoreMotion's
 /// frame is fixed to the portrait device (+x right edge, +y top, +z out of the screen); the
 /// controller frame keeps +z (the screen always faces the player) and rotates x/y so they
 /// mean "player's right" and "player's up". Derived, like the wire scale constants — pinned
-/// by `DeviceGyroRemapTests`, correctable in one place if on-glass says otherwise.
-/// File-scope rather than nested so the sample thread can use it without actor isolation.
+/// by `DeviceGyroVectorTests` (the table Android's `DeviceGyro.remap` runs too), correctable
+/// in one place if on-glass says otherwise.
+/// File-scope rather than nested so the sample thread can use it without actor isolation, and
+/// outside the iOS gate so its table runs under `swift test`.
 enum DeviceGyroRemap {
     case identity
     /// Upside-down portrait: both in-plane axes flip.
@@ -45,15 +44,6 @@ enum DeviceGyroRemap {
     /// Landscape, device top to the player's RIGHT (interface `.landscapeLeft`).
     case topRight
 
-    init(_ orientation: UIInterfaceOrientation) {
-        switch orientation {
-        case .portraitUpsideDown: self = .flipped
-        case .landscapeRight: self = .topLeft
-        case .landscapeLeft: self = .topRight
-        default: self = .identity
-        }
-    }
-
     /// Rotate one device-frame vector (rotation rate or acceleration — both transform the
     /// same way under an in-plane rotation) into the controller frame.
     func apply(x: Float, y: Float, z: Float) -> (x: Float, y: Float, z: Float) {
@@ -62,6 +52,21 @@ enum DeviceGyroRemap {
         case .flipped: return (-x, -y, z)
         case .topLeft: return (-y, x, z)
         case .topRight: return (y, -x, z)
+        }
+    }
+}
+
+#if os(iOS)
+import CoreMotion
+import UIKit
+
+extension DeviceGyroRemap {
+    init(_ orientation: UIInterfaceOrientation) {
+        switch orientation {
+        case .portraitUpsideDown: self = .flipped
+        case .landscapeRight: self = .topLeft
+        case .landscapeLeft: self = .topRight
+        default: self = .identity
         }
     }
 }

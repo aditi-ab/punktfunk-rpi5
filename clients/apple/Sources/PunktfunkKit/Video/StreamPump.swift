@@ -34,14 +34,8 @@ final class StreamPump {
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         let token = token
-        // Coalesced host keyframe requests (100 ms throttle — see KeyframeRecovery).
-        let recovery = KeyframeRecovery()
-        recovery.bind(connection)
-        // Post-loss freeze-until-reanchor (shared core policy via the C ABI). Stage-1 has no per-frame
-        // decode callback, so the gate is folded at ENQUEUE (from the AU's wire flags): a withheld
-        // frame is still enqueued but flagged DoNotDisplay so the layer's decoder keeps the reference
-        // chain fed while the last GOOD picture stays on glass — until a clean re-anchor lifts it.
-        let gate = ReanchorGate(framesDropped: connection.framesDropped())
+        // A pump start is a fresh decoder: the core's post-loss freeze starts over with it.
+        connection.recoveryReset()
         // The layer is non-Sendable but its enqueue/flush are documented thread-safe, and after
         // this point only the pump thread drives it — assert that so the @Sendable Thread closure
         // may capture it.
@@ -49,7 +43,11 @@ final class StreamPump {
         layer.flush() // drop any frames a previous connection left queued
 
         let thread = Thread {
-            var intake = AUIntake(connection: connection, gate: gate, recovery: recovery)
+            var intake = AUIntake(connection: connection)
+            // The core assembles each AU in a pool slot, and the sample is that slot.
+            var pool = AccessUnitSlotPool(capacity: AccessUnitSlotPool.defaultCapacity)
+            connection.setAccessUnitMemory(pool)
+            defer { connection.setAccessUnitMemory(nil) }
             var wasFailed = false
             // Every iteration drains its own autorelease pool: this thread has no runloop, so
             // autoreleased CM/layer temporaries would otherwise accumulate until session end.
@@ -65,25 +63,28 @@ final class StreamPump {
                     if failed {
                         // Decode wedged (a lost opening IDR, or an iOS interruption that left the
                         // layer ignoring samples): flush and, unless THIS AU is the recovering IDR,
-                        // re-gate on the next in-band parameter sets and keep asking.
+                        // report the loss (the core freezes and asks) and wait for parameter sets.
                         if !wasFailed { pumpLog.warning("video: display layer wedged — flushing + re-anchoring") }
                         layer.flush()
-                        gate.arm() // a wedged decoder is a loss — freeze until the re-anchor
-                        if !ready.idr { intake.requireIDR() }
+                        if !ready.idr {
+                            connection.recoveryLost()
+                            intake.requireIDR()
+                        }
                     }
                     wasFailed = failed
                     // A delta between a loss and its re-anchor references the lost picture; one
                     // such AU wedges the layer's decoder until an IDR. Withheld, the anchor lands.
                     if ready.step.withhold { return true }
+                    pool = AccessUnitSlotPool.grown(
+                        for: au, keyframe: ready.idr, from: pool, connection: connection)
                     guard let f = intake.pump.format,
-                          let sample = connection.videoCodec.sampleBuffer(au: au, format: f),
+                          let sample = connection.videoCodec.sampleBuffer(au: au, format: f, in: pool),
                           !token.isStopped // don't enqueue a stale frame after a restart
                     else { return true }
-                    // Freeze-until-reanchor: while holding, WITHHOLD this concealed post-loss frame by
-                    // flagging it DoNotDisplay — the layer still decodes it (keeping the reference
-                    // chain fed) but shows the last GOOD picture until a clean re-anchor lifts the
-                    // gate. Folded from the AU's wire flags (stage-1 has no decode callback).
-                    if gate.onDecoded(flags: au.flags) {
+                    // Stage-1 has no decode callback, so the core's freeze is folded at ENQUEUE from
+                    // the AU's wire flags. A held frame is flagged DoNotDisplay: the layer still
+                    // decodes it, keeping the reference chain fed, and the last GOOD picture stays.
+                    if !connection.recoveryOnDecoded(flags: au.flags) {
                         // Capture→enqueue (see start's doc). Only frames that will DISPLAY:
                         // a withheld frame never reaches glass, so its enqueue instant would
                         // dilute the population the Metal rungs are compared against. The

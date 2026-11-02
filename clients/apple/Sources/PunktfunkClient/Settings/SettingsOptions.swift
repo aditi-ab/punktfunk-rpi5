@@ -16,6 +16,8 @@ enum SettingsOptions {
         ("KWin (KDE Plasma)", 1),
         ("Mutter (GNOME)", 3),
         ("Hyprland", 5),
+        ("niri", 7),
+        ("Umbriel", 8),
         ("wlroots (Sway / River)", 2),
         ("gamescope", 4),
     ]
@@ -113,7 +115,6 @@ enum SettingsOptions {
         ("Lowest latency", "latency"),
         ("Smoothness", "smooth"),
     ]
-    static let presentPriorityDefault = "latency"
 
     /// Smoothness's jitter-buffer sizes (`DefaultsKey.smoothBuffer`; 0 = Automatic, currently 2
     /// frames). The ms hints derive from the chosen refresh setting — each buffered frame costs
@@ -171,13 +172,23 @@ enum SettingsOptions {
     // MARK: - Bitrate
 
     /// Discrete bitrate steps for the surfaces with no Slider (tvOS pushed pickers, the gamepad
-    /// settings' left/right cycling), up to the same 3 Gbps ceiling the slider has.
+    /// settings' left/right cycling), up to the same 3 Gbps ceiling the slider has. 5 Mbps
+    /// apart to 50, where most links settle.
     static let bitratePresets: [(label: String, tag: Int)] = [
         ("Automatic", 0),
+        ("5 Mbps", 5_000),
         ("10 Mbps", 10_000),
+        ("15 Mbps", 15_000),
         ("20 Mbps", 20_000),
+        ("25 Mbps", 25_000),
+        ("30 Mbps", 30_000),
+        ("35 Mbps", 35_000),
         ("40 Mbps", 40_000),
+        ("45 Mbps", 45_000),
+        ("50 Mbps", 50_000),
+        ("60 Mbps", 60_000),
         ("80 Mbps", 80_000),
+        ("100 Mbps", 100_000),
         ("150 Mbps", 150_000),
         ("300 Mbps", 300_000),
         ("500 Mbps", 500_000),
@@ -251,15 +262,18 @@ enum SettingsOptions {
         return Resolutions.familyOf(families, width, height) ?? 0
     }
 
-    /// Native (`0 × 0`, the display resolved at connect), this device's other native mode (the
-    /// safe area, below the notch), then one entry's sizes from `families()` (unnamed — a picker
-    /// shows them as plain `w × h`), deduped by dimensions (native wins a tie).
+    /// Native (`0 × 0`, the display resolved at connect), this device's other native mode (a
+    /// phone's safe area, a notched Mac's whole panel — never the one Native already is), then
+    /// one entry's sizes from `families()` (unnamed — a picker shows them as plain `w × h`),
+    /// deduped by dimensions (native wins a tie).
     @MainActor
     static func resolutionModes(family: Int) -> [(name: String, w: Int, h: Int)] {
         let entries = families()
         let sizes = entries[min(family, entries.count - 1)].sizes.map { (name: "", w: $0.w, h: $0.h) }
+        let native = NativeDisplay.mode
+        let others = nativeModes().filter { $0.w != native.width || $0.h != native.height }
         var seen = Set<String>()
-        return ([(name: "Native", w: 0, h: 0)] + nativeModes().dropFirst() + sizes)
+        return ([(name: "Native", w: 0, h: 0)] + others + sizes)
             .filter { seen.insert("\($0.w)x\($0.h)").inserted }
     }
 
@@ -280,23 +294,22 @@ enum SettingsOptions {
     /// On iOS the safe-area variant is the same mode narrowed so the picture clears the sensor
     /// housing and the rounded corners — see [`SafeDisplay`] for why a narrower mode is the whole
     /// fix. A notched Mac gets the same pair from [`macDisplayModes`], shortened instead of
-    /// narrowed. On a device with no housing the two are identical and the second is dropped.
+    /// narrowed. A device with no housing has no second mode: an odd panel would otherwise
+    /// differ from its even-floored self.
     @MainActor
     static func nativeModes() -> [(name: String, w: Int, h: Int)] {
         var native: [(name: String, w: Int, h: Int)] = []
-        #if os(visionOS)
+        #if !os(macOS)
         let mode = NativeDisplay.mode
         native = [("This device", mode.width, mode.height)]
-        #elseif os(iOS) || os(tvOS)
-        let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels (tvOS: the TV mode)
-        let nativeW = Int(max(bounds.width, bounds.height))
-        let nativeH = Int(min(bounds.width, bounds.height))
-        native = [("This device", nativeW, nativeH)]
         #if os(iOS)
-        let safe = SafeDisplay.mode(
-            nativeWidth: nativeW, nativeHeight: nativeH,
-            sideInsetPoints: mainWindowSideInset(), scale: UIScreen.main.nativeScale)
-        native.append(("This device (safe area)", safe.width, safe.height))
+        let inset = mainWindowSideInset()
+        if inset > 0 {
+            let safe = SafeDisplay.mode(
+                nativeWidth: mode.width, nativeHeight: mode.height,
+                sideInsetPoints: inset, scale: NativeDisplay.screen.nativeScale)
+            native.append(("This device (safe area)", safe.width, safe.height))
+        }
         #endif
         #else
         native = macDisplayModes()
@@ -307,8 +320,9 @@ enum SettingsOptions {
 
     #if os(macOS)
     /// This display's real modes: the PANEL first, then — on a notched Mac — the variant that
-    /// clears the camera housing, which is the mode a full-screen stream can show whole (see
-    /// `NSScreen.panelPixelSize`, the one definition the fullscreen video fit reads too).
+    /// clears the camera housing, which is Native's mode there (`NativeDisplay.mode`): the one
+    /// native fullscreen shows whole and scans out Direct. The panel is named for the housing it
+    /// covers only on a Mac that has one.
     ///
     /// The two are deduped here, so a second entry means "this display has a housing" and a caller
     /// can offer the choice on exactly the Macs that have one.
@@ -317,12 +331,11 @@ enum SettingsOptions {
         guard let screen = NSScreen.main else { return [] }
         let panel = screen.panelPixelSize
         let safe = screen.notchSafePixelSize
-        let modes: [(name: String, w: Int, h: Int)] = [
-            (name: "This display", w: panel.width, h: panel.height),
+        guard panel.height > safe.height else { return [(name: "This display", w: panel.width, h: panel.height)] }
+        return [
+            (name: "This display (over the notch)", w: panel.width, h: panel.height),
             (name: "This display (below the notch)", w: safe.width, h: safe.height),
         ]
-        var seen = Set<String>()
-        return modes.filter { seen.insert("\($0.w)x\($0.h)").inserted }
     }
     #endif
 
@@ -330,8 +343,8 @@ enum SettingsOptions {
     /// The key window's per-side safe-area inset in points, resolved for the LANDSCAPE stream even
     /// when this settings screen is currently portrait (see `SafeDisplay.sideInsetPoints`).
     ///
-    /// Zero when no window is up yet — the safe mode then equals the native one and `resolutionModes`
-    /// dedups the row away, which is the right answer for a device we can't measure.
+    /// Zero when no window is up yet: `nativeModes` then offers no safe mode, which is the right
+    /// answer for a device we can't measure.
     @MainActor
     private static func mainWindowSideInset() -> Double {
         let insets = UIApplication.shared.connectedScenes
@@ -348,23 +361,22 @@ enum SettingsOptions {
 
     /// Native (`0`), then the rates the device can actually display (no point asking the host to
     /// render frames the screen can't show), plus any stored custom value so it stays selectable.
-    /// A Mac lists the desktop clients' rates; a phone or tablet the few its panels run at.
+    /// A Mac lists the desktop clients' rates; a phone or tablet the few its panels run at; a
+    /// Vision Pro the rates its panels run at, which visionOS does not report.
     @MainActor
     static func refreshRates(including current: Int) -> [Int] {
         #if os(visionOS)
+        // 90 is what Native asks for; M5 panels reach 120.
+        let maxHz = 120
+        let ladder = [60, 90, 120]
+        #elseif !os(macOS)
         let maxHz = NativeDisplay.mode.hz
-        let ladder = [60, 120, 240]
-        #elseif os(iOS) || os(tvOS)
-        let maxHz = UIScreen.main.maximumFramesPerSecond
         let ladder = [60, 120, 240]
         #else
         let maxHz = NSScreen.main?.maximumFramesPerSecond ?? 60
         let ladder = [30, 60, 90, 120, 144, 165, 240]
         #endif
         var rates = ladder.filter { $0 <= maxHz }
-        #if os(visionOS)
-        rates.append(maxHz) // 90, which the 60/120/240 ladder skips
-        #endif
         if rates.isEmpty { rates = [maxHz] }
         if current != 0, !rates.contains(current) { rates.append(current) }
         return [0] + rates.sorted()

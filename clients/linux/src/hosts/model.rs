@@ -2,10 +2,12 @@
 //! order the device's host sort asks for. Built from the store, the probe sweep and the live
 //! adverts; the page compares a build with the last one, so an unchanged sweep redraws nothing.
 
-use super::{saved_request, ConnectRequest};
+use super::ConnectRequest;
 use crate::discovery::{self, DiscoveredHost};
 use crate::trust::{KnownHost, Settings};
 use pf_client_core::host_order::{self, Arrangeable};
+use pf_client_core::orchestrate::HostTarget;
+use pf_client_core::profiles::ProfilePick;
 use std::collections::HashMap;
 
 /// A preset as a card needs it: what to call it and the colour its chip carries.
@@ -100,6 +102,8 @@ pub enum CardKind {
         pinned: Option<(String, String)>,
         /// The record `Settings::default_host` names.
         is_default: bool,
+        /// The profile this device plays as on the host.
+        profile: Option<ProfilePick>,
     },
     /// Found on the network and not saved. `pair_optional`: the host offers trust on first use.
     Discovered { pair_optional: bool },
@@ -127,7 +131,7 @@ impl CardModel {
     /// still dials straight away (`WakeConnect` dials first).
     pub fn wake_first(&self) -> bool {
         matches!(self.status, Status::Offline | Status::OfflineWakes)
-            && !self.request.mac.is_empty()
+            && !self.request.host.mac.is_empty()
     }
 }
 
@@ -157,8 +161,8 @@ pub struct Band {
 pub struct Live<'a> {
     /// The last probe sweep, by [`KnownHost::card_key`].
     pub probed: &'a HashMap<String, bool>,
-    /// The card key this device's session is with, and how far it got.
-    pub session: Option<(&'a str, Phase)>,
+    /// This device's sessions by card key, and how far each got.
+    pub sessions: &'a HashMap<String, Phase>,
     /// What a host has up, by fingerprint; empty when nothing is.
     pub playing: &'a dyn Fn(&str) -> String,
 }
@@ -191,7 +195,10 @@ pub fn saved_bands(
                 .preset_id
                 .as_deref()
                 .and_then(|id| presets.iter().find(|p| p.id == id));
-            let mut request = saved_request(k);
+            let mut request = ConnectRequest {
+                host: HostTarget::from(k),
+                ..ConnectRequest::default()
+            };
             request.preset = pinned.map(|p| p.id.clone());
             CardModel {
                 key: match pinned {
@@ -208,17 +215,14 @@ pub fn saved_bands(
                     paired: k.paired,
                     pinned: pinned.map(|p| (p.id.clone(), p.name.clone())),
                     is_default,
+                    profile: k.profile.clone(),
                 },
                 request,
                 last_used: k.last_used,
             }
         };
         // The session shows on the host's own card, never on a pinned one.
-        let key = k.card_key();
-        let phase = live
-            .session
-            .and_then(|(at, phase)| (at == key).then_some(phase));
-        cards.push(card(None, phase));
+        cards.push(card(None, live.sessions.get(&k.card_key()).copied()));
         for id in &k.pinned_presets {
             if let Some(p) = presets.iter().find(|p| &p.id == id) {
                 cards.push(card(Some(p), None));
@@ -245,7 +249,7 @@ pub fn saved_bands(
 pub fn discovered_cards<'a>(
     adverts: impl Iterator<Item = &'a DiscoveredHost>,
     hosts: &[KnownHost],
-    connecting: Option<&str>,
+    sessions: &HashMap<String, Phase>,
 ) -> Vec<CardModel> {
     let mut fresh: Vec<&DiscoveredHost> = adverts
         .filter(|a| !hosts.iter().any(|k| discovery::same_host(k, a)))
@@ -255,19 +259,22 @@ pub fn discovered_cards<'a>(
         .into_iter()
         .map(|a| {
             let request = ConnectRequest {
-                name: a.name.clone(),
-                addr: a.addr.clone(),
-                port: a.port,
-                fp_hex: (!a.fp_hex.is_empty()).then(|| a.fp_hex.clone()),
+                host: HostTarget {
+                    name: a.name.clone(),
+                    addr: a.addr.clone(),
+                    port: a.port,
+                    fp_hex: (!a.fp_hex.is_empty()).then(|| a.fp_hex.clone()),
+                    mac: a.mac.clone(),
+                    mgmt_port: a.mgmt_port,
+                    ..HostTarget::default()
+                },
                 // Trust on first use only when the host explicitly opts in.
                 pair_optional: a.pair == "optional",
-                launch: None,
-                mac: a.mac.clone(),
-                preset: None,
+                ..ConnectRequest::default()
             };
             let key = request.card_key();
             CardModel {
-                status: if connecting == Some(key.as_str()) {
+                status: if sessions.get(&key) == Some(&Phase::Connecting) {
                     Status::Connecting
                 } else {
                     Status::Online
@@ -338,7 +345,7 @@ mod tests {
         let probed: HashMap<String, bool> = [("ab".to_string(), true)].into_iter().collect();
         let live = Live {
             probed: &probed,
-            session: None,
+            sessions: &HashMap::new(),
             playing: &|fp| {
                 if fp == "ab" {
                     "Hades".into()
@@ -417,9 +424,42 @@ mod tests {
             wire: Vec::new(),
         };
         let adverts = [advert("saved", "ab"), advert("new", "ef")];
-        let cards = discovered_cards(adverts.iter(), &[host("Desk", "10.0.0.2", "ab")], None);
+        let sessions = HashMap::new();
+        let saved = [host("Desk", "10.0.0.2", "ab")];
+        let cards = discovered_cards(adverts.iter(), &saved, &sessions);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].name, "new");
         assert!(cards[0].request.pair_optional);
+    }
+
+    /// Two sessions show on their own cards, whatever phase each is in.
+    #[test]
+    fn each_card_shows_its_own_session() {
+        let hosts = [
+            host("Desk", "10.0.0.2", "ab"),
+            host("Den", "10.0.0.3", "cd"),
+            host("Lab", "10.0.0.4", "ef"),
+        ];
+        let sessions: HashMap<String, Phase> = [
+            ("ab".to_string(), Phase::Streaming),
+            ("cd".to_string(), Phase::Connecting),
+        ]
+        .into_iter()
+        .collect();
+        let live = Live {
+            probed: &HashMap::new(),
+            sessions: &sessions,
+            playing: &|_| String::new(),
+        };
+        let status = |name: &str| {
+            saved_bands(&hosts, &[], &Settings::default(), &live)
+                .iter()
+                .flat_map(|b| &b.cards)
+                .find(|c| c.name == name)
+                .map(|c| c.status.clone())
+        };
+        assert_eq!(status("Desk"), Some(Status::Streaming));
+        assert_eq!(status("Den"), Some(Status::Connecting));
+        assert_eq!(status("Lab"), Some(Status::Offline));
     }
 }

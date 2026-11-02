@@ -3,7 +3,7 @@
 //! the power-user CLI build).
 //!
 //! One stream session per invocation: `--connect host[:port]` (+ `--fp HEX`,
-//! `--launch id`, `--fullscreen`), exits when the session ends. Reads the same identity
+//! `--launch id`, `--as profile`, `--fullscreen`), exits when the session ends. Reads the same identity
 //! / known-hosts / settings stores as the desktop shell on each OS — the GTK client
 //! (`punktfunk-client`) on Linux, the WinUI client on Windows — so pairing on either side
 //! makes the other connect silently. `--pair - --connect host` runs the ceremony here,
@@ -199,10 +199,9 @@ mod session_main {
     /// same known-hosts store `--connect` reads, so pairing here is exactly what makes the
     /// later stream connect silently.
     ///
-    /// Deliberately identical in shape and output to `punktfunk-client --pair` (which stays
-    /// the desktop route) — the difference is only that this binary carries no toolkit, so it
-    /// is the one a minimal image installs. Present in the `--no-default-features` build too:
-    /// enrolment must not be the reason an embedded image has to pull in Skia.
+    /// Prints the same `paired {addr}:{port} fp=…` line as `punktfunk pair`; provisioning
+    /// scripts read it. Present in the `--no-default-features` build too: enrolment must not
+    /// be the reason an embedded image has to pull in Skia.
     fn headless_pair(pin: &str) -> u8 {
         let Some(target) = arg_value("--connect") else {
             eprintln!("--pair requires --connect host[:port]");
@@ -220,21 +219,13 @@ mod session_main {
                 return exit::CONNECT_FAILED;
             }
         };
-        match trust::pair_with_host(&addr, port, &identity, pin, &name) {
-            Ok(fp) => {
-                let fp_hex = trust::hex(&fp);
-                if let Err(e) = trust::persist_host(
-                    &arg_value("--host-label").unwrap_or_else(|| addr.clone()),
-                    &addr,
-                    port,
-                    &fp_hex,
-                    true,
-                    &[],
-                ) {
+        let label = arg_value("--host-label").unwrap_or_else(|| addr.clone());
+        match trust::pair_and_save(&addr, port, &identity, pin, &name, &label, &[]) {
+            Ok(paired) => {
+                if let Err(e) = paired.saved {
                     eprintln!("couldn't save the host: {e:#}");
                 }
-                trust::forget_placeholder(&addr, port);
-                println!("paired {addr}:{port} fp={fp_hex}");
+                println!("paired {addr}:{port} fp={}", paired.fp_hex);
                 0
             }
             Err(e) => {
@@ -259,6 +250,30 @@ mod session_main {
     /// `punktfunk://…&preset=` link both land here. Absent = honor the host's binding;
     /// `--preset ""` (or a bare `--preset`) forces the global defaults, which is how "Connect
     /// with ▸ Default settings" reaches a bound host. `--profile` is the pre-rename spelling.
+    /// `--as` takes a profile id or name; the wire takes the id, so a name is looked up in the
+    /// host's list. A minted id (12 hex) is sent as is, and so is anything the host can't list.
+    fn as_profile(
+        addr: &str,
+        host: Option<&trust::KnownHost>,
+        identity: &(String, String),
+        pin: [u8; 32],
+        wanted: String,
+    ) -> String {
+        if wanted.len() == 12 && wanted.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return wanted;
+        }
+        let mgmt = host.map_or(pf_client_core::library::DEFAULT_MGMT_PORT, |h| {
+            h.effective_mgmt_port()
+        });
+        let port = host.map_or(0, |h| h.port);
+        match pf_client_core::profiles::fetch_enumerate(addr, mgmt, port, identity, Some(pin)) {
+            Ok(Some(listed)) => {
+                pf_client_core::profiles::find(&listed, &wanted).map_or(wanted, |p| p.id.clone())
+            }
+            _ => wanted,
+        }
+    }
+
     fn preset_arg() -> Option<String> {
         ["--preset", "--profile"]
             .into_iter()
@@ -405,6 +420,8 @@ mod session_main {
                 port,
                 pin,
                 launch,
+                // The caller sets it on the params: only a launch knows its profile.
+                profile: None,
                 connect_timeout: connect_timeout(),
             },
             Probes {
@@ -417,7 +434,6 @@ mod session_main {
                 display_hdr,
                 hevc_444_hardware,
                 stats_verbosity: stats_tier(settings),
-                latch_grid: std::sync::Arc::new(pf_client_core::session::LatchGrid::default()),
             },
         )
     }
@@ -433,17 +449,12 @@ mod session_main {
     /// The Match-window hook (design/midstream-resolution-resize.md D1/D2): each resize-end's
     /// logical size goes out as a `window` line and the spawner persists it.
     /// `persist_locally` is for a hand-run session, where nobody reads stdout.
-    pub(crate) fn match_window(
-        settings: &trust::Settings,
-        persist_locally: bool,
-    ) -> Option<Box<dyn FnMut(u32, u32)>> {
-        settings.match_window.then(|| {
-            Box::new(move |w: u32, h: u32| {
-                emit(SessionLine::Window { w, h });
-                if persist_locally {
-                    pf_client_core::orchestrate::persist_window_size(w, h);
-                }
-            }) as Box<dyn FnMut(u32, u32)>
+    pub(crate) fn on_window_size(persist_locally: bool) -> Box<dyn FnMut(u32, u32)> {
+        Box::new(move |w: u32, h: u32| {
+            emit(SessionLine::Window { w, h });
+            if persist_locally {
+                pf_client_core::orchestrate::persist_window_size(w, h);
+            }
         })
     }
 
@@ -516,7 +527,10 @@ mod session_main {
     /// Per-adapter Vulkan Video decode capability, in human words — a triage tool, not a
     /// picker source. That is why it is its own flag: `--list-adapters` is parsed
     /// line-by-line by the desktop shells' GPU picker and must keep printing bare names.
+    /// It opens with the presenter backend a session would pick, and why.
     fn probe_decode_report() -> u8 {
+        let (backend, why) = pf_presenter::probe_backend();
+        println!("presenter backend: {backend} ({why})");
         match pf_presenter::vk::probe_decode() {
             Ok(adapters) => {
                 if adapters.is_empty() {
@@ -528,6 +542,7 @@ mod session_main {
                     // a default run presents on — the decoder shares that device, so
                     // on a hybrid box this line is usually the answer.
                     let kind = if a.discrete { "discrete" } else { "integrated" };
+                    let marked = i == 0 && backend == "vulkan";
                     // `a.index`, NOT the loop position: this list is sorted
                     // discrete-first, while PUNKTFUNK_VK_DEVICE indexes the raw
                     // enumeration, which puts the iGPU first on some hybrids. The
@@ -537,30 +552,13 @@ mod session_main {
                         "[{}] {} ({kind}){}",
                         a.index,
                         a.name,
-                        if i == 0 { "  <- default presenter" } else { "" }
+                        if marked { "  <- default presenter" } else { "" }
                     );
                     println!(
                         "     vulkan video decode: {}",
                         if a.usable { "YES" } else { "no" }
                     );
-                    // Name every advertised bit, including unsupported VP9, so the labels
-                    // account for the complete mask.
-                    const OPS: [(u32, &str); 4] = [
-                        (0x1, "H.264"),
-                        (0x2, "H.265"),
-                        (0x4, "AV1"),
-                        (0x8, "VP9 (no punktfunk rung)"),
-                    ];
-                    let mut codecs: Vec<String> = OPS
-                        .iter()
-                        .filter(|(bit, _)| a.codec_ops & bit != 0)
-                        .map(|(_, n)| (*n).to_string())
-                        .collect();
-                    let named: u32 = OPS.iter().map(|(b, _)| b).sum();
-                    let unknown = a.codec_ops & !named;
-                    if unknown != 0 {
-                        codecs.push(format!("unrecognised bits 0x{unknown:X}"));
-                    }
+                    let codecs = a.codec_names();
                     println!(
                         "     driver decode ops:   {}",
                         if codecs.is_empty() {
@@ -570,28 +568,8 @@ mod session_main {
                         }
                     );
                     if !a.usable {
-                        // Say which conjunct failed. "no" with no reason is the thing
-                        // this whole flag exists to stop.
-                        let mut why: Vec<String> = Vec::new();
-                        if !a.api_1_3 {
-                            why.push("device is not Vulkan 1.3".into());
-                        }
-                        if !a.features_ok {
-                            why.push(
-                                "missing samplerYcbcrConversion / timelineSemaphore / \
-                                 synchronization2"
-                                    .into(),
-                            );
-                        }
-                        if a.decode_family.is_none() {
-                            why.push("no queue family advertises VIDEO_DECODE".into());
-                        }
-                        if !a.base_missing.is_empty() {
-                            why.push(format!("missing {}", a.base_missing.join(", ")));
-                        }
-                        if a.codec_exts.is_empty() {
-                            why.push("no VK_KHR_video_decode_{h264,h265,av1} extension".into());
-                        }
+                        // "no" with no reason is the thing this whole flag exists to stop.
+                        let why = a.why_not();
                         println!("     why not:             {}", why.join("; "));
                     } else {
                         println!("     extensions:          {}", a.codec_exts.join(", "));
@@ -640,6 +618,70 @@ mod session_main {
     /// early exits. Those create Vulkan instances of their own and Mesa latches these
     /// variables when its ICD initialises, so a later call leaves the triage tools
     /// describing a device that cannot decode while the streaming path decodes on it.
+    /// Inside gamescope with another compositor's `WAYLAND_DISPLAY` (a flatpak binds the
+    /// desktop's `wayland-0`), runs this binary again, same argv, on gamescope's socket name.
+    /// gamescope's WSI layer stays off for a process whose `WAYLAND_DISPLAY` is not
+    /// gamescope's. The new process finds the name in place, so it does not restart again.
+    /// Returns only when the exec fails; the presenter then routes SDL itself.
+    #[cfg(target_os = "linux")]
+    fn restart_on_gamescope() {
+        use std::os::unix::process::CommandExt as _;
+        let Some(name) = pf_client_core::gamescope::foreign() else {
+            return;
+        };
+        tracing::info!(wayland_display = ?name, "restarting on gamescope's socket");
+        let mut argv = std::env::args_os();
+        let err = std::process::Command::new("/proc/self/exe")
+            .arg0(argv.next().unwrap_or_default())
+            .args(argv)
+            .env("WAYLAND_DISPLAY", &name)
+            .exec();
+        tracing::warn!(error = %err, "restart on gamescope's socket did not exec");
+    }
+
+    /// What Steam's launch hands a title and the session must not carry. The SDL device
+    /// filter names every pad Steam Input virtualised, and the Deck's own pad needs it
+    /// gone. On Linux under Steam, a game's graphics environment goes too: a Vulkan driver
+    /// or layer named by manifest path (Armada's Turnip variants live under `/usr/share`,
+    /// a path no sandbox has), Steam's overlay and fossilize layers, Mesa debug switches;
+    /// the loader's own search then finds the box's driver. `SDL_*` hints and
+    /// `ENABLE_GAMESCOPE_WSI` stay: the pads and the HDR swapchain need them.
+    fn steam_foreign_vars() -> Vec<&'static str> {
+        const GRAPHICS: [&str; 19] = [
+            "VK_DRIVER_FILES",
+            "VK_ICD_FILENAMES",
+            "VK_ADD_DRIVER_FILES",
+            "VK_LOADER_DRIVERS_SELECT",
+            "VK_LOADER_DRIVERS_DISABLE",
+            "VK_LAYER_PATH",
+            "VK_INSTANCE_LAYERS",
+            "VK_LOADER_LAYERS_ENABLE",
+            "VK_LOADER_LAYERS_DISABLE",
+            "ENABLE_VK_LAYER_VALVE_steam_overlay_1",
+            "ENABLE_VK_LAYER_VALVE_steam_fossilize_1",
+            "TU_DEBUG",
+            "FD_MESA_DEBUG",
+            "IR3_SHADER_DEBUG",
+            "MESA_LOADER_DRIVER_OVERRIDE",
+            "MESA_VK_WSI_PRESENT_MODE",
+            "LIBGL_ALWAYS_SOFTWARE",
+            "vblank_mode",
+            "__GL_SYNC_TO_VBLANK",
+        ];
+        let pads = [
+            "SDL_GAMECONTROLLER_IGNORE_DEVICES",
+            "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
+        ];
+        let under_steam =
+            std::env::var_os("SteamAppId").is_some() || std::env::var_os("SteamGameId").is_some();
+        let graphics: &[&str] = if cfg!(target_os = "linux") && under_steam {
+            &GRAPHICS
+        } else {
+            &[]
+        };
+        pads.into_iter().chain(graphics.iter().copied()).collect()
+    }
+
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)] // the SAFETY-commented single-threaded-startup env write below
     fn enable_mesa_video_decode() {
@@ -655,25 +697,6 @@ mod session_main {
             unsafe { std::env::set_var(var, &value) };
             tracing::info!(var, value = %value, "opted into Mesa Vulkan Video decode");
         }
-    }
-
-    /// SDL falls back to XWayland where the compositor lacks `wp_fifo_v1` (KWin before
-    /// 6.4, Mutter before 48). The compositor stamps, the native lane and colour
-    /// management live on the Wayland surface, so a Wayland session stays Wayland. A
-    /// driver the environment names, or gamescope's nested display, is left alone.
-    #[cfg(target_os = "linux")]
-    #[allow(unsafe_code)] // the SAFETY-commented single-threaded-startup env write below
-    fn prefer_wayland() {
-        if std::env::var_os("WAYLAND_DISPLAY").is_none()
-            || std::env::var_os("SDL_VIDEO_DRIVER").is_some()
-            || std::env::var_os("SDL_VIDEODRIVER").is_some()
-            || pf_client_core::gamescope::under_gamescope()
-        {
-            return;
-        }
-        // SAFETY: called at the top of `run()`, before this process creates any thread.
-        unsafe { std::env::set_var("SDL_VIDEO_DRIVER", "wayland") };
-        tracing::info!("SDL kept on Wayland (WAYLAND_DISPLAY is set)");
     }
 
     /// `current` with `token` appended to its comma list; `None` when it is already there.
@@ -753,6 +776,22 @@ mod session_main {
         // SEH last-resort: a driver AV otherwise leaves only an exit code in the shell's log.
         #[cfg(windows)]
         punktfunk_core::crash::install();
+        // Before any Vulkan instance: gamescope's WSI layer reads WAYLAND_DISPLAY once.
+        #[cfg(target_os = "linux")]
+        restart_on_gamescope();
+        // Steam's launch variables go before the Vulkan loader or SDL reads them — ahead of
+        // the probe flags below too, so triage sees the environment the stream will run on.
+        for var in steam_foreign_vars() {
+            if let Ok(v) = std::env::var(var) {
+                tracing::info!(var, value = %v, "dropping a variable of Steam's launch");
+                // SAFETY: the single-threaded top of `run()`, before the Vulkan loader, SDL
+                // or any other thread exists — nothing reads the environment concurrently.
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::env::remove_var(var)
+                };
+            }
+        }
 
         // Runs before ANY Vulkan call, including the probe flags below — hence the top of
         // `run`, ahead of the early exits, so triage answers the same question the streaming
@@ -760,8 +799,6 @@ mod session_main {
         // decoder's `auto` path can take Vulkan Video. Windows drivers expose theirs already.
         #[cfg(target_os = "linux")]
         enable_mesa_video_decode();
-        #[cfg(target_os = "linux")]
-        prefer_wayland();
 
         // `--list-adapters`: print the Vulkan physical devices' marketing names (one per
         // line, discrete first) for the desktop shells' GPU picker, then exit.
@@ -848,24 +885,6 @@ mod session_main {
             }
         }
 
-        // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming
-        // every pad Steam Input has virtualized; capturing the Deck's real built-in
-        // controller needs it cleared (same rationale as the GTK client's `app::run`).
-        for var in [
-            "SDL_GAMECONTROLLER_IGNORE_DEVICES",
-            "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
-        ] {
-            if let Ok(v) = std::env::var(var) {
-                tracing::info!(var, value = %v, "clearing Steam's SDL device filter");
-                // SAFETY: as the settings block above — single-threaded startup, before SDL
-                // (the reader of these variables) or any other thread exists.
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::env::remove_var(var)
-                };
-            }
-        }
-
         if arg_flag("--browse") {
             // Bare `--browse` opens the console home (hosts, pairing, settings);
             // `--browse host[:port]` opens straight into that host's library.
@@ -884,8 +903,8 @@ mod session_main {
         }
         let Some(target) = arg_value("--connect") else {
             eprintln!(
-                "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--preset REF] [--fullscreen]\n\
-                 \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--json-status] [--until-no-controller]\n\
+                "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--preset REF] [--as PROFILE] [--fullscreen] [--all-screens]\n\
+                 \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--all-screens] [--json-status] [--until-no-controller]\n\
                  \x20      punktfunk-session --pair - --connect host[:port] [--name LABEL]\n\
                  \n\
                  Streams from a paired punktfunk host in a Vulkan window. --browse opens the\n\
@@ -894,6 +913,7 @@ mod session_main {
                  library; --until-no-controller returns once the last controller is gone\n\
                  and no stream is up. --preset picks a preset by id or name for this session\n\
                  only (\"\" = the global defaults); without it the host's own preset applies.\n\
+                 --all-screens asks for a host screen per monitor, as the Screens setting does.\n\
                  --connect never dials a host it has no pinned fingerprint for —\n\
                  enrol with --pair (no display needed), in the console, or from the desktop\n\
                  client."
@@ -909,15 +929,15 @@ mod session_main {
                 emit(SessionLine::Error {
                     msg: "this device's client key didn't load",
                     trust_rejected: None,
+                    refused: None,
                 });
                 return exit::CONNECT_FAILED;
             }
         };
-        // `--resolved-spec <path>`: the spawner already did the resolving, so this process
-        // performs ZERO store reads (design/client-architecture-split.md §5) — no Settings
-        // load, no known-hosts lookup, no preset resolution. Without it (a hand-run
-        // `--connect`, an old Decky script) the session resolves for itself through the SAME
-        // helper, so the two modes cannot drift.
+        // `--resolved-spec <path>`: the spawner resolved settings, preset and clipboard, so
+        // this process loads no Settings and no preset catalog. It still reads the saved-hosts
+        // store below, for the pin and the window's name. Without a spec (a hand-run
+        // `--connect`, an old Decky script) it resolves through the same helper.
         let spec = arg_value("--resolved-spec").map(std::path::PathBuf::from);
         // `--fp` names its own record; only a bare address falls back to what it answers with.
         let fp_arg = arg_value("--fp").map(|f| f.to_ascii_lowercase());
@@ -932,6 +952,7 @@ mod session_main {
                     emit(SessionLine::Error {
                         msg: "this stream's settings didn't load",
                         trust_rejected: None,
+                        refused: None,
                     });
                     return exit::CONNECT_FAILED;
                 }
@@ -971,6 +992,7 @@ mod session_main {
                     "{addr}:{port} isn't paired with this device yet. Pair it to continue."
                 ),
                 trust_rejected: Some(true),
+                refused: None,
             });
             return exit::TRUST_REJECTED;
         };
@@ -995,7 +1017,6 @@ mod session_main {
             mouse_mode: settings.mouse_mode(),
             invert_scroll: settings.invert_scroll,
             inhibit_shortcuts: settings.inhibit_shortcuts,
-            overlay_actions: settings.overlay_actions.clone(),
             present_priority: settings.present_priority(),
             vsync: settings.vsync,
             allow_vrr: settings.allow_vrr,
@@ -1018,17 +1039,21 @@ mod session_main {
             #[cfg(not(feature = "ui"))]
             overlay: None,
             window_size: window_size(&settings),
+            match_window: settings.match_window,
             // A spawned session (spec mode) reports its window; a hand-run one persists it.
-            match_window: match_window(&settings, spec.is_none()),
+            on_window_size: on_window_size(spec.is_none()),
             render_scale: settings.render_scale,
             render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings.codec),
             video_fit: punktfunk_core::video_fit::VideoFit::from_name(&settings.video_fit),
             until_no_pads: false,
         };
 
+        let all_screens = arg_flag("--all-screens");
+        let profile =
+            arg_value("--as").map(|wanted| as_profile(&addr, known_host, &identity, pin, wanted));
         let outcome =
             pf_presenter::run_session(opts, move |gamepad, native, hdr, force_software, vulkan| {
-                match resolved {
+                let mut params = match resolved {
                     Some(spec) => params_from_spec(
                         spec,
                         addr,
@@ -1058,7 +1083,10 @@ mod session_main {
                         force_software,
                         vulkan,
                     ),
-                }
+                };
+                params.profile = profile;
+                params.shows_screens |= all_screens;
+                params
             });
 
         match outcome {
@@ -1072,10 +1100,12 @@ mod session_main {
             Ok(pf_presenter::Outcome::ConnectFailed {
                 msg,
                 trust_rejected,
+                refused,
             }) => {
                 emit(SessionLine::Error {
                     msg: &msg,
                     trust_rejected: Some(trust_rejected),
+                    refused,
                 });
                 if trust_rejected {
                     exit::TRUST_REJECTED
@@ -1088,6 +1118,7 @@ mod session_main {
                 emit(SessionLine::Error {
                     msg: "the stream window didn't start",
                     trust_rejected: None,
+                    refused: None,
                 });
                 exit::RENDERER_FAILED
             }

@@ -11,12 +11,6 @@ object NativeBridge {
         System.loadLibrary("punktfunk_android")
     }
 
-    /** punktfunk-core C-ABI version. A successful call proves the native library is linked. */
-    external fun abiVersion(): Int
-
-    /** punktfunk-core crate version string. */
-    external fun coreVersion(): String
-
     /**
      * Mint a fresh persistent self-signed identity, returned as
      * `"<certPem>\n-----PUNKTFUNK-KEY-----\n<keyPem>"`, or `""` on error. Kotlin persists it
@@ -29,6 +23,12 @@ object NativeBridge {
      * failure ([nativeTakeLastError] says why). Pair with exactly one [nativeClose].
      */
     external fun nativeConnect(requestJson: String): Long
+
+    /**
+     * True while the dial [nativeConnect] is blocked on has been parked by the host for its
+     * operator's approval. The dial then waits for the verdict; show the approval wait.
+     */
+    external fun nativeDialPending(): Boolean
 
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */
     external fun nativeHostFingerprint(handle: Long): String
@@ -53,6 +53,19 @@ object NativeBridge {
      * ending. Cheap (one atomic load); UI-safe.
      */
     external fun nativeEndReason(handle: Long): Int
+
+    /** Milliseconds before redial [attempt] of a session that ended with [endReason]; -1 = stay ended. */
+    external fun nativeRedialDelayMs(endReason: Int, attempt: Int): Long
+
+    /**
+     * Milliseconds before dialing again a host that refused a connect with [token]
+     * ([nativeTakeLastError]), [sinceFirstMs] after its first such refusal (-1: the first);
+     * -1 = show the refusal. The woken-host rule every client shares.
+     */
+    external fun nativeWakeRedialDelayMs(autoWake: Boolean, token: String, sinceFirstMs: Long): Long
+
+    /** [nativeWakeRedialDelayMs] for a session that ended: its close counts only before any frame. */
+    external fun nativeSessionWakeRedialDelayMs(handle: Long, autoWake: Boolean, sinceFirstMs: Long): Long
 
     /**
      * The session's live access state as `[grants, remainingSecs, updateSeq]`, or `null` on a `0`
@@ -80,12 +93,41 @@ object NativeBridge {
     ): String
 
     /**
-     * The native client's recent log ring rendered as one text bundle, oldest first,
-     * prefixed by [header] (this app's identity line) — the body for "Send logs to host"
-     * (`POST /api/v1/client-logs` over the same mTLS client the library fetch uses).
-     * Never empty; cheap (string copy, no I/O).
+     * Ask for access with no PIN and wait (up to ~185 s) for the host's operator to approve.
+     * [pinHex] is the advertised fingerprint, `""` to trust on first use. Returns the host's
+     * fingerprint (64-hex) to persist as paired, or `""` with the cause in [nativeTakeLastError].
+     * Never streams. Blocking — call off the main thread.
+     */
+    external fun nativeRequestAccess(
+        host: String,
+        port: Int,
+        certPem: String,
+        keyPem: String,
+        pinHex: String,
+        name: String,
+    ): String
+
+    /**
+     * The native client's log rendered as one text bundle, oldest first, prefixed by [header]
+     * (this app's identity line) — the body for "Send logs to host" (`POST /api/v1/client-logs`
+     * over the same mTLS client the library fetch uses). It is the newest 768 KiB of the file
+     * [nativeOpenLogFile] opened, earlier runs included, or the in-memory ring when none is open.
+     * Never empty; reads the file, so call it off the main thread.
      */
     external fun nativeRenderLogs(header: String): String
+
+    /** Keep every native log line in [dir]`/client.log` from now on, rotated at 768 KiB. */
+    external fun nativeOpenLogFile(dir: String)
+
+    /** Each line of [text] as an ERROR `pf.crash` line in the log, on disk before this returns. */
+    external fun nativeLogCrash(text: String)
+
+    /**
+     * How the previous run ended: [summary] (`ApplicationExitInfo.toString()`) as one log line,
+     * then, by [reason], the crashing thread of a native crash's tombstone or the main thread of
+     * an ANR from [trace] (its `traceInputStream`, empty when Android kept none).
+     */
+    external fun nativeLogExit(summary: String, reason: Int, trace: ByteArray)
 
     /**
      * One `pf.wifi` line in the log ring above: why it was written, then the Wi-Fi link's signal
@@ -113,6 +155,9 @@ object NativeBridge {
      * WHY instead of the old catch-all that blamed the PIN for dead network paths.
      */
     external fun nativeTakeLastError(): String
+
+    /** The host's own sentence with the last refusal, cleared on read; "" when it said none. */
+    external fun nativeTakeLastSaid(): String
 
     /**
      * Signal a **deliberate** user disconnect on [handle] before [nativeClose]: the session closes
@@ -171,6 +216,25 @@ object NativeBridge {
     external fun nativeWakeOnLan(macsCsv: String, lastIp: String): Boolean
 
     /**
+     * `method path` with [body] over the host's stream port as this device, refusing any host
+     * but [pinHex]. An empty [contentType] sends none. The reply as two bytes of big-endian
+     * status, then its body; null when the port carried nothing, so HTTPS may. One connection
+     * per host serves every call. Blocking; never on the main thread.
+     */
+    external fun nativeMgmtRequest(
+        host: String,
+        port: Int,
+        certPem: String,
+        keyPem: String,
+        pinHex: String,
+        method: String,
+        path: String,
+        contentType: String,
+        body: ByteArray,
+        timeoutMs: Int,
+    ): ByteArray?
+
+    /**
      * Bounded QUIC reachability probe to [host]:[port] (mDNS-independent): the lowercase-hex
      * SHA-256 of the certificate that answered within [timeoutMs], or `null` if nothing did.
      * Lets a saved host reached over a routed network (Tailscale/VPN/another subnet) — which
@@ -183,32 +247,37 @@ object NativeBridge {
     external fun nativeProbe(host: String, port: Int, timeoutMs: Int): String?
 
     /**
-     * Start a bandwidth speed test on [handle]: the host bursts filler over the real data plane at
-     * [targetKbps] of goodput for [durationMs] (each clamped host-side to ≤ 3 Gbps / ≤ 5 s),
-     * **briefly pausing video**. Measuring over the stream's own path is the point — the answer is
-     * about the link this host's stream will take, not about generic throughput.
-     *
-     * Non-blocking: poll [nativeProbeResult] until it reports done. Starting a probe resets any
-     * prior measurement. Returns false on a dead handle. Cheap; safe on the main thread.
-     */
-    external fun nativeSpeedTest(handle: Long, targetKbps: Int, durationMs: Int): Boolean
-
-    /**
-     * The current speed-test measurement, partial until `[0] != 0.0`:
-     * `[done, throughputKbps, lossPct, hostDropPct, elapsedMs, recvBytes]`. Zeros before any
-     * probe, null on a dead handle. Cheap (one lock + a copy); safe to poll on the main thread.
-     */
-    external fun nativeProbeResult(handle: Long): DoubleArray?
-
-    /**
      * Run the network check over this session and return its report: `[ceilingKbps, wall,
      * hasClean, cleanRateKbps, cleanLossPct, cleanJitterUs, clientIfaceKind, clientLinkMbps,
-     * clientRcvbufKb, hasHost, hostIfaceKind, hostLinkMbps, hostSndbufKb, nLegs, burstsLossPct,
-     * cappedLossPct, nFindings]` then `[id, severity, profile, n0, n1, n2]` per finding. Blocking
-     * for ten to twenty seconds — call it off the main thread. Null on a dead handle or when the
-     * check could not run.
+     * clientRcvbufKb, hostIfaceKind, hostLinkMbps, hostSndbufKb, nLegs, burstsLossPct,
+     * cappedLossPct, nFindings]`, `[id, severity, n0, n1, n2]` per finding, then
+     * `recommendedKbps`. Blocking for ten to twenty seconds — call it off the main thread. Null on
+     * a dead handle or when the check could not run.
      */
     external fun nativeNetworkCheck(handle: Long): DoubleArray?
+
+    /**
+     * This device's link toward its default route as core reads it: `[kind, mbps]`, a
+     * `PUNKTFUNK_IFACE_KIND_*` (0 unknown, 1 Ethernet, 2 Wi-Fi, 3 other) and Mbit/s, `0` where
+     * the OS did not say. A route lookup: nothing is sent. Cheap; UI-safe.
+     */
+    external fun nativeLocalLink(): IntArray?
+
+    /**
+     * The PyroWave quality row, priced by core: `"<rate>\n<warning>"`, the rate [bppX100] needs
+     * at this mode (`1.6 Gbit/s`), then the warning when a link of [linkKind] and [linkMbps] is
+     * short of it, empty when it fits. Pure; UI-safe.
+     */
+    external fun nativePyrowaveQuality(
+        width: Int,
+        height: Int,
+        refreshHz: Int,
+        chroma444: Boolean,
+        bitDepth: Int,
+        bppX100: Int,
+        linkKind: Int,
+        linkMbps: Int,
+    ): String
 
     /**
      * Apply the user's "Low-latency mode (experimental)" toggle to the process-wide transport
@@ -551,10 +620,6 @@ object NativeBridge {
     /** One mouse-button transition. button: 1=left 2=middle 3=right 4=X1 5=X2. */
     external fun nativeSendPointerButton(handle: Long, button: Int, down: Boolean)
 
-    /** One scroll step. axis: 0=vertical 1=horizontal. delta: signed, 120-scaled, +=up/right.
-     *  Legacy embedder API — production capture uses [nativeSendNormalizedScroll]. */
-    external fun nativeSendScroll(handle: Long, axis: Int, delta: Int, precise: Boolean)
-
     /**
      * One normalized scroll step (`InputKind::Scroll`). [axis]: 0=vertical 1=horizontal. [delta]:
      * signed Q24.8 in the source's unit — 120-per-detent for Wheel/Unknown, DIP for the rest.
@@ -564,6 +629,20 @@ object NativeBridge {
 
     /** Live natural-scroll toggle, applied once at the core's outbound seam. False on a dead session. */
     external fun nativeSetInvertScroll(handle: Long, invert: Boolean): Boolean
+
+    /** The default network or its addresses changed: the host follows a roam within a round trip. */
+    external fun nativePathChanged(handle: Long): Boolean
+
+    /**
+     * Whether this stream holds the screen awake right now: always with [keepAwake] (the "Keep
+     * screen awake" setting) on, else only while the player's input is recent, so the device's
+     * own timeout runs over a game left alone.
+     *
+     * Answered natively, off `punktfunk_core::client::holds_screen_awake`: every input this
+     * client forwards passes through the session, which is the one clock for "recent". Poll it
+     * every few seconds. `true` when the session handle is dead.
+     */
+    external fun nativeHoldsScreenAwake(handle: Long, keepAwake: Boolean): Boolean
 
     /**
      * One REAL touchscreen transition (the touch-passthrough input mode). [kind]: 0=down 1=move
@@ -589,6 +668,24 @@ object NativeBridge {
      * for splitting stylus pointers out of the touch path onto the pen plane. False on `0`.
      */
     external fun nativeHostSupportsPen(handle: Long): Boolean
+
+    /** Whether the host forwards its cursor instead of compositing it (`HOST_CAP_CURSOR`). */
+    external fun nativeCursorChannel(handle: Long): Boolean
+
+    /**
+     * The newest host cursor state as `[serial, flags, x, y]`, the hotspot in frame pixels;
+     * flags bit 0 = visible. Waits up to 100 ms; `null` when none came.
+     */
+    external fun nativeNextCursorState(handle: Long): IntArray?
+
+    /**
+     * One queued host cursor shape as `[serial, w, h, hotX, hotY, pixels…]`, the pixels
+     * unpremultiplied ARGB. Never waits; `null` when none is queued.
+     */
+    external fun nativeNextCursorShape(handle: Long): IntArray?
+
+    /** `true`: this client draws the pointer and the host leaves it out of the picture. */
+    external fun nativeSetCursorRender(handle: Long, clientDraws: Boolean)
 
     /**
      * Whether the host advertised touch injection (`HOST_CAP2_TOUCH`). Without it a passthrough
@@ -714,12 +811,61 @@ object NativeBridge {
     external fun nativePadMotionReaches(handle: Long, declaredPref: Int): Boolean
 
     /**
+     * Whether the host's device for a pad that declared [declaredPref] has a Quick Access button,
+     * so a synthetic Quick Access tap presses [Gamepad.BTN_MISC1] there and Steam's chord
+     * everywhere else ([Gamepad.quickAccessPresses]). A negative [declaredPref] is a pad that
+     * never declared: the session default answers for it.
+     *
+     * Answered natively, off `punktfunk_core::config::pad_has_quick_access`, for the reason
+     * [nativePadMotionReaches] is. `false` when the session handle is dead.
+     */
+    external fun nativePadHasQuickAccess(handle: Long, declaredPref: Int): Boolean
+
+    /**
+     * The console's outline for a GamepadPref wire byte's pad family, as 24-unit SVG path data,
+     * stroked at 1.5. Empty for Automatic, which keeps its generic gamepad icon.
+     */
+    external fun nativePadMark(pref: Int): String
+
+    /**
      * One raw HID input report from a client-captured controller (the as-is Steam Controller 2
      * passthrough), forwarded verbatim on the rich-input plane. [buf] is a DIRECT ByteBuffer whose
      * first [len] bytes are the report, id byte first (0x42/0x45/0x47 state, 0x43 battery, …);
      * len is clamped to 64. Called from the capture thread at the controller's own report rate.
      */
     external fun nativeSendPadHidReport(handle: Long, pad: Int, buf: java.nio.ByteBuffer, len: Int)
+
+    /** What core holds back of a Steam Controller 2's raw reports on [pad]: an OR of
+     *  [GamepadRouter.SC2_GATE_MASKED] and its siblings, latest wins. */
+    external fun nativeSetSc2Gate(handle: Long, pad: Int, gate: Int)
+
+    /** The [index]th feature query a Steam Controller 2's identity is read with; null past the
+     *  last. [puck] adds the dongle's own queries. */
+    external fun nativeSc2IdentityRequest(puck: Boolean, index: Int): ByteArray?
+
+    /** The [index]th feature query a 2015 Steam Controller's identity is read with, report id 0
+     *  first; null past the last. */
+    external fun nativeSc1IdentityRequest(index: Int): ByteArray?
+
+    /** A fresh state for one 2015 Steam Controller's Bluetooth input, for [nativeSc1BleInput]. */
+    external fun nativeSc1BleState(): ByteArray
+
+    /** One segment of a 2015 Steam Controller's Bluetooth input, `[0x03, header, 18 bytes]`: the
+     *  64-byte wired frame when it completed a state message, else null. [state] changes in place. */
+    external fun nativeSc1BleInput(state: ByteArray, segment: ByteArray): ByteArray?
+
+    /** A wired feature frame for a 2015 Steam Controller, report id 0 first, as its Bluetooth
+     *  segments back to back. */
+    external fun nativeSc1BleSegments(frame: ByteArray): ByteArray
+
+    /** The segments read back for one 2015 Steam Controller feature query, in order: the reply,
+     *  report id 0 first, once the last is in, else null. */
+    external fun nativeSc1BleReply(segments: ByteArray): ByteArray?
+
+    /** A captured Steam Controller 2's identity for wire pad [pad]: its Puck [slot] (0 off a
+     *  Puck), its USB serial and its replies, packed `[len][request][len][reply]…`. The host
+     *  builds the virtual pad from it. */
+    external fun nativeSendPadIdentity(handle: Long, pad: Int, slot: Int, serial: String, replies: ByteArray)
 
     /**
      * One touchpad contact from a client-captured controller (the Sony USB capture), forwarded on
@@ -765,12 +911,12 @@ object NativeBridge {
      */
     external fun nativeNextHidout(handle: Long, buf: java.nio.ByteBuffer): Int
 
-    // ---- The Skia console UI (crates/pf-console-ui over EGL/GLES — clients/android/native/src/console) ----
+    // ---- The Skia console UI (crates/client/pf-console-ui over EGL/GLES — clients/android/native/src/console) ----
     //
     // The same console shell the Linux/Windows session binary shows, drawn by native onto a
     // SurfaceView. Kotlin keeps the services and feeds the console's models as JSON in the model
     // types' own serde shape (HostRow, LibraryGame, ConsoleCmd, OverlayAction, Settings — see
-    // `crates/pf-console-ui/src/model.rs` and `pf-client-core/src/trust.rs`); what the console
+    // `crates/client/pf-console-ui/src/model.rs` and `pf-client-core/src/trust.rs`); what the console
     // raises comes back through [nativeConsoleNextEvent]. Every call is main-thread-safe and cheap
     // except the two polls, which block ~100 ms and belong on their own threads.
 
@@ -788,9 +934,6 @@ object NativeBridge {
      * document. EGL/Skia failures arrive later as a `{"dead": …}` event.
      */
     external fun nativeConsoleCreate(optionsJson: String): Long
-
-    /** Stop the render thread (joined) and free. Stop + join the event poll thread FIRST. */
-    external fun nativeConsoleDestroy(handle: Long)
 
     /** The SurfaceView's surface is up. */
     external fun nativeConsoleSurfaceCreated(handle: Long, surface: android.view.Surface)
@@ -843,7 +986,8 @@ object NativeBridge {
 
     /**
      * Where the session the console asked for stands: 0 connecting, 1 streaming, 2 failed([message]),
-     * 3 ended ([message] = the abnormal reason, or "" for a clean end), 4 reconnecting([message]).
+     * 3 ended ([message] = the abnormal reason, or "" for a clean end), 4 reconnecting([message]),
+     * 5 failed as profile-unknown([message]), 6 awaiting the host operator's approval.
      */
     external fun nativeConsoleSessionPhase(handle: Long, phase: Int, message: String)
 
@@ -884,6 +1028,12 @@ object NativeBridge {
      */
     external fun nativeConsoleAdvanceSpeed(handle: Long, key: String, json: String)
 
+    /**
+     * The answer to `FetchProfiles` for the host pinned to [fpHex]: `{"Listed": [rows]}`,
+     * `"NoProfiles"` or `{"Failed": "why"}`.
+     */
+    external fun nativeConsoleSetProfiles(handle: Long, fpHex: String, json: String)
+
     /** A one-shot toast from a service worker. */
     external fun nativeConsoleNotice(handle: Long, text: String)
 
@@ -904,6 +1054,9 @@ object NativeBridge {
 
     /** One title's poster, encoded (JPEG/PNG bytes). */
     external fun nativeConsoleLibraryArt(handle: Long, id: String, bytes: ByteArray)
+
+    /** A profile's picture, encoded, under the URL `FetchAvatar` named. */
+    external fun nativeConsoleAvatar(handle: Long, url: String, bytes: ByteArray)
 
     /** The host's `/status` games: `[{"app_id": "steam:570", "state": "running"}, …]`. */
     external fun nativeConsoleLibraryRunning(handle: Long, json: String)

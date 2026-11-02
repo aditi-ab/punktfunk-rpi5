@@ -1,4 +1,5 @@
-# Does the NixOS module actually evaluate, and does it still render the units we decided on?
+# Does the NixOS module actually evaluate, and does it still render the drop-ins we decided on?
+# The units under them are the packages' own (scripts/*.service); vm-test.nix runs them.
 #
 # WHY THIS FILE EXISTS. `nix flake check` does NOT check `nixosModules`. It forces the value and
 # asserts it is a lambda taking an open attribute set — nothing more; nix's own source carries
@@ -50,6 +51,7 @@ let
       "punktfunk-client"
       "punktfunk-web"
       "punktfunk-scripting"
+      "punktfunk-seats"
       "punktfunk-gamescope"
     ] (name: fakeDrv "${prefix}${name}");
 
@@ -127,12 +129,45 @@ let
 
   clientOnly = evalWith { services.punktfunk.client.enable = true; };
 
+  # The seat supervisor, on a host. The other two are the refusals: no host to run in each seat,
+  # and users the supervisor could not create with useradd.
+  seats = evalWith {
+    services.punktfunk.host = {
+      enable = true;
+      openFirewall = true;
+      gamescopeHdr = false;
+      settings.RUST_LOG = "info";
+      settings.PUNKTFUNK_MGMT_BIND = "0.0.0.0:47991";
+    };
+    services.punktfunk.web.bind = "127.0.0.1";
+    services.punktfunk.seats.enable = true;
+  };
+  seatsWithoutHost = evalWith { services.punktfunk.seats.enable = true; };
+  seatsImmutableUsers = evalWith {
+    services.punktfunk.host.enable = true;
+    services.punktfunk.seats.enable = true;
+    users.mutableUsers = false;
+  };
+
   unit = cfg: name: cfg.systemd.user.units."${name}.service".text;
   has =
     cfg: name: infix:
     lib.hasInfix infix (unit cfg name);
+  # The same for a system unit, which a `systemd.services` entry renders under `systemd.units`.
+  hasSys =
+    cfg: name: infix:
+    lib.hasInfix infix cfg.systemd.units."${name}".text;
   # A module's own failed assertions, as messages.
   failedAssertions = cfg: map (a: a.message) (lib.filter (a: !a.assertion) cfg.assertions);
+  # A shipped unit's EnvironmentFile entries without host.env, which NixOS never reads. A drop-in
+  # that clears the list must restate these, in this order.
+  shippedEnvFiles =
+    unitFile:
+    lib.filter (f: !(lib.hasSuffix "/host.env" f)) (
+      map (lib.removePrefix "EnvironmentFile=") (
+        lib.filter (lib.hasPrefix "EnvironmentFile=") (lib.splitString "\n" (builtins.readFile unitFile))
+      )
+    );
 
   results = [
     # --- the module evaluates at all, in every shape an operator can ask for -------------------
@@ -163,18 +198,10 @@ let
         let
           scoped = name: has desktop name "ConditionUser=|alice";
         in
-        scoped "punktfunk-host" && scoped "punktfunk-web" && scoped "punktfunk-scripting";
-    }
-    {
-      # web-init is the console's readiness gate (it blocks until the host has written the mgmt
-      # token + identity cert), so it has to RUN on every start — not just the first. The
-      # `ConditionPathExists=!…/web-password` it used to carry skipped it from the second boot
-      # onward, which is exactly when the wait still matters; web-init.sh is idempotent instead.
-      # Keep the user scope: root's instance has no business generating the operator's password.
-      name = "web-init is user-scoped and NOT self-skipped by the password file";
-      ok =
-        has desktop "punktfunk-web-init" "ConditionUser=|alice"
-        && !(has desktop "punktfunk-web-init" "ConditionPathExists=");
+        scoped "punktfunk-host"
+        && scoped "punktfunk-web"
+        && scoped "punktfunk-web-init"
+        && scoped "punktfunk-scripting";
     }
     {
       # With no host.users to name, still keep SYSTEM users (root) out, while leaving the module
@@ -188,11 +215,13 @@ let
     # --- the KWin identification trap (packaging/arch/punktfunk-host.install) -------------------
     # The host MUST exec the plain store path. A capability wrapper here would put CAP_SYS_NICE in
     # the process's permitted set, and the kernel then refuses KWin the /proc/<pid>/exe readlink it
-    # identifies the client by — which cost every KDE box its desktop streaming in 0.26.0-1.
+    # identifies the client by. The packaged ExecStart is that path; GameStream replaces it here.
     {
-      name = "host ExecStart is the store binary, never a capability wrapper";
+      # The empty line clears the packaged ExecStart: two on a simple service fail the unit.
+      name = "gamestream=true runs the store binary with --gamestream, never a wrapper";
       ok =
-        has desktop "punktfunk-host" "ExecStart=/pf-stub/system-punktfunk-host/bin/punktfunk-host serve"
+        has desktop "punktfunk-host"
+          "ExecStart=\nExecStart=/pf-stub/system-punktfunk-host/bin/punktfunk-host serve --gamestream\n"
         && !(has desktop "punktfunk-host" "ExecStart=/run/wrappers");
     }
     # ...while the ENCODE WORKER, which nothing ever has to identify, is pointed at the wrapper.
@@ -233,10 +262,6 @@ let
 
     # --- GameStream opt-out reaches both the argv and the firewall -----------------------------
     {
-      name = "gamestream=true passes --gamestream";
-      ok = has desktop "punktfunk-host" "serve --gamestream";
-    }
-    {
       name = "gamestream=false drops --gamestream and its firewall ports";
       ok =
         !(has nativeOnly "punktfunk-host" "--gamestream")
@@ -258,71 +283,33 @@ let
         && lib.elem 47993 appliance.networking.firewall.allowedTCPPorts;
     }
 
-    # --- the three divergences from the shipped units, as regression guards --------------------
-    # Each of these was ONCE wrong here while right in scripts/*.service. Assert the decision, so a
-    # future edit cannot quietly drift back.
+    # --- the console ---------------------------------------------------------------------------
     {
-      # Without this, systemd's default 5-starts-per-10s against RestartSec=2 gives up permanently
-      # after ~10 s — the exact window before the host's first `serve` writes the mgmt token.
-      name = "web console retries indefinitely while the host writes its mgmt token";
-      ok = has appliance "punktfunk-web" "StartLimitIntervalSec=0";
-    }
-    {
-      # A console that exits 0 has still stopped serving.
-      name = "web console restarts on ANY exit, not just failure";
+      # web-init.sh writes a PUNKTFUNK_UI_BIND into host.env; read, it would beat `web.bind`. The
+      # rest is the shipped list as it stands, mandatory token included.
+      name = "the console binds where web.bind says, never host.env";
       ok =
-        has appliance "punktfunk-web" "Restart=always"
-        && !(has appliance "punktfunk-web" "Restart=on-failure");
+        let
+          files = appliance.systemd.user.services.punktfunk-web.serviceConfig.EnvironmentFile;
+        in
+        lib.head files == ""
+        && lib.tail files == shippedEnvFiles ../../scripts/punktfunk-web.service
+        && has appliance "punktfunk-web" "PUNKTFUNK_UI_BIND=0.0.0.0";
     }
+
+    # --- the packaged units and the runner's drop-in --------------------------------------------
     {
-      # Unit hardening for the supervisor and the operator's own scripts. What confines a PLUGIN
-      # is its own bwrap sandbox — these directives are a mount namespace, which does not hold
-      # against a process of the same uid.
-      name = "the plugin runner is hardened like the deb/rpm unit";
+      # The module's units are drop-ins: without the packages there is no unit to extend.
+      name = "the host, console and runner units come from their packages";
       ok =
-        has appliance "punktfunk-scripting" "NoNewPrivileges=true"
-        && has appliance "punktfunk-scripting" "ProtectSystem=strict"
-        && has appliance "punktfunk-scripting" "ReadWritePaths=/tmp"
-        && has appliance "punktfunk-scripting" "RestrictAddressFamilies=AF_UNIX"
-        # bwrap needs netlink and a fresh /proc; the sandbox takes both back from the plugin.
-        && !(has appliance "punktfunk-scripting" "ProtectKernelTunables=true")
-        && has appliance "punktfunk-scripting" "AF_NETLINK"
-        && has appliance "punktfunk-scripting" "ProtectControlGroups=true"
-        && has appliance "punktfunk-scripting" "RestrictNamespaces=user mnt pid net ipc uts cgroup"
-        && has appliance "punktfunk-scripting" "SystemCallArchitectures=native"
-        && has appliance "punktfunk-scripting" "CapabilityBoundingSet=";
-    }
-    {
-      # `ReadWritePaths=%h` re-opened the whole home, so the runner read `mgmt-token` and `key.pem`
-      # beside the scoped token it is supposed to be limited to — the privilege split the docs
-      # promise did not hold on Linux. The home is a tmpfs now and the binds are the allow-list.
-      name = "the plugin runner cannot read the host's admin token or identity key";
-      ok =
-        has appliance "punktfunk-scripting" "ProtectHome=tmpfs"
-        && !(has appliance "punktfunk-scripting" "ReadWritePaths=%h")
-        && has appliance "punktfunk-scripting" "InaccessiblePaths=-%h/.config/punktfunk/mgmt-token"
-        && has appliance "punktfunk-scripting" "InaccessiblePaths=-%h/.config/punktfunk/key.pem";
-    }
-    {
-      # Everything ProtectHome=tmpfs takes away that the runner itself needs. Drop one of these and
-      # the runner comes up unable to authenticate or persist. Library roots are not listed here:
-      # the host binds them through its 50-plugin-roots.conf drop-in.
-      name = "the plugin runner keeps the paths it needs through the empty home";
-      ok =
-        has appliance "punktfunk-scripting" "BindPaths=-%h/.config/punktfunk/plugins"
-        && has appliance "punktfunk-scripting" "BindPaths=-%h/.config/punktfunk/plugin-state"
-        # $XDG_RUNTIME_DIR: the host's live-stream marker, the session bus, compositor sockets.
-        && has appliance "punktfunk-scripting" "BindPaths=%t"
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/plugin-token"
-        # A directory bind keeps atomic replacements visible; ExecStartPre makes it exist.
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=%h/.config/punktfunk/plugin-run"
-        && has appliance "punktfunk-scripting" "bin/mkdir -p -m 0700 %h/.config/punktfunk/plugin-run %h/.config/punktfunk/plugin-state"
-        # The TLS pin is native-cert.pem after the identity split, cert.pem before it.
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/native-cert.pem"
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/cert.pem"
-        # Without this a moved listener leaves every plugin dialling 47990 forever.
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/mgmt-endpoint"
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/scripts";
+        let
+          p = appliance.services.punktfunk;
+        in
+        lib.all (pkg: lib.elem pkg appliance.systemd.packages) [
+          p.host.package
+          p.web.package
+          p.scripting.package
+        ];
     }
     {
       # Without bwrap on its PATH the runner starts no plugin at all, and the library is empty.
@@ -330,12 +317,6 @@ let
       ok = builtins.any (p: lib.hasInfix "bubblewrap" (toString p)) (
         appliance.systemd.user.services.punktfunk-scripting.path or [ ]
       );
-    }
-    {
-      # PrivateTmp is OFF on purpose (the VirtualHere field report: a private /tmp hides
-      # /tmp/vhclient and /tmp/.X11-unix, so a plugin cannot reach the daemon it integrates with).
-      name = "the plugin runner keeps the real /tmp";
-      ok = has appliance "punktfunk-scripting" "PrivateTmp=false";
     }
     {
       # Since the library scanners became plugins, a runner that is off means an EMPTY LIBRARY and
@@ -377,6 +358,197 @@ let
         && lib.hasInfix "restart-user-units" u.serviceConfig.ExecReload;
     }
 
+    # --- the seat supervisor -------------------------------------------------------------------
+    {
+      name = "the seat scenario has no failing assertions";
+      ok = failedAssertions seats == [ ];
+    }
+    {
+      # Both units and the tmpfiles rules come from the package; the module only adds what a
+      # packaged unit lacks.
+      name = "seats installs the package's units and tmpfiles rules";
+      ok =
+        lib.elem seats.services.punktfunk.seats.package seats.systemd.packages
+        && lib.elem seats.services.punktfunk.seats.package seats.systemd.tmpfiles.packages;
+    }
+    {
+      # `enable` is the operator's decision here, so the daemon starts at boot. The packaged
+      # distros ship it disabled and let the console turn it on.
+      name = "seats starts the supervisor at boot";
+      ok = hasSys seats "punktfunk-seats.service" "WantedBy=multi-user.target";
+    }
+    {
+      # A unit from `systemd.packages` has no PATH of its own, and useradd, setfacl and
+      # loginctl are all looked up on it.
+      name = "seats gives both units a PATH with the account tools";
+      ok =
+        let
+          onPath = name: hasSys seats name "-shadow-" && hasSys seats name "-acl-";
+        in
+        onPath "punktfunk-seats.service" && onPath "punktfunk-seat@.service";
+    }
+    {
+      # seat-session defaults to /usr/bin/punktfunk-host, which NixOS has not got.
+      name = "seats points seat-session at the system's host build";
+      ok =
+        hasSys seats "punktfunk-seat@.service"
+          "PUNKTFUNK_HOST_BIN=/pf-stub/system-punktfunk-host/bin/punktfunk-host";
+    }
+    {
+      name = "a switch leaves running seats up";
+      ok = hasSys seats "punktfunk-seat@.service" "X-RestartIfChanged=false";
+    }
+    {
+      # The owner's row runs its host from seat-session, so it takes the module's settings and
+      # the gamestream flag from a file only the owner's branch reads, and every seat encodes
+      # through the capped worker.
+      name = "seats hand the owner's row the module's settings and every seat the capped worker";
+      ok =
+        let
+          env = seats.systemd.services."punktfunk-seat@".environment;
+        in
+        lib.hasSuffix "-punktfunk-owner.env" env.PUNKTFUNK_OWNER_ENV
+        && lib.hasSuffix "/punktfunk-encode-worker" env.PUNKTFUNK_ENCODE_WORKER;
+    }
+    {
+      name = "seats refuses a box with no host";
+      ok = lib.any (lib.hasInfix "seats needs services.punktfunk.host.enable") (
+        failedAssertions seatsWithoutHost
+      );
+    }
+    {
+      name = "seats refuses immutable users";
+      ok = lib.any (lib.hasInfix "seats needs users.mutableUsers = true") (
+        failedAssertions seatsImmutableUsers
+      );
+    }
+    {
+      name = "a host without seats defines neither seat unit";
+      ok =
+        !(desktop.systemd.services ? punktfunk-seats) && !(desktop.systemd.services ? "punktfunk-seat@");
+    }
+
+    # --- the door: the box's host as a system service ------------------------------------------
+    {
+      # The packaged unit names /usr/bin/punktfunk-host. The empty line first clears it: a second
+      # ExecStart on a simple service is an error.
+      name = "the door runs the system's host build";
+      ok =
+        hasSys seats "punktfunk-door.service"
+          "ExecStart=\nExecStart=/pf-stub/system-punktfunk-host/bin/punktfunk-host serve --door";
+    }
+    {
+      name = "the door's console runs the module's web package";
+      ok =
+        hasSys seats "punktfunk-web-door.service"
+          "ExecStart=\nExecStart=/pf-stub/punktfunk-web/bin/punktfunk-web-server";
+    }
+    {
+      # The helpers and the door's ExecStartPre call useradd, runuser, flock and awk by name.
+      name = "the door's helpers have a PATH with the account tools";
+      ok =
+        let
+          onPath =
+            name:
+            hasSys seats name "-shadow-"
+            && hasSys seats name "-util-linux-"
+            && hasSys seats name "-gawk-";
+        in
+        onPath "punktfunk-door-on@.service"
+        && onPath "punktfunk-door-off@.service"
+        && onPath "punktfunk-door.service";
+    }
+    {
+      name = "the door takes the port keys from settings and no other knob";
+      ok =
+        let
+          env = seats.systemd.services.punktfunk-door.environment;
+        in
+        env.PUNKTFUNK_MGMT_BIND or null == "0.0.0.0:47991" && !(env ? RUST_LOG);
+    }
+    {
+      # The helper's `systemctl enable` has nowhere to write on NixOS, so the units are wired
+      # here. They start at boot only while the owner record exists: the door is off without it.
+      name = "the door's units start at boot once the owner record exists";
+      ok =
+        let
+          wired =
+            name: unit:
+            seats.systemd.services.${name}.wantedBy == [ "multi-user.target" ]
+            && lib.hasInfix "\nConditionPathExists=/var/lib/punktfunk-seats/owner\n" (
+              builtins.readFile unit
+            );
+        in
+        wired "punktfunk-door" ../linux/punktfunk-door.service
+        && wired "punktfunk-web-door" ../linux/punktfunk-web-door.service;
+    }
+    {
+      # A console limited to this machine stays so when the door takes over. host.env, which
+      # carries the bind on other distros, is not read: the option is the source.
+      name = "the door's console binds where web.bind says, never host.env";
+      ok =
+        let
+          files = seats.systemd.services.punktfunk-web-door.serviceConfig.EnvironmentFile;
+        in
+        hasSys seats "punktfunk-web-door.service" "PUNKTFUNK_UI_BIND=127.0.0.1"
+        && lib.head files == ""
+        && lib.tail files == shippedEnvFiles ../linux/punktfunk-web-door.service;
+    }
+    {
+      # polkit reads /etc/polkit-1/rules.d; the rule is the package's file, not a copy.
+      name = "the door's polkit rule is the package's file";
+      ok =
+        seats.security.polkit.enable
+        && seats.environment.etc."polkit-1/rules.d/49-punktfunk-door.rules".source
+          == "/pf-stub/punktfunk-seats/share/polkit-1/rules.d/49-punktfunk-door.rules";
+    }
+    {
+      # The rule and the helper both name this group.
+      name = "the door's group exists";
+      ok = seats.users.groups ? punktfunk-update;
+    }
+    {
+      # The door's user has a group of its own. `punktfunk` owns the usbip attach nodes and
+      # passes pf-dm-helper, which the door has no use for.
+      name = "the door's units run in a group the module declares";
+      ok =
+        seats.users.groups ? punktfunk-door
+        && lib.all (f: lib.hasInfix "\nGroup=punktfunk-door\n" (builtins.readFile f)) [
+          ../linux/punktfunk-door.service
+          ../linux/punktfunk-web-door.service
+        ];
+    }
+    {
+      name = "seats open the seat ports with the host's";
+      ok = lib.elem {
+        from = 9779;
+        to = 9786;
+      } seats.networking.firewall.allowedUDPPortRanges;
+    }
+    {
+      # The packaged list starts with host.env, which NixOS does not read. The owner row's env
+      # comes after `settings`, so its ports and the box's identity win.
+      name = "the host reads settings, never host.env, and the seat env last";
+      ok =
+        let
+          files = seats.systemd.user.services.punktfunk-host.serviceConfig.EnvironmentFile;
+          shipped = shippedEnvFiles ../../scripts/punktfunk-host.service;
+        in
+        lib.head files == ""
+        && lib.length files == 3
+        && lib.hasInfix "punktfunk-host.env" (lib.elemAt files 1)
+        && shipped == [ "-/run/punktfunk/seats/%u.env" ]
+        && lib.last files == lib.last shipped;
+    }
+    {
+      name = "a host without seats keeps its ports and units as they were";
+      ok =
+        appliance.networking.firewall.allowedUDPPortRanges == [ ]
+        && !(desktop.systemd.services ? punktfunk-door)
+        && !(desktop.users.groups ? punktfunk-update)
+        && !(desktop.users.groups ? punktfunk-door);
+    }
+
     # --- the client half must not drag the host's system wiring in -----------------------------
     {
       name = "a client-only machine defines no host/web/scripting units";
@@ -398,7 +570,8 @@ let
         && p.host.gamescopePackage.name == "system-punktfunk-gamescope"
         && clientOnly.services.punktfunk.client.package.name == "system-punktfunk-client"
         && p.web.package.name == "punktfunk-web"
-        && p.scripting.package.name == "punktfunk-scripting";
+        && p.scripting.package.name == "punktfunk-scripting"
+        && p.seats.package.name == "punktfunk-seats";
     }
   ];
 

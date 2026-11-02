@@ -15,7 +15,7 @@ its own. In Desktop Mode, run the app directly. Both share one identity and one 
 2. Install the Punktfunk client, in Desktop Mode:
 
    ```sh
-   flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
+   flatpak install --user https://flatpak.unom.io/io.unom.punktfunk.flatpakref
    ```
 
    A native `punktfunk-client` (a sysext, a distro package, your own build) works too. With both
@@ -30,8 +30,9 @@ its own. In Desktop Mode, run the app directly. Both share one identity and one 
 2. Open the **Developer** tab and choose **Install Plugin from URL**.
 3. Paste `https://unom.io/pf-decky` and confirm.
 
-The **Punktfunk** panel appears right away. That link is the stable channel; for canary builds or a
-pinned version, see [Release Channels](/docs/channels).
+The **Punktfunk** panel appears right away. That link is the stable channel. For canary builds,
+paste `https://unom.io/pf-decky-canary` instead. To pin a version, see
+[Release Channels](/docs/channels).
 
 ## Use it
 
@@ -46,6 +47,7 @@ Open the **Punktfunk** panel from the Quick Access Menu.
   client knows its MAC address.
 - **▸ Preset name** under a host streams it with that [preset](/docs/presets-and-links). Pin
   presets in the Punktfunk app; the panel only shows them.
+- **● Name** under a host with more than one profile streams as that profile, this time only.
 - **Open Punktfunk** opens the app's console: add a host by address, pair, browse a host's
   [library](/docs/game-library), and change [settings](/docs/client-settings).
 
@@ -155,7 +157,7 @@ Panel → **About** → **Recreate library shortcut**.
 4. To remove the client too, in Desktop Mode:
 
    ```sh
-   flatpak uninstall --user --delete-data io.unom.Punktfunk
+   flatpak uninstall --user --delete-data io.unom.punktfunk
    ```
 
    Delete `~/.config/punktfunk` as well to forget this Deck's identity and saved hosts.

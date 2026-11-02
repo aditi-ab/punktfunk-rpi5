@@ -7,13 +7,13 @@
 //! (`super::present`). Nothing here touches the MediaCodec path.
 //!
 //! The feature set is not ours to choose — it mirrors `pf-presenter`'s probe exactly
-//! (`crates/pf-presenter/src/vk/setup.rs`), because pyrowave 0.4.0 reconstructs the
+//! (`crates/client/pf-presenter/src/vk/setup.rs`), because pyrowave 0.4.0 reconstructs the
 //! create-infos from what we report and reads those features to pick its kernels. A
 //! device that misses one is not a slower device, it is a device the codec refuses.
 
 use anyhow::{anyhow, bail, Result};
 use ash::vk;
-use pf_client_core::video_vk::{QueueLock, VulkanDecodeDevice};
+use pf_client_video::video_vk::{QueueLock, VulkanDecodeDevice};
 use std::ffi::CString;
 
 /// Instance extensions, in creation order. `VulkanDecodeDevice::instance_extensions` must
@@ -21,8 +21,17 @@ use std::ffi::CString;
 const INSTANCE_EXTS: [&std::ffi::CStr; 2] =
     [ash::khr::surface::NAME, ash::khr::android_surface::NAME];
 
-/// Device extensions, same contract. Only the swapchain: decode and CSC are core 1.3.
+/// Device extensions, same contract: the swapchain, plus [`BUFFER_EXTS`] where all three are
+/// offered. Decode and CSC are core 1.3.
 const DEVICE_EXTS: [&std::ffi::CStr; 1] = [ash::khr::swapchain::NAME];
+
+/// What presenting through `AHardwareBuffer`s takes: import, hand-over to the compositor, and
+/// fences as sync fds.
+const BUFFER_EXTS: [&std::ffi::CStr; 3] = [
+    ash::android::external_memory_android_hardware_buffer::NAME,
+    ash::ext::queue_family_foreign::NAME,
+    ash::khr::external_semaphore_fd::NAME,
+];
 
 /// The instance and the window surface on it. Dropping destroys the surface, then the instance.
 pub(super) struct WindowSurface {
@@ -55,6 +64,8 @@ pub(super) struct PyroDevice {
     pub(super) vkd: VulkanDecodeDevice,
     /// The surface every swapchain is built on, outliving the device as Vulkan requires.
     pub(super) base: WindowSurface,
+    /// [`BUFFER_EXTS`] are enabled: the lane may present `AHardwareBuffer`s.
+    pub(super) buffers: bool,
 }
 
 /// The compute feature set pyrowave's kernels need, read off a physical device.
@@ -208,8 +219,20 @@ impl PyroDevice {
         let queue_ci = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(qf)
             .queue_priorities(&prio)];
-        let ext_ptrs: Vec<*const std::ffi::c_char> =
-            DEVICE_EXTS.iter().map(|n| n.as_ptr()).collect();
+        // SAFETY: read-only query on a live physical device.
+        let offered =
+            unsafe { instance.enumerate_device_extension_properties(pdev) }.unwrap_or_default();
+        let buffers = BUFFER_EXTS.iter().all(|want| {
+            offered
+                .iter()
+                .any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == *want))
+        });
+        let exts: Vec<&std::ffi::CStr> = DEVICE_EXTS
+            .iter()
+            .chain(buffers.then_some(BUFFER_EXTS.iter()).into_iter().flatten())
+            .copied()
+            .collect();
+        let ext_ptrs: Vec<*const std::ffi::c_char> = exts.iter().map(|n| n.as_ptr()).collect();
         // Exactly the probe's conjuncts, enabled. `shader_float16` rides along when the
         // driver has it: pyrowave picks a half-precision kernel path off it, and reporting
         // it enabled when it is not would make the codec choose a path the device refuses.
@@ -258,14 +281,11 @@ impl PyroDevice {
             decode_qf: qf,
             decode_video_caps: 0,
             instance_extensions: INSTANCE_EXTS.iter().map(|n| CString::from(*n)).collect(),
-            device_extensions: DEVICE_EXTS.iter().map(|n| CString::from(*n)).collect(),
+            device_extensions: exts.iter().map(|n| CString::from(*n)).collect(),
             f_sampler_ycbcr: false,
             f_timeline_semaphore: true,
             f_synchronization2: true,
             video_decode: false,
-            // No `VK_KHR_present_wait` on this path — Android's latch stamps come from the
-            // ASurfaceControl backend, which the wavelet lane does not use.
-            present_timing: false,
             pyrowave_decode: true,
             f_shader_int16: true,
             f_storage_buffer8: true,
@@ -280,6 +300,8 @@ impl PyroDevice {
             vaapi_hevc_decode: false,
             d3d11_nv12: false,
             d3d11_p010: false,
+            d3d11_present: false,
+            d3d11_fence: false,
             d3d11_hdr10: false,
             adapter_luid: None,
             queue_lock: std::sync::Arc::new(QueueLock::new()),
@@ -291,6 +313,7 @@ impl PyroDevice {
             qf,
             vkd,
             base,
+            buffers,
         })
     }
 

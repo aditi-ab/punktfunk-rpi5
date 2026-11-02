@@ -344,8 +344,9 @@ private fun slotGroups(cfg: OverlayConfig): List<SlotGroup> {
             SlotOption("pad", "Virtual controller", "Shows or hides the on-screen controller"),
             SlotOption("send_text", "Send text"),
             SlotOption("guide", "Guide button", "The host's Xbox / PS / Steam button"),
-            SlotOption("qam", "Quick access menu", "Only where the host's pad is Steam-shaped"),
+            SlotOption("qam", "Quick access menu", "Where the host runs Steam"),
             SlotOption("pad_mouse", "Controller mouse", "Your controller moves the host's pointer"),
+            SlotOption("pad_type", "Controller type", "The controller the host emulates, for this stream"),
         )),
         SlotGroup("View", listOf(
             SlotOption("stats", "Statistics"),

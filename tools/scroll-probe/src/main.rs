@@ -85,6 +85,7 @@ mod linux {
             phase,
             axis: 0,
             delta: (delta * SCROLL_SCALE) as i32,
+            axis_units: false,
         }
         .to_event()
     }

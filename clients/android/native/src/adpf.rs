@@ -29,6 +29,22 @@ type ReportFn = unsafe extern "C" fn(*mut c_void, i64) -> c_int;
 type UpdateTargetFn = unsafe extern "C" fn(*mut c_void, i64) -> c_int;
 type CloseFn = unsafe extern "C" fn(*mut c_void);
 type SetPreferPowerEfficiencyFn = unsafe extern "C" fn(*mut c_void, bool) -> c_int;
+type WorkCreateFn = unsafe extern "C" fn() -> *mut c_void;
+type WorkReleaseFn = unsafe extern "C" fn(*mut c_void);
+type WorkSetFn = unsafe extern "C" fn(*mut c_void, i64);
+type Report2Fn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+
+/// `AWorkDuration` and `reportActualWorkDuration2`, NDK **API 35**: a report that splits CPU
+/// from GPU time, so the GPU clock can be raised as well as the cores.
+struct WorkApi {
+    create: WorkCreateFn,
+    release: WorkReleaseFn,
+    set_start: WorkSetFn,
+    set_total: WorkSetFn,
+    set_cpu: WorkSetFn,
+    set_gpu: WorkSetFn,
+    report2: Report2Fn,
+}
 
 /// The entry points we use, resolved once from `libandroid.so`, plus the process-wide manager.
 struct Api {
@@ -39,6 +55,8 @@ struct Api {
     /// `APerformanceHint_setPreferPowerEfficiency` — NDK **API 35**, so `Option`al even when the
     /// rest of ADPF resolved (a 33/34 device has the session API but not this one).
     set_prefer_power_efficiency: Option<SetPreferPowerEfficiencyFn>,
+    /// API 35, as above.
+    work: Option<WorkApi>,
     manager: *mut c_void,
 }
 
@@ -72,6 +90,17 @@ fn resolve_api() -> Option<Api> {
                 lib,
                 c"APerformanceHint_setPreferPowerEfficiency",
             ),
+            work: (|| {
+                Some(WorkApi {
+                    create: crate::sym(lib, c"AWorkDuration_create")?,
+                    release: crate::sym(lib, c"AWorkDuration_release")?,
+                    set_start: crate::sym(lib, c"AWorkDuration_setWorkPeriodStartTimestampNanos")?,
+                    set_total: crate::sym(lib, c"AWorkDuration_setActualTotalDurationNanos")?,
+                    set_cpu: crate::sym(lib, c"AWorkDuration_setActualCpuDurationNanos")?,
+                    set_gpu: crate::sym(lib, c"AWorkDuration_setActualGpuDurationNanos")?,
+                    report2: crate::sym(lib, c"APerformanceHint_reportActualWorkDuration2")?,
+                })
+            })(),
             manager,
         })
     }
@@ -82,6 +111,8 @@ fn resolve_api() -> Option<Api> {
 pub struct HintSession {
     api: Api,
     session: *mut c_void,
+    /// The one `AWorkDuration` [`HintSession::report_work`] refills; null below API 35.
+    work: *mut c_void,
 }
 
 impl HintSession {
@@ -111,7 +142,37 @@ impl HintSession {
                 unsafe { f(session, false) };
             }
         }
-        Some(Self { api, session })
+        let work = match &api.work {
+            // SAFETY: the NDK constructor; null on failure, which `report_work` checks.
+            Some(w) => unsafe { (w.create)() },
+            None => std::ptr::null_mut(),
+        };
+        Some(Self { api, session, work })
+    }
+
+    /// Report one frame split into CPU and GPU time (API 35). `start_ns` is
+    /// `CLOCK_MONOTONIC`. Below API 35 the total goes through [`HintSession::report_actual`].
+    #[cfg_attr(
+        not(target_pointer_width = "64"),
+        expect(dead_code, reason = "only the 64-bit PyroWave lane calls it")
+    )]
+    pub fn report_work(&self, start_ns: i64, total_ns: i64, cpu_ns: i64, gpu_ns: i64) {
+        let Some(w) = self.api.work.as_ref().filter(|_| !self.work.is_null()) else {
+            return self.report_actual(total_ns);
+        };
+        // The platform rejects the whole report on a zero start or total, or no CPU or GPU time.
+        if start_ns <= 0 || total_ns <= 0 || cpu_ns.max(gpu_ns) <= 0 {
+            return;
+        }
+        // SAFETY: `self.work` is the live `AWorkDuration` created with the session and
+        // `self.session` the live session; every setter takes the handle and an i64.
+        unsafe {
+            (w.set_start)(self.work, start_ns);
+            (w.set_total)(self.work, total_ns);
+            (w.set_cpu)(self.work, cpu_ns.max(0));
+            (w.set_gpu)(self.work, gpu_ns.max(0));
+            (w.report2)(self.session, self.work);
+        }
     }
 
     /// Report the wall-clock time the hinted thread spent producing the last displayed frame. When
@@ -139,7 +200,13 @@ impl HintSession {
 
 impl Drop for HintSession {
     fn drop(&mut self) {
-        // SAFETY: `self.session` was created by `createSession` and is closed exactly once, here.
-        unsafe { (self.api.close)(self.session) };
+        // SAFETY: `self.session` was created by `createSession` and is closed exactly once, here;
+        // `self.work`, when not null, was created by `AWorkDuration_create` and released here.
+        unsafe {
+            (self.api.close)(self.session);
+            if let (Some(w), false) = (&self.api.work, self.work.is_null()) {
+                (w.release)(self.work);
+            }
+        }
     }
 }

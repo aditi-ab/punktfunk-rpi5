@@ -1,0 +1,1275 @@
+//! HTTP handlers for the game catalog, source toggles, provider reconcile, and box-art proxy.
+//!
+//! Domain logic lives in [`crate::library`] and [`crate::runstate`]; this is the `/api/v1/library`
+//! surface. Lanes split on [`super::auth::AuthLane`]:
+//! - **admin** — custom CRUD, hide/unhide, scanner toggles, and operator-only launch fields
+//!   (`command`, `prep`).
+//! - **plugin** — reconcile and liveness report for the store it publishes; privileged fields
+//!   403, unservable local art is stripped rather than refusing the set.
+//! - **paired cert** — `GET /library` (hidden titles filtered, `command` values cleared) and
+//!   the art proxy.
+//!
+//! Pin: `mgmt::tests` lane matrix and `crate::library` art/privilege tests.
+
+use super::auth::{AnyId, AuthLane, OwnedId, PluginIdentity, ProviderId};
+use super::shared::*;
+use crate::library::sort_key;
+use axum::extract::Request;
+use axum::http::{header, Method};
+use axum::middleware::Next;
+use axum::Extension;
+use sha2::{Digest, Sha256};
+
+/// A seat host reading the box's library ([`pf_paths::seat::box_library_dir`], `box_library`)
+/// changes none of it: every write under `/api/v1/library` answers 409. The box host is the
+/// library's one writer.
+pub(super) async fn box_library_is_read_only(
+    box_library: bool,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    let library = path == "/api/v1/library" || path.starts_with("/api/v1/library/");
+    let write = !matches!(*req.method(), Method::GET | Method::HEAD);
+    if box_library && library && write {
+        return api_error(
+            StatusCode::CONFLICT,
+            "This seat plays the box's library, so it can't be changed here. Change it on the box.",
+        );
+    }
+    next.run(req).await
+}
+
+/// Refuse a custom-entry write that carries an operator-privileged field on a lane that may
+/// not set one, or local art the proxy would not serve.
+///
+/// Single-entry writes only. Provider reconcile uses [`check_privileged_fields`] and
+/// [`crate::library::sanitize_art_paths`]: one bad cover must not drop the whole store.
+/// Route reachability is a different question — `PUT /library/provider/{p}` is a plugin
+/// route, but `prep` / a non-host-resolved `launch.kind` are operator-only.
+///
+/// Returns `Some((reason, response))` to send, `None` to proceed. Not `Result`: the
+/// "error" is the response, and a 128-byte `Response` in `Err` trips
+/// `clippy::result_large_err`. `reason` is the log line so a 403 (privileged field) and a
+/// 400 (unservable art) are not both logged as an auth failure.
+fn check_entry_fields(
+    lane: AuthLane,
+    art: &crate::library::Artwork,
+    launch: Option<&crate::library::LaunchSpec>,
+    prep: &[crate::hooks::PrepCmd],
+    icon: Option<&str>,
+) -> Option<(String, Response)> {
+    check_privileged_fields(lane, launch, prep, icon).or_else(|| {
+        crate::library::validate_art_paths(art)
+            .err()
+            .map(|e| (e.clone(), api_error(StatusCode::BAD_REQUEST, &e)))
+    })
+}
+
+/// Authority half of [`check_entry_fields`]: privileged field this lane may not set (403),
+/// or an unrepresentable icon token (400).
+///
+/// Provider reconcile uses this and sanitizes unservable covers instead of 400-ing the
+/// payload. See [`crate::library::sanitize_art_paths`].
+fn check_privileged_fields(
+    lane: AuthLane,
+    launch: Option<&crate::library::LaunchSpec>,
+    prep: &[crate::hooks::PrepCmd],
+    icon: Option<&str>,
+) -> Option<(String, Response)> {
+    if !lane.may_set_privileged_fields() {
+        if let Some(field) = crate::library::privileged_field(launch, prep) {
+            return Some((
+                format!("payload carries `{field}`, which this lane may not set"),
+                api_error(
+                    StatusCode::FORBIDDEN,
+                    &format!(
+                        "`{field}` can become a command the host runs as the host user, so it may \
+                         only be set with the operator's admin token — a plugin may publish entries \
+                         with any host-resolved launch kind (steam_appid, steam_ui, launcher_ui, \
+                         epic, gog, aumid, xbox, lutris_id, heroic, playnite, uplay, amazon, \
+                         battlenet, ea, rockstar) or `plugin` instead"
+                    ),
+                ),
+            ));
+        }
+    }
+    // Shape, every lane: an icon token names no host resource, so an operator token cannot
+    // unlock it. Clients interpolate the value; refuse unrepresentable slugs here
+    // (`crate::library::validate_icon`).
+    if let Err(e) = crate::library::validate_icon(icon) {
+        return Some((e.clone(), api_error(StatusCode::BAD_REQUEST, &e)));
+    }
+    None
+}
+
+/// `?as=<profile id>`: the profile whose own numbers ride as `stats.mine`.
+#[derive(Deserialize)]
+pub(crate) struct AsProfile {
+    #[serde(rename = "as")]
+    profile: Option<String>,
+}
+
+impl AsProfile {
+    fn fill<'a>(&self, games: impl IntoIterator<Item = &'a mut crate::library::GameEntry>) {
+        if let Some(p) = self.profile.as_deref().filter(|p| !p.is_empty()) {
+            crate::library::fill_mine(games, p);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LibraryQuery {
+    provider: Option<String>,
+    platform: Option<String>,
+}
+
+/// List every title this host knows, sorted by title.
+///
+/// Plugin-synced entries plus custom ones. Art the host can serve is rewritten to this API's
+/// art proxy, local paths and remote URLs alike; a URL the proxy already refused passes
+/// through. `?provider=` / `?platform=` (case-insensitive) narrow. `?as=` names the
+/// asking device's profile: each title it has launched carries its own numbers in `stats.mine`.
+///
+/// The operator lane sees hidden titles (`hidden: true`) so the console can un-hide them.
+/// Every other lane is filtered upstream and cannot tell they exist.
+#[utoipa::path(
+    get,
+    path = "/library",
+    tag = "library",
+    operation_id = "getLibrary",
+    params(
+        ("provider" = Option<String>, Query, description = "Only entries owned by this external provider"),
+        ("platform" = Option<String>, Query, description = "Only entries on this platform (case-insensitive, e.g. `PS2`)"),
+        ("as" = Option<String>, Query, description = "Profile id whose own play stats fill `stats.mine`"),
+    ),
+    responses(
+        (status = OK, description = "Unified library across all stores (the operator's lane also gets hidden entries, flagged)", body = [crate::library::OperatorGameEntry]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn get_library(
+    Extension(lane): Extension<AuthLane>,
+    Query(q): Query<LibraryQuery>,
+    Query(who): Query<AsProfile>,
+) -> Response {
+    // Operator list is a different type, not a flag, so a hidden title cannot reach a paired
+    // client by forgetting a filter. Skip redaction here: this arm is the operator's token,
+    // and the command line being shown is the one they typed.
+    if lane.is_operator() {
+        let mut rows = crate::library::all_games_for_operator();
+        rows.retain(|r| matches_query(&r.entry, &q));
+        crate::library::downloads::fill_free(rows.iter_mut().map(|r| &mut r.entry));
+        who.fill(rows.iter_mut().map(|r| &mut r.entry));
+        for r in &mut rows {
+            crate::library::proxy_art(&r.entry.id, &mut r.entry.art);
+        }
+        return Json(rows).into_response();
+    }
+    let mut games = crate::library::all_games();
+    games.retain(|g| matches_query(g, &q));
+    crate::library::downloads::fill_free(games.iter_mut());
+    who.fill(games.iter_mut());
+    // Rewrite to the art proxy: an on-host path a client cannot reach, and a CDN URL every
+    // client would otherwise fetch over the WAN for itself.
+    for g in &mut games {
+        crate::library::proxy_art(&g.id, &mut g.art);
+    }
+    for g in &mut games {
+        redact_for_lane(g, &lane);
+    }
+    Json(games).into_response()
+}
+
+/// What a lane other than the operator's may not read. `cert_may_access` allows the library
+/// reads, so paired clients see these bodies: a custom entry's `launch.value` is the operator's
+/// shell command and is cleared, `kind` stays so launchability still renders. `ids` and
+/// `filled` serve metadata sources and the console; a player needs neither, nor the folder a
+/// title installs into.
+fn redact_for_lane(g: &mut crate::library::GameEntry, lane: &AuthLane) {
+    if lane.is_operator() {
+        return;
+    }
+    if let Some(l) = g.launch.as_mut() {
+        if l.kind == "command" {
+            l.value.clear();
+        }
+    }
+    if matches!(lane, AuthLane::Cert) {
+        g.ids.clear();
+        g.filled.clear();
+        if let Some(i) = g.install.as_mut() {
+            i.target = None;
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LibraryPageQuery {
+    provider: Option<String>,
+    platform: Option<String>,
+    q: Option<String>,
+    role: Option<String>,
+    id: Option<String>,
+    install: Option<String>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+/// How many titles a platform holds under a page's other filters.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PlatformCount {
+    platform: String,
+    count: usize,
+}
+
+/// One page of the library in title order.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct LibraryPage {
+    items: Vec<crate::library::OperatorGameEntry>,
+    /// Hand back as `cursor` for the page after this one. Absent on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    /// Titles matching the filters, across every page.
+    total: usize,
+    /// Platforms among the titles matching every filter but `platform`, largest first.
+    platforms: Vec<PlatformCount>,
+    /// Titles not installed on this host among those matching every filter but `install`.
+    /// Absent when there are none.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[schema(required = false)]
+    not_installed: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// 60 fills a wide grid a few rows deep; 200 bounds one response.
+const PAGE_DEFAULT: u32 = 60;
+const PAGE_MAX: u32 = 200;
+
+fn encode_cursor(key: &(String, String)) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{}\0{}", key.0, key.1))
+}
+
+fn decode_cursor(cursor: &str) -> Option<(String, String)> {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    let (title, id) = text.split_once('\0')?;
+    Some((title.to_string(), id.to_string()))
+}
+
+/// One page of the library.
+///
+/// Title order, `limit` titles a page (60 when absent, 200 at most). `next_cursor` names the
+/// last title sent; pass it back as `cursor` for the next page. It is a place in the order, not
+/// an offset: a title added or removed between two pages neither repeats nor skips one.
+/// `q` matches inside the title, any case. `provider`, `platform`, `role` (`game`,
+/// `launcher`) and `install` (`installed`, `missing`) narrow, and `id` names one title, for a
+/// caller that needs only that entry. Lanes see what `GET /library` shows them, `as`
+/// included.
+#[utoipa::path(
+    get,
+    path = "/library/page",
+    tag = "library",
+    operation_id = "getLibraryPage",
+    params(
+        ("limit" = Option<u32>, Query, description = "Titles per page, 1 to 200. 60 when absent"),
+        ("cursor" = Option<String>, Query, description = "`next_cursor` of the page before"),
+        ("q" = Option<String>, Query, description = "Only titles containing this text, any case"),
+        ("provider" = Option<String>, Query, description = "Only entries owned by this external provider"),
+        ("platform" = Option<String>, Query, description = "Only entries on this platform (case-insensitive, e.g. `PS2`)"),
+        ("role" = Option<String>, Query, description = "`game` or `launcher`"),
+        ("id" = Option<String>, Query, description = "Only the entry with this library id"),
+        ("install" = Option<String>, Query, description = "`installed` (on this host) or `missing` (not installed)"),
+        ("as" = Option<String>, Query, description = "Profile id whose own play stats fill `stats.mine`"),
+    ),
+    responses(
+        (status = OK, description = "One page, the total and the platform counts", body = LibraryPage),
+        (status = BAD_REQUEST, description = "The cursor isn't one this host issued", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn get_library_page(
+    Extension(lane): Extension<AuthLane>,
+    Query(q): Query<LibraryPageQuery>,
+    Query(who): Query<AsProfile>,
+) -> Response {
+    let after = match q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        None => None,
+        Some(c) => match decode_cursor(c) {
+            Some(key) => Some(key),
+            None => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "That page marker isn't valid. Load the list again from the start",
+                )
+            }
+        },
+    };
+    let limit = q.limit.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX) as usize;
+    // Rows borrow the kept list: only the titles of this page are copied out of it.
+    let library = crate::library::sorted_games();
+    let hidden = crate::library::hidden_ids();
+    let needle = q.q.as_deref().map(str::trim).unwrap_or("").to_lowercase();
+    let narrow = LibraryQuery {
+        provider: q.provider.clone(),
+        platform: None,
+    };
+    let mut rows: Vec<(&crate::library::GameEntry, bool)> = library
+        .iter()
+        .map(|g| (g, hidden.contains(&g.id)))
+        // Only the operator's lane sees a hidden title.
+        .filter(|(_, hidden)| lane.is_operator() || !hidden)
+        .filter(|(g, _)| {
+            matches_query(g, &narrow)
+                && (needle.is_empty() || g.title.to_lowercase().contains(&needle))
+                && q.id.as_deref().is_none_or(|id| g.id == id)
+                && match q.role.as_deref() {
+                    Some("launcher") => g.role == crate::library::GameRole::Launcher,
+                    Some("game") => g.role != crate::library::GameRole::Launcher,
+                    _ => true,
+                }
+        })
+        .collect();
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for (g, _) in &rows {
+        if let Some(p) = g.meta.platform.as_deref().filter(|p| !p.is_empty()) {
+            *counts.entry(p.to_string()).or_default() += 1;
+        }
+    }
+    let mut platforms: Vec<PlatformCount> = counts
+        .into_iter()
+        .map(|(platform, count)| PlatformCount { platform, count })
+        .collect();
+    platforms.sort_by(|a, b| b.count.cmp(&a.count).then(a.platform.cmp(&b.platform)));
+
+    let by_platform = LibraryQuery {
+        provider: None,
+        platform: q.platform.clone(),
+    };
+    rows.retain(|(g, _)| matches_query(g, &by_platform));
+    let missing = |g: &crate::library::GameEntry| g.install.as_ref().is_some_and(|i| i.missing());
+    let not_installed = rows.iter().filter(|(g, _)| missing(g)).count();
+    match q.install.as_deref() {
+        Some("missing") => rows.retain(|(g, _)| missing(g)),
+        Some("installed") => rows.retain(|(g, _)| !missing(g)),
+        _ => {}
+    }
+    let total = rows.len();
+    // The library arrives sorted by `sort_key` and the filters keep that order.
+    let start = after.map_or(0, |key| rows.partition_point(|(g, _)| sort_key(g) <= key));
+    let more = rows.len() > start + limit;
+    let mut items: Vec<crate::library::OperatorGameEntry> = rows
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .map(|(g, hidden)| crate::library::OperatorGameEntry {
+            entry: g.clone(),
+            hidden,
+        })
+        .collect();
+    let next_cursor = more
+        .then(|| items.last().map(|r| encode_cursor(&sort_key(&r.entry))))
+        .flatten();
+    crate::library::downloads::fill_free(items.iter_mut().map(|r| &mut r.entry));
+    who.fill(items.iter_mut().map(|r| &mut r.entry));
+    for r in &mut items {
+        crate::library::proxy_art(&r.entry.id, &mut r.entry.art);
+        redact_for_lane(&mut r.entry, &lane);
+    }
+    Json(LibraryPage {
+        items,
+        next_cursor,
+        total,
+        platforms,
+        not_installed,
+    })
+    .into_response()
+}
+
+/// Shared by both `get_library` arms so the filters cannot drift.
+fn matches_query(g: &crate::library::GameEntry, q: &LibraryQuery) -> bool {
+    if let Some(provider) = q.provider.as_deref().filter(|p| !p.is_empty()) {
+        if g.provider.as_deref() != Some(provider) {
+            return false;
+        }
+    }
+    if let Some(platform) = q.platform.as_deref().filter(|p| !p.is_empty()) {
+        if !g
+            .meta
+            .platform
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(platform))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct HiddenToggle {
+    hidden: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct HiddenState {
+    id: String,
+    hidden: bool,
+}
+
+/// Hide or un-hide one library title.
+///
+/// Curation, not access control: the title leaves every play surface and launch resolution
+/// but is not deleted. The operator console still lists it (`hidden: true`) so it can return.
+/// The id is not required to exist now — a plugin mid-sync or an unmounted drive would
+/// otherwise refuse a choice that should stick. Emits `library.changed` only on a real change.
+#[utoipa::path(
+    put,
+    path = "/library/hidden/{id}",
+    tag = "library",
+    operation_id = "setLibraryEntryHidden",
+    params(("id" = String, Path, description = "The library entry id (e.g. `steam:70`)")),
+    request_body = HiddenToggle,
+    responses(
+        (status = OK, description = "Stored; the entry's visibility after the call", body = HiddenState),
+        (status = BAD_REQUEST, description = "Empty entry id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the settings", body = ApiError),
+    )
+)]
+pub(crate) async fn set_library_entry_hidden(
+    Path(id): Path<String>,
+    ApiJson(toggle): ApiJson<HiddenToggle>,
+) -> Response {
+    if id.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "entry id must not be empty");
+    }
+    match crate::library::set_entry_hidden(&id, toggle.hidden) {
+        Ok(hidden) => {
+            tracing::info!(entry = %id, hidden, "management API: library entry visibility set");
+            Json(HiddenState { id, hidden }).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct ScannerToggle {
+    enabled: bool,
+}
+
+/// List library sources
+///
+/// One row per installed library plugin, with its enable state. Sources default to
+/// enabled; disabling hides titles from the next read. The custom store is not a
+/// source and is always on. Every row is
+/// `origin: "plugin"`.
+#[utoipa::path(
+    get,
+    path = "/library/scanners",
+    tag = "library",
+    operation_id = "listLibraryScanners",
+    responses(
+        (status = OK, description = "This host's scanners with their enable state", body = [crate::library::ScannerInfo]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn list_library_scanners() -> Json<Vec<crate::library::ScannerInfo>> {
+    Json(crate::library::list_scanners())
+}
+
+/// Enable or disable a library source.
+///
+/// Takes effect on the next library read. Disabling hides titles; the plugin may keep
+/// reconciling while off. Nothing is deleted. Emits `library.changed` when the state changes.
+#[utoipa::path(
+    put,
+    path = "/library/scanners/{id}",
+    tag = "library",
+    operation_id = "setLibraryScanner",
+    params(("id" = String, Path, description = "The scanner id (e.g. `steam`)")),
+    request_body = ScannerToggle,
+    responses(
+        (status = OK, description = "Toggle stored; the full scanner list", body = [crate::library::ScannerInfo]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = FORBIDDEN, description = "A plugin toggled another plugin's source", body = ApiError),
+        (status = NOT_FOUND, description = "No such scanner on this platform", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the settings", body = ApiError),
+    )
+)]
+pub(crate) async fn set_library_scanner(
+    OwnedId(id, _): OwnedId<AnyId>,
+    ApiJson(toggle): ApiJson<ScannerToggle>,
+) -> Response {
+    match crate::library::set_scanner_enabled(&id, toggle.enabled) {
+        Ok(Some(scanners)) => {
+            tracing::info!(
+                scanner = %id,
+                enabled = toggle.enabled,
+                "management API: library scanner toggled"
+            );
+            Json(scanners).into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "no such scanner on this platform"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Create a custom title
+///
+/// A user-curated entry. The host assigns a stable id, returned in the body.
+#[utoipa::path(
+    post,
+    path = "/library/custom",
+    tag = "library",
+    operation_id = "createCustomGame",
+    request_body = crate::library::CustomInput,
+    responses(
+        (status = CREATED, description = "Entry created", body = crate::library::CustomEntry),
+        (status = BAD_REQUEST, description = "Empty title", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the catalog", body = ApiError),
+    )
+)]
+pub(crate) async fn create_custom_game(
+    Extension(lane): Extension<AuthLane>,
+    ApiJson(input): ApiJson<crate::library::CustomInput>,
+) -> Response {
+    if input.title.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
+    }
+    if let Some((_, denied)) = check_entry_fields(
+        lane,
+        &input.art,
+        input.launch.as_ref(),
+        input.prep.as_deref().unwrap_or(&[]),
+        input.icon.as_deref(),
+    ) {
+        return denied;
+    }
+    match crate::library::add_custom(input) {
+        Ok(entry) => (StatusCode::CREATED, Json(entry)).into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// One custom entry as stored, `detect` and `prep` included
+///
+/// Operator lane only: the hint names host paths, which is why the catalog read
+/// model leaves it out. The paired-cert allowlist names `GET /library` exactly.
+#[utoipa::path(
+    get,
+    path = "/library/custom/{id}",
+    tag = "library",
+    operation_id = "getCustomGame",
+    params(("id" = String, Path, description = "The custom entry id (without the `custom:` prefix)")),
+    responses(
+        (status = OK, description = "The stored entry", body = crate::library::CustomEntry),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = NOT_FOUND, description = "No custom entry with that id", body = ApiError),
+    )
+)]
+pub(crate) async fn get_custom_game(Path(id): Path<String>) -> Response {
+    match crate::library::get_custom(&id) {
+        Some(entry) => Json(entry).into_response(),
+        None => api_error(StatusCode::NOT_FOUND, "no custom entry with that id"),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/library/custom/{id}",
+    tag = "library",
+    operation_id = "updateCustomGame",
+    params(("id" = String, Path, description = "The custom entry id (without the `custom:` prefix)")),
+    request_body = crate::library::CustomInput,
+    responses(
+        (status = OK, description = "Entry updated", body = crate::library::CustomEntry),
+        (status = BAD_REQUEST, description = "Empty title", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = FORBIDDEN, description = "A plugin named a row its own provider does not publish", body = ApiError),
+        (status = NOT_FOUND, description = "No custom entry with that id", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the catalog", body = ApiError),
+    )
+)]
+pub(crate) async fn update_custom_game(
+    Extension(lane): Extension<AuthLane>,
+    who: Option<Extension<PluginIdentity>>,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<crate::library::CustomInput>,
+) -> Response {
+    if input.title.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
+    }
+    if let Some((_, denied)) = check_entry_fields(
+        lane,
+        &input.art,
+        input.launch.as_ref(),
+        input.prep.as_deref().unwrap_or(&[]),
+        input.icon.as_deref(),
+    ) {
+        return denied;
+    }
+    if let Some(denied) = not_the_plugins_row(lane, who, &id) {
+        return denied;
+    }
+    use crate::library::MutateOutcome;
+    match crate::library::update_custom(&id, input) {
+        Ok(MutateOutcome::Done(entry)) => Json(entry).into_response(),
+        Ok(MutateOutcome::NotFound) => {
+            api_error(StatusCode::NOT_FOUND, "no custom entry with that id")
+        }
+        Ok(MutateOutcome::ProviderOwned(p)) => api_error(
+            StatusCode::CONFLICT,
+            &format!("entry is owned by provider `{p}` — update it through its reconcile"),
+        ),
+        // Manual CRUD never requests a store claim; this arm is a programming error.
+        Ok(MutateOutcome::StoreClaimed { .. }) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The entry wasn't updated — the host hit an unexpected state",
+        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[utoipa::path(
+    delete,
+    path = "/library/custom/{id}",
+    tag = "library",
+    operation_id = "deleteCustomGame",
+    params(("id" = String, Path, description = "The custom entry id (without the `custom:` prefix)")),
+    responses(
+        (status = NO_CONTENT, description = "Entry deleted"),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = FORBIDDEN, description = "A plugin named a row its own provider does not publish", body = ApiError),
+        (status = NOT_FOUND, description = "No custom entry with that id", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the catalog", body = ApiError),
+    )
+)]
+pub(crate) async fn delete_custom_game(
+    Extension(lane): Extension<AuthLane>,
+    who: Option<Extension<PluginIdentity>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(denied) = not_the_plugins_row(lane, who, &id) {
+        return denied;
+    }
+    use crate::library::MutateOutcome;
+    match crate::library::delete_custom(&id) {
+        Ok(MutateOutcome::Done(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(MutateOutcome::NotFound) => {
+            api_error(StatusCode::NOT_FOUND, "no custom entry with that id")
+        }
+        Ok(MutateOutcome::ProviderOwned(p)) => api_error(
+            StatusCode::CONFLICT,
+            &format!(
+                "entry is owned by provider `{p}` — remove it there, or DELETE the provider set"
+            ),
+        ),
+        // Manual CRUD never requests a store claim; this arm is a programming error.
+        Ok(MutateOutcome::StoreClaimed { .. }) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The entry wasn't deleted — the host hit an unexpected state",
+        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// On the plugin lane, a stored row its caller's provider does not publish answers 403: the
+/// operator's rows and another plugin's are not a plugin's to change. The shared runner token
+/// names no provider, so it owns none. An unknown id falls through to the 404.
+fn not_the_plugins_row(
+    lane: AuthLane,
+    who: Option<Extension<PluginIdentity>>,
+    id: &str,
+) -> Option<Response> {
+    if lane != AuthLane::Plugin {
+        return None;
+    }
+    let row = crate::library::get_custom(id)?;
+    let own = who.is_some_and(|Extension(PluginIdentity(me))| row.provider == Some(me));
+    (!own).then(|| {
+        api_error(
+            StatusCode::FORBIDDEN,
+            "A plugin can change only the library rows it publishes.",
+        )
+    })
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ProviderRemoved {
+    removed: usize,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ReconcileQuery {
+    /// Claim this store so entries take `<store>:<external_id>` instead of `custom:<id>`.
+    store: Option<String>,
+}
+
+/// Replace a provider's entries
+///
+/// The payload is the desired set, keyed by `external_id`. The host diffs, keeps surviving
+/// host ids stable, and drops orphans. Empty array removes everything this provider owns.
+/// Emits `library.changed` with the provider as `source` when its rows or claim change.
+///
+/// `?store=` claims that store: entries surface as `<store>:<external_id>` with the store
+/// badge. One provider per store; a second claimant gets 409. Release the claim with
+/// `DELETE`, not an empty reconcile — a store can have zero installed titles.
+#[utoipa::path(
+    put,
+    path = "/library/provider/{provider}",
+    tag = "library",
+    operation_id = "reconcileProviderEntries",
+    params(
+        ("provider" = String, Path, description = "The provider id ([a-z0-9._-], `manual` reserved)"),
+        ("store" = Option<String>, Query, description = "Claim this store for the provider ([a-z0-9_-], `custom`/`manual` reserved)"),
+    ),
+    request_body = Vec<crate::library::ProviderEntryInput>,
+    responses(
+        (status = OK, description = "The provider's resulting entries (host ids assigned/kept)", body = [crate::library::CustomEntry]),
+        (status = BAD_REQUEST, description = "Invalid provider id, store id, or payload", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = CONFLICT, description = "That store is already claimed by another provider", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the catalog", body = ApiError),
+    )
+)]
+pub(crate) async fn reconcile_provider_entries(
+    Extension(lane): Extension<AuthLane>,
+    OwnedId(provider, _): OwnedId<ProviderId>,
+    Query(q): Query<ReconcileQuery>,
+    ApiJson(mut inputs): ApiJson<Vec<crate::library::ProviderEntryInput>>,
+) -> Response {
+    let store = q.store.filter(|s| !s.is_empty());
+    if let Some(store) = &store {
+        if let Err(e) = crate::library::validate_store_claim(store) {
+            return api_error(StatusCode::BAD_REQUEST, &e);
+        }
+    }
+    match crate::library::validate_provider_payload(&provider, &mut inputs) {
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, &e),
+        // One warn per reconcile: a template that misses its roots misses every entry.
+        Ok(dropped) => {
+            if let Some((id, reason)) = dropped.first() {
+                tracing::warn!(
+                    provider,
+                    dropped = dropped.len(),
+                    first = %id,
+                    reason = %reason,
+                    "library reconcile dropped entries this host would not launch"
+                );
+            }
+        }
+    }
+    // Check every entry: one privileged field anywhere is one command the host would run.
+    // Art is not in this refusal — an unservable cover is stripped below so one bad
+    // thumbnail cannot drop the store. Privileged fields still 403 the write.
+    for (i, e) in inputs.iter().enumerate() {
+        if let Some((reason, denied)) =
+            check_privileged_fields(lane, e.launch.as_ref(), &e.prep, e.icon.as_deref())
+        {
+            tracing::warn!(
+                provider,
+                index = i,
+                title = %e.title,
+                reason = %reason,
+                "library reconcile refused"
+            );
+            return denied;
+        }
+    }
+    // A launcher this host cannot open is a fact about the box; drop that tile, not the set.
+    for (title, value) in crate::library::sanitize_launcher_entries(&mut inputs) {
+        tracing::warn!(
+            provider,
+            launcher = %value,
+            title = %title,
+            "library reconcile: dropped a launcher tile this host cannot open — the rest of the \
+             payload still syncs. Install the launcher, or turn the tile off in the plugin's config"
+        );
+    }
+    // One warn for the batch: a root mismatch misses every cover; per-entry would flood the log.
+    let mut dropped_art = 0usize;
+    let mut first_dropped: Option<(String, &'static str, String)> = None;
+    for e in inputs.iter_mut() {
+        for (field, value) in crate::library::sanitize_art_paths(&mut e.art) {
+            dropped_art += 1;
+            first_dropped.get_or_insert_with(|| (e.title.clone(), field, value));
+        }
+    }
+    if let Some((title, field, path)) = first_dropped {
+        tracing::warn!(
+            provider,
+            dropped = dropped_art,
+            example_title = %title,
+            example_field = field,
+            example_path = %path,
+            "library reconcile: dropped local art the proxy may not serve — these entries still \
+             sync, but their covers will be blank. The path must be an image file (jpg/png/webp/\
+             gif/bmp/ico/tga) inside an allowed art root; set PUNKTFUNK_LIBRARY_ART_ROOTS if this \
+             library's art lives outside the defaults"
+        );
+    }
+    match crate::library::reconcile_provider(&provider, store.as_deref(), inputs) {
+        Ok(crate::library::MutateOutcome::Done(entries)) => {
+            tracing::info!(
+                provider,
+                store = store.as_deref().unwrap_or("-"),
+                count = entries.len(),
+                "library provider reconciled"
+            );
+            Json(entries).into_response()
+        }
+        Ok(crate::library::MutateOutcome::StoreClaimed { store, provider }) => api_error(
+            StatusCode::CONFLICT,
+            &format!("store `{store}` is already claimed by provider `{provider}`"),
+        ),
+        Ok(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The library wasn't updated — the host hit an unexpected state",
+        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Delete a provider's entries
+///
+/// Everything owned by `{provider}`, for plugin uninstall. Emits `library.changed`
+/// when anything was removed.
+#[utoipa::path(
+    delete,
+    path = "/library/provider/{provider}",
+    tag = "library",
+    operation_id = "deleteProviderEntries",
+    params(("provider" = String, Path, description = "The provider id")),
+    responses(
+        (status = OK, description = "How many entries were removed", body = ProviderRemoved),
+        (status = BAD_REQUEST, description = "Invalid provider id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the catalog", body = ApiError),
+    )
+)]
+pub(crate) async fn delete_provider_entries(OwnedId(provider, _): OwnedId<ProviderId>) -> Response {
+    match crate::library::delete_provider(&provider) {
+        Ok(removed) => {
+            if removed > 0 {
+                tracing::info!(provider, removed, "library provider entries removed");
+            }
+            // Entries are gone; drop the liveness lease so a missing provider cannot hold it open.
+            crate::runstate::forget(&provider);
+            Json(ProviderRemoved { removed }).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct RunningTitle {
+    /// Same key the reconcile payload uses.
+    pub external_id: String,
+    /// Pid the provider started, when it knows one. Re-resolved and pinned to start time
+    /// before any signal; a stale or recycled pid contributes nothing.
+    #[serde(default)]
+    pub pid: Option<u32>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct ProviderRunningInput {
+    /// Complete running set, not a delta: anything absent is reported as stopped.
+    #[serde(default)]
+    pub running: Vec<RunningTitle>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ProviderRunningAccepted {
+    matched: usize,
+    /// Ignored because no such entry exists (report raced a reconcile).
+    unknown: usize,
+    /// Seconds this report stays authoritative without being restated.
+    ttl_s: u64,
+}
+
+/// Report which of a provider's titles are running.
+///
+/// Live counterpart to reconcile `detect` hints: the body is the complete running set
+/// ([`crate::runstate`]). Missed events and plugin restarts self-correct on the next PUT.
+///
+/// Authoritative for [`crate::runstate::REPORT_TTL`] unless restated; a dead plugin then
+/// falls back to process scanning. Re-report on change and on a timer inside the window.
+/// Titles the provider does not currently publish count as `unknown`, not an error — a
+/// report may race its own reconcile.
+#[utoipa::path(
+    put,
+    path = "/library/provider/{provider}/running",
+    tag = "library",
+    operation_id = "reportProviderRunning",
+    params(("provider" = String, Path, description = "The provider id ([a-z0-9._-], `manual` reserved)")),
+    request_body = ProviderRunningInput,
+    responses(
+        (status = OK, description = "The report was accepted", body = ProviderRunningAccepted),
+        (status = BAD_REQUEST, description = "Invalid provider id or payload", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = FORBIDDEN, description = "A plugin reported another plugin's titles", body = ApiError),
+    )
+)]
+pub(crate) async fn report_provider_running(
+    // Another plugin's report would end or prolong that provider's game lease.
+    OwnedId(provider, _): OwnedId<ProviderId>,
+    ApiJson(input): ApiJson<ProviderRunningInput>,
+) -> Response {
+    // Map the provider's `external_id`s to catalog library ids. Only published entries
+    // resolve, so a report cannot name a title it does not own.
+    let mine: Vec<(String, String)> = crate::library::load_custom()
+        .into_iter()
+        .filter(|e| e.provider.as_deref() == Some(provider.as_str()))
+        .filter_map(|e| {
+            let external = e.external_id.clone()?;
+            Some((external, crate::library::library_id_for(&e)))
+        })
+        .collect();
+    let owned: std::collections::HashSet<String> = mine.iter().map(|(_, id)| id.clone()).collect();
+
+    let mut running = std::collections::HashMap::new();
+    let mut unknown = 0usize;
+    for t in &input.running {
+        match mine.iter().find(|(external, _)| *external == t.external_id) {
+            Some((_, id)) => {
+                running.insert(id.clone(), t.pid);
+            }
+            None => unknown += 1,
+        }
+    }
+    let matched = running.len();
+    tracing::debug!(
+        provider,
+        owned = owned.len(),
+        matched,
+        unknown,
+        "provider liveness report"
+    );
+    crate::runstate::report(&provider, owned, running);
+    Json(ProviderRunningAccepted {
+        matched,
+        unknown,
+        ttl_s: crate::runstate::REPORT_TTL.as_secs(),
+    })
+    .into_response()
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct MetadataAccepted {
+    /// Entries the host kept.
+    entries: usize,
+    /// Values dropped because the host does not store them (non-`http(s)` art, overlong text).
+    dropped: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct MetadataRemoved {
+    removed: bool,
+}
+
+/// Replace an Art & Metadata source's result
+///
+/// Everything the source has, keyed by library id: art for the four slots and `GameMeta`
+/// fields. The host merges it into `GET /library` at read time; a source fills only what the
+/// entry lacks unless the operator set it to replace art. A value the host does not store is
+/// dropped, not refused. A new source takes its place in the order by `matching`, exact first.
+/// Emits `library.changed` with the source as `source` when anything changed.
+#[utoipa::path(
+    put,
+    path = "/library/metadata/{source}",
+    tag = "library",
+    operation_id = "putLibraryMetadata",
+    params(("source" = String, Path, description = "The source's plugin id ([a-z0-9._-], `manual` reserved)")),
+    request_body = crate::library::MetadataInput,
+    responses(
+        (status = OK, description = "Stored; what the host kept", body = MetadataAccepted),
+        (status = BAD_REQUEST, description = "Invalid source id or payload", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = FORBIDDEN, description = "A plugin wrote another plugin's source", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the result", body = ApiError),
+    )
+)]
+pub(crate) async fn put_library_metadata(
+    OwnedId(source, _): OwnedId<ProviderId>,
+    ApiJson(input): ApiJson<crate::library::MetadataInput>,
+) -> Response {
+    match crate::library::put_metadata(&source, input) {
+        Ok((entries, dropped)) => {
+            if dropped > 0 {
+                tracing::warn!(
+                    source,
+                    dropped,
+                    "library metadata: dropped values the host does not store — art must be an \
+                     http(s) URL, short fields at most 256 characters"
+                );
+            }
+            tracing::debug!(source, entries, "library metadata stored");
+            Json(MetadataAccepted { entries, dropped }).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Forget an Art & Metadata source
+///
+/// Its result and its place in the order, for plugin uninstall. Emits `library.changed`
+/// when there was anything to forget.
+#[utoipa::path(
+    delete,
+    path = "/library/metadata/{source}",
+    tag = "library",
+    operation_id = "deleteLibraryMetadata",
+    params(("source" = String, Path, description = "The source's plugin id")),
+    responses(
+        (status = OK, description = "Whether anything was removed", body = MetadataRemoved),
+        (status = BAD_REQUEST, description = "Invalid source id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = FORBIDDEN, description = "A plugin removed another plugin's source", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the settings", body = ApiError),
+    )
+)]
+pub(crate) async fn delete_library_metadata(OwnedId(source, _): OwnedId<ProviderId>) -> Response {
+    match crate::library::delete_metadata(&source) {
+        Ok(removed) => Json(MetadataRemoved { removed }).into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// List Art & Metadata sources
+///
+/// Every source that has pushed a result, in the operator's order, with its switches and how
+/// many entries it has something for.
+#[utoipa::path(
+    get,
+    path = "/library/metadata",
+    tag = "library",
+    operation_id = "listLibraryMetadata",
+    responses(
+        (status = OK, description = "Sources in the operator's order", body = [crate::library::MetadataSourceInfo]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn list_library_metadata() -> Json<Vec<crate::library::MetadataSourceInfo>> {
+    Json(crate::library::list_metadata_sources())
+}
+
+/// Order and switch Art & Metadata sources
+///
+/// The array is the new order; each row sets `enabled` and `replace` ("Use for every game",
+/// art only). A source the array leaves out keeps its switches and goes after the named ones.
+/// Emits `library.changed`.
+#[utoipa::path(
+    put,
+    path = "/library/metadata",
+    tag = "library",
+    operation_id = "setLibraryMetadata",
+    request_body = Vec<crate::library::MetadataSourceUpdate>,
+    responses(
+        (status = OK, description = "Stored; the sources in their new order", body = [crate::library::MetadataSourceInfo]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the settings", body = ApiError),
+    )
+)]
+pub(crate) async fn set_library_metadata(
+    ApiJson(updates): ApiJson<Vec<crate::library::MetadataSourceUpdate>>,
+) -> Response {
+    match crate::library::set_metadata_sources(&updates) {
+        Ok(sources) => {
+            tracing::info!(
+                sources = sources.len(),
+                "management API: metadata sources set"
+            );
+            Json(sources).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Pick the art for one slot of a library entry
+///
+/// The operator's choice beats the entry's own art and every metadata source, and survives
+/// the provider's next reconcile. `url: null` clears the pick. The id is not required to
+/// exist now, as with hiding. Emits `library.changed`.
+#[utoipa::path(
+    put,
+    path = "/library/picks/{id}",
+    tag = "library",
+    operation_id = "setLibraryArtPick",
+    params(("id" = String, Path, description = "The library entry id (e.g. `steam:70`)")),
+    request_body = crate::library::ArtPickInput,
+    responses(
+        (status = OK, description = "Stored; the entry's picks after the call", body = crate::library::Artwork),
+        (status = BAD_REQUEST, description = "Empty id, unknown kind, or a URL that is not http(s)", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the picks", body = ApiError),
+    )
+)]
+pub(crate) async fn set_library_art_pick(
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<crate::library::ArtPickInput>,
+) -> Response {
+    if id.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "entry id must not be empty");
+    }
+    let Some(kind) = crate::library::ArtKind::parse(&input.kind) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "kind must be portrait, hero, logo or header",
+        );
+    };
+    if input
+        .url
+        .as_deref()
+        .is_some_and(|u| !crate::library::valid_remote_url(u))
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "url must be an http(s) URL of at most 2048 characters",
+        );
+    }
+    match crate::library::set_art_pick(&id, kind, input.url) {
+        Ok(picks) => {
+            tracing::info!(entry = %id, kind = kind.name(), "management API: library art picked");
+            Json(picks).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Stream one cover-art image for a library entry.
+///
+/// Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for a catalog id and returns the
+/// bytes: a launcher's cover cache on the host disk, or a remote URL the host fetches once on
+/// the first miss and then serves from its own store. Unknown id or kind is 404 so the client
+/// can try the next candidate, and so is a URL the fetch refused — `GET /library` advertises
+/// that one verbatim again. The response carries `Cache-Control` and an `ETag` of the bytes; a
+/// request whose `If-None-Match` names that tag gets 304 with no body. On a Linux door the
+/// covers are in the owner's home, and the owner's host serves them while it runs.
+#[utoipa::path(
+    get,
+    path = "/library/art/{id}/{kind}",
+    tag = "library",
+    operation_id = "getLibraryArt",
+    params(
+        ("id" = String, Path, description = "The store-qualified library id, e.g. `steam:570`"),
+        ("kind" = String, Path, description = "`portrait` | `hero` | `logo` | `header`"),
+        ("If-None-Match" = Option<String>, Header, description = "An `ETag` from an earlier response"),
+    ),
+    responses(
+        (status = OK, description = "Image bytes", content_type = "image/jpeg"),
+        (status = NOT_MODIFIED, description = "The tag in `If-None-Match` is current"),
+        (status = UNAUTHORIZED, description = "Missing or invalid credentials", body = ApiError),
+        (status = NOT_FOUND, description = "No art of that kind for that id", body = ApiError),
+    )
+)]
+pub(crate) async fn get_library_art(
+    Path((id, kind)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(kind) = crate::library::ArtKind::parse(&kind) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown art kind");
+    };
+    // Any catalog id (manual, provider, claimed-store) serves its local file from here.
+    // The proxy does not know which store the id belongs to.
+    let stored = tokio::task::spawn_blocking(move || {
+        crate::library::library_art_bytes(&id, kind).or_else(|| owner_art(&id, kind))
+    })
+    .await;
+    if let Ok(Some((bytes, ctype))) = stored {
+        // The tag is the bytes' hash: a replaced cover misses, an unchanged one revalidates
+        // for free. A day of freshness keeps a shelf revisit off the network entirely.
+        let etag = format!("\"{}\"", hex::encode(&Sha256::digest(&bytes)[..16]));
+        let cache = [
+            (header::CACHE_CONTROL, "public, max-age=86400".to_string()),
+            (header::ETAG, etag.clone()),
+        ];
+        let sent = headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok());
+        if not_modified(sent, &etag) {
+            return (StatusCode::NOT_MODIFIED, cache).into_response();
+        }
+        let [cc, et] = cache;
+        return ([cc, et, (header::CONTENT_TYPE, ctype)], bytes).into_response();
+    }
+    api_error(StatusCode::NOT_FOUND, "no art of that kind for this title")
+}
+
+/// The door's library is a copy of the owner's, whose covers sit in the owner's home where the
+/// door can't read: the owner's host serves them. `None` off a door, for a title the door doesn't
+/// list, and while that host is down; a cover never starts the owner's session. Blocking.
+fn owner_art(id: &str, kind: crate::library::ArtKind) -> Option<(Vec<u8>, String)> {
+    if !pf_paths::seat::role().is_door() {
+        return None;
+    }
+    crate::library::entry_for_library_id(id)?;
+    // The shared snapshot: a page asks for every cover at once.
+    let seats = crate::seats::snapshot();
+    let path = format!("library/art/{}/{}", path_segment(id), kind.name());
+    let owner = seats.owner().ok().flatten()?;
+    match crate::seats::forward(owner, super::owner::Forwarded::get(path))? {
+        super::owner::Answer::Reply(200, Some(ctype), bytes) if ctype.starts_with("image/") => {
+            Some((bytes, ctype))
+        }
+        _ => None,
+    }
+}
+
+/// `s` as one path segment: unreserved characters, `:` and `@` stay, every other byte is
+/// percent-encoded.
+pub(super) fn path_segment(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' | b'@' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Whether an `If-None-Match` value names `etag`: a list, `*`, or a weak `W/` form of it.
+pub(super) fn not_modified(if_none_match: Option<&str>, etag: &str) -> bool {
+    if_none_match.is_some_and(|v| {
+        v.split(',')
+            .map(|t| t.trim().trim_start_matches("W/"))
+            .any(|t| t == "*" || t == etag)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{not_modified, path_segment};
+
+    /// A library id reaches the owner's host as the one segment it is on the door.
+    #[test]
+    fn a_library_id_stays_one_path_segment() {
+        assert_eq!(path_segment("steam:570"), "steam:570");
+        assert_eq!(path_segment("heroic:a b/c?d"), "heroic:a%20b%2Fc%3Fd");
+        assert_eq!(path_segment("rom:é"), "rom:%C3%A9");
+    }
+
+    #[test]
+    fn if_none_match_forms() {
+        let tag = "\"abc\"";
+        assert!(not_modified(Some("\"abc\""), tag));
+        assert!(not_modified(Some("\"x\", \"abc\""), tag));
+        assert!(not_modified(Some("W/\"abc\""), tag));
+        assert!(not_modified(Some("*"), tag));
+        assert!(!not_modified(Some("\"abd\""), tag));
+        assert!(
+            !not_modified(Some("abc"), tag),
+            "an unquoted tag is not ours"
+        );
+        assert!(!not_modified(None, tag));
+    }
+}

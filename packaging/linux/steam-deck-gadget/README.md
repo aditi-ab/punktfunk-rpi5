@@ -29,6 +29,8 @@ SteamOS ships every piece (`CONFIG_USB_DUMMY_HCD=m`, `CONFIG_USB_RAW_GADGET=m`,
   gcc -O2 -static -pthread -o deck_raw_gadget deck_raw_gadget.c
   ```
   Run as root with `dummy_hcd` + `raw_gadget` loaded: `./deck_raw_gadget [seconds]`.
+  `deck_raw_gadget_test.c` checks what each control request puts on ep0, on any Linux box, no
+  device: `gcc -O2 -o deck_raw_gadget_test deck_raw_gadget_test.c -lpthread && ./deck_raw_gadget_test`.
 - **`configfs_gadget_up.sh` / `_down.sh`** — the simpler **configfs `f_hid`** variant. It proves the
   structure (interface 2 → `hid-steam` binds → Steam *opens* it + *reserves an XInput slot*) but
   `f_hid` cannot serve HID feature reports, so Steam can't read controller details and drops it as a
@@ -59,7 +61,7 @@ Steam Input, which exposes its own X-Box 360 pad — exactly a real Deck's behav
 ## Host backend (shipped — default on for SteamOS)
 
 The C PoC's transport is ported to a Rust host gamepad backend:
-`crates/punktfunk-host/src/inject/linux/steam_gadget.rs` (`SteamDeckGadget`), driven by the same
+`crates/host/punktfunk-host/src/inject/linux/steam_gadget.rs` (`SteamDeckGadget`), driven by the same
 `steam_proto` serializer as the UHID `SteamDeckPad`. The Steam-Deck manager
 (`inject/linux/steam_controller.rs`) selects per-pad between **UHID** (universal) and the **USB
 gadget**: the gadget is the **default on SteamOS hosts** (`gadget_preferred()` → `ID=steamos`;

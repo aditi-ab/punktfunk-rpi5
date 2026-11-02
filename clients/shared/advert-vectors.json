@@ -1,0 +1,42 @@
+{
+  "$comment": "What a client makes of an mDNS advert, replayed by pf-client-core (discovery::same_host, os::sanitize_os, os::os_icon_tokens), the Apple AdvertVectorTests and the Android AdvertVectorTest. `match`: a saved host and an advert are one machine when both carry a fingerprint and the two agree without regard to case, whatever their addresses; when either has none, when address and port agree. `os_chain`: the untrusted `os` TXT value cut to at most five lowercase [a-z0-9._-] tokens of 32 characters; a token with nothing left is dropped before the cap counts. `os_icon_tokens`: the sanitized chain most-specific-first, with macos read as apple and steamos as steam.",
+  "version": 1,
+  "match": [
+    { "name": "same pin, same address", "saved": { "fp": "ab12", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "ab12", "addr": "10.0.0.2", "port": 9777 }, "same": true },
+    { "name": "pins differ in case only", "saved": { "fp": "ab12", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "AB12", "addr": "10.0.0.2", "port": 9777 }, "same": true },
+    { "name": "same pin after a new lease", "saved": { "fp": "ab12", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "ab12", "addr": "10.0.0.50", "port": 9777 }, "same": true },
+    { "name": "same pin on another port", "saved": { "fp": "ab12", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "ab12", "addr": "10.0.0.2", "port": 9800 }, "same": true },
+    { "name": "second OS of a dual-boot box", "saved": { "fp": "ab12", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "cd34", "addr": "10.0.0.2", "port": 9777 }, "same": false },
+    { "name": "saved record has no pin", "saved": { "fp": "", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "ab12", "addr": "10.0.0.2", "port": 9777 }, "same": true },
+    { "name": "advert has no pin", "saved": { "fp": "ab12", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "", "addr": "10.0.0.2", "port": 9777 }, "same": true },
+    { "name": "neither has a pin", "saved": { "fp": "", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "", "addr": "10.0.0.2", "port": 9777 }, "same": true },
+    { "name": "no pin to go on and another port", "saved": { "fp": "", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "", "addr": "10.0.0.2", "port": 9800 }, "same": false },
+    { "name": "no pin to go on and another address", "saved": { "fp": "", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "", "addr": "10.0.0.3", "port": 9777 }, "same": false },
+    { "name": "one side unpinned and another address", "saved": { "fp": "ab12", "addr": "10.0.0.2", "port": 9777 }, "advert": { "fp": "", "addr": "10.0.0.3", "port": 9777 }, "same": false }
+  ],
+  "os_chain": [
+    { "raw": "windows", "expect": "windows" },
+    { "raw": "linux/fedora/bazzite", "expect": "linux/fedora/bazzite" },
+    { "raw": "linux/opensuse/opensuse-tumbleweed", "expect": "linux/opensuse/opensuse-tumbleweed" },
+    { "raw": "Linux/Fedora", "expect": "linux/fedora" },
+    { "raw": "linux/fe do ra!/§", "expect": "linux/fedora" },
+    { "raw": "a._-b/C0", "expect": "a._-b/c0" },
+    { "raw": "linux//arch", "expect": "linux/arch" },
+    { "raw": "!!!/windows", "expect": "windows" },
+    { "raw": "a/!!!/b/c/d/e/f", "expect": "a/b/c/d/e" },
+    { "raw": "a/b/c/d/e/f/g", "expect": "a/b/c/d/e" },
+    { "raw": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "expect": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+    { "raw": "///", "expect": "" },
+    { "raw": "", "expect": "" }
+  ],
+  "os_icon_tokens": [
+    { "chain": "linux/fedora/bazzite", "expect": ["bazzite", "fedora", "linux"] },
+    { "chain": "windows", "expect": ["windows"] },
+    { "chain": "macos", "expect": ["apple"] },
+    { "chain": "linux/arch/steamos", "expect": ["steam", "arch", "linux"] },
+    { "chain": "macos/steamos", "expect": ["steam", "apple"] },
+    { "chain": "Linux/Fe do!ra", "expect": ["fedora", "linux"] },
+    { "chain": "!!!", "expect": [] },
+    { "chain": "", "expect": [] }
+  ]
+}

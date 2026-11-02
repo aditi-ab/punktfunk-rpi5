@@ -14,96 +14,129 @@ extension ConsoleModel {
         else { return }
         for cmd in cmds {
             // A unit variant arrives as a bare string, one with fields as `{"Name": {…}}`.
-            if let name = cmd as? String {
-                switch name {
-                case "CancelWake": waker.cancel()
-                case "Probe": Task { await store.refreshReachability(discovery: discovery) }
-                case "LoadLicenses": pushLicenses()
-                default: break
-                }
-                continue
-            }
-            guard let cmd = cmd as? [String: Any], let (name, body) = cmd.first else { continue }
-            run(name, body as? [String: Any] ?? [:])
+            let fields = cmd as? [String: Any]
+            guard let name = cmd as? String ?? fields?.keys.first,
+                let command = ConsoleBridge.Command(rawValue: name)
+            else { continue }
+            run(command, fields?[name] as? [String: Any] ?? [:])
         }
     }
 
-    private func run(_ name: String, _ a: [String: Any]) {
-        switch name {
-        case "FetchLibrary":
+    /// No `default`: a command the console gains is a compile error here until it is handled.
+    private func run(_ command: ConsoleBridge.Command, _ a: [String: Any]) {
+        switch command {
+        case .cancelWake:
+            wakeReq = nil
+            waker.cancel()
+        case .probe: Task { await store.refreshReachability(discovery: discovery) }
+        case .loadLicenses: pushLicenses()
+        case .fetchLibrary:
+            fetchReq = (a["fp_hex"] as? String ?? "", a["req"] ?? ConsoleJSON.unasked)
             fetchLibrary(
-                addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
+                addr: a["addr"] as? String ?? "", port: port(a["port"]), mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", refreshOnly: false)
-        case "RefreshRunning":
+        case .refreshRunning:
             fetchLibrary(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", refreshOnly: true)
-        case "Pair":
+        case .pair:
             pair(
                 addr: a["addr"] as? String ?? "", port: port(a["port"]),
-                pin: a["pin"] as? String ?? "", deviceName: a["device_name"] as? String ?? "")
-        case "SendLogs":
+                pin: a["pin"] as? String ?? "", deviceName: a["device_name"] as? String ?? "",
+                req: a["req"] ?? ConsoleJSON.unasked)
+        case .requestAccess:
+            requestAccess(
+                addr: a["addr"] as? String ?? "", port: port(a["port"]),
+                fpHex: a["fp_hex"] as? String ?? "",
+                deviceName: a["device_name"] as? String ?? "", req: a["req"] ?? ConsoleJSON.unasked)
+        case .sendLogs:
             sendLogs(fp: a["fp_hex"] as? String ?? "", addr: a["addr"] as? String ?? "")
-        case "SaveHost":
+        case .saveHost:
             saveHost(
                 name: a["name"] as? String ?? "", addr: a["addr"] as? String ?? "",
                 port: port(a["port"]))
-        case "UpdateHost":
+        case .updateHost:
             updateHost(
                 key: a["key"] as? String ?? "", name: a["name"] as? String ?? "",
                 addr: a["addr"] as? String ?? "", port: port(a["port"]))
-        case "ForgetHost":
+        case .forgetHost:
             if let host = host(key: a["key"] as? String ?? "") { store.remove(host) }
-        case "SavePreset":
+        case .savePreset:
             savePreset(
                 id: a["id"] as? String ?? "", name: a["name"] as? String ?? "",
                 overrides: a["overrides"] as? [String: Any] ?? [:])
-        case "DeletePreset":
+        case .deletePreset:
             presets.delete(a["id"] as? String ?? "")
-        case "UnpairHost":
+        case .unpairHost:
             if let host = host(key: a["key"] as? String ?? "") { store.forgetIdentity(host) }
-        case "Wake":
-            wake(key: a["key"] as? String ?? "", thenConnect: a["then_connect"] as? Bool ?? false)
-        case "SetPin":
+        case .wake:
+            let key = a["key"] as? String ?? ""
+            wakeReq = (key, a["req"] ?? ConsoleJSON.unasked)
+            wake(key: key, thenConnect: a["then_connect"] as? Bool ?? false)
+        case .setPin:
             if let host = host(key: a["key"] as? String ?? ""),
                 let preset = a["preset_id"] as? String
             {
                 store.setPinned(host.id, presetID: preset, pinned: a["pin"] as? Bool ?? false)
             }
-        case "BindPreset":
-            bindPreset(key: a["key"] as? String ?? "", preset: a["preset_id"] as? String)
-        case "SetClipboard":
+        case .bindPreset:
+            bindPreset(
+                key: a["key"] as? String ?? "", game: a["game"] as? String,
+                preset: a["preset_id"] as? String)
+        case .fetchProfiles:
+            fetchProfiles(
+                addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
+                fp: a["fp_hex"] as? String ?? "")
+        case .fetchAvatar:
+            fetchAvatar(
+                addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
+                fp: a["fp_hex"] as? String ?? "", url: a["url"] as? String ?? "")
+        case .wakeProfile:
+            wakeProfile(
+                addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
+                fp: a["fp_hex"] as? String ?? "", id: a["id"] as? String ?? "")
+        case .setProfile:
+            if let host = host(key: a["key"] as? String ?? "") {
+                let pick = a["profile"] as? [String: Any]
+                store.setProfile(
+                    host.id,
+                    (pick?["id"] as? String).map {
+                        ProfilePick(
+                            id: $0, displayName: pick?["display_name"] as? String ?? "",
+                            avatar: pick?["avatar"] as? String,
+                            remember: pick?["remember"] as? Bool ?? false)
+                    })
+            }
+        case .setClipboard:
             if var host = host(key: a["key"] as? String ?? "") {
                 host.clipboardSync = a["on"] as? Bool ?? false
                 store.update(host)
             }
-        case "EndGame":
+        case .endGame:
             endGame(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", appID: a["app_id"] as? String ?? "",
                 title: a["title"] as? String ?? "")
-        case "Install":
+        case .install:
             guard let action = InstallAction(rawValue: a["action"] as? String ?? "") else { return }
             changeInstall(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", appID: a["app_id"] as? String ?? "",
                 title: a["title"] as? String ?? "", action: action)
-        case "HostAction":
+        case .hostAction:
             hostAction(
                 fp: a["fp_hex"] as? String ?? "", id: a["action_id"] as? String ?? "",
                 label: a["label"] as? String ?? "")
-        case "PadAction":
+        case .padAction:
             padAction(a["action"] as? String ?? "", key: a["pad_key"] as? String ?? "")
-        case "PadTest":
+        case .padTest:
             padTest(a["on"] as? Bool ?? false)
-        case "PromptAnswer":
+        case .promptAnswer:
             answerPrompt(id: a["id"] as? String ?? "", choice: a["choice"] as? Int)
-        case "SpeedTest":
+        case .speedTest:
             speedTest(
                 key: a["key"] as? String ?? "", addr: a["addr"] as? String ?? "",
                 port: port(a["port"]), fp: a["fp_hex"] as? String ?? "")
-        default:
-            break
         }
     }
 
@@ -146,12 +179,11 @@ extension ConsoleModel {
         Task.detached(priority: .userInitiated) { [weak self] in
             let conn: PunktfunkConnection
             do {
-                // A diagnostic session: probes only, the host's facts asked for.
+                // A diagnostic session: probes only.
                 conn = try PunktfunkConnection(
                     host: addr, port: port, width: 1280, height: 720, refreshHz: 60,
                     pinSHA256: pin, identity: identity,
-                    deliveryFlags: PunktfunkConnection.deliveryFacts
-                        | PunktfunkConnection.deliveryProbeOnly)
+                    deliveryFlags: PunktfunkConnection.deliveryProbeOnly)
             } catch {
                 await self?.pushSpeed(key, ["Failed": "Couldn't reach \(addr) — it may be asleep."])
                 return
@@ -171,7 +203,6 @@ extension ConsoleModel {
                 "findings": r.findings.map { f -> [String: Any] in
                     [
                         "id": f.id, "severity": f.severity, "numbers": f.numbers,
-                        "profile": f.profile == 0 ? NSNull() : f.profile,
                     ]
                 },
             ]
@@ -213,11 +244,23 @@ extension ConsoleModel {
     // MARK: - library
 
     /// The shelf's catalog, its cached copy first so the grid is never empty while the fetch
-    /// runs, then what the host answers. `refreshOnly` asks about running titles alone.
-    func fetchLibrary(addr: String, mgmt: UInt16, fp: String, refreshOnly: Bool) {
-        guard let host = host(fp: fp, addr: addr, port: 0) else { return }
+    /// runs, then what the host answers; a sleeping host is woken when auto-wake is on.
+    /// `refreshOnly` asks about running titles alone. The list and phase go up under the last
+    /// `FetchLibrary`'s `req`; a refetch this model starts reuses it, and only for its host.
+    /// The host is the record `fp` pins, else the unpinned one at `addr:port` (the stream port):
+    /// never one pinned to another fingerprint, the other OS of a dual-boot box.
+    func fetchLibrary(
+        addr: String, port: UInt16 = 0, mgmt: UInt16, fp: String, refreshOnly: Bool
+    ) {
+        let placeholder = store.hosts.first {
+            $0.pinnedSHA256 == nil && $0.address == addr && $0.port == port
+        }
+        guard let host = host(fp: fp, addr: "", port: 0) ?? placeholder else { return }
+        // The console has moved off this host: no shelf to refill.
+        if !refreshOnly, fetchReq.fp != fp { return }
         if !refreshOnly { fetchSerial += 1 }
         let serial = fetchSerial
+        let req = fetchReq.req
         // The demo host serves no management API; its shelf is built in. The shot harness has
         // no host to ask, so every host shows that shelf there.
         #if DEBUG
@@ -229,89 +272,102 @@ extension ConsoleModel {
             bridge.push(.libraryRunning, ConsoleJSON.runningGames([]))
             if refreshOnly { return }
             bridge.push(.libraryBegin, "{}")
-            bridge.push(.libraryGames, ConsoleJSON.libraryGames(DemoMode.games))
-            bridge.push(.libraryPhase, "\"Ready\"")
-            pushArt(DemoMode.games, from: DemoMode.art)
+            bridge.push(.libraryGames, ConsoleJSON.libraryGames(req, DemoMode.games))
+            bridge.push(.libraryPhase, ConsoleJSON.libraryPhase(req, "Ready"))
+            let art = DemoMode.art
+            pushArt(DemoMode.games) { try? await art.data(for: $0) }
             return
         }
-        guard let identity = (try? ClientIdentityStore.shared.load())?.identity else {
+        guard let target = MgmtTarget.make(host: host, port: mgmt).target(orSay: { why in
+            if refreshOnly { return }
             bridge.push(
                 .libraryPhase,
                 ConsoleJSON.libraryError(
-                    title: "No identity", body: "This device has no client certificate yet.",
-                    canRetry: false))
+                    req, title: "Couldn't load the library", body: why, canRetry: false))
+        }) else { return }
+        // A running-titles refresh must not cut a list fetch short; only a new fetch does.
+        if refreshOnly {
+            Task { [weak self] in
+                let status = await LibraryClient.status(target)
+                self?.pushStatus(status, serial: serial)
+            }
             return
         }
-        // A running-titles refresh must not cut a list fetch short; only a new fetch does.
-        if !refreshOnly {
-            fetching?.cancel()
-            artTask?.cancel()
-            bridge.push(.libraryBegin, "{}")
-        }
-        let task = Task { [weak self] in
-            guard let self else { return }
-            var cached: CachedLibrary?
-            if !refreshOnly { cached = await LibraryCache.shared?.load(hostID: host.id.uuidString) }
-            if let cached {
-                bridge.push(.libraryCached, ConsoleJSON.libraryGames(cached.games))
-            }
-            let status = await LibraryClient.status(
-                address: addr, port: mgmt, certPEM: identity.certPEM, keyPEM: identity.keyPEM,
-                hostFingerprint: host.pinnedSHA256)
-            let running = status.games
-            // A newer fetch owns the shelf by the time a slow host answers: not its titles.
-            guard serial == self.fetchSerial else { return }
-            bridge.push(.libraryDownloads, ConsoleJSON.downloads(status.downloads, grants: status.grants))
-            bridge.push(.libraryRunning, ConsoleJSON.runningGames(running))
-            if refreshOnly { return }
-            do {
-                let games = try await LibraryClient.fetch(
-                    address: addr, port: mgmt, certPEM: identity.certPEM, keyPEM: identity.keyPEM,
-                    hostFingerprint: host.pinnedSHA256
-                ).launchersFirst
-                bridge.push(.libraryGames, ConsoleJSON.libraryGames(games))
-                bridge.push(.libraryPhase, games.isEmpty ? "\"Empty\"" : "\"Ready\"")
-                await LibraryCache.shared?.store(games, hostID: host.id.uuidString)
-                loadArt(games, host: host, identity: identity, mgmt: mgmt)
-            } catch {
-                // A newer fetch owns the shelf now.
-                if Task.isCancelled { return }
-                // The cached shelf stays up, marked offline; its covers come from the art cache.
-                if let cached {
-                    loadArt(cached.games, host: host, identity: identity, mgmt: mgmt)
+        fetching?.cancel()
+        artTask?.cancel()
+        artShown = []
+        bridge.push(.libraryBegin, "{}")
+        // The session binary's console wakes on the same switch.
+        let autoWake = UserDefaults.standard.object(forKey: DefaultsKey.autoWake) as? Bool
+            ?? SettingDefault.autoWake
+        let events = LibraryLoad.run(
+            target: target, hostID: host.id.uuidString, wakeMacs: host.wakeMacs, autoWake: autoWake)
+        fetching = Task { [weak self] in
+            for await event in events {
+                // A newer fetch owns the shelf by the time a slow host answers.
+                guard let self, serial == self.fetchSerial else { return }
+                switch event {
+                case .cached(let cached):
+                    bridge.push(.libraryCached, ConsoleJSON.libraryGames(req, cached.games))
+                    // The cached covers go up with the cached shelf, not after the host's answer.
+                    loadArt(cached.games, target: target, cachedOnly: true)
+                case .waking:
+                    bridge.push(.libraryStale, "1")
+                case .fetched(let games):
+                    bridge.push(.libraryGames, ConsoleJSON.libraryGames(req, games))
+                    let phase = games.isEmpty ? "Empty" : "Ready"
+                    bridge.push(.libraryPhase, ConsoleJSON.libraryPhase(req, phase))
+                    loadArt(games, target: target)
+                case .failed(_, hadCache: true):
+                    // The cached shelf stays up, marked offline, with the covers the cache held.
                     bridge.push(.libraryStale, "2")
-                    return
+                case .failed(let error, hadCache: false):
+                    bridge.push(
+                        .libraryPhase,
+                        ConsoleJSON.libraryError(
+                            req, title: "Couldn't load the library",
+                            body: error.errorDescription ?? "", canRetry: true))
+                case .status(let games, let downloads, let grants):
+                    pushStatus((games, downloads, grants), serial: serial)
                 }
-                bridge.push(
-                    .libraryPhase,
-                    ConsoleJSON.libraryError(
-                        title: "Couldn't read the library", body: "\(error)", canRetry: true))
             }
         }
-        if !refreshOnly { fetching = task }
     }
 
-    /// Posters, as they arrive. The shell decodes each at the size it draws.
-    private func loadArt(
-        _ games: [GameEntry], host: StoredHost, identity: ClientIdentity, mgmt: UInt16
+    /// What the host runs and downloads, unless a newer fetch owns the shelf.
+    private func pushStatus(
+        _ status: (games: [RunningGame], downloads: [HostDownload], grants: UInt32?), serial: Int
     ) {
-        guard let loader = try? LibraryArtLoader(
-            address: host.address, port: mgmt, certPEM: identity.certPEM,
-            keyPEM: identity.keyPEM, hostFingerprint: host.pinnedSHA256)
-        else { return }
-        pushArt(games, from: loader)
+        guard serial == fetchSerial else { return }
+        bridge.push(.libraryDownloads, ConsoleJSON.downloads(status.downloads, grants: status.grants))
+        bridge.push(.libraryRunning, ConsoleJSON.runningGames(status.games))
     }
 
-    /// Each title's first poster that loads, in the order the touch grid takes them.
-    private func pushArt(_ games: [GameEntry], from loader: any LibraryArtSource) {
+    /// Posters, as they arrive. The shell decodes each at the size it draws. `cachedOnly`
+    /// asks the disk cache alone, for a shelf whose host has not answered.
+    private func loadArt(_ games: [GameEntry], target: MgmtTarget, cachedOnly: Bool = false) {
+        let loader = LibraryArtLoader(target)
+        pushArt(games) { url in
+            if cachedOnly { return await loader.cached(for: url) }
+            return try? await loader.data(for: url)
+        }
+    }
+
+    /// Each title's first poster that loads, in the order the touch grid takes them. A title
+    /// this fetch already has a poster for is skipped.
+    private func pushArt(_ games: [GameEntry], poster: @escaping @Sendable (URL) async -> Data?) {
         artTask?.cancel()
         artTask = Task { [weak self] in
             for game in games {
-                if Task.isCancelled { return }
+                guard let self, !Task.isCancelled else { return }
+                if artShown.contains(game.id) { continue }
                 // The capsule first, then the header: the same order the touch grid takes.
                 for url in game.art.posterCandidates {
-                    guard let bytes = try? await loader.data(for: url) else { continue }
-                    self?.bridge.art(id: game.id, bytes: bytes)
+                    guard let bytes = await poster(url) else { continue }
+                    // A newer fetch owns the shelf and its `artShown` by now.
+                    if Task.isCancelled { return }
+                    bridge.art(id: game.id, bytes: bytes)
+                    artShown.insert(game.id)
                     break
                 }
             }
@@ -319,6 +375,50 @@ extension ConsoleModel {
     }
 
     // MARK: - hosts
+
+    /// The host's profile list, handed back to the shell's connect or Switch-profile screen.
+    private func fetchProfiles(addr: String, mgmt: UInt16, fp: String) {
+        guard let host = host(fp: fp, addr: addr, port: 0) else {
+            pushProfiles(fp, ["Failed": "That host is no longer saved."])
+            return
+        }
+        Task { [weak self] in
+            let answer = await ProfileFetch.list(host, mgmt: mgmt)
+            switch answer {
+            case .listed(let rows?):
+                let data = try? JSONEncoder().encode(rows)
+                let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? []
+                self?.pushProfiles(fp, ["Listed": json])
+            case .listed(nil):
+                self?.pushProfiles(fp, "NoProfiles")
+            case .failed:
+                self?.pushProfiles(fp, ["Failed": "Couldn't load the profiles."])
+            }
+        }
+    }
+
+    /// A profile's picture for the faces the shell draws. A read that fails leaves the initials.
+    private func fetchAvatar(addr: String, mgmt: UInt16, fp: String, url: String) {
+        guard let host = host(fp: fp, addr: addr, port: 0),
+              case .success(let target) = MgmtTarget.make(host: host, port: mgmt),
+              let resolved = LibraryClient.pictureURL(url, on: target)
+        else { return }
+        let loader = LibraryArtLoader(target)
+        Task { [weak self] in
+            guard let bytes = try? await loader.data(for: resolved) else { return }
+            self?.bridge.avatar(url: url, bytes: bytes)
+        }
+    }
+
+    /// Starts a profile's stopped seat. The shell polls `FetchProfiles` for `ready` itself.
+    private func wakeProfile(addr: String, mgmt: UInt16, fp: String, id: String) {
+        guard let host = host(fp: fp, addr: addr, port: 0) else { return }
+        Task { try? await ProfileFetch.wake(host, mgmt: mgmt, id: id) }
+    }
+
+    private func pushProfiles(_ fp: String, _ answer: Any) {
+        bridge.push(.profiles, ConsoleJSON.string(["fp_hex": fp, "answer": answer]))
+    }
 
     private func saveHost(name: String, addr: String, port: UInt16) {
         var host = StoredHost(name: name, address: addr)
@@ -334,9 +434,16 @@ extension ConsoleModel {
         store.update(host)
     }
 
-    private func bindPreset(key: String, preset: String?) {
+    /// The host's default binding, or with `game` that one title's. A nil `preset` clears either.
+    private func bindPreset(key: String, game: String?, preset: String?) {
         guard var host = host(key: key) else { return }
-        host.presetID = preset
+        if let game {
+            var bound = host.gamePresets ?? [:]
+            bound[game] = preset
+            host.gamePresets = bound.isEmpty ? nil : bound
+        } else {
+            host.presetID = preset
+        }
         store.update(host)
     }
 
@@ -354,11 +461,12 @@ extension ConsoleModel {
             onOnline: { [weak self] in
                 guard let self else { return }
                 bridge.push(.wake, "null")
-                if thenConnect { actions.connect(host, .inherit) }
+                if thenConnect { actions.connect(host, .inherit, host.pickedProfile?.id) }
             })
     }
 
-    /// The wake card the shell draws, from the waker's own state.
+    /// The wake card the shell draws, from the waker's own state: under the console's `Wake`
+    /// for that row, else unasked, which the console shows only with no card of its own up.
     func pushWake() {
         guard let waking = waker.waking, let host = store.hosts.first(where: { $0.id == waking.hostID })
         else {
@@ -366,10 +474,12 @@ extension ConsoleModel {
             return
         }
         let fp = host.pinnedSHA256?.map { String(format: "%02x", $0) }.joined() ?? ""
+        let key = ConsoleJSON.rowKey(fp, host.address, host.port)
+        let req = wakeReq.flatMap { $0.key == key ? $0.req : nil } ?? ConsoleJSON.unasked
         bridge.push(
             .wake,
             ConsoleJSON.wake(
-                key: ConsoleJSON.rowKey(fp, host.address, host.port), name: waking.hostName,
+                req: req, key: key, name: waking.hostName,
                 seconds: waking.seconds, timedOut: waking.timedOut,
                 online: store.probedOnline.contains(host.id),
                 thenConnect: waking.connectsAfter))
@@ -377,21 +487,68 @@ extension ConsoleModel {
 
     // MARK: - pairing, logs and host actions
 
-    private func pair(addr: String, port: UInt16, pin: String, deviceName: String) {
-        bridge.push(.pair, ConsoleJSON.pairBusy)
+    private func pair(addr: String, port: UInt16, pin: String, deviceName: String, req: Any) {
+        bridge.push(.pair, ConsoleJSON.pairBusy(req))
+        accessRequest = UUID() // a request still waiting answers no screen now
         ceremony.run(host: addr, port: port, pin: pin, clientName: deviceName) { [weak self] cert in
-            guard let self else { return }
-            guard var host = host(fp: "", addr: addr, port: port) else {
-                bridge.push(.pair, ConsoleJSON.pairFailed("That host is no longer saved."))
-                return
-            }
-            host.pinnedSHA256 = cert
-            store.update(host)
-            actions.paired(host, cert)
-            let fp = cert.map { String(format: "%02x", $0) }.joined()
-            bridge.push(.pair, ConsoleJSON.pairPaired(key: fp))
-            pushHosts()
+            self?.paired(addr: addr, port: port, cert: cert, req: req)
         }
+    }
+
+    /// No PIN: wait for the host's operator, pinned to the advertised fingerprint. Never streams.
+    private func requestAccess(
+        addr: String, port: UInt16, fpHex: String, deviceName: String, req: Any
+    ) {
+        bridge.push(.pair, ConsoleJSON.pairBusy(req))
+        let token = UUID()
+        accessRequest = token
+        let pin = Data(hexString: fpHex).flatMap { $0.count == 32 ? $0 : nil }
+        let name = deviceName.isEmpty ? DeviceName.current : deviceName
+        Task { @MainActor [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result {
+                    let identity = try ClientIdentityStore.shared.loadForPairing()
+                    return try PunktfunkKit.requestAccess(
+                        host: addr, port: port, identity: identity, pinSHA256: pin, name: name)
+                }
+            }.value
+            guard let self, accessRequest == token else { return }
+            switch result {
+            case .success(let cert):
+                paired(addr: addr, port: port, cert: cert, req: req)
+            case .failure(let error):
+                let hostName = host(fp: "", addr: addr, port: port)?.displayName ?? addr
+                let why = ConnectOffer.failureMessage(
+                    error, hostName: hostName, pinned: false, requestAccess: true,
+                    callerRecovers: false)
+                bridge.push(.pair, ConsoleJSON.pairFailed(req, why ?? ""))
+            }
+        }
+    }
+
+    /// Pin `cert` and tell the Pair screen that sent `req`. The record is the one pinned to
+    /// `cert`, else the unpinned one at `addr:port`, else the advert there, saved as a tap on it
+    /// would. A record pinned to another fingerprint is the other OS of a dual-boot box.
+    private func paired(addr: String, port: UInt16, cert: Data, req: Any) {
+        let fp = cert.map { String(format: "%02x", $0) }.joined()
+        let host = store.hosts.first { $0.pinnedSHA256 == cert }
+            ?? store.hosts.first { $0.pinnedSHA256 == nil && $0.address == addr && $0.port == port }
+            ?? saveAdvert(addr: addr, port: port, fp: fp)
+        store.pin(host.id, fingerprint: cert)
+        actions.paired(host, cert)
+        bridge.push(.pair, ConsoleJSON.pairPaired(req, key: fp))
+        pushHosts()
+    }
+
+    /// The advert at `addr:port` that answered as `fp`, or a bare record when it has gone quiet.
+    private func saveAdvert(addr: String, port: UInt16, fp: String) -> StoredHost {
+        let advert = discovery.hosts.first {
+            $0.host == addr && $0.port == port && $0.matches(pin: fp, address: addr, port: port)
+        }
+        let host = advert.map(StoredHost.init(advert:))
+            ?? StoredHost(name: "", address: addr, port: port)
+        store.add(host)
+        return host
     }
 
     private func sendLogs(fp: String, addr: String) {
@@ -405,12 +562,11 @@ extension ConsoleModel {
     /// End a title this device launched, say how it went, then re-read what the host runs so
     /// the poster's badge follows.
     private func endGame(addr: String, mgmt: UInt16, fp: String, appID: String, title: String) {
-        guard let host = host(fp: fp, addr: addr, port: 0), let pin = host.pinnedSHA256,
-              let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
+        guard let host = host(fp: fp, addr: addr, port: 0),
+              let target = MgmtTarget.make(host: host, port: mgmt).target(orSay: notice)
+        else { return }
         Task { [weak self] in
-            let outcome = await LibraryClient.endGame(
-                appID: appID, address: addr, port: mgmt,
-                certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
+            let outcome = await LibraryClient.endGame(appID: appID, on: target)
             self?.notice(outcome.notice(title: title))
             self?.fetchLibrary(addr: addr, mgmt: mgmt, fp: fp, refreshOnly: true)
         }
@@ -421,12 +577,11 @@ extension ConsoleModel {
     private func changeInstall(
         addr: String, mgmt: UInt16, fp: String, appID: String, title: String, action: InstallAction
     ) {
-        guard let host = host(fp: fp, addr: addr, port: 0), let pin = host.pinnedSHA256,
-              let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
+        guard let host = host(fp: fp, addr: addr, port: 0),
+              let target = MgmtTarget.make(host: host, port: mgmt).target(orSay: notice)
+        else { return }
         Task { [weak self] in
-            let outcome = await LibraryClient.changeInstall(
-                appID: appID, action: action, address: addr, port: mgmt,
-                certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
+            let outcome = await LibraryClient.changeInstall(appID: appID, action: action, on: target)
             self?.notice(outcome.notice(action, title: title))
             let removed = outcome == .done && action == .remove
             self?.fetchLibrary(addr: addr, mgmt: mgmt, fp: fp, refreshOnly: !removed)

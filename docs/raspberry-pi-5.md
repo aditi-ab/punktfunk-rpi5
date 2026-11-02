@@ -6,12 +6,15 @@ systems. Choose a complete kiosk image or a portable client bundle from
 
 ## Install the kiosk image
 
-Download the release's `punktfunk-<release>-rpi5-kiosk.img.xz`, matching
+Read the release notes before upgrading. If the release changes host compatibility,
+update the host before installing its matching client image.
+
+Download the release's `punktfunk-<release>-kiosk.img.xz`, matching
 `.img.sha256`, `.img.packages.txt`, and `.img.build.txt` files into one directory.
 The checksum file covers the compressed image and both reports. Verify all files:
 
 ```sh
-sha256sum --check punktfunk-*-rpi5-kiosk.img.sha256
+sha256sum --check punktfunk-*-kiosk.img.sha256
 ```
 
 Use Raspberry Pi Imager's **Use custom** option to write the `.img.xz` to your

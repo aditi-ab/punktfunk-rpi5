@@ -29,8 +29,8 @@ import java.nio.ByteBuffer
  * id (bounded — at most 16 pads).
  *
  * Mirrors `nativeStartAudio`'s lifecycle: [start]/[stop] driven by the StreamScreen. [stop] flips a
- * flag; the ~100 ms native pull timeout lets the threads exit, then they're joined (bounded) — and
- * this MUST run before the router is released and `nativeClose` frees the session handle.
+ * flag; the ~100 ms native pull timeout lets the threads exit, then they're joined. It MUST run
+ * before the router is released.
  *
  * With no controller connected (emulator) rumble/lights become logged no-ops — exactly the
  * verification path; the `Log.i` receipt lines fire regardless of rendering hardware.
@@ -183,19 +183,15 @@ class GamepadFeedback(
         return seen + 1
     }
 
-    /** Idempotent. Stops + joins the poll threads (must complete before the router is released / handle freed). */
+    /** Idempotent. Stops and joins the poll threads; the caller releases the router after. */
     fun stop() {
         running = false
         rumbleThread?.interrupt()
         hidoutThread?.interrupt()
-        // Join WITHOUT a timeout. These poll threads dereference the native session handle on every
-        // pull (nativeNextRumble/nativeNextHidout) and read the router, so they MUST be dead before
-        // StreamScreen's onDispose reaches router.release() / nativeClose, which free that state. A
-        // *bounded* join that times out would let a thread survive into the freed handle → use-after-
-        // free SIGSEGV (the back-while-streaming crash, on the one path the main-thread `closed` guard
-        // can't cover). Safe to block unbounded: the native pulls are internally time-bounded
-        // (PULL_TIMEOUT ~100 ms) and rendering is a quick best-effort binder call, so each thread
-        // observes running=false and exits within ~one timeout — the join returns promptly.
+        // Join WITHOUT a timeout: the threads read the router, so they must be dead before the
+        // caller's router.release(). A closed session handle only turns their pulls into no-ops. Each
+        // pull is bounded (~100 ms) and a render is one binder call, so the join returns within
+        // about one pull.
         runCatching { rumbleThread?.join() }
         runCatching { hidoutThread?.join() }
         rumbleThread = null
@@ -426,7 +422,9 @@ class GamepadFeedback(
                 if (len > 0) {
                     val data = ByteArray(len)
                     buf.get(data)
-                    onHidRaw?.invoke(pad, kind, data)
+                    // Controller rumble off plays Steam's rumble report as a stop, like every pad's.
+                    val muted = !rumble && kind == 0 && data[0] == 0x80.toByte()
+                    onHidRaw?.invoke(pad, kind, if (muted) Sc2Device.rumbleFrame(0, 0) else data)
                 }
             }
             else -> Log.d(TAG, "hidout: unknown kind, dropped")

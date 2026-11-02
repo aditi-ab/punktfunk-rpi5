@@ -10,8 +10,8 @@
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 // P0 lint (audit §8): an unsafe op inside an `unsafe fn` must be in an explicit `unsafe {}` block, so the
-// fn-level `unsafe` never silently blesses the whole body, AND every `unsafe {}` must carry a `// SAFETY:`
-// proof. An IddCx display driver is inherently FFI-bound (D3D11 / IddCx DDIs / cross-process shared
+// fn-level `unsafe` never silently blesses the whole body, AND every `unsafe {}` must carry its proof.
+// An IddCx display driver is inherently FFI-bound (D3D11 / IddCx DDIs / cross-process shared
 // textures), so it can't be unsafe-FREE the way the gamepad drivers now are (their logic moved onto the
 // safe `pf_umdf_util` layer); these gates make it unsafe-AUDITED instead, and stop it regressing.
 
@@ -20,13 +20,14 @@ mod log;
 mod adapter;
 mod callbacks;
 mod control;
+mod cursor;
 mod cursor_cell;
-mod cursor_worker;
 mod direct_3d_device;
 mod encode;
 #[cfg(feature = "encode-probe")]
 mod encode_probe;
 mod entry;
+mod modes;
 mod monitor;
 mod registry;
 mod swap_chain_processor;
@@ -39,6 +40,7 @@ use wdk_sys::NTSTATUS;
 pub(crate) const STATUS_SUCCESS: NTSTATUS = 0;
 pub(crate) const STATUS_NOT_IMPLEMENTED: NTSTATUS = 0xC000_0002u32 as NTSTATUS;
 pub(crate) const STATUS_NOT_FOUND: NTSTATUS = 0xC000_0225u32 as NTSTATUS;
+pub(crate) const STATUS_DEVICE_NOT_READY: NTSTATUS = 0xC000_00A3u32 as NTSTATUS;
 pub(crate) const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000_000Du32 as NTSTATUS;
 pub(crate) const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023u32 as NTSTATUS;
 pub(crate) const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022u32 as NTSTATUS;

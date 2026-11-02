@@ -153,63 +153,99 @@ static void enable_endpoints(void){
     char m[128]; snprintf(m,sizeof m,"endpoints enabled: mouse=%d(e%d) kbd=%d(e%d) ctrl=%d(e%d)", h0,h0<0?e0:0,h1,h1<0?e1:0,h2,h2<0?e2:0); log_line(m);
 }
 
+enum ep0_action { EP0_STALL, EP0_ACK, EP0_WRITE, EP0_SET_CONFIG, EP0_SET_REPORT };
+/* One control request's answer, decided before any ep0 I/O: `data`/`len` for EP0_WRITE, the data
+   stage to read for EP0_SET_REPORT. */
+struct ep0_plan { enum ep0_action action; const void *data; int len; };
+
+static struct ep0_plan ep0_plan_write(const void *data, int len){ return (struct ep0_plan){ EP0_WRITE, data, len }; }
+static struct ep0_plan ep0_plan_act(enum ep0_action a){ return (struct ep0_plan){ a, NULL, 0 }; }
+
+/* GET_DESCRIPTOR. The config, string and report descriptors are cut to wLength; the device and
+   HID descriptors go out whole. `scratch` (260 bytes) backs the string reply. */
+static struct ep0_plan plan_descriptor(const struct usb_ctrlrequest *ctrl, __u8 *scratch){
+    int type = ctrl->wValue >> 8, di = ctrl->wValue & 0xff, idx = ctrl->wIndex & 0xff;
+    int l;
+    switch(type){
+    case USB_DT_DEVICE: return ep0_plan_write(&dev_desc, dev_desc.bLength);
+    case USB_DT_CONFIG: l=sizeof(cfg); if(l>ctrl->wLength) l=ctrl->wLength; return ep0_plan_write(&cfg, l);
+    case USB_DT_STRING: l=build_string(di,scratch); if(l>ctrl->wLength) l=ctrl->wLength; return ep0_plan_write(scratch, l);
+    case HID_RPT_DT: { // the interface in wIndex; any other index answers as the controller
+        const __u8 *r = idx==0?RDESC_MOUSE:idx==1?RDESC_KBD:RDESC_CTRL;
+        l = idx==0?sizeof(RDESC_MOUSE):idx==1?sizeof(RDESC_KBD):sizeof(RDESC_CTRL);
+        if(l>ctrl->wLength) l=ctrl->wLength;
+        return ep0_plan_write(r, l);
+    }
+    case HID_DT: { const struct hid_desc *h = idx==0?&cfg.h0:idx==1?&cfg.h1:&cfg.h2; return ep0_plan_write(h, h->bLength); }
+    default: return ep0_plan_act(EP0_STALL);
+    }
+}
+
+/* Standard requests. `scratch` also carries the 2-byte GET_STATUS reply. */
+static struct ep0_plan plan_standard(const struct usb_ctrlrequest *ctrl, __u8 *scratch){
+    switch(ctrl->bRequest){
+    case USB_REQ_GET_DESCRIPTOR: return plan_descriptor(ctrl, scratch);
+    case USB_REQ_SET_CONFIGURATION: return ep0_plan_act(EP0_SET_CONFIG);
+    case USB_REQ_SET_INTERFACE: return ep0_plan_act(EP0_ACK);
+    case USB_REQ_GET_STATUS: scratch[0]=0; scratch[1]=0; return ep0_plan_write(scratch, 2);
+    default: return ep0_plan_act(EP0_STALL);
+    }
+}
+
+/* HID class requests. GET_REPORT is the serial-style feature blob for the controller (harmless
+   for the others): [cmd, len, 0x01, serial...], `cmd` echoing the last SET_REPORT, 0xAE before
+   any. `scratch` (64 bytes) carries it. */
+static struct ep0_plan plan_class(const struct usb_ctrlrequest *ctrl, __u8 last_cmd, __u8 *scratch){
+    int l = ctrl->wLength>64?64:ctrl->wLength;
+    switch(ctrl->bRequest){
+    case 0x01: { // GET_REPORT
+        const char *serial = "PFDECK0001";
+        memset(scratch,0,64);
+        scratch[0]=last_cmd?last_cmd:0xAE; scratch[1]=strlen(serial); scratch[2]=0x01;
+        memcpy(scratch+3, serial, strlen(serial));
+        return ep0_plan_write(scratch, l);
+    }
+    case 0x09: return (struct ep0_plan){ EP0_SET_REPORT, NULL, l }; // SET_REPORT: read the data stage
+    case 0x0a: return ep0_plan_act(EP0_ACK); // SET_IDLE (OUT/no-data)
+    case 0x0b: return ep0_plan_act(EP0_ACK); // SET_PROTOCOL (OUT/no-data)
+    case 0x03: scratch[0]=0; return ep0_plan_write(scratch, 1); // GET_PROTOCOL
+    default: return ep0_plan_act(EP0_STALL);
+    }
+}
+
+/* What one control request gets, by request type. Pure: touches no fd. */
+static struct ep0_plan plan_control(const struct usb_ctrlrequest *ctrl, __u8 last_cmd, __u8 *scratch){
+    switch(ctrl->bRequestType & USB_TYPE_MASK){
+    case USB_TYPE_STANDARD: return plan_standard(ctrl, scratch);
+    case USB_TYPE_CLASS: return plan_class(ctrl, last_cmd, scratch);
+    default: return ep0_plan_act(EP0_STALL);
+    }
+}
+
+/* Plan the reply, then do the ep0 I/O it names. */
 static void handle_control(struct usb_ctrlrequest *ctrl){
-    int idx = ctrl->wIndex & 0xff;
     if(dbg){ char m[128]; snprintf(m,sizeof m,"  CTRL bRT=0x%02x bR=0x%02x wV=0x%04x wI=0x%04x wL=%u",
         ctrl->bRequestType, ctrl->bRequest, ctrl->wValue, ctrl->wIndex, ctrl->wLength); log_line(m); }
-    // Standard requests
-    if((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD){
-        switch(ctrl->bRequest){
-        case USB_REQ_GET_DESCRIPTOR: {
-            int type = ctrl->wValue >> 8, di = ctrl->wValue & 0xff;
-            if(type==USB_DT_DEVICE){ ep0_write(&dev_desc, dev_desc.bLength); return; }
-            if(type==USB_DT_CONFIG){ int l=sizeof(cfg); if(l>ctrl->wLength) l=ctrl->wLength; ep0_write(&cfg, l); return; }
-            if(type==USB_DT_STRING){ __u8 s[260]; int l=build_string(di,s); if(l>ctrl->wLength) l=ctrl->wLength; ep0_write(s,l); return; }
-            if(type==HID_RPT_DT){ // HID report descriptor for the interface in wIndex
-                const __u8 *r; int l;
-                if(idx==0){ r=RDESC_MOUSE; l=sizeof(RDESC_MOUSE);} else if(idx==1){ r=RDESC_KBD; l=sizeof(RDESC_KBD);} else { r=RDESC_CTRL; l=sizeof(RDESC_CTRL);}
-                if(l>ctrl->wLength) l=ctrl->wLength; ep0_write(r,l); return;
-            }
-            if(type==HID_DT){ struct hid_desc *h = idx==0?&cfg.h0:idx==1?&cfg.h1:&cfg.h2; ep0_write(h,h->bLength); return; }
-            ep0_stall(); return;
-        }
-        case USB_REQ_SET_CONFIGURATION: {
-            __u32 power = 0x32; ioctl(fd, USB_RAW_IOCTL_VBUS_DRAW, power);
-            ioctl(fd, USB_RAW_IOCTL_CONFIGURE);
-            enable_endpoints();
-            ep0_ack(); // OUT/no-data: complete via a zero-length read
-            configured = 1; log_line("  SET_CONFIG: done");
-            return;
-        }
-        case USB_REQ_SET_INTERFACE: ep0_ack(); return;
-        case USB_REQ_GET_STATUS: { __u16 s=0; ep0_write(&s,2); return; }
-        default: ep0_stall(); return;
-        }
+    __u8 scratch[260];
+    struct ep0_plan p = plan_control(ctrl, last_feature_cmd, scratch);
+    switch(p.action){
+    case EP0_WRITE: ep0_write(p.data, p.len); return;
+    case EP0_ACK: ep0_ack(); return;
+    case EP0_SET_CONFIG: {
+        __u32 power = 0x32; ioctl(fd, USB_RAW_IOCTL_VBUS_DRAW, power);
+        ioctl(fd, USB_RAW_IOCTL_CONFIGURE);
+        enable_endpoints();
+        ep0_ack(); // OUT/no-data: complete via a zero-length read
+        configured = 1; log_line("  SET_CONFIG: done");
+        return;
     }
-    // HID class requests
-    if((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS){
-        switch(ctrl->bRequest){
-        case 0x01: { // GET_REPORT
-            // Reply the serial-style feature blob for the controller (iface 2); harmless for others.
-            __u8 rep[64]; memset(rep,0,sizeof rep);
-            // Reply [cmd, len, 0x01, serial...] echoing the last requested command (serial = 0xAE).
-            const char *serial = "PFDECK0001";
-            rep[0]=last_feature_cmd?last_feature_cmd:0xAE; rep[1]=strlen(serial); rep[2]=0x01;
-            memcpy(rep+3, serial, strlen(serial));
-            int l=ctrl->wLength>64?64:ctrl->wLength; ep0_write(rep,l); return;
-        }
-        case 0x09: { // SET_REPORT — read the host's data, remember the command byte
-            __u8 buf[64]; int r=ep0_read(buf,ctrl->wLength>64?64:ctrl->wLength);
-            if(r>0) last_feature_cmd = buf[0]; // unnumbered report: data[0] is the command
-            return; // ep0_read consumes the data stage + acks
-        }
-        case 0x0a: ep0_ack(); return; // SET_IDLE (OUT/no-data)
-        case 0x0b: ep0_ack(); return; // SET_PROTOCOL (OUT/no-data)
-        case 0x03: { __u8 z=0; ep0_write(&z,1); return; } // GET_PROTOCOL
-        default: ep0_stall(); return;
-        }
+    case EP0_SET_REPORT: { // read the host's data, remember the command byte
+        __u8 buf[64]; int r=ep0_read(buf,p.len);
+        if(r>0) last_feature_cmd = buf[0]; // unnumbered report: data[0] is the command
+        return; // ep0_read consumes the data stage + acks
     }
-    ep0_stall();
+    case EP0_STALL: ep0_stall(); return;
+    }
 }
 
 static void *stream_thread(void *arg){

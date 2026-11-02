@@ -19,7 +19,7 @@
 //! * [`skeleton`] — `DriverEntry`, both queues and the periodic timer the HID drivers share.
 //!
 //! Lint gates (workspace-wide, enforced by the drivers CI clippy step): `unsafe_op_in_unsafe_fn`
-//! + `clippy::undocumented_unsafe_blocks` — every `unsafe {}` carries a `// SAFETY:` proof.
+//! + `clippy::undocumented_unsafe_blocks`.
 
 pub mod channel;
 pub mod hid;

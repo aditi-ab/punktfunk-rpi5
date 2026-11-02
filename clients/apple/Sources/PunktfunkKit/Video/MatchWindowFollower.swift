@@ -74,6 +74,10 @@ public final class MatchWindowFollower {
     /// overlay clears when a decoded frame reaches this size (or on a timeout). Deduped per target.
     public var onResizeTarget: ((_ width: UInt32, _ height: UInt32) -> Void)?
 
+    /// The refresh to ask for along with a size; nil keeps the live one. A foldable's two screens
+    /// can run at different rates, and a session streaming the native rate follows the screen.
+    public var refreshHz: (() -> UInt32?)?
+
     /// `debounce` = quiet time after the last size event before requesting (Win32 gets
     /// `WM_EXITSIZEMOVE` for free; we debounce). `minSpacing` = floor between accepted requests
     /// (a full host pipeline rebuild each). Defaults match the other clients.
@@ -167,8 +171,9 @@ public final class MatchWindowFollower {
             current: (mode.width, mode.height),
             lastRequested: lastRequested
         ) else { return }
-        // Keep the current refresh — Match-window follows SIZE, not rate.
-        connection.requestMode(width: req.width, height: req.height, refreshHz: mode.refreshHz)
+        // Match window follows size. The rate rides along only where the screen sets it.
+        connection.requestMode(
+            width: req.width, height: req.height, refreshHz: refreshHz?() ?? mode.refreshHz)
         lastRequested = req
         lastRequestAt = Date()
     }

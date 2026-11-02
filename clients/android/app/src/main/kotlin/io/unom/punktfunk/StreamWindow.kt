@@ -1,12 +1,13 @@
 package io.unom.punktfunk
 
+import android.app.GameManager
+import android.app.GameState
 import android.content.Context
-import android.content.pm.ActivityInfo
 import android.hardware.display.DisplayManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
 import android.view.Display
@@ -89,8 +90,8 @@ internal fun Display.streamPanelFps(hz: Int, size: Pair<Int, Int>? = null): Int 
 
 /**
  * Everything a stream does to the activity's WINDOW, and how to put it back: the wake and Wi-Fi
- * locks, the Wi-Fi link log, the panel's refresh pin, HDMI ALLM, the soft-keyboard and cutout
- * modes, the landscape lock, unbuffered input dispatch and the render-rate vote.
+ * locks, the Wi-Fi link log, the panel's refresh pin, HDMI ALLM, the Game Mode state, the
+ * soft-keyboard and cutout modes, unbuffered input dispatch and the render-rate vote.
  *
  * It is one object because it is one obligation — every field below is a prior value captured on the
  * way in, and [detach] is the only thing that ever restores one. Held in [StreamScreen]'s session
@@ -178,11 +179,13 @@ internal class StreamWindow(
     }
 
     /**
-     * The Wi-Fi link read once a second on the main thread, logged through the native ring
-     * ([WifiLinkLog]) so a field bundle can tell a radio problem from a stream one. Stops in [detach].
+     * The Wi-Fi link read once a second, logged through the native ring ([WifiLinkLog]) so a
+     * field bundle can tell a radio problem from a stream one. Its own thread: `connectionInfo`
+     * is a binder call, and the main thread is the stream's input path. Stops in [detach].
      */
     private val wifiLinkLog = WifiLinkLog()
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val wifiThread = HandlerThread("pf-wifi-link").apply { start() }
+    private val wifiHandler = Handler(wifiThread.looper)
     private val pollWifiLink = object : Runnable {
         override fun run() {
             val link = wifiManager?.readLink() ?: return
@@ -193,13 +196,24 @@ internal class StreamWindow(
                     )
                 }
             }
-            mainHandler.postDelayed(this, 1_000)
+            wifiHandler.postDelayed(this, 1_000)
         }
     }
 
     private var priorSoftInput = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_UNSPECIFIED
     private var priorCutout: Int? = null
-    private var priorOrientation: Int? = null
+
+    /**
+     * Hold the screen awake, or hand it back to the device's own timeout. [attach] holds it;
+     * the stream screen calls this as the keep-awake rule changes its answer.
+     */
+    fun holdAwake(hold: Boolean) {
+        if (hold) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
 
     /** Window state the stream wants from its first frame, before any peripheral exists. */
     fun attach() {
@@ -212,12 +226,18 @@ internal class StreamWindow(
                 Log.w("punktfunk", "WifiLock acquire failed — power save stays ON: $lock", e)
             }
         }
-        mainHandler.post(pollWifiLink)
+        wifiHandler.post(pollWifiLink)
         // HDMI Auto Low-Latency Mode: ask the display to drop its post-processing (game mode) —
         // the biggest panel-side latency win on the TV boxes. No-op where ALLM isn't supported. API
         // 30+. Part of the experimental low-latency stack.
         if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window?.setPreferMinimalPostProcessing(true)
+        }
+        // Game Mode state (API 33): a game is in play, so the OEM power HAL applies its game
+        // profile (MediaTek sizes CPU clocks by it). Interruptible: a stream has no match to guard.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.getSystemService(GameManager::class.java)
+                ?.setGameState(GameState(false, GameState.MODE_GAMEPLAY_INTERRUPTIBLE))
         }
         // System bars: NOT hidden here — App.kt owns hide/show (one owner; the AnimatedContent
         // handoff broke per-screen ownership, see the `immersive` effect there).
@@ -243,20 +263,6 @@ internal class StreamWindow(
                         WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
                 }
             }
-        }
-        // Lock to landscape while streaming — the host streams a landscape desktop, so pin the
-        // device there (either direction is fine) and stop it rotating to portrait mid-session. The
-        // activity declares configChanges=orientation, so this re-lays out the surface in place
-        // without recreating the activity (no stream restart). On TV it is a harmless no-op.
-        //
-        // COMPACT devices only (sw < 600 dp): on tablets/foldables/desktop windows the lock is a
-        // large-display anti-pattern (Play flags it; Android 16+ ignores it there outright), and the
-        // stream doesn't need it — the aspect-ratio letterbox renders correctly in any orientation,
-        // the lock is purely a phone-ergonomics choice.
-        val compactDevice = context.resources.configuration.smallestScreenWidthDp < 600
-        priorOrientation = activity?.requestedOrientation
-        if (compactDevice) {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         }
     }
 
@@ -320,10 +326,11 @@ internal class StreamWindow(
         if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window?.setPreferMinimalPostProcessing(false)
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.getSystemService(GameManager::class.java)
+                ?.setGameState(GameState(false, GameState.MODE_NONE))
+        }
         wifiLocks.forEach { runCatching { if (it.isHeld) it.release() } }
-        mainHandler.removeCallbacks(pollWifiLink)
-        // Release the landscape lock so the rest of the app follows the device/system again.
-        activity?.requestedOrientation =
-            priorOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        wifiThread.quitSafely()
     }
 }

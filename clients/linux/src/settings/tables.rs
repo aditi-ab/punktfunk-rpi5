@@ -52,11 +52,13 @@ pub mod index {
         REFRESH.iter().position(|&r| r == s.refresh_hz).unwrap_or(0) as u32
     }
 
+    /// The Render scale row's Custom entry: after the stops.
+    pub const CUSTOM_SCALE: u32 = RENDER_SCALES.len() as u32;
+
+    /// A stop's entry, or Custom for a typed scale.
     pub fn render_scale(s: &Settings) -> u32 {
-        RENDER_SCALES
-            .iter()
-            .position(|&x| (x - s.render_scale).abs() < 1e-6)
-            .unwrap_or_else(|| RENDER_SCALES.iter().position(|&x| x == 1.0).unwrap()) as u32
+        punktfunk_core::render_scale::preset_index(s.render_scale)
+            .map_or(CUSTOM_SCALE, |i| i as u32)
     }
 
     pub fn codec(s: &Settings) -> u32 {
@@ -134,6 +136,10 @@ pub mod index {
             .unwrap_or(0) as u32
     }
 
+    pub fn screens(s: &Settings) -> u32 {
+        u32::from(s.all_screens())
+    }
+
     pub fn present_priority(s: &Settings) -> u32 {
         // Unknown values (a newer client's intent) read as the default, exactly as
         // `PresentPriority::resolve` treats them.
@@ -200,7 +206,16 @@ pub const SYSTEM_BUTTON_LABELS: &[&str] = &["Automatic", "Send to host", "This d
 /// only where the raw guide press can't reach the host (Gaming Mode here).
 pub const GUIDE_GESTURES: &[&str] = &["auto", "on", "off"];
 pub const GUIDE_GESTURE_LABELS: &[&str] = &["Automatic", "On", "Off"];
-pub const COMPOSITORS: &[&str] = &["auto", "kwin", "mutter", "hyprland", "wlroots", "gamescope"];
+pub const COMPOSITORS: &[&str] = &[
+    "auto",
+    "kwin",
+    "mutter",
+    "hyprland",
+    "niri",
+    "umbriel",
+    "wlroots",
+    "gamescope",
+];
 /// Codec setting values (persisted) paired with their display labels below. PyroWave is
 /// preference-only by design (`Settings::preferred_codec`) — the ladder falls back to
 /// HEVC when either side can't do it.
@@ -238,6 +253,13 @@ pub const VIDEO_FIT_CAPTIONS: &[&str] = &[
     "The whole picture, with black bars when shapes differ",
     "No bars — the picture's edges are cut off",
     "No bars — the picture is stretched to the window",
+];
+/// `screens` values + labels + one-line captions, index-aligned.
+pub const SCREENS: &[&str] = &["this", "all"];
+pub const SCREENS_LABELS: &[&str] = &["This monitor", "All monitors"];
+pub const SCREENS_CAPTIONS: &[&str] = &[
+    "The stream shows on the monitor the window is on",
+    "A host screen on each monitor, laid out as they sit. Close one to give it back",
 ];
 /// Presentation-intent values (persisted under the `present_priority` key the Apple and
 /// Android clients share) + labels + dynamic captions. Captions stay ONE line, like the
@@ -368,13 +390,15 @@ mod tests {
         assert!(!REFRESH.contains(&odd.refresh_hz));
         assert_eq!(index::refresh(&odd), 0);
 
-        // Render scale falls back to 1.0's rung, which is not index 0 — so "unmoved" cannot
-        // be spelled as "index 0" for this row.
+        // A scale that is no stop seeds Custom, past the last stop, so the typed value
+        // shows as typed. Native's stop is not index 0, so "unmoved" cannot be spelled as
+        // "index 0" for this row.
         let odd_scale = Settings {
             render_scale: 0.63,
             ..Default::default()
         };
-        let fallback = index::render_scale(&odd_scale);
-        assert!(RENDER_SCALES[fallback as usize] == 1.0 && fallback != 0);
+        assert_eq!(index::render_scale(&odd_scale), index::CUSTOM_SCALE);
+        let native = index::render_scale(&Settings::default());
+        assert!(RENDER_SCALES[native as usize] == 1.0 && native != 0);
     }
 }

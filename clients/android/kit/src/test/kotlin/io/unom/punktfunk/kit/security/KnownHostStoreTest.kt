@@ -97,6 +97,19 @@ class KnownHostStoreTest {
         assertEquals("p1", j.getString("profile"))
         assertEquals("p2", j.getJSONObject("game_profiles").getString("halo"))
     }
+
+    /** A card follows the host's renames while it carries the host's own name. */
+    @Test
+    fun aCardFollowsTheHostNameUnlessThePlayerNamedIt() {
+        val seen = KnownHost("10.0.0.5", 9777, "bazzite", "a".repeat(64), true)
+            .followingName("bazzite")
+        val renamed = seen.followingName("Living Room")
+        assertEquals("Living Room", renamed.name)
+        assertEquals("Couch", renamed.copy(name = "Couch").followingName("Den").name)
+        // A legacy record whose name already differs from the first advert keeps it.
+        assertEquals("Desk", KnownHost("10.0.0.5", 9777, "Desk", "", false).followingName("box").name)
+        assertEquals("Living Room", KnownHostStore.decode(KnownHostStore.encode(renamed))?.advertName)
+    }
 }
 
 /**

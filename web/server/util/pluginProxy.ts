@@ -4,8 +4,8 @@
 // browser; the BFF additionally denylists the credential endpoint from the generic passthrough).
 //
 // The credential is cached briefly so a burst of iframe asset requests doesn't hammer the host. On a
-// 401 from the plugin (its secret rotated on restart within the cache window) the proxy busts this
-// cache and re-fetches once — see the route.
+// 401 from the plugin (its secret rotated on restart within the cache window) `callPlugin` busts this
+// cache and re-fetches once.
 import { isError } from "h3";
 import { mgmtFetch } from "./forward";
 import { consoleOriginPort, pluginOriginPort } from "./pluginOrigin";
@@ -33,6 +33,17 @@ export interface UiCredential {
 	port: number;
 	secret: string;
 }
+
+/**
+ * Port 0: the plugin has no listener (a Windows AppContainer can bind nothing), and the host
+ * relays to it over the plugin's own channel. The request goes to the management API under
+ * `/plugins/<id>/ui/`, and the host adds the plugin's secret itself.
+ */
+export const viaHost = (cred: UiCredential): boolean => cred.port === 0;
+
+/** Where the management API relays a request for this plugin's page. */
+export const hostRelayPath = (id: string, pathAndQuery: string): string =>
+	`/api/v1/plugins/${id}/ui${pathAndQuery}`;
 
 const TTL_MS = 15_000;
 const cache = new Map<string, { cred: UiCredential | null; at: number }>();
@@ -89,7 +100,7 @@ export async function fetchUiCredential(
 		// A port we refuse to dial is treated exactly like "no UI registered" — the callers already
 		// render that as offline, and the negative is cached so a planted entry can't be used to make
 		// us re-ask the host on every asset request.
-		if (!isDialablePort(cred.port)) {
+		if (!viaHost(cred) && !isDialablePort(cred.port)) {
 			cache.set(id, { cred: null, at: now });
 			return null;
 		}
@@ -105,39 +116,52 @@ export async function fetchUiCredential(
 	return null;
 }
 
+/** One request to a plugin. `body` and `headers` go through as given; the dial adds only the bearer. */
+interface PluginRequest {
+	method: string;
+	headers?: Record<string, string>;
+	body?: Uint8Array;
+	redirect?: RequestRedirect;
+}
+
 /**
- * One request to a plugin's loopback surface (`/__config`, `/__game?entry=…`, `/__metadata/…`)
- * with its secret.
- * A 401 means the secret rotated inside the cache window, so it retries once with a fresh one.
- * `null` means unreachable. Callers read `body` before calling: a retry must not resend an
- * emptied stream.
+ * The only dial to a plugin's UI server: `pathAndQuery` on 127.0.0.1 with its secret, or through
+ * the host's relay for a plugin with no listener.
+ *
+ * A 401 means the secret rotated inside the cache window, so it retries once with a fresh
+ * credential, and keeps the first answer when the retry finds no plugin. A throw (the port died)
+ * busts the credential. `null` means unreachable. Callers read `body` before calling: a retry must
+ * not resend an emptied stream.
  */
 export async function callPlugin(
 	id: string,
-	path: string,
-	method: "GET" | "PUT" | "POST",
-	body?: Uint8Array,
+	pathAndQuery: string,
+	{ headers = {}, body, ...init }: PluginRequest,
 ): Promise<Response | null> {
 	const attempt = async (bustCache: boolean): Promise<Response | null> => {
+		// `null` also covers a port we refuse to dial (see isDialablePort).
 		const cred = await fetchUiCredential(id, { bustCache });
 		if (!cred) return null;
+		const sent = { ...init, body: body as BodyInit | undefined };
 		try {
-			return await fetch(`http://127.0.0.1:${cred.port}${path}`, {
-				method,
-				headers: {
-					authorization: `Bearer ${cred.secret}`,
-					...(method !== "GET" ? { "content-type": "application/json" } : {}),
-				},
-				body: body as BodyInit | undefined,
+			if (viaHost(cred)) {
+				return await mgmtFetch(hostRelayPath(id, pathAndQuery), {
+					...sent,
+					headers,
+				});
+			}
+			return await fetch(`http://127.0.0.1:${cred.port}${pathAndQuery}`, {
+				...sent,
+				headers: { ...headers, authorization: `Bearer ${cred.secret}` },
 			});
 		} catch {
+			bustCredential(id);
 			return null;
 		}
 	};
 	const res = await attempt(false);
 	if (res?.status !== 401) return res;
-	bustCredential(id);
-	return attempt(true);
+	return (await attempt(true)) ?? res;
 }
 
 /** A plugin's answer as JSON, or its text wrapped as an error. */

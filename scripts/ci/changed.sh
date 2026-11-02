@@ -42,7 +42,11 @@ classify() {
                 data/platforms.json|ci/rust-ci.Dockerfile|web/src/lib/command-execution.ts|\
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh|\
                 scripts/ci/check-installer-behavior.sh|scripts/ci/check-install-defaults.sh|\
-                scripts/ci/check-unsafe-hygiene.sh|\
+                scripts/ci/check-unsafe-hygiene.sh|scripts/ci/check-android-jni-names.sh|\
+                clients/android/kit/src/main/kotlin/io/unom/punktfunk/kit/NativeBridge.kt|\
+                scripts/unsafe-census.py|scripts/ci/unsafe-census-baseline.json|\
+                packaging/windows/drivers/*.rs|packaging/windows/drivers/*/*.inx|\
+                clients/windows/*.rs|packaging/windows/pf-vkhdr-layer/*.rs|\
                 scripts/ci/check-workflow-paths.py|scripts/ci/cargo_graph.py|\
                 scripts/gen-third-party-notices.sh|scripts/gen-third-party-notices.py|\
                 about.toml|about.hbs|\
@@ -56,20 +60,19 @@ classify() {
             case "$path" in
                 .cargo/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|\
                 clients/linux/*|clients/session/*|clients/shared/*|\
-                crates/punktfunk-core/*|crates/punktfunk-ffi/*|\
-                crates/pf-bitstream/*|crates/pf-client-core/*|crates/pf-console-ui/*|\
-                crates/pf-dmabuf/*|crates/pf-dxvadec/*|crates/pf-libva/*|crates/pf-presenter/*|\
-                crates/pf-update-check/*|crates/pf-vaapi/*|crates/pf-v4l2dec/*|crates/pf-v4l2/*|crates/pf-vkdecode/*|\
-                crates/pyrowave-sys/*|ci/rust-ci-arm64cross.Dockerfile|\
+                crates/core/*|crates/client/*|\
+                crates/codec/pf-bitstream/*|crates/codec/pf-dxvadec/*|crates/codec/pf-libva/*|crates/codec/pf-vaapi/*|\
+                crates/codec/pf-v4l2dec/*|crates/codec/pf-v4l2/*|crates/codec/pf-vkdecode/*|crates/codec/pyrowave-sys/*|\
+                ci/rust-ci-arm64cross.Dockerfile|\
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh)
                     rust_arm64=true
                     ;;
             esac
             case "$path" in
                 web/*|api/openapi.json|scripts/ci/retry.sh|clients/shared/library-id-vectors.json|\
-                crates/punktfunk-host/src/library/custom.rs|\
-                crates/punktfunk-core/testdata/grant-vectors.json|\
-                crates/punktfunk-core/testdata/gamepad-button-vectors.json)
+                crates/host/punktfunk-host/src/library/custom.rs|plugin-kit/src/wire.ts|\
+                crates/core/punktfunk-core/testdata/grant-vectors.json|\
+                crates/core/punktfunk-core/testdata/gamepad-button-vectors.json)
                     web=true
                     ;;
             esac
@@ -80,12 +83,14 @@ classify() {
             esac
             case "$path" in
                 sdk/*|plugin-kit/*|api/openapi.json|scripts/ci/retry.sh|\
-                clients/shared/library-id-vectors.json)
+                clients/shared/library-id-vectors.json|\
+                crates/host/punktfunk-host/testdata/path-refusal-vectors.json|\
+                packaging/nix/packages.nix|packaging/nix/nixos-module.nix)
                     sdk_plugin_kit=true
                     ;;
             esac
             case "$path" in
-                clients/decky/*)
+                clients/decky/*|clients/shared/host-row-vectors.json)
                     decky_typecheck=true
                     ;;
             esac
@@ -123,6 +128,9 @@ self_test() {
         'rust=false rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check android 'clients/android/app/build.gradle.kts' \
         'rust=false rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # The rust job compares its JNI names with the native exports.
+    check android-bridge 'clients/android/kit/src/main/kotlin/io/unom/punktfunk/kit/NativeBridge.kt' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     # A workspace member with no cfg gate: workspace clippy compiles it on Linux, android.yml
     # (cargo-ndk, android cfg) does not stand in for that.
     check android-native 'clients/android/native/src/lib.rs' \
@@ -134,11 +142,26 @@ self_test() {
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check notice-template 'about.hbs' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
-    check host 'crates/punktfunk-host/src/main.rs' \
+    check host 'crates/host/punktfunk-host/src/main.rs' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check workspace-tool 'tools/loss-harness/src/main.rs' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check notice-generator 'scripts/gen-third-party-notices.py' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # The unsafe gates in the rust job read the driver workspace's sources too.
+    check driver-rust 'packaging/windows/drivers/pf-vdisplay/src/lib.rs' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # And the Windows client's and the Vulkan layer's: the census counts both.
+    check client-windows-rust 'clients/windows/src/main.rs' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check vkhdr-rust 'packaging/windows/pf-vkhdr-layer/src/lib.rs' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # A driver INF names the hardware ids a Rust table holds, so an INF-only change runs rust.
+    check driver-inf 'packaging/windows/drivers/pf-vdisplay/pf_vdisplay.inx' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check driver-script 'packaging/windows/drivers/deploy-dev.ps1' \
+        'rust=false rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check unsafe-census 'scripts/ci/unsafe-census-baseline.json' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check workflow-paths 'scripts/ci/cargo_graph.py' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
@@ -146,17 +169,29 @@ self_test() {
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check client-shared 'clients/shared/deeplink-vectors.json' \
         'rust=true rust_arm64=true web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # Decky replays the host rows through its own merge.
+    check host-row-vectors 'clients/shared/host-row-vectors.json' \
+        'rust=true rust_arm64=true web=false docs_site=false sdk_plugin_kit=false decky_typecheck=true'
     check library-id-vectors 'clients/shared/library-id-vectors.json' \
         'rust=true rust_arm64=true web=true docs_site=false sdk_plugin_kit=true decky_typecheck=false'
     # The host's unprivileged launch kinds and the console's copy: each side's test reads the other.
     check launch-kinds-console 'web/src/lib/command-execution.ts' \
         'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
-    check launch-kinds-host 'crates/punktfunk-host/src/library/custom.rs' \
+    check launch-kinds-host 'crates/host/punktfunk-host/src/library/custom.rs' \
         'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
-    check grant-vectors 'crates/punktfunk-core/testdata/grant-vectors.json' \
+    check grant-vectors 'crates/core/punktfunk-core/testdata/grant-vectors.json' \
         'rust=true rust_arm64=true web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
-    check gamepad-button-vectors 'crates/punktfunk-core/testdata/gamepad-button-vectors.json' \
+    check gamepad-button-vectors 'crates/core/punktfunk-core/testdata/gamepad-button-vectors.json' \
         'rust=true rust_arm64=true web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # The console types the plugin surfaces from the kit's wire.ts.
+    check plugin-surface 'plugin-kit/src/wire.ts' \
+        'rust=false rust_arm64=false web=true docs_site=false sdk_plugin_kit=true decky_typecheck=false'
+    # The runner's sandbox replays the host's path refusals.
+    check path-refusal-vectors 'crates/host/punktfunk-host/testdata/path-refusal-vectors.json' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=true decky_typecheck=false'
+    # The runner tests read how the Nix packages install its unit.
+    check nix-runner-unit 'packaging/nix/packages.nix' \
+        'rust=false rust_arm64=false web=false docs_site=false sdk_plugin_kit=true decky_typecheck=false'
     check openapi 'api/openapi.json' \
         'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=true decky_typecheck=false'
     check platforms 'data/platforms.json' \

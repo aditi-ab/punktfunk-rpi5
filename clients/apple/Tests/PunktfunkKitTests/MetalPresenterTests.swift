@@ -20,28 +20,66 @@ final class MetalPresenterTests: XCTestCase {
             "stage-2 Metal shaders failed to compile (presenter init returned nil)")
     }
 
-    /// The HDR fix: `configure(hdr:)` must put the layer into the BT.2020-PQ EDR configuration with a
-    /// reference-white anchor (`edrMetadata`) — the missing anchor was what made HDR render "too
-    /// bright". SDR must use the plain 8-bit path with EDR off and no metadata. A mid-session flip is a
-    /// per-mode reconfigure, so the round trip back to SDR must fully restore the SDR config.
+    /// Linear always takes half-float; the env lever picks the PQ drawable over the device rule.
+    func testHDRDrawableFormat() {
+        XCTAssertEqual(hdrDrawableFormat(linear: true, env: "10", halfFloatPQ: false), .rgba16Float)
+        XCTAssertEqual(hdrDrawableFormat(linear: false, env: nil, halfFloatPQ: false), .bgr10a2Unorm)
+        XCTAssertEqual(
+            hdrDrawableFormat(linear: false, env: nil, halfFloatPQ: true), .rgba16Float,
+            "an Apple TV older than the A15")
+        XCTAssertEqual(hdrDrawableFormat(linear: false, env: "10", halfFloatPQ: true), .bgr10a2Unorm)
+        XCTAssertEqual(hdrDrawableFormat(linear: false, env: "16", halfFloatPQ: false), .rgba16Float)
+    }
+
+    /// The layer colour space HDR takes under the session's `HdrMode`.
+    private var hdrSpace: CFString {
+        HdrMode.current == .linear ? CGColorSpace.extendedLinearDisplayP3 : CGColorSpace.itur_2100_PQ
+    }
+
+    /// `configure(hdr:)`: PQ mode tags BT.2100 PQ with EDR and a reference-white anchor
+    /// (`edrMetadata`; without it PQ renders too bright). Linear mode tags extended-linear P3 with
+    /// EDR and no metadata, on half-float. SDR is the plain 8-bit path, EDR off, no metadata, and a
+    /// mid-session flip back must restore it fully.
     func testConfigureHDRSetsEDRAnchor() throws {
         guard let presenter = MetalVideoPresenter.make() else {
             throw XCTSkip("no Metal device available in this environment")
         }
         presenter.configure(hdr: true)
-        XCTAssertEqual(presenter.layer.pixelFormat, .rgba16Float, "HDR uses an EDR-capable drawable")
-        XCTAssertNotNil(presenter.layer.colorspace, "HDR layer must be tagged (itur_2100_PQ)")
+        XCTAssertEqual(presenter.layer.pixelFormat, hdrDrawable, "HDR uses the HDR drawable")
+        XCTAssertEqual(presenter.layer.colorspace?.name, hdrSpace)
         XCTAssertTrue(
             presenter.layer.wantsExtendedDynamicRangeContent, "EDR must be requested on all platforms")
-        XCTAssertNotNil(
-            presenter.layer.edrMetadata,
-            "HDR must anchor reference white via edrMetadata (the fix for 'too bright')")
+        if HdrMode.current == .linear {
+            XCTAssertEqual(hdrDrawable, .rgba16Float, "linear EDR values exceed 1")
+            XCTAssertNil(presenter.layer.edrMetadata, "linear leaves the system nothing to tone-map")
+        } else {
+            XCTAssertNotNil(
+                presenter.layer.edrMetadata, "PQ must anchor reference white via edrMetadata")
+        }
+        presenter.layer.drawableSize = CGSize(width: 64, height: 64)
+        if let drawable = presenter.layer.nextDrawable() {
+            XCTAssertEqual(
+                drawable.texture.pixelFormat, hdrDrawable, "the layer must vend the HDR format")
+        }
 
         // Mid-session HDR→SDR flip: the 8-bit path, EDR off, no metadata.
         presenter.configure(hdr: false)
         XCTAssertEqual(presenter.layer.pixelFormat, .bgra8Unorm, "SDR uses the plain 8-bit drawable")
         XCTAssertFalse(presenter.layer.wantsExtendedDynamicRangeContent)
         XCTAssertNil(presenter.layer.edrMetadata)
+    }
+
+    /// The shader filters luma only while it resamples: 1:1 on the pixel grid takes one tap.
+    func testLumaIsOnGridOnlyAtOneToOneOnWholeTexels() {
+        let target = CGSize(width: 2752, height: 2064)
+        XCTAssertTrue(MetalVideoPresenter.lumaOnGrid(
+            target: target, crop: CGRect(x: 0, y: 0, width: 2752, height: 2064)))
+        XCTAssertFalse(MetalVideoPresenter.lumaOnGrid(
+            target: target, crop: CGRect(x: 0, y: 0, width: 2560, height: 1920)), "upscale")
+        XCTAssertFalse(MetalVideoPresenter.lumaOnGrid(
+            target: target, crop: CGRect(x: 0.5, y: 0, width: 2752, height: 2064)), "half-texel")
+        XCTAssertTrue(MetalVideoPresenter.lumaOnGrid(
+            target: target, crop: CGRect(x: 8, y: 4, width: 2752, height: 2064)), "whole-texel crop")
     }
 
     /// Deadline pacing: once the link vends, layer writes wait for the link thread to apply them
@@ -56,8 +94,8 @@ final class MetalPresenterTests: XCTestCase {
         XCTAssertEqual(presenter.layer.pixelFormat, .bgra8Unorm, "a queued write leaves the layer")
         XCTAssertNil(presenter.layer.edrMetadata)
         presenter.applyLayerWrites()
-        XCTAssertEqual(presenter.layer.pixelFormat, .rgba16Float)
-        XCTAssertNotNil(presenter.layer.edrMetadata)
+        XCTAssertEqual(presenter.layer.pixelFormat, hdrDrawable)
+        XCTAssertEqual(presenter.layer.colorspace?.name, hdrSpace)
         XCTAssertEqual(presenter.layer.drawableSize, CGSize(width: 64, height: 32))
     }
 
@@ -82,7 +120,8 @@ final class MetalPresenterTests: XCTestCase {
                 "the layer must vend the 10-bit format rather than fall back")
         }
         presenter.configure(hdr: true, tenBitSDR: true)
-        XCTAssertEqual(presenter.layer.pixelFormat, .rgba16Float, "HDR outranks the depth flag")
+        XCTAssertTrue(presenter.layer.wantsExtendedDynamicRangeContent, "HDR outranks the depth flag")
+        XCTAssertEqual(presenter.layer.colorspace?.name, hdrSpace, "the HDR tag, not the SDR one")
         presenter.configure(hdr: false, tenBitSDR: false)
         XCTAssertEqual(
             presenter.layer.pixelFormat, .bgra8Unorm, "an 8-bit session keeps the 8-bit drawable")

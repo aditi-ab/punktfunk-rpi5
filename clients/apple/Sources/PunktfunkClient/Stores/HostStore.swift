@@ -28,6 +28,14 @@ extension StoredHost {
     func matches(_ discovered: DiscoveredHost) -> Bool {
         discovered.matches(pin: pinnedSHA256?.hexLower, address: address, port: port)
     }
+
+    /// A record for a host seen only in its advert, with what the advert carries.
+    init(advert d: DiscoveredHost) {
+        self.init(
+            name: d.name, address: d.host, port: d.port, mgmtPort: d.mgmtPort,
+            macAddresses: d.macAddresses.isEmpty ? nil : d.macAddresses,
+            osChain: d.osChain.isEmpty ? nil : d.osChain)
+    }
 }
 
 /// The join of live mDNS discovery against the saved-host store, shared by the touch grid
@@ -237,10 +245,11 @@ final class HostStore: ObservableObject {
         probedOnline = online
     }
 
-    /// Presence while a home is on screen, touch or console: a sweep every 10 s, and each
-    /// reachable paired host's actions and running title kept warm on the same beat, so a
-    /// card's menu is built from a settled answer. Both are TTL-gated inside. Run it from the
-    /// home's `.task`; it returns when that task is cancelled.
+    /// Presence while a home is on screen, touch or console: a sweep every 10 s, each saved
+    /// host's name following its live advert, and each reachable paired host's actions and
+    /// running title kept warm on the same beat, so a card's menu is built from a settled
+    /// answer. Both caches are TTL-gated inside. Run it from the home's `.task`; it returns
+    /// when that task is cancelled.
     ///
     /// Each Mac window runs one. A lap that finds a sweep younger than the period skips its
     /// own, so the process probes once per period however many windows are open.
@@ -250,6 +259,11 @@ final class HostStore: ObservableObject {
         while !Task.isCancelled {
             if Date().timeIntervalSince(lastSweep) >= Self.presencePeriod {
                 await refreshReachability(discovery: discovery)
+            }
+            for host in hosts {
+                if let live = discovery.hosts.first(where: { host.matches($0) }) {
+                    updateName(host.id, advertised: live.name)
+                }
             }
             for host in hosts where host.pinnedSHA256 != nil && probedOnline.contains(host.id) {
                 power.refresh(host)
@@ -307,6 +321,15 @@ final class HostStore: ObservableObject {
         hosts[i].osChain = chain
     }
 
+    /// Follow the name this host advertises (`StoredHost.followAdvertName`) — same contract as
+    /// `updateMacs`: no write when nothing changed.
+    func updateName(_ hostID: UUID, advertised: String) {
+        guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
+        var host = hosts[i]
+        guard host.followAdvertName(advertised) else { return }
+        hosts[i] = host
+    }
+
     /// Learn/refresh this host's management-API port from its live advert — same contract as
     /// `updateMacs`. Until this existed, `StoredHost.mgmtPort` was declared and read but never
     /// written, so `effectiveMgmtPort` always answered 47990 and a host that had moved its mgmt
@@ -324,6 +347,14 @@ final class HostStore: ObservableObject {
     func setPreset(_ hostID: UUID, presetID: String?) {
         guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
         hosts[i].presetID = presetID
+    }
+
+    /// Save the host profile this device plays as on this host, or forget it (nil). No-op when
+    /// unchanged, so an unchanged pick doesn't churn UserDefaults.
+    func setProfile(_ hostID: UUID, _ pick: ProfilePick?) {
+        guard let i = hosts.firstIndex(where: { $0.id == hostID }),
+              hosts[i].pickedProfile != pick else { return }
+        hosts[i].pickedProfile = pick
     }
 
     /// Pin or unpin a host+preset combo as its own card (§5.2a). Presentation only: it never

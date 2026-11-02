@@ -1,0 +1,5 @@
+• 120 fps streams show at 120 Hz on tablets and phones that held them at 60.
+• 5.1 and 7.1 surround plays on every speaker.
+• A dropped connection dials the host again instead of ending the stream, and a switch from Wi-Fi to mobile data follows at once.
+• Fixes a crash on Android 10 and grey blacks on Android 11.
+• PyroWave uses about a fifth less bandwidth and blurs a patch instead of dropping a frame.

@@ -15,5 +15,9 @@ publish = false
 [dependencies]
 cbindgen = "0.29"
 
+[dev-dependencies]
+# `abi_header_hash` compares the generated header with `ABI_HEADER_HASH`.
+punktfunk-core = { path = "../../crates/core/punktfunk-core" }
+
 [lints]
 workspace = true

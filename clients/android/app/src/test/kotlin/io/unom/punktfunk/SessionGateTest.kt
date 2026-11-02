@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import io.unom.punktfunk.models.ActiveSession
 import org.junit.After
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -12,7 +13,7 @@ import org.junit.Test
 class SessionGateTest {
     @After
     fun reset() {
-        SessionGate.live = null
+        endLive()
         SessionGate.release()
     }
 
@@ -27,21 +28,34 @@ class SessionGateTest {
 
     @Test
     fun noDialBehindALiveSession() {
-        SessionGate.live = SessionGate.Live("host-1")
+        SessionGate.owner.open(session("host-1"))
         assertFalse(SessionGate.take())
         // Another host is refused too: this app shows one stream, so a second dial replaces the
         // session on screen and strands the first handle on the host.
         assertFalse(SessionGate.take())
-        SessionGate.live = null
+        endLive()
         assertTrue(SessionGate.take())
     }
 
     @Test
     fun aRefusedDialNeverTakesTheGate() {
-        SessionGate.live = SessionGate.Live(null)
+        SessionGate.owner.open(session(null))
         assertFalse(SessionGate.take())
-        SessionGate.live = null
+        endLive()
         // A refusal that had claimed the flag would wedge every later dial.
         assertTrue(SessionGate.take())
+    }
+
+    private fun session(hostId: String?) =
+        ActiveSession(HANDLE, Settings(), clipboardSync = false, hostId = hostId)
+
+    // Ends it with a screen on it, so nothing closes: the JVM has no native library.
+    private fun endLive() {
+        SessionGate.owner.attach(HANDLE)
+        SessionGate.owner.end(HANDLE)
+    }
+
+    private companion object {
+        const val HANDLE = 7L
     }
 }

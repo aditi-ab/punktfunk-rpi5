@@ -78,9 +78,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.ImageLoader
+import coil3.ImageLoader
 import io.unom.punktfunk.components.launcherIcon
-import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.library.Download
 import io.unom.punktfunk.kit.library.GameEntry
@@ -236,6 +235,24 @@ fun LibraryScreen(
     }
     val streamSettings = remember(settings, preset) { settings.effectiveFor(preset) }
     val knownHostStore = remember { KnownHostStore(context) }
+    val services = remember { HostServices(knownHostStore, JniHostNative(context)) }
+    // The profile picker a launch waits on.
+    var profileAsk by remember { mutableStateOf<ProfileAsk?>(null) }
+    profileAsk?.let { ask ->
+        ProfilePickerDialog(
+            hostName = host.name.ifBlank { host.address },
+            answer = ProfilesAnswer.Listed(ask.listed),
+            saved = ask.host.asProfile,
+            gone = ask.gone,
+            art = rememberProfileArt(ask.host),
+            onPick = { ask.answer.complete(it) },
+            onDismiss = { ask.answer.complete(null) },
+        )
+    }
+    var seatWait by remember { mutableStateOf<ProfileWait?>(null) }
+    seatWait?.let { w ->
+        SeatWaitDialog(w, onCancel = { w.cancelled.complete(Unit); seatWait = null })
+    }
 
     // Keyed on the mgmt port too: a discovery tick can learn it after this screen is composed, and
     // the fetch must redo itself against the real port rather than stay on a stale 47990 failure.
@@ -251,11 +268,10 @@ fun LibraryScreen(
         "${host.name} — Library"
     }
 
-    // Dial the host over the same pinned mTLS trust, booting straight into this title (the host
-    // resolves `launch` = its library id). Shared by both presentations: a tap on a grid tile and A
-    // on a centred cover are the same act, and a launch that behaved differently between them would
-    // be a bug nobody could see until they switched input device.
-    fun launch(identity: ClientIdentity, game: GameEntry) {
+    // Dial through [HostServices.dial] on the pinned trust, booting straight into this title (the
+    // host resolves `launch` = its library id). A grid tap and A on a centred cover share this one
+    // launch. [link] names the profile to play as; [redial] marks the one dial [ProfileRetry] grants.
+    fun launch(identity: ClientIdentity, game: GameEntry, link: String? = null, redial: Boolean = false) {
         if (launching) return
         launching = true
         // The desktop tile is the host, not one of its titles: it streams with no launch id, and
@@ -269,17 +285,29 @@ fun LibraryScreen(
             LibraryPosition.remember(context, host.id, game.id)
         }
         scope.launch {
-            val handle = connectToHost(
-                context, streamSettings, identity,
-                host.address, host.port, host.fpHex,
+            val choice = chooseProfile(knownHostStore, identity, host, link, wait = { seatWait = it }) {
+                profileAsk = it
+            }
+            profileAsk = null
+            if (choice !is ProfileChoice.Dial) {
+                launching = false
+                if (choice is ProfileChoice.Refused) {
+                    Toast.makeText(context, choice.line, Toast.LENGTH_LONG).show()
+                }
+                return@launch
+            }
+            val spec = DialSpec(
+                streamSettings, identity, host.address, host.port, host.fpHex,
                 launch = game.id.takeUnless { game.isDesktop },
                 dialer = "touch/library",
                 preset = preset,
+                profile = choice.id,
             )
+            val dialed = services.dial(spec, host, host.name)
             launching = false
-            if (handle != 0L) {
+            if (dialed is HostServices.Connected) {
                 onLaunched(
-                    SessionFactory.afterDial(handle, host, streamSettings, preset, knownHostStore).copy(
+                    dialed.session.copy(
                         // Where to come back to when this game exits — this shelf, pin and all,
                         // not the host's default one.
                         launchedFromLibrary = true,
@@ -289,15 +317,23 @@ fun LibraryScreen(
                         launchHold = game.takeUnless { it.isLauncher || it.isDesktop }?.let {
                             LaunchHold(
                                 it, host.address, host.effectiveMgmtPort, host.fpHex,
-                                sourceRect = TileFrames.rect(it.id),
+                                sourceRect = TileFrames.rect(it.id), streamPort = host.port,
                             )
                         },
                     ),
                 )
-            } else {
+            } else if (dialed is HostServices.Failed) {
+                val token = dialed.token
+                if (ProfileRetry.afterRefusal(token, host, choice, redial, knownHostStore) { h, p ->
+                        stillListed(identity, h, p)
+                    }
+                ) {
+                    launch(identity, game, choice.id, redial = true)
+                    return@launch
+                }
                 Toast.makeText(
                     context,
-                    ConnectErrors.connectMessage(NativeBridge.nativeTakeLastError(), requestAccess = false),
+                    dialed.said.ifEmpty { ConnectErrors.connectMessage(token, requestAccess = false) },
                     Toast.LENGTH_LONG,
                 ).show()
             }
@@ -312,20 +348,30 @@ fun LibraryScreen(
         if (autoStream && ready != null) launch(ready, GameEntry.desktop())
     }
 
-    // "Copy link" for one TITLE — the self-emitted form a host card already hands out (design/
-    // client-deep-links.md §4/§5), plus this game's `launch=` id, so pasting the URL into Playnite
-    // or a Stream Deck macro boots straight into it. A shelf opened from a PINNED card copies that
-    // card's preset with it, because that combination is the thing being copied.
-    fun copyLink(game: GameEntry) {
+    // One TITLE's link handed out (design/client-deep-links.md §4/§5): the host card's form plus
+    // this game's `launch=` id, so Playnite, a frontend or a home-screen tap boots straight into
+    // it. A shelf opened from a PINNED card carries that card's preset: that combination is the
+    // thing handed out. Every answer is a toast: this screen has no notice banner or status line.
+    fun linkAction(game: GameEntry, action: LinkAction) {
         val url = DeepLinks.forHost(host, launch = game.id, preset = pinnedPresetId).toUrl()
-        // A toast either way here: this screen renders neither the touch home's notice banner nor
-        // the console's status line, and both of its presentations are full-bleed over artwork.
-        linkCopyMessage(putLinkOnClipboard(context, url))?.let {
-            Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
+        val name = if (game.isDesktop) host.name else game.title
+        val say = { text: String -> Toast.makeText(context, text, Toast.LENGTH_SHORT).show() }
+        when (action) {
+            LinkAction.Copy -> linkCopyMessage(putLinkOnClipboard(context, url))?.let(say)
+            LinkAction.LauncherFile -> (context as? MainActivity)?.saveLauncherFile(name, url, say)
+            LinkAction.HomeScreen -> {
+                val identity = (state as? LibState.Ready)?.identity
+                val key = shortcutId(host.id, game.id.takeUnless { game.isDesktop }, pinnedPresetId)
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        pinTitleShortcut(context, identity, host, game.art.posterCandidates, url, name, key)
+                    }?.let(say)
+                }
+            }
         }
     }
 
-    // Lambdas, NOT `::launch` / `::copyLink`: two callable references to the same local function
+    // Lambdas, NOT `::launch` / `::linkAction`: two callable references to the same local function
     // compare EQUAL however different the frame they captured, so a skipped recomposition would
     // leave the child calling a closure over stale settings. SettingsScreen documents the same
     // trap at `scopePreset()`, having been bitten by it.
@@ -342,8 +388,7 @@ fun LibraryScreen(
         scope.launch {
             val outcome = withContext(Dispatchers.IO) {
                 LibraryClient.endGame(
-                    host.address, host.effectiveMgmtPort, ready.identity.certPem,
-                    ready.identity.privateKeyPem, host.fpHex, game.id,
+                    ready.identity, host.address, host.effectiveMgmtPort, host.fpHex, game.id, host.port,
                 )
             }
             if (outcome.gameGone) {
@@ -361,7 +406,7 @@ fun LibraryScreen(
             val status = withContext(Dispatchers.IO) {
                 LibraryClient.fetchStatus(
                     host.address, host.effectiveMgmtPort, ready.identity.certPem,
-                    ready.identity.privateKeyPem, host.fpHex,
+                    ready.identity.privateKeyPem, host.fpHex, host.port,
                 )
             }
             (state as? LibState.Ready)?.let { state = it.withStatus(status) }
@@ -372,8 +417,8 @@ fun LibraryScreen(
         scope.launch {
             val outcome = withContext(Dispatchers.IO) {
                 LibraryClient.changeInstall(
-                    host.address, host.effectiveMgmtPort, ready.identity.certPem,
-                    ready.identity.privateKeyPem, host.fpHex, game.id, action,
+                    ready.identity, host.address, host.effectiveMgmtPort, host.fpHex, game.id, action,
+                    host.port,
                 )
             }
             if (outcome == InstallOutcome.Done && action == InstallAction.Remove) {
@@ -431,7 +476,7 @@ fun LibraryScreen(
         onBack = onBack,
         onReload = { reloadKey++ },
         onLaunch = { identity, game -> launch(identity, game) },
-        onCopyLink = { game -> copyLink(game) },
+        onLink = { game, action -> linkAction(game, action) },
         onEndGame = { game -> endAsk = game },
         onFiles = { game, action ->
             if (action == InstallAction.Remove) removeAsk = game else changeInstall(game, action)
@@ -479,6 +524,7 @@ private suspend fun loadLibrary(
             fpHex = host.fpHex,
             macs = host.mac,
             autoWake = autoWake,
+            streamPort = host.port,
             isCancelled = { !isActive },
             onWaking = {
                 if (cached != null) {
@@ -503,6 +549,7 @@ private suspend fun loadLibrary(
                     certPem = identity.certPem,
                     keyPem = identity.privateKeyPem,
                     fpHex = host.fpHex,
+                    streamPort = host.port,
                 )
             }
             set(LibState.Ready(res.games, loader, identity).withStatus(status))
@@ -531,10 +578,10 @@ private suspend fun loadLibrary(
  * The identity and the art loader, needed whether or not the host ever answers — cached posters
  * have to render behind a cached catalog with the box still down. Null = no identity.
  */
-private suspend fun prepareLoader(context: Context, host: KnownHost): Pair<ClientIdentity, ImageLoader>? =
+internal suspend fun prepareLoader(context: Context, host: KnownHost): Pair<ClientIdentity, ImageLoader>? =
     withContext(Dispatchers.IO) {
         val id = IdentityHolder.shared(context).await() ?: return@withContext null
-        val loader = runCatching { posterLoader(context, id, host.address, host.fpHex) }.getOrNull()
+        val loader = runCatching { posterLoader(context, id, host.address, host.fpHex, host.port) }.getOrNull()
             ?: return@withContext null
         id to loader
     }
@@ -555,7 +602,7 @@ private fun TouchLibrary(
     onBack: () -> Unit,
     onReload: () -> Unit,
     onLaunch: (ClientIdentity, GameEntry) -> Unit,
-    onCopyLink: (GameEntry) -> Unit,
+    onLink: (GameEntry, LinkAction) -> Unit,
     /** Ask to end a title this device launched; the caller confirms. */
     onEndGame: (GameEntry) -> Unit = {},
     /** Install, pause, resume or remove a title's download; the caller confirms a removal. */
@@ -627,7 +674,7 @@ private fun TouchLibrary(
                     games = state.ordered,
                     loader = state.loader,
                     onLaunch = { game -> onLaunch(state.identity, game) },
-                    onCopyLink = onCopyLink,
+                    onLink = onLink,
                     onEndGame = onEndGame,
                     running = state.running,
                     downloads = state.downloads,
@@ -668,7 +715,7 @@ internal fun TouchGrid(
     games: List<GameEntry>,
     loader: ImageLoader,
     onLaunch: (GameEntry) -> Unit,
-    onCopyLink: (GameEntry) -> Unit,
+    onLink: (GameEntry, LinkAction) -> Unit,
     onEndGame: (GameEntry) -> Unit = {},
     /**
      * Which titles the host already has up, keyed by library id — so a tile the player can return
@@ -719,7 +766,7 @@ internal fun TouchGrid(
             if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Launchers") }
             items(launchers, key = { "launcher-${it.id}" }) {
                 TouchPoster(
-                    it, loader, onLaunch, onCopyLink, running[it.id] != null,
+                    it, loader, onLaunch, onLink, running[it.id] != null,
                     endable = running[it.id]?.endable == true, onEndGame = onEndGame,
                     download = downloads[it.id], grants = grants, onFiles = onFiles,
                 )
@@ -729,7 +776,7 @@ internal fun TouchGrid(
             if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Games") }
             items(titles, key = { "game-${it.id}" }) {
                 TouchPoster(
-                    it, loader, onLaunch, onCopyLink, running[it.id] != null,
+                    it, loader, onLaunch, onLink, running[it.id] != null,
                     endable = running[it.id]?.endable == true, onEndGame = onEndGame,
                     download = downloads[it.id], grants = grants, onFiles = onFiles,
                 )
@@ -781,7 +828,7 @@ private fun TouchPoster(
     game: GameEntry,
     loader: ImageLoader,
     onLaunch: (GameEntry) -> Unit,
-    onCopyLink: (GameEntry) -> Unit,
+    onLink: (GameEntry, LinkAction) -> Unit,
     /** Already up on the host, so tapping resumes rather than starts. */
     running: Boolean = false,
     /** Up, and this device launched it: the long press offers End game. */
@@ -793,6 +840,8 @@ private fun TouchPoster(
     onFiles: (GameEntry, InstallAction) -> Unit = { _, _ -> },
 ) {
     var menu by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val canPin = remember { canPinShortcuts(context) }
     val files = InstallAction.forTitle(game.install, download, grants)
     val badge = TileBadge.forTitle(game.install, download)
     val shape = MaterialTheme.shapes.medium
@@ -871,7 +920,23 @@ private fun TouchPoster(
                 text = { Text("Copy link") },
                 onClick = {
                     menu = false
-                    onCopyLink(game)
+                    onLink(game, LinkAction.Copy)
+                },
+            )
+            if (canPin) {
+                DropdownMenuItem(
+                    text = { Text("Add to home screen") },
+                    onClick = {
+                        menu = false
+                        onLink(game, LinkAction.HomeScreen)
+                    },
+                )
+            }
+            DropdownMenuItem(
+                text = { Text("Save launcher file\u2026") },
+                onClick = {
+                    menu = false
+                    onLink(game, LinkAction.LauncherFile)
                 },
             )
             if (files != null) {

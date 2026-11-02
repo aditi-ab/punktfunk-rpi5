@@ -140,6 +140,8 @@ struct HostActions {
     var speedTest: (() -> Void)?
     var sendLogs: (() -> Void)?
     var wake: (() -> Void)?
+    /// Opens the profile picker to change who plays. nil until this device has picked one.
+    var switchProfile: (() -> Void)?
     var copyLink: (() -> Void)?
     /// Opens the host page. nil on a pinned card, which is a shortcut rather than a host.
     var showDetails: (() -> Void)?
@@ -159,6 +161,8 @@ struct HostActionSurface {
     var wake: () -> Void
     var showDetails: () -> Void
     var runPower: (HostAction) -> Void
+    /// Only the grid opens the profile picker; a surface that can't leaves this empty.
+    var switchProfile: () -> Void = {}
 }
 
 extension HostActions {
@@ -175,8 +179,7 @@ extension HostActions {
         // test nor a log inbox.
         let paired = host.pinnedSHA256 != nil
         let measurable = paired && !DemoMode.isDemo(host)
-        let wakeable = pinned == nil && !online && !host.wakeMacs.isEmpty
-            && PunktfunkConnection.wakeOnLANAvailable
+        let wakeable = pinned == nil && !online && WakePolicy.canWake(host.wakeMacs)
         self.init(
             connect: { surface.connect(selection) },
             pair: surface.pair,
@@ -186,6 +189,8 @@ extension HostActions {
             speedTest: measurable ? surface.speedTest : nil,
             sendLogs: measurable ? surface.sendLogs : nil,
             wake: wakeable ? surface.wake : nil,
+            switchProfile: pinned == nil && paired && host.pickedProfile != nil
+                && !DemoMode.isDemo(host) ? surface.switchProfile : nil,
             copyLink: LinkClipboard.isAvailable
                 ? { LinkClipboard.copy(DeepLink.forHost(host, preset: pinned?.id).urlString) }
                 : nil,
@@ -228,7 +233,7 @@ enum HostStatus: Equatable {
             } else {
                 self = .online
             }
-        } else if autoWake, !host.wakeMacs.isEmpty, PunktfunkConnection.wakeOnLANAvailable {
+        } else if WakePolicy.autoWakes(host.wakeMacs, autoWake: autoWake) {
             self = .offlineWakes
         } else {
             self = .offline
@@ -307,7 +312,7 @@ struct HostCardView: View {
     var pinnedPreset: StreamPreset? = nil
     /// What the host has up right now (`NowPlayingStore`), if anything.
     var nowPlaying: String? = nil
-    @AppStorage(DefaultsKey.autoWake) private var autoWake = true
+    @AutoWake private var autoWake
 
     /// The preset this card announces: a pinned card's own, else the host's binding.
     private var shownPreset: StreamPreset? {
@@ -329,6 +334,17 @@ struct HostCardView: View {
                         .opacity(isOnline || isConnecting ? 1 : 0.55)
                         .overlay(alignment: .bottomTrailing) {
                             if isDefaultHost { DefaultHostBadge(size: m.tile) }
+                        }
+                        .overlay(alignment: .topTrailing) {
+                            // Who plays here; the pick stores no colour.
+                            if let pick = host.pickedProfile {
+                                ProfileAvatar(
+                                    name: pick.displayName, size: m.tile * 0.38,
+                                    picture: pick.avatar, host: host)
+                                    .overlay(Circle().strokeBorder(.background, lineWidth: 2))
+                                    .offset(x: m.tile * 0.06, y: -m.tile * 0.06)
+                                    .accessibilityLabel("Playing as \(pick.displayName)")
+                            }
                         }
                     VStack(alignment: .leading, spacing: 4) {
                         Text(host.displayName)
@@ -370,6 +386,9 @@ struct HostCardView: View {
             .buttonStyle(.card)
             #elseif os(iOS) || os(visionOS)
             .buttonStyle(HostCardButtonStyle(cornerRadius: m.radius))
+            #if os(visionOS)
+            .cardHover(RoundedRectangle(cornerRadius: m.radius, style: .continuous))
+            #endif
             #else
             .buttonStyle(.plain)
             #endif
@@ -440,6 +459,9 @@ struct HostCardView: View {
             }
             if let wake = actions.wake {
                 Button("Wake Host", systemImage: "power", action: wake)
+            }
+            if let switchProfile = actions.switchProfile {
+                Button("Switch profile…", systemImage: "person.crop.circle", action: switchProfile)
             }
             if let copyLink = actions.copyLink {
                 Button("Copy Link", systemImage: "link", action: copyLink)
@@ -569,6 +591,9 @@ struct DiscoveredCardView: View {
         .buttonStyle(.card)
         #elseif os(iOS) || os(visionOS)
         .buttonStyle(HostCardButtonStyle(cornerRadius: m.radius))
+        #if os(visionOS)
+        .cardHover(RoundedRectangle(cornerRadius: m.radius, style: .continuous))
+        #endif
         #else
         .buttonStyle(.plain)
         #endif
@@ -577,12 +602,13 @@ struct DiscoveredCardView: View {
 }
 
 #if os(iOS) || os(visionOS)
-/// The iOS host-card press/hover treatment, one style for both idioms:
+/// The touch host-card press/hover treatment:
 /// - iPhone: a subtle scale-down on press + a light impact haptic on press-down. (`hoverEffect` is
 ///   inert without a pointer.)
 /// - iPad: the system pointer "magnet" — the cursor morphs into a highlight that conforms to the
 ///   card's rounded rect on hover. (`sensoryFeedback` is inert without a Taptic Engine, and the
 ///   press scale doubles as click feedback.)
+/// - Vision Pro: the press scale; the gaze highlight is `cardHover` on the button itself.
 struct HostCardButtonStyle: ButtonStyle {
     var cornerRadius: CGFloat
 
@@ -590,14 +616,29 @@ struct HostCardButtonStyle: ButtonStyle {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .animation(.spring(response: 0.3, dampingFraction: 0.65), value: configuration.isPressed)
+            #if os(iOS)
             // Conform the pointer highlight to the card's rounded rect, not its square bounds.
             .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .hoverEffect(.highlight)
+            #endif
             // Light tap on press-down (nil on release so it fires once, on touch). No haptic
             // hardware on iPad → silently ignored there.
             .sensoryFeedback(trigger: configuration.isPressed) { _, pressed in
                 pressed ? .impact(weight: .light) : nil
             }
+    }
+}
+#endif
+
+#if os(visionOS)
+extension View {
+    /// The gaze highlight in `shape`, on a button itself. The system draws its own platter round
+    /// the whole button at a large radius, outside any shape the label or style sets; that one is
+    /// switched off here, and the highlight above it takes its place.
+    func cardHover(_ shape: some Shape) -> some View {
+        hoverEffectDisabled()
+            .contentShape(.hoverEffect, shape)
+            .hoverEffect(.highlight)
     }
 }
 #endif

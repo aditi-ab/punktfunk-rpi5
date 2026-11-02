@@ -3,7 +3,6 @@ package io.unom.punktfunk
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import io.unom.punktfunk.kit.discovery.WakeLoop
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -14,7 +13,7 @@ import kotlinx.coroutines.withContext
 
 /**
  * Wake a sleeping host and WAIT for it to come back before proceeding — the Android mirror of the
- * Apple client's `HostWaker`, driving [WakeLoop] behind a visible "Waking…" state.
+ * Apple client's `HostWaker`, driving [HostServices.wake] behind a visible "Waking…" state.
  *
  * A magic packet is fire-and-forget, and a cold box can take 20–60 s to POST, boot, and start
  * answering again — far longer than a connect attempt will sit. On success this runs [onOnline]
@@ -27,7 +26,7 @@ import kotlinx.coroutines.withContext
  * [scope] is the composition's coroutine scope (main-dispatched), so [waking] mutations and the
  * [onOnline] callback run on the main thread; the loop itself runs on IO.
  */
-class WakeController(private val scope: CoroutineScope) {
+class WakeController(private val scope: CoroutineScope, private val services: HostServices) {
     /** null = idle; non-null drives the "Waking…" phase of [ConnectOverlay]. */
     data class Waking(
         val hostName: String,
@@ -90,10 +89,11 @@ class WakeController(private val scope: CoroutineScope) {
     ) {
         loop?.cancel()
         waking = Waking(hostName = hostName, connectsAfter = connectsAfter)
+        val claim = services.wakes.next()
         loop = scope.launch {
             val job = coroutineContext.job
             val up = withContext(Dispatchers.IO) {
-                WakeLoop.run(macs, lastIp, isOnline, cancelled = { !isActive }) { seconds, _, _ ->
+                services.wake(claim, macs, lastIp, isOnline, cancelled = { !isActive }) { seconds, _, _ ->
                     // Posted, and dropped once this wait is no longer the current one.
                     scope.launch { if (loop === job) waking = waking?.copy(seconds = seconds) }
                 }

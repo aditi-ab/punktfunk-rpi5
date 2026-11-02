@@ -28,9 +28,9 @@
 
 use std::ffi::c_void;
 
+use windows::core::{HRESULT, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::core::{HRESULT, PCSTR, PCWSTR};
 
 /// `GameInputKind` values we use (GameInput.h).
 const GAME_INPUT_KIND_GAMEPAD: u32 = 0x0004_0000;
@@ -238,6 +238,23 @@ impl GameInput {
                 return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+    }
+
+    /// `(timestamp, sequence)` of the current gamepad reading. `None` when GameInput hands this
+    /// process nothing: no pad, or its one focus per box sits on another process.
+    pub fn gamepad_stamp(&self) -> Option<(u64, u64)> {
+        let (kind, r) = [GAME_INPUT_KIND_GAMEPAD, GAME_INPUT_KIND_CONTROLLER]
+            .into_iter()
+            .find_map(|kind| self.reading(kind).map(|r| (kind, r)))?;
+        // SAFETY: `r` is a live IGameInputReading we own; slot 4 is GetSequenceNumber(kind),
+        // slot 5 GetTimestamp, slot 2 Release (GameInput.h).
+        unsafe {
+            let vtbl = *(r as *mut *const IGameInputReadingVtbl);
+            let seq = ((*vtbl).GetSequenceNumber)(r, kind);
+            let ts = ((*vtbl).GetTimestamp)(r);
+            ((*vtbl).Release)(r);
+            Some((ts, seq))
         }
     }
 

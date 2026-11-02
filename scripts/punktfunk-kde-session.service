@@ -22,6 +22,8 @@
 Description=punktfunk headless KDE Plasma session (kwin --virtual on wayland-kde)
 After=pipewire.service pipewire-pulse.service dbus.service
 Wants=pipewire.service
+# Stands down while the box's owner row runs this user's own headless desktop (punktfunk-seat@%u).
+ConditionPathExists=!/run/punktfunk-seat-%u
 
 [Service]
 Type=simple

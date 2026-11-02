@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Punktfunk host unsafe census.
+Punktfunk unsafe census.
 
-Reproducible, compiler-free census of `unsafe` in the HOST-scope crates.
+Reproducible, compiler-free census of `unsafe` in every crate a shipped binary links.
 Classifies by WHAT THE UNSAFE DOES (operations), not by block count.
 
-Usage:  python3 unsafe_census.py <repo-root> [--json]
+Usage:  python3 unsafe-census.py <repo-root> [--json | --baseline <path> | --write-baseline <path>]
+        python3 unsafe-census.py --self-test
+
+`--baseline` is the CI ratchet: per crate, the shipped non-FFI operation count must EQUAL the
+committed file. A rise fails; so does a baseline left above today's count, because that slack is
+where a later rise hides. `--write-baseline` regenerates the file.
 
 Method (and its error bars) are documented in the report; in short:
-  0. Take the crate scope from `cargo metadata` (see host_roots), so a new crate is counted.
+  0. Take the crate scope from `cargo metadata` (see scope_roots), so a new crate is counted.
   1. Strip line/block comments and string/char literals (a hand-rolled scanner).
   2. Resolve each crate's module tree from lib.rs/main.rs, propagating `#[cfg(..)]`
      from `mod x;` declarations down to files, so cfg attribution is structural
@@ -19,33 +24,40 @@ Method (and its error bars) are documented in the report; in short:
      unsafe OPERATIONS by regex, deduped by source span so nested blocks don't
      double count.
 """
-import os, re, sys, json, collections, subprocess
+import os, re, sys, json, argparse, collections, subprocess
 
 # ---------------------------------------------------------------- scope
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci"))
 from cargo_graph import closure  # noqa: E402
 
-# The host scope is every local crate these binaries link on either OS with every feature on (no
-# dev-dependencies), plus the Windows drivers, which build in their own workspace.
-HOST_BINARIES = ["punktfunk-host", "punktfunk-encode-worker", "punktfunk-tray"]
-HOST_TRIPLES = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
-EXTRA_HOST_ROOTS = ["packaging/windows/drivers"]
+# The scope is every local crate these shipped binaries link on any target with every feature
+# on (no dev-dependencies), plus the cdylibs Windows loads into other processes and the crates
+# that build in their own workspaces. `cargo metadata` resolves a target it cannot build for,
+# so the Apple and Android closures need no installed toolchain.
+SHIPPED = ["punktfunk-host", "punktfunk-encode-worker", "punktfunk-capture-worker",
+           "punktfunk-seats", "punktfunk-tray", "pf-seat-audio",
+           "punktfunk-cli", "punktfunk-client-linux", "punktfunk-client-windows",
+           "punktfunk-client-android", "punktfunk-client-apple", "punktfunk-ffi"]
+TRIPLES = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin",
+           "aarch64-apple-ios", "aarch64-linux-android"]
+EXTRA_ROOTS = ["packaging/windows/drivers", "packaging/windows/pf-vkhdr-layer",
+               "crates/host/pf-seat-keeper"]
 
 
-def host_roots():
-    """Crate directories in the host scope, relative to the repo root (the cwd)."""
+def scope_roots():
+    """Crate directories in scope, relative to the repo root (the cwd)."""
     dirs = set()
-    for triple in HOST_TRIPLES:
+    for triple in TRIPLES:
         meta = json.loads(subprocess.check_output(
             ["cargo", "metadata", "--format-version", "1", "--locked", "--all-features",
              "--filter-platform", triple], text=True))
-        ids = closure(meta, HOST_BINARIES, dev=False)
+        ids = closure(meta, SHIPPED, dev=False)
         dirs |= {os.path.relpath(os.path.dirname(p["manifest_path"])).replace(os.sep, "/")
                  for p in meta["packages"] if p["id"] in ids and p["source"] is None}
     # A crate vendored inside another crate's directory is walked with its parent.
     nested = {d for d in dirs if any(d.startswith(o + "/") for o in dirs)}
-    return sorted(dirs - nested) + EXTRA_HOST_ROOTS
+    return sorted(dirs - nested) + EXTRA_ROOTS
 
 EXCLUDE_DIR_PARTS = {"target", ".claude", "node_modules", ".git"}
 
@@ -245,10 +257,21 @@ FFI_CALL = re.compile(
 # a fn-pointer call through a dlopen'd symbol table: (self.api.foo)(..) / (f.bar)(..)
 FNPTR_CALL = re.compile(r'\(\s*(?:self\s*\.\s*)?(?:\w+\s*\.\s*)+\w+\s*\)\s*\(')
 
+# A name this file binds to a `windows::core::Owned<T>`: `let h = Owned::new(..)`, a `h: Owned<T>`
+# field or a `h: &Owned<T>` parameter. `*h` on one is `Deref`, a safe call that copies the handle
+# out; the FFI call that takes it is the unsafe operation, and it is counted as one.
+OWNED_NAME = re.compile(
+    r'\blet\s+(?:mut\s+)?(\w+)\s*=\s*(?:unsafe\s*\{\s*)?(?:\w+\s*::\s*)*Owned\s*::\s*new\s*\('
+    r'|\b(\w+)\s*:\s*&?\s*(?:\w+\s*::\s*)*Owned\s*<')
+
+def owned_names(src):
+    return frozenset(a or b for a, b in OWNED_NAME.findall(src))
+
 class _DerefRx:
     """`*expr` in DEREF position (not multiplication, not a `*mut`/`*const` type)."""
     STAR = re.compile(r'\*')
-    def finditer(self, body):
+    OPERAND = re.compile(r'\*\s*(?:self\s*\.\s*)?(\w+)\b(?!\s*(?:\.|\(|\[|::))')
+    def finditer(self, body, owned=frozenset()):
         n = len(body)
         for m in self.STAR.finditer(body):
             i = m.start()
@@ -269,6 +292,9 @@ class _DerefRx:
             # what follows must start an expression
             if not re.match(r'\*\s*(?:\(|\*|[A-Za-z_])', body[i:i+6]):
                 continue
+            operand = self.OPERAND.match(body, i)
+            if operand and operand.group(1) in owned:
+                continue
             yield type('M', (), {'start': lambda s, i=i: i, 'end': lambda s, i=i: i+1})()
 
 DEREF_RX = _DerefRx()
@@ -277,12 +303,13 @@ DEREF_RX = _DerefRx()
 # one). `Option::as_ref` deeper inside a block is safe and must not be counted.
 PTR_AS_REF = re.compile(r'^\s*(?:&\s*)?[\w.]+\s*\.\s*as_(?:ref|mut)\s*\(\s*\)\s*$')
 
-def count_ops(body: str):
-    """Return Counter of unsafe operations in a region body (already noise-stripped)."""
+def count_ops(body: str, owned=frozenset()):
+    """Return Counter of unsafe operations in a region body (already noise-stripped). `owned`
+    is the file's `Owned<T>` names, whose `*name` is not a raw deref."""
     c = collections.Counter()
     spans = []
     def take(cat, rx):
-        for m in rx.finditer(body):
+        for m in (rx.finditer(body, owned) if rx is DEREF_RX else rx.finditer(body)):
             if any(s <= m.start() < e for s, e in spans): continue
             spans.append((m.start(), m.end()))
             c[cat] += 1
@@ -303,7 +330,7 @@ FORBID = re.compile(r'#!\s*\[\s*forbid\s*\(\s*unsafe_code')
 REPRC = re.compile(r'#\s*\[\s*repr\s*\(\s*C')
 # NOTE: the `const _: () = { ... };` BLOCK form is as common in this tree as the direct
 # `const _: () = assert!(...)` form (18 files use it, incl. the C ABI, gamepad.rs and
-# idd_push/probes.rs). An earlier version of this regex matched only the direct form and
+# idd/probes.rs). An earlier version of this regex matched only the direct form and
 # therefore reported 102 unguarded repr(C) declarations where the true number is 60 —
 # it counted three well-guarded files as defenceless. Keep both alternatives.
 LAYOUT_ASSERT = re.compile(
@@ -382,6 +409,7 @@ def census_file(path, plat, feats):
     if not UNSAFE_TOK.search(src):
         return rec
     covered = []  # spans of already-counted region bodies
+    owned = owned_names(src)
     for m in UNSAFE_TOK.finditer(src):
         i = m.end()
         rest = src[i:i+40]
@@ -410,7 +438,7 @@ def census_file(path, plat, feats):
                 continue
             covered.append((ob, end))
             body = src[ob+1:end-1]
-            ops = count_ops(body)
+            ops = count_ops(body, owned)
             rec["ops"].update(ops)
             if _is_test: rec["test_ops"].update(ops)
             rec["regions"].append({"line": src[:ob].count('\n')+1,
@@ -429,10 +457,65 @@ def census_file(path, plat, feats):
             keep = body
             for s, e in sorted(inner, reverse=True):
                 keep = keep[:s-ob-1] + " " * (e-s) + keep[e-ob-1:]
-            ops = count_ops(keep)
+            ops = count_ops(keep, owned)
             rec["ops"].update(ops)
             rec["forms"]["fenced_fn_body"] += 1
     return rec
+
+# ---------------------------------------------------------------- ratchet
+
+METRIC = "shipped_nonffi_unsafe_ops"
+
+def baseline_crates(recs):
+    """The baseline: per crate root, the unsafe operations that are neither an FFI call nor
+    inside `#[cfg(test)]`. A crate at zero is left out. The file carries no total: that would
+    be one line every count-changing PR edits, so any two of them would conflict."""
+    per = collections.Counter()
+    for r in recs:
+        for k, v in r["ops"].items():
+            if not k.startswith("ffi_call"):
+                per[r["crate_root"]] += v - r["test_ops"].get(k, 0)
+    return {k: per[k] for k in sorted(per) if per[k]}
+
+def baseline_diff(today, base):
+    """(crate, today, baseline) for each crate whose count differs."""
+    rows = [(c, today.get(c, 0), base.get(c, 0)) for c in sorted(set(today) | set(base))]
+    return [r for r in rows if r[1] != r[2]]
+
+def check_baseline(today, path):
+    with open(path, encoding="utf-8") as f:
+        rows = baseline_diff(today, json.load(f)["crates"])
+    if not rows:
+        print(f"unsafe-census: {sum(today.values())} shipped non-FFI unsafe ops, baseline matches")
+        return 0
+    print(f"{'crate':<40}{'today':>7}{'baseline':>10}{'delta':>7}")
+    for c, t, b in rows:
+        print(f"{c:<40}{t:>7}{b:>10}{t - b:>+7}")
+    for c, t, b in rows:
+        if t > b:
+            print(f"::error::non-FFI unsafe ops rose in {c} ({b} -> {t}). Remove the op, or if "
+                  "the rise is deliberate regenerate the baseline and say why in the PR.")
+        else:
+            print(f"::error::baseline stale for {c} ({b} -> {t}). Regenerate the baseline.")
+    print("regenerate: python3 scripts/unsafe-census.py . --write-baseline "
+          "scripts/ci/unsafe-census-baseline.json")
+    return 1
+
+def self_test():
+    assert baseline_diff({"a": 2}, {"a": 2}) == []
+    assert baseline_diff({"a": 3}, {"a": 2}) == [("a", 3, 2)]
+    assert baseline_diff({"a": 1}, {"a": 2}) == [("a", 1, 2)]
+    assert baseline_diff({"a": 2, "new": 1}, {"a": 2}) == [("new", 1, 0)]
+    assert baseline_diff({}, {"gone": 4}) == [("gone", 0, 4)]
+    recs = [{"crate_root": "a", "ops": {"ptr_deref": 3, "ffi_call": 5}, "test_ops": {"ptr_deref": 1}},
+            {"crate_root": "b", "ops": {"ffi_call": 2}, "test_ops": {}}]
+    assert baseline_crates(recs) == {"a": 2}
+    owned = owned_names("let h = unsafe { Owned::new(raw) }; fn f(t: &Owned<HANDLE>) {}")
+    assert owned == {"h", "t"}
+    assert count_ops("Close(*h); Query(*t, *p);", owned)["ptr_deref"] == 1
+    assert count_ops("Close(*h); Query(*t, *p);")["ptr_deref"] == 3
+    print("unsafe-census self-test ok")
+    return 0
 
 # ---------------------------------------------------------------- driver
 
@@ -444,11 +527,19 @@ def walk_rs(root):
                 yield os.path.join(dirpath, f)
 
 def main():
-    repo = os.path.abspath(sys.argv[1])
-    as_json = "--json" in sys.argv
-    os.chdir(repo)
+    if sys.argv[1:] == ["--self-test"]:
+        return self_test()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("repo")
+    ap.add_argument("--json", action="store_true")
+    # Resolved here, before the chdir into the repo below.
+    ap.add_argument("--baseline", type=os.path.abspath, metavar="PATH")
+    ap.add_argument("--write-baseline", type=os.path.abspath, metavar="PATH")
+    args = ap.parse_args()
+    as_json = args.json
+    os.chdir(os.path.abspath(args.repo))
     allrecs = []
-    for root in host_roots():
+    for root in scope_roots():
         if not os.path.isdir(root): continue
         # crate entry points (a dir may hold several crates, e.g. packaging/windows/drivers)
         entries = []
@@ -462,13 +553,24 @@ def main():
         for p in walk_rs(root):
             plat, feats = modmap.get(p, (None, frozenset()))
             if p not in modmap:
-                # not reached from a crate root: tests/, build.rs, examples/ — mark by path
+                # not reached from a crate root. Integration tests, examples, benches and build
+                # scripts never ship; anything else is a module the walk missed — mark by path.
                 low = p.replace(os.sep, '/')
+                if ('/tests/' in low or '/examples/' in low or '/benches/' in low
+                        or low.endswith('/build.rs')):
+                    continue
                 if '/windows' in low or '_windows' in low: plat = 'windows'
                 elif '/linux' in low or '_linux' in low: plat = 'linux'
             rec = census_file(p, plat, feats)
             rec["crate_root"] = root
             allrecs.append(rec)
+    if args.write_baseline:
+        with open(args.write_baseline, "w", encoding="utf-8") as f:
+            json.dump({"metric": METRIC, "crates": baseline_crates(allrecs)}, f, indent=2)
+            f.write("\n")
+        return
+    if args.baseline:
+        return check_baseline(baseline_crates(allrecs), args.baseline)
     if as_json:
         for r in allrecs:
             r["forms"] = dict(r["forms"]); r["ops"] = dict(r["ops"]); r["test_ops"] = dict(r["test_ops"])
@@ -592,4 +694,4 @@ def main():
         print(f"{nf:>5}  {r['path']}\n         {det}")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

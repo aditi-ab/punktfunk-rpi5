@@ -49,7 +49,7 @@ def check(name: str, cond: bool):
 # `flatpak run --command=X <app-id> ARGS` — everything after the app id is the APP's argv, so
 # an app id that drifts left silently turns our flags into the client's. This is the shape the
 # deleted _session_argv used and the one thing about it that is easy to get wrong.
-main._client_argv = lambda: ["/usr/bin/flatpak", "run", "--arch=x86_64", "io.unom.Punktfunk"]
+main._client_argv = lambda: ["/usr/bin/flatpak", "run", "--arch=x86_64", "io.unom.punktfunk"]
 main._flatpak = lambda: "/usr/bin/flatpak"
 check(
     "cli argv: flatpak form, app id last",
@@ -59,7 +59,7 @@ check(
         "run",
         "--arch=x86_64",
         "--command=punktfunk",
-        "io.unom.Punktfunk",
+        "io.unom.punktfunk",
     ],
 )
 
@@ -83,13 +83,12 @@ check("cli argv: native sibling found", main._cli_argv() == [str(tmp / "punktfun
 #
 # The bug this exists to prevent: every client-update query used to name no branch, and the
 # punktfunk remote publishes `stable` AND `canary` — so `flatpak remote-info <origin>
-# io.unom.Punktfunk` failed with "Multiple branches available", the check swallowed the failure,
+# io.unom.punktfunk` failed with "Multiple branches available", the check swallowed the failure,
 # and the panel reported the client up to date forever. One branch INSTALLED is not enough to
 # make the query unambiguous; the ambiguity lives on the remote.
 shutil.rmtree("/tmp/pf-test-home", ignore_errors=True)
-# An arm install (Steam Frame): the resolver must look under the machine's arch, not x86_64.
-main._FLATPAK_ARCH = "aarch64"
-_fp_root = Path("/tmp/pf-test-home/.local/share/flatpak/app/io.unom.Punktfunk/aarch64")
+# An arm install (Steam Frame): the resolver must look under the installed arch, not uname's.
+_fp_root = Path("/tmp/pf-test-home/.local/share/flatpak/app/io.unom.punktfunk/aarch64")
 main._flatpak = lambda: "/usr/bin/flatpak"
 main._client_argv = _real_client_argv  # undo the fixture patches above
 
@@ -109,12 +108,13 @@ check("ref: a branch dir without `active` is leftovers, not an install", main._f
 _install_branch("canary")
 ref = main._flatpak_ref()
 check("ref: the single installed branch is used", ref == {
-    "scope": "--user", "branch": "canary", "ref": "io.unom.Punktfunk//canary",
+    "scope": "--user", "branch": "canary", "arch": "aarch64", "app_id": "io.unom.punktfunk",
+    "ref": "io.unom.punktfunk//canary",
 })
 check(
     "ref: the launcher pins that branch, app id still LAST",
     main._client_argv() == [
-        "/usr/bin/flatpak", "run", "--arch=aarch64", "--branch=canary", "io.unom.Punktfunk",
+        "/usr/bin/flatpak", "run", "--arch=aarch64", "--branch=canary", "io.unom.punktfunk",
     ],
 )
 # The pin must survive _cli_argv's rewrite, or the CLI runs a different build than the GUI.
@@ -122,7 +122,7 @@ check(
     "ref: --command= is inserted before the app id, keeping the pin",
     main._cli_argv() == [
         "/usr/bin/flatpak", "run", "--arch=aarch64", "--branch=canary",
-        "--command=punktfunk", "io.unom.Punktfunk",
+        "--command=punktfunk", "io.unom.punktfunk",
     ],
 )
 
@@ -132,6 +132,27 @@ check(
 _install_branch("stable")
 check("ref: with both installed, stable wins (what `flatpak run` picks)",
       main._flatpak_ref()["branch"] == "stable")
+
+# A Deck still on the CamelCase id until its next update: it must launch and update under that
+# id, and the new id wins as soon as both are there. The two ids are one directory on a
+# case-insensitive /tmp (macOS), where this cannot be staged.
+shutil.rmtree("/tmp/pf-test-home", ignore_errors=True)
+Path("/tmp/pf-test-home").mkdir(parents=True)
+(Path("/tmp/pf-test-home") / "CaseProbe").touch()
+if (Path("/tmp/pf-test-home") / "caseprobe").exists():
+    print("skip ref: legacy id (case-insensitive /tmp)")
+else:
+    _fp_root = Path("/tmp/pf-test-home/.local/share/flatpak/app/io.unom.Punktfunk/x86_64")
+    _install_branch("stable")
+    ref = main._flatpak_ref()
+    check("ref: a legacy-only install resolves under its own id",
+          ref["app_id"] == "io.unom.Punktfunk" and ref["ref"] == "io.unom.Punktfunk//stable")
+    check("ref: the launcher runs the legacy id, still LAST",
+          main._client_argv()[-1] == "io.unom.Punktfunk")
+    _fp_root = Path("/tmp/pf-test-home/.local/share/flatpak/app/io.unom.punktfunk/x86_64")
+    _install_branch("stable")
+    check("ref: the new id wins once both are installed",
+          main._flatpak_ref()["app_id"] == "io.unom.punktfunk")
 
 shutil.rmtree("/tmp/pf-test-home", ignore_errors=True)
 
@@ -206,6 +227,26 @@ captured.clear()
 got = asyncio.run(main.Plugin().library("   "))
 check("library: an empty ref is refused the same way", "args" not in captured and got["ok"] is False)
 
+# ---- Plugin.request_access: the advertised fingerprint pins the request -------------------
+#
+# Both OS installs of a dual-boot box answer at one address. Without `--fp` the CLI takes the
+# newest record there, which can be the other OS.
+desk = "ab" * 32
+captured.clear()
+asyncio.run(main.Plugin().request_access("192.168.1.9", 9777, "Steam Deck", desk))
+check(
+    "request access: argv pins the advertised fingerprint",
+    captured.get("args")
+    == ["pair", "192.168.1.9:9777", "--request-access", "--name", "Steam Deck", "--fp", desk],
+)
+captured.clear()
+asyncio.run(main.Plugin().request_access("192.168.1.9", 9777, "Steam Deck"))
+check("request access: no fingerprint, no --fp", "--fp" not in captured.get("args", []))
+captured.clear()
+got = asyncio.run(main.Plugin().request_access("192.168.1.9", 9777, "Steam Deck", "--exec"))
+check("request access: a flag-shaped fingerprint never reaches the CLI", "args" not in captured)
+check("request access: ...and is reported as unresolved", got["error"] == "unresolved")
+
 # ---- game_art: the inputs that become a URL and a file name are validated ----------------
 #
 # `appid` and `icon_hash` come from Steam's overview through the frontend; a bad one must fail
@@ -272,7 +313,7 @@ except ValueError:
     check("fetch: a body over the cap raises", True)
 
 # ---- _field_from (flatpak info parsing, drives the client update check) ------------------
-info = "        ID: io.unom.Punktfunk\n    Origin: punktfunk-origin\n    Commit: abc123def\n"
+info = "        ID: io.unom.punktfunk\n    Origin: punktfunk-origin\n    Commit: abc123def\n"
 check("field: commit", main._field_from(info, "Commit") == "abc123def")
 check("field: origin", main._field_from(info, "Origin") == "punktfunk-origin")
 check("field: absent", main._field_from(info, "Nope") == "")

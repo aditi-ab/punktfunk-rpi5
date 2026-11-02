@@ -1,8 +1,5 @@
 package io.unom.punktfunk.kit.discovery
 
-import android.os.SystemClock
-import io.unom.punktfunk.kit.NativeBridge
-
 /**
  * Wake a host and wait for it, for both Android shells (the desktop's `spawn_wake`).
  *
@@ -19,29 +16,11 @@ object WakeLoop {
     const val RESEND_EVERY_S = 6
 
     /**
-     * Blocking. [onTick] gets the status after every probe the wait was not [cancelled] across,
-     * the last one included. True when the host came up.
+     * Blocking. [send] is one magic packet; [now] and [sleep] are the clock in milliseconds.
+     * [onTick] gets the status after every probe the wait was not [cancelled] across, the last
+     * one included. True when the host came up.
      */
     fun run(
-        macs: List<String>,
-        lastIp: String,
-        isOnline: () -> Boolean,
-        cancelled: () -> Boolean,
-        onTick: (seconds: Int, timedOut: Boolean, online: Boolean) -> Unit,
-    ): Boolean {
-        val csv = macs.joinToString(",")
-        return run(
-            send = { NativeBridge.nativeWakeOnLan(csv, lastIp) },
-            isOnline = isOnline,
-            cancelled = cancelled,
-            onTick = onTick,
-            now = { SystemClock.elapsedRealtime() },
-            sleep = { Thread.sleep(it) },
-        )
-    }
-
-    /** [run] with its effects and clock passed in, so the cadence is testable off-device. */
-    internal fun run(
         send: () -> Unit,
         isOnline: () -> Boolean,
         cancelled: () -> Boolean,

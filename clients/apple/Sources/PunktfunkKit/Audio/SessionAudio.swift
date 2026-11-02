@@ -3,7 +3,7 @@
 // Host → speaker: a drain thread pulls decoded audio off its plane in the core (nextAudioPcm)
 // into a jitter ring, and an AVAudioSourceNode plays the ring. An underrun plays silence and
 // re-primes. The ring, the A/V sync loop and the render format are built from the NEGOTIATED
-// rate and channel count (`connection.resolvedAudioRateHz`), never from 48 kHz stereo: the
+// rate and channel count (`connection.audioFormat`), never from 48 kHz stereo: the
 // lossless plane carries other rates and surround (design/hi-res-audio.md §9).
 //
 // Mic → host: `MicUplink` folds each IO quantum to mono, and a worker resamples to 48 kHz,
@@ -32,7 +32,9 @@ private final class ScratchBuffer {
     deinit { ptr.deallocate() }
 }
 
-public final class SessionAudio {
+// Shared by main, `engineQueue`, `sessionQueue` and the drain thread: `stateLock` guards the
+// engine handles, and the rebuild bookkeeping is main-actor.
+public final class SessionAudio: @unchecked Sendable {
     private let connection: PunktfunkConnection
     private let flag = StopFlag()
     private let drainDone = DispatchSemaphore(value: 0)
@@ -115,6 +117,7 @@ public final class SessionAudio {
         let micChannel: Int
         let micEnabled: Bool
         let echoCancel: Bool
+        let spatialAudio: Bool
     }
     /// Watches the hardware for us (see `AudioDeviceWatcher`). Guarded by `stateLock`.
     private var deviceWatcher: AudioDeviceWatcher?
@@ -123,11 +126,11 @@ public final class SessionAudio {
     /// may act on. Guarded by `stateLock` (set on `engineQueue`, read on the main queue).
     private var enginesAttempted = false
     /// A rebuild is already on the main queue — one device switch produces a burst of triggers
-    /// and they must collapse into one restart. Main-thread confined.
-    private var rebuildQueued = false
+    /// and they must collapse into one restart.
+    @MainActor private var rebuildQueued = false
     /// Debounce/floor for the next rebuild, with an escalating floor when rebuilds chain (each
-    /// retriggered by its predecessor — see `RebuildBackoff`). Main-thread confined.
-    private var rebuildBackoff = RebuildBackoff()
+    /// retriggered by its predecessor — see `RebuildBackoff`).
+    @MainActor private var rebuildBackoff = RebuildBackoff()
     #if os(macOS)
     /// Latches a voice-processing start failure per input device, so a rebuild never re-attempts
     /// a topology that deterministically fails — the retry is what turned one failure into a
@@ -177,9 +180,10 @@ public final class SessionAudio {
     /// A/V sync: it is the only thing that tells the audio plane where the picture actually is, and
     /// without it the ring keeps today's free-running behaviour. Omit it for a playback-only or
     /// stage-1 session, where no such figure is measured.
+    @MainActor
     public func start(
         speakerUID: String, micUID: String, micChannel: Int, micEnabled: Bool, echoCancel: Bool,
-        videoLatency: LatencyMeter? = nil
+        spatialAudio: Bool = SettingDefault.spatialAudio, videoLatency: LatencyMeter? = nil
     ) {
         self.videoLatency = videoLatency // before any dispatch below — startDrain reads it
         // Before any engine exists: the recovery watches the hardware, not the engines, and the
@@ -187,7 +191,7 @@ public final class SessionAudio {
         stateLock.lock()
         startConfig = StartConfig(
             speakerUID: speakerUID, micUID: micUID, micChannel: micChannel,
-            micEnabled: micEnabled, echoCancel: echoCancel)
+            micEnabled: micEnabled, echoCancel: echoCancel, spatialAudio: spatialAudio)
         stateLock.unlock()
         installDeviceChangeRecovery(micEnabled: micEnabled)
         #if os(macOS)
@@ -223,7 +227,7 @@ public final class SessionAudio {
     /// Everything that turns samples into time — the ring's ms ⇄ sample conversion, the A/V sync
     /// loop's, and the `AVAudioFormat` the render graph is built at — is denominated in this,
     /// because it is what `nextAudioPcm` hands back.
-    private var wireRateHz: Int { Int(connection.resolvedAudioRateHz) }
+    private var wireRateHz: Int { Int(connection.audioFormat.rateHz) }
 
     /// How much audio one datagram carries, in MICROSECONDS — `Welcome`'s resolved
     /// `audio_frame_us`. 5 000 on every Opus session; on the lossless plane the host sizes it so
@@ -231,7 +235,7 @@ public final class SessionAudio {
     /// 96 kHz/24-bit stereo, and shorter again for surround (a 5.1 frame carries three times the
     /// samples, so it drops to roughly 1 000–1 500). Microseconds because the ladder has
     /// sub-millisecond rungs (`AudioRing.setFrameUs`).
-    private var wireFrameUs: Int { Int(connection.resolvedAudioFrameUs) }
+    private var wireFrameUs: Int { Int(connection.audioFormat.frameUs) }
 
     /// The same figure rounded UP to whole milliseconds, for the one consumer that can only express
     /// itself in them: the drain thread's poll timeout. Rounding up rather than down keeps it "at
@@ -294,6 +298,20 @@ public final class SessionAudio {
             // mix with on the box anyway.
             try session.setCategory(.playback, mode: .default)
             #endif
+            #if os(visionOS)
+            // The room places app audio at its window; off, the game's own mix goes straight to
+            // the ears.
+            stateLock.lock()
+            let spatialAudio = startConfig?.spatialAudio ?? SettingDefault.spatialAudio
+            stateLock.unlock()
+            try? session.setIntendedSpatialExperience(
+                spatialAudio
+                    ? .headTracked(soundStageSize: .automatic, anchoringStrategy: .automatic)
+                    : .bypassed)
+            let spatial = spatialAudio ? "head_tracked" : "bypassed"
+            #else
+            let spatial = "none"
+            #endif
             // Asked for on every branch, mic on or off. The hardware IO buffer is one shared,
             // device-wide setting: a session that asks for nothing runs at whatever iOS or another
             // mixing app chose (85 ms seen), and the ring's floor is this quantum plus one packet.
@@ -307,7 +325,7 @@ public final class SessionAudio {
             // nothing is offered the route's default — 2 on HDMI — and the mixer then folds a
             // negotiated 5.1 to stereo without a word. Best-effort like the rest: a stereo
             // route answers 2.
-            let wireChannels = Int(connection.resolvedAudioChannels)
+            let wireChannels = Int(connection.audioFormat.channels)
             if wireChannels > 2 {
                 try? session.setPreferredOutputNumberOfChannels(wireChannels)
             }
@@ -331,7 +349,8 @@ public final class SessionAudio {
                 out_ch=\(session.outputNumberOfChannels)/\(session.maximumOutputNumberOfChannels) \
                 wire_ch=\(wireChannels) \
                 route=\(session.currentRoute.outputs.first?.portType.rawValue ?? "none") \
-                input=\(session.currentRoute.inputs.first?.portType.rawValue ?? "none")
+                input=\(session.currentRoute.inputs.first?.portType.rawValue ?? "none") \
+                spatial=\(spatial)
                 """)
             // The ring cannot hold less than quantum + one packet, so a grant far above the
             // request IS the audio delay — said at connect, with what is known to cause it.
@@ -640,7 +659,7 @@ public final class SessionAudio {
     /// (`RebuildBackoff`).
     ///
     /// `micEnabled` only decides whether the mic-bearing session observers are worth installing.
-    /// Main thread.
+    @MainActor
     private func installDeviceChangeRecovery(micEnabled: Bool) {
         stateLock.lock()
         let already = deviceWatcher != nil
@@ -675,6 +694,7 @@ public final class SessionAudio {
     /// question — is playback still where it should be — but they answer it differently: an engine
     /// that told us it stopped is definitive, while the default device moving might not concern us
     /// at all.
+    @MainActor
     private func hardwareMoved(_ reason: AudioDeviceWatcher.Reason, posted: AnyObject?) {
         guard !flag.isStopped else { return }
         switch reason {
@@ -745,7 +765,8 @@ public final class SessionAudio {
     /// Coalesce: one device switch produces a burst — the old device leaving, the default moving,
     /// the new device settling, and each engine we own posting its own change — and one rebuild
     /// serves all of it. The floor between rebuilds keeps a device that renegotiates in a loop
-    /// from spinning the session. Main thread.
+    /// from spinning the session.
+    @MainActor
     private func scheduleEngineRebuild(reason: String) {
         guard !rebuildQueued else { return }
         rebuildQueued = true
@@ -771,6 +792,7 @@ public final class SessionAudio {
     /// for seconds, and the main thread is where macOS captures and sends the stream's input.
     /// A trigger arriving while the work is in flight schedules a fresh rebuild rather than
     /// being swallowed; `engineQueue` is serial, so the two never interleave.
+    @MainActor
     private func rebuildFire(attempt: Int) {
         rebuildQueued = false
         guard !flag.isStopped else { return }
@@ -817,6 +839,7 @@ public final class SessionAudio {
     /// (0.3 s, 0.6 s, 1.2 s): a failed rebuild leaves no engine to post the next notification,
     /// so this ladder — and, on macOS, the HAL listener — is all that stands between a mistimed
     /// switch and a silent session.
+    @MainActor
     private func rebuildFailed(attempt: Int) {
         guard !flag.isStopped else { return }
         guard attempt < Self.rebuildAttempts else {
@@ -844,6 +867,7 @@ public final class SessionAudio {
     /// it should be on (a pinned one that came back). Somebody changing the default while we are
     /// pinned to a named speaker is none of our business, and rebuilding for it would cost an
     /// audible gap for nothing. Main queue (the listener block is registered against it).
+    @MainActor
     private func defaultOutputChanged() {
         guard !flag.isStopped, let config = startConfig else { return }
         stateLock.lock()
@@ -949,6 +973,7 @@ public final class SessionAudio {
     /// full reconfigure — either path stops room audio leaving the device, which is the
     /// privacy-relevant part. Main thread; the engine work runs on `engineQueue`, where an unmute's
     /// start can block on a Bluetooth mic, and where it can't race a rebuild's teardown.
+    @MainActor
     public func setMicMuted(_ muted: Bool) {
         stateLock.lock()
         micMuted = muted
@@ -1042,8 +1067,8 @@ public final class SessionAudio {
     {
         // Build the playback layout from the host-RESOLVED channel count (never the request):
         // 2 = stereo / 6 = 5.1 / 8 = 7.1, canonical wire order FL FR FC LFE RL RR SL SR. Same rule
-        // for the rate — `resolvedAudioRateHz`, never the 96 kHz this client may have asked for.
-        let channels = Int(connection.resolvedAudioChannels)
+        // for the rate — `audioFormat.rateHz`, never the 96 kHz this client may have asked for.
+        let channels = Int(connection.audioFormat.channels)
         let rateHz = wireRateHz
         // One second of capacity at the session's format. The de-jitter depth is the ring's
         // `JitterPolicy`, not a prefill passed in here.
@@ -1133,7 +1158,7 @@ public final class SessionAudio {
         // 0 = the node has no device yet (a start that is about to fail) — nothing to compare.
         guard deviceRate > 0 else { return }
         let outChannels = Int(outFormat.channelCount)
-        let wireChannels = Int(connection.resolvedAudioChannels)
+        let wireChannels = Int(connection.audioFormat.channels)
         let mixerChannels = Int(engine.mainMixerNode.outputFormat(forBus: 0).channelCount)
         if mixerChannels < wireChannels, outChannels >= wireChannels {
             log.warning("""
@@ -1230,7 +1255,7 @@ public final class SessionAudio {
         // nil disarms the loop entirely — no reference, no correction (see `videoLatency`).
         let videoLatency = syncEnabled ? self.videoLatency : nil
         if !syncEnabled { log.info("A/V sync disabled by PUNKTFUNK_NO_AV_SYNC") }
-        let channels = Int(connection.resolvedAudioChannels)
+        let channels = Int(connection.audioFormat.channels)
         let rateHz = wireRateHz
         // Read on the caller's thread, not inside the closure: `self` is deliberately not captured
         // by the drain thread (it holds the connection strongly and self not at all — see
@@ -1240,7 +1265,31 @@ public final class SessionAudio {
         AudioDrain.start(
             connection: connection, flag: flag, done: drainDone, ring: ring,
             videoLatency: videoLatency, channels: channels, rateHz: rateHz,
-            frameUs: frameUs, frameMS: frameMS)
+            frameUs: frameUs, frameMS: frameMS,
+            onFormat: { [weak self] in self?.audioFormatChanged() })
+    }
+
+    /// The host moved the audio format and the drain ended on it. The ring and the render
+    /// graph are the old format's, so this is the one rebuild that does NOT keep the ring:
+    /// the engines come back with a new one, and a new drain, at the format the connection
+    /// reads now. Runs on `engineQueue`, like every rebuild.
+    private func audioFormatChanged() {
+        engineQueue.async { [weak self] in
+            guard let self, !self.flag.isStopped else { return }
+            // The ended drain's signal, so `stop()` waits for the new one.
+            _ = self.drainDone.wait(timeout: .now() + .milliseconds(400))
+            self.stateLock.lock()
+            let config = self.startConfig
+            self.drainStarted = false
+            self.ring = nil
+            self.stateLock.unlock()
+            guard let config else { return }
+            self.tearDownEngines()
+            self.startEngines(
+                speakerUID: config.speakerUID, micUID: config.micUID,
+                micChannel: config.micChannel, micEnabled: config.micEnabled,
+                echoCancel: config.echoCancel)
+        }
     }
 
     // MARK: - Mic (mic → host)
@@ -1424,7 +1473,12 @@ public final class SessionAudio {
             log.error("no usable input device — mic uplink disabled")
             return nil
         }
-        let uplink = MicUplink(pinned: micChannel >= 1 ? micChannel - 1 : nil)
+        #if os(macOS)
+        let skip = AudioDevices.loopbackInputChannels(forUID: micUID)
+        #else
+        let skip: [Int] = []
+        #endif
+        let uplink = MicUplink(pinned: micChannel >= 1 ? micChannel - 1 : nil, skip: skip)
         engine.attach(uplink.node)
         // nil follows the bus. A format read a moment ago can be stale by now, and a stale one
         // raises.
@@ -1440,16 +1494,18 @@ public final class SessionAudio {
         }
 
         // A pro interface has the mic on one of N inputs, and a converter's downmix takes
-        // channels 0 and 1. So the uplink folds to mono itself: 0 sums every channel, n ≥ 1
-        // pins 1-based input channel n.
+        // channels 0 and 1. So the uplink folds to mono itself: 0 sums every channel but the
+        // device's loopback inputs, n ≥ 1 pins 1-based input channel n.
         let inChannels = Int(inFormat.channelCount)
         if micChannel > inChannels {
             log.warning(
                 "mic channel \(micChannel) out of range (device has \(inChannels)) — mixing all")
         }
+        let skipped = skip.filter { $0 < inChannels }.count
+        let mixed = skipped < inChannels ? inChannels - skipped : inChannels
         let channelPlan = (1...inChannels).contains(micChannel)
             ? "channel \(micChannel)/\(inChannels)"
-            : (inChannels > 1 ? "mix \(inChannels)ch→mono" : "mono")
+            : (inChannels > 1 ? "mix \(mixed)/\(inChannels)ch→mono" : "mono")
 
         // The device being recorded, its format and the fold, once per session. A UID that
         // fell back to the default, or a wrong channel, reads here and not as silence at the
@@ -1640,12 +1696,14 @@ public final class SessionAudio {
     /// Fold `channels` of input (`floatChannelData` layout: `interleaved` → one buffer strided by
     /// channel count; else one buffer per channel) down to a single mono bus in `out` (`frames`
     /// long). `pinned` (0-based, must be `< channels`) copies exactly that channel — the fix for a
-    /// mic on one input of a multi-channel interface; `nil` sums every channel, clamped to
-    /// [-1, 1], so a lone hot channel still passes at full level instead of the silent 0/1 the
-    /// default N→stereo downmix would grab. Pure + `internal` for unit testing the index math.
+    /// mic on one input of a multi-channel interface. Otherwise every channel not in `skip` is
+    /// summed, clamped to [-1, 1], so a lone hot channel still passes at full level instead of
+    /// the silent 0/1 the default N→stereo downmix would grab. `skip` is the device's loopback
+    /// inputs: a copy of what the Mac plays, which would send the stream back up as the mic. A
+    /// `skip` covering every channel is ignored. Pure + `internal` for unit testing the index math.
     static func foldToMono(
         input: UnsafePointer<UnsafeMutablePointer<Float>>, frames: Int, channels: Int,
-        interleaved: Bool, pinned: Int?, out: UnsafeMutablePointer<Float>
+        interleaved: Bool, pinned: Int?, skip: [Int] = [], out: UnsafeMutablePointer<Float>
     ) {
         if let ch = pinned, ch < channels {
             if interleaved {
@@ -1655,22 +1713,20 @@ public final class SessionAudio {
                 let d = input[ch]
                 for i in 0..<frames { out[i] = d[i] }
             }
-        } else if interleaved {
-            let d = input[0]
-            for i in 0..<frames {
-                var s: Float = 0
-                for c in 0..<channels { s += d[i * channels + c] }
-                out[i] = max(-1, min(1, s))
-            }
-        } else {
-            let d0 = input[0]
-            for i in 0..<frames { out[i] = d0[i] }
-            for c in 1..<channels {
+            return
+        }
+        let all = (0..<channels).allSatisfy { skip.contains($0) }
+        out.update(repeating: 0, count: frames)
+        for c in 0..<channels where all || !skip.contains(c) {
+            if interleaved {
+                let d = input[0]
+                for i in 0..<frames { out[i] += d[i * channels + c] }
+            } else {
                 let d = input[c]
                 for i in 0..<frames { out[i] += d[i] }
             }
-            if channels > 1 { for i in 0..<frames { out[i] = max(-1, min(1, out[i])) } }
         }
+        if channels > 1 { for i in 0..<frames { out[i] = max(-1, min(1, out[i])) } }
     }
     #endif
 

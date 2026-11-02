@@ -27,6 +27,16 @@ final class RenderScaleTests: XCTestCase {
         for row in try XCTUnwrap(root["sanitize"] as? [[String: Any]]) {
             XCTAssertEqual(RenderScale.sanitize(num(row["raw"])), num(row["want"]), "\(row)")
         }
+        for row in try XCTUnwrap(root["percent"] as? [[String: Any]]) {
+            let typed = try XCTUnwrap(row["typed"] as? Int, "\(row)")
+            let want = num(row["want"])
+            XCTAssertEqual(RenderScale.fromPercent(typed), want, "\(row)")
+            XCTAssertEqual(RenderScale.percent(want), row["reads"] as? Int, "\(row)")
+        }
+        for row in try XCTUnwrap(root["preset"] as? [[String: Any]]) {
+            XCTAssertEqual(
+                RenderScale.presetIndex(num(row["scale"])), row["index"] as? Int, "\(row)")
+        }
         let cases = try XCTUnwrap(root["apply"] as? [[String: Any]])
         XCTAssertGreaterThanOrEqual(cases.count, 12, "the vector file is the contract; keep it rich")
         for c in cases {

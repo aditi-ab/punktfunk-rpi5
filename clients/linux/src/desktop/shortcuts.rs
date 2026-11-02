@@ -81,7 +81,7 @@ fn write_desktop_entry(label: &str, url: &str) -> Result<PathBuf, String> {
          Name={name}\n\
          Comment=Stream from this Punktfunk host\n\
          Exec=punktfunk-client \"{exec_url}\"\n\
-         Icon=io.unom.Punktfunk\n\
+         Icon=io.unom.punktfunk\n\
          Terminal=false\n\
          Categories=Game;Network;\n\
          StartupNotify=true\n"

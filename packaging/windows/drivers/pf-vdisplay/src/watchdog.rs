@@ -87,15 +87,11 @@ pub fn create(device: WDFDEVICE) -> NTSTATUS {
 
 /// Arm the watchdog from `adapter_init_finished` — the point where monitors become reachable.
 /// Idempotent across re-entrant adapter inits: re-arming a queued timer only re-bases its due
-/// time, and every owner's sample is reset so the first tick after a re-arm never counts as
-/// silence.
+/// time, and [`rebase`] restarts every owner's silence, so a reap counts no tick from before it.
 pub fn start() {
     let timer = lock(&TIMER).as_ref().map(|t| t.0);
     let Some(timer) = timer else { return };
-    for o in lock(&OWNERS).iter_mut() {
-        o.seen = o.pings;
-        o.silent = 0;
-    }
+    rebase(&mut lock(&OWNERS));
     // SAFETY: `timer` is the live device-parented handle from `create`; a negative due time is
     // relative (100 ns units), so the first tick lands one period out.
     let _armed = unsafe {
@@ -124,39 +120,74 @@ pub fn stop() {
 /// proves the host alive just as well — and note the control handle it arrived on as one of
 /// that process's, so its cleanup can tell whether the process still holds another.
 pub fn ping(pid: u32, file_object: WDFFILEOBJECT) {
-    {
-        let mut owners = lock(&OWNERS);
-        match owners.iter_mut().find(|o| o.pid == pid) {
-            Some(o) => o.pings += 1,
-            None => owners.push(Owner {
-                pid,
-                pings: 1,
-                seen: 0,
-                silent: 0,
-            }),
-        }
+    count(&mut lock(&OWNERS), pid);
+    note_handle(&mut lock(&HANDLES), file_object as usize, pid);
+}
+
+/// One IOCTL from `pid`. A pid seen for the first time becomes an owner whose first tick
+/// samples the count instead of counting silence.
+fn count(owners: &mut Vec<Owner>, pid: u32) {
+    match owners.iter_mut().find(|o| o.pid == pid) {
+        Some(o) => o.pings += 1,
+        None => owners.push(Owner {
+            pid,
+            pings: 1,
+            seen: 0,
+            silent: 0,
+        }),
     }
-    let key = file_object as usize;
-    let mut handles = lock(&HANDLES);
+}
+
+/// Note the control handle `key` as one of `pid`'s; a handle is noted once.
+fn note_handle(handles: &mut Vec<(usize, u32)>, key: usize, pid: u32) {
     if !handles.iter().any(|(fo, _)| *fo == key) {
         handles.push((key, pid));
     }
 }
 
+/// Forget the control handle `key`. Names its pid when that was the pid's last handle; a handle
+/// still held beside it, or one that never sent an IOCTL, names nothing.
+fn close_handle(handles: &mut Vec<(usize, u32)>, key: usize) -> Option<u32> {
+    let pos = handles.iter().position(|(fo, _)| *fo == key)?;
+    let (_, pid) = handles.swap_remove(pos);
+    (!handles.iter().any(|(_, p)| *p == pid)).then_some(pid)
+}
+
+/// Sample every owner's count now and clear its silence: a reap then needs [`TICKS_TO_REAP`]
+/// silent ticks counted from here.
+fn rebase(owners: &mut [Owner]) {
+    for o in owners {
+        o.seen = o.pings;
+        o.silent = 0;
+    }
+}
+
+/// One tick over the owner table: a count that moved is sampled and its silence cleared, one
+/// that stood still adds a silent tick. Returns the owners silent for [`TICKS_TO_REAP`] ticks
+/// and removes them from the table.
+fn stale_owners(owners: &mut Vec<Owner>) -> Vec<u32> {
+    let mut stale = Vec::new();
+    for o in owners.iter_mut() {
+        if o.seen != o.pings {
+            o.seen = o.pings;
+            o.silent = 0;
+            continue;
+        }
+        o.silent += 1;
+        if o.silent >= TICKS_TO_REAP {
+            stale.push(o.pid);
+        }
+    }
+    owners.retain(|o| !stale.contains(&o.pid));
+    stale
+}
+
 /// `EvtFileCleanup` on the control device: a handle is closing. When it was the last one its
-/// process held, that process is gone and its monitors depart now — not after
-/// [`WATCHDOG_TIMEOUT_S`] of silence — so a restarted host finds its connectors free. A handle
-/// that never sent an IOCTL is not in the table and passes through.
+/// process held ([`close_handle`]), that process is gone and its monitors depart now — not
+/// after [`WATCHDOG_TIMEOUT_S`] of silence — so a restarted host finds its connectors free. The
+/// handle lock is released before the reap.
 pub unsafe extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
-    let key = file_object as usize;
-    let gone = {
-        let mut handles = lock(&HANDLES);
-        let Some(pos) = handles.iter().position(|(fo, _)| *fo == key) else {
-            return;
-        };
-        let (_, pid) = handles.swap_remove(pos);
-        (!handles.iter().any(|(_, p)| *p == pid)).then_some(pid)
-    };
+    let gone = close_handle(&mut lock(&HANDLES), file_object as usize);
     if let Some(pid) = gone {
         lock(&OWNERS).retain(|o| o.pid != pid);
         let n = crate::monitor::reap_owner(pid, Duration::ZERO);
@@ -165,34 +196,101 @@ pub unsafe extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
 }
 
 /// One tick: depart the monitors of every owner whose IOCTL count has stood still for
-/// [`WATCHDOG_TIMEOUT_S`]. A live host PINGs every `timeout/3`, so a count only stalls this long
-/// when the host is hung, or gone with a handle the cleanup never reported. The reap runs here on
-/// a framework thread and joins the swap-chain workers, which is why cleanup stops the timer with
-/// Wait=TRUE. A reaped owner's rows go with its monitors: whatever it was, it starts over as a
-/// fresh owner on its next IOCTL.
+/// [`WATCHDOG_TIMEOUT_S`] ([`stale_owners`]). A live host PINGs every `timeout/3`, so a count
+/// only stalls this long when the host is hung, or gone with a handle the cleanup never
+/// reported. The reap runs here on a framework thread with no lock held and joins the
+/// swap-chain workers, which is why cleanup stops the timer with Wait=TRUE. A reaped owner's
+/// rows go with its monitors: it starts over as a fresh owner on its next IOCTL.
 unsafe extern "C" fn evt_timer(_timer: WDFTIMER) {
-    let stale: Vec<u32> = {
-        let mut owners = lock(&OWNERS);
-        let mut stale = Vec::new();
-        for o in owners.iter_mut() {
-            if o.seen != o.pings {
-                o.seen = o.pings;
-                o.silent = 0;
-                continue;
-            }
-            o.silent += 1;
-            if o.silent >= TICKS_TO_REAP {
-                stale.push(o.pid);
-            }
-        }
-        owners.retain(|o| !stale.contains(&o.pid));
-        stale
-    };
+    let stale = stale_owners(&mut lock(&OWNERS));
     for pid in stale {
         lock(&HANDLES).retain(|(_, p)| *p != pid);
         let n = crate::monitor::reap_owner(pid, Duration::from_secs(3));
         dbglog!(
             "[pf-vd] watchdog: no IOCTL from owner {pid} in {WATCHDOG_TIMEOUT_S}s — departed {n} monitor(s)"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tick up to `limit` times: the first tick that reaps, counted from 1, with its pids.
+    fn ticks_to_reap(owners: &mut Vec<Owner>, limit: u32) -> Option<(u32, Vec<u32>)> {
+        (1..=limit).find_map(|tick| {
+            let stale = stale_owners(owners);
+            (!stale.is_empty()).then_some((tick, stale))
+        })
+    }
+
+    /// Owner 7 after one IOCTL and the tick that sampled it.
+    fn sampled() -> Vec<Owner> {
+        let mut owners = Vec::new();
+        count(&mut owners, 7);
+        assert!(
+            stale_owners(&mut owners).is_empty(),
+            "a moved count is no silence"
+        );
+        owners
+    }
+
+    #[test]
+    fn a_silent_owner_reaps_on_the_fourth_silent_tick() {
+        let mut owners = sampled();
+        count(&mut owners, 8);
+        for tick in 1..=3 {
+            assert!(stale_owners(&mut owners).is_empty(), "silent tick {tick}");
+            count(&mut owners, 8);
+        }
+        assert_eq!(stale_owners(&mut owners), [7]);
+        let left: Vec<u32> = owners.iter().map(|o| o.pid).collect();
+        assert_eq!(left, [8], "an owner that keeps sending stays");
+    }
+
+    #[test]
+    fn an_ioctl_between_ticks_restarts_the_silence() {
+        let mut owners = sampled();
+        assert_eq!(ticks_to_reap(&mut owners, 3), None);
+        count(&mut owners, 7);
+        assert!(
+            stale_owners(&mut owners).is_empty(),
+            "the tick that sees the IOCTL"
+        );
+        assert_eq!(ticks_to_reap(&mut owners, 4), Some((4, vec![7])));
+    }
+
+    #[test]
+    fn a_re_arm_restarts_the_silence() {
+        let mut owners = sampled();
+        assert_eq!(ticks_to_reap(&mut owners, 3), None);
+        rebase(&mut owners);
+        assert_eq!(ticks_to_reap(&mut owners, 4), Some((4, vec![7])));
+    }
+
+    #[test]
+    fn the_last_handle_to_close_names_its_pid() {
+        let mut handles = Vec::new();
+        note_handle(&mut handles, 0x10, 7);
+        note_handle(&mut handles, 0x20, 8);
+        assert_eq!(
+            close_handle(&mut handles, 0x30),
+            None,
+            "never sent an IOCTL"
+        );
+        assert_eq!(close_handle(&mut handles, 0x10), Some(7));
+        assert_eq!(handles, [(0x20, 8)]);
+    }
+
+    #[test]
+    fn a_pid_on_two_handles_is_gone_when_both_closed() {
+        let mut handles = Vec::new();
+        for key in [0x10, 0x20, 0x10] {
+            note_handle(&mut handles, key, 7);
+        }
+        assert_eq!(handles, [(0x10, 7), (0x20, 7)]);
+        assert_eq!(close_handle(&mut handles, 0x10), None);
+        assert_eq!(close_handle(&mut handles, 0x20), Some(7));
+        assert!(handles.is_empty());
     }
 }

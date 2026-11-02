@@ -104,7 +104,7 @@ sed -i 's/\r$//' "$units"/punktfunk-*.service
 install -d "$units/punktfunk-kiosk.service.d"
 cat >"$units/punktfunk-kiosk.service.d/diagnostics.conf" <<'EOF'
 [Service]
-Environment=RUST_LOG=info,pf_client_core::video=debug,pf_client_core::video_v4l2_request=trace,pf_client_core::session=debug,pf_client_core::audio=debug
+Environment=RUST_LOG=info,pf_client_video=debug,pf_client_video::video_v4l2_request=trace,pf_client_core::session=debug,pf_client_core::audio=debug
 StandardOutput=journal
 StandardError=journal
 LogRateLimitIntervalSec=0

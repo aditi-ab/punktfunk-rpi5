@@ -26,19 +26,20 @@ on:
     branches: [main]
     paths:
       - '.gitea/workflows/windows-drivers.yml'
-      - 'crates/pf-driver-proto/**'
+      - 'crates/host/pf-driver-proto/**'
       # The driver hosts the encoder backends, so a change to them is a driver change.
-      - 'crates/pf-encode-core/**'
-      - 'crates/pf-encode-win/**'
+      - 'crates/host/pf-encode-core/**'
+      - 'crates/host/pf-encode-session/**'
+      - 'crates/host/pf-encode-win/**'
       # …and the crates those backends compile against: pf-frame owns the frame vocabulary
       # their signatures take, pf-zerocopy and pf-dmabuf sit under it, and the two -sys crates are the
       # QSV and PyroWave features. Unlisted, a change to any of them reached main with no
       # driver build behind it — the Cargo.lock-luck gap the host lane already closed.
-      - 'crates/pf-frame/**'
-      - 'crates/pf-zerocopy/**'
-      - 'crates/pf-dmabuf/**'
-      - 'crates/libvpl-sys/**'
-      - 'crates/pyrowave-sys/**'
+      - 'crates/codec/libvpl-sys/**'
+      - 'crates/codec/pyrowave-sys/**'
+      - 'crates/core/pf-dmabuf/**'
+      - 'crates/host/pf-frame/**'
+      - 'crates/host/pf-zerocopy/**'
       - 'packaging/windows/drivers/**'
       # Every build job below runs these, and they sit beside the driver tree rather than in it.
       - 'packaging/windows/drivers-cargo.ps1'
@@ -47,19 +48,20 @@ on:
   pull_request:
     paths:
       - '.gitea/workflows/windows-drivers.yml'
-      - 'crates/pf-driver-proto/**'
+      - 'crates/host/pf-driver-proto/**'
       # The driver hosts the encoder backends, so a change to them is a driver change.
-      - 'crates/pf-encode-core/**'
-      - 'crates/pf-encode-win/**'
+      - 'crates/host/pf-encode-core/**'
+      - 'crates/host/pf-encode-session/**'
+      - 'crates/host/pf-encode-win/**'
       # …and the crates those backends compile against: pf-frame owns the frame vocabulary
       # their signatures take, pf-zerocopy and pf-dmabuf sit under it, and the two -sys crates are the
       # QSV and PyroWave features. Unlisted, a change to any of them reached main with no
       # driver build behind it — the Cargo.lock-luck gap the host lane already closed.
-      - 'crates/pf-frame/**'
-      - 'crates/pf-zerocopy/**'
-      - 'crates/pf-dmabuf/**'
-      - 'crates/libvpl-sys/**'
-      - 'crates/pyrowave-sys/**'
+      - 'crates/codec/libvpl-sys/**'
+      - 'crates/codec/pyrowave-sys/**'
+      - 'crates/core/pf-dmabuf/**'
+      - 'crates/host/pf-frame/**'
+      - 'crates/host/pf-zerocopy/**'
       - 'packaging/windows/drivers/**'
       # Every build job below runs these, and they sit beside the driver tree rather than in it.
       - 'packaging/windows/drivers-cargo.ps1'
@@ -244,6 +246,11 @@ jobs:
         # A plain lib links no WDF import libs, so its tests run where the cdylib drivers' cannot:
         # the HID IOCTL table, descriptor lengths, string replies and the channel state machine.
         run: ../drivers-cargo.ps1 'test --locked -p pf-umdf-util'
+      - name: cargo test pf-vdisplay --lib (the display driver's own models)
+        # `--lib` builds the cdylib's unit tests as an ordinary test binary, so the pure models
+        # inside the driver (the cursor cell) run here. The host lane's `-p pf-vdisplay` is the
+        # Linux crate of that name, not this driver.
+        run: ../drivers-cargo.ps1 'test --locked -p pf-vdisplay --lib'
       - name: cargo fmt --check the driver workspace
         run: cargo fmt -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse -p wdk-iddcx -p pf-vdisplay --check
       - name: Inspect /INTEGRITYCHECK (before) — expect FORCE_INTEGRITY set by wdk-build

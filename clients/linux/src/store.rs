@@ -69,31 +69,29 @@ impl Store {
         self.presets.borrow()
     }
 
-    /// Re-read the hosts file, apply `f`, save, and tell the listeners.
+    /// [`KnownHosts::update`], then tell the listeners.
     pub fn update_hosts<R>(&self, f: impl FnOnce(&mut KnownHosts) -> R) -> anyhow::Result<R> {
-        let mut known = KnownHosts::read();
-        let r = f(&mut known);
-        known.save()?;
-        self.set(Changed::Hosts, known, &self.hosts);
+        let r = KnownHosts::update(f)?;
+        self.reload(Changed::Hosts);
         Ok(r)
     }
 
-    /// Re-read the settings file, apply `f`, save, and tell the listeners. A failed write is
-    /// logged by nobody, like every settings save: it must never take a stream down.
+    /// [`Settings::update`], then tell the listeners. A failed write is logged by nobody, like
+    /// every settings save: it must never take a stream down.
     pub fn update_settings<R>(&self, f: impl FnOnce(&mut Settings) -> R) -> R {
-        let mut s = Settings::load();
-        let r = f(&mut s);
-        s.save();
+        let mut r = None;
+        let s = Settings::update(|s| {
+            r = Some(f(s));
+            true
+        });
         self.set(Changed::Settings, s, &self.settings);
-        r
+        r.expect("Settings::update runs its edit")
     }
 
-    /// Re-read the preset catalog, apply `f`, save, and tell the listeners.
+    /// [`PresetsFile::update`], then tell the listeners.
     pub fn update_presets<R>(&self, f: impl FnOnce(&mut PresetsFile) -> R) -> anyhow::Result<R> {
-        let mut catalog = PresetsFile::load();
-        let r = f(&mut catalog);
-        catalog.save()?;
-        self.set(Changed::Presets, catalog, &self.presets);
+        let r = PresetsFile::update(f)?;
+        self.reload(Changed::Presets);
         Ok(r)
     }
 

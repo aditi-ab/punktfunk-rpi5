@@ -24,9 +24,9 @@ always one minor version ahead of stable, so going back to stable is a downgrade
 | **dnf / rpm-ostree** | baseurl `…/rpm/fedora-44-canary` (Bazzite: `…/rpm/bazzite-canary`) | `…/rpm/fedora-44` (`…/rpm/bazzite`) |
 | **Bazzite sysext** | `sudo punktfunk-sysext install --channel canary` | `sudo punktfunk-sysext install` |
 | **pacman** | a `[punktfunk-canary]` section in `/etc/pacman.conf` | `[punktfunk]` |
-| **Flatpak client** | `https://flatpak.unom.io/io.unom.Punktfunk.Canary.flatpakref` | `…/io.unom.Punktfunk.flatpakref` |
+| **Flatpak client** | `https://flatpak.unom.io/io.unom.punktfunk.canary.flatpakref` | `…/io.unom.punktfunk.flatpakref` |
 | **NixOS** | flake input `git+https://git.unom.io/unom/punktfunk?ref=nix-canary`, built nightly | `?ref=nix-stable` |
-| **Decky plugin** | `…/generic/punktfunk-decky/canary/punktfunk.zip` | `…/generic/punktfunk-decky/latest/punktfunk.zip` |
+| **Decky plugin** | `https://unom.io/pf-decky-canary` | `https://unom.io/pf-decky` |
 | **SteamOS on-device build** | `~/punktfunk` on the `main` branch | `~/punktfunk` on the `stable` branch |
 | **Windows host and client** | `canary/` in the download URL, e.g. `…/generic/punktfunk-host-windows/canary/punktfunk-host-setup.exe` | `latest/` in the URL, the releases page, or winget |
 | **Android** | Google Play open testing, or `…/generic/punktfunk-android/canary/punktfunk-android.apk` | [Google Play](https://play.google.com/store/apps/details?id=io.unom.punktfunk), or `latest/` |
@@ -86,7 +86,7 @@ git -C ~/punktfunk fetch && git -C ~/punktfunk switch main
 bash ~/punktfunk/scripts/steamdeck/update.sh --pull
 
 # Flatpak client
-flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.Canary.flatpakref
+flatpak install --user https://flatpak.unom.io/io.unom.punktfunk.canary.flatpakref
 
 # NixOS: change ?ref=nix-stable to ?ref=nix-canary on the flake input, then
 nix flake update punktfunk && sudo nixos-rebuild switch

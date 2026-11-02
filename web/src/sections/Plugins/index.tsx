@@ -22,6 +22,12 @@ import { useLocale } from "@/lib/i18n";
 import { pluginPin, togglePin, usePins } from "@/lib/nav";
 import { m } from "@/paraglide/messages";
 import { TierBadge } from "@/sections/Store/TierBadge";
+import {
+	frameAction,
+	healthFailure,
+	healthIntervalMs,
+	pluginBody,
+} from "./pluginFrame";
 
 const route = getRouteApi("/plugins/$pluginId/$");
 
@@ -69,11 +75,11 @@ export const SectionPlugin: FC = () => {
 	useLocale();
 	const { pluginId, _splat } = route.useParams();
 	const navigate = useNavigate();
-	// This page is a plugin's only fixed address now that plugin UIs no longer inject a sidebar
-	// entry — so the way back into the sidebar is here, on the page you are already on.
+	// The page is a plugin's only fixed address, so the pin back into the sidebar lives here.
 	const [pins, setPins] = usePins();
 	const pin = pluginPin(pluginId);
 	const isPinned = pins.includes(pin);
+	const pinLabel = isPinned ? m.nav_unpin() : m.nav_pin();
 	const iframeRef = useRef<HTMLIFrameElement>(null);
 
 	// Header metadata (title/version/icon) from the directory; falls back to the id.
@@ -94,19 +100,9 @@ export const SectionPlugin: FC = () => {
 	const { data: uiConfig } = useUiConfig();
 	const pluginOrigin = pluginOriginFrom(uiConfig);
 
-	// Liveness: a 200 from /__health means the plugin is up.
-	//
-	// Two subtleties, both learned the hard way:
-	//
-	//  - A 200 is not enough. `fetch` follows redirects, so an expired session — where the gate
-	//    answers 302 → /login → 200 HTML — looked exactly like a healthy plugin, and the console
-	//    rendered its own login page inside the plugin's iframe. This now asks the CONSOLE origin,
-	//    which probes the plugin server-side (the plugin origin is cross-origin to us and would need
-	//    CORS to be readable from here) — and a bounced session is a plain 401, not HTML.
-	//  - One failure must not be terminal. The runner is restarted at the end of every successful
-	//    install, so a single missed probe is routine; giving up on the first one threw away
-	//    whatever the operator had open in another plugin. Retry a few times, and keep probing on a
-	//    slower beat while down so it recovers on its own.
+	// The console probes the plugin server-side; the plugin origin is cross-origin to the page.
+	// A redirect or non-2xx is a failure, so a bounced session never reads as a healthy plugin.
+	// One miss is routine while the runner restarts: retry, then keep probing.
 	const health = useQuery({
 		queryKey: ["plugin-health", pluginId],
 		queryFn: async () => {
@@ -114,27 +110,17 @@ export const SectionPlugin: FC = () => {
 				credentials: "same-origin",
 				redirect: "manual",
 			});
-			// `type === "opaqueredirect"` is the gate bouncing us to /login, not an answer.
-			if (r.type === "opaqueredirect") throw new Error("session expired");
-			if (!r.ok) throw new Error(`health ${r.status}`);
+			const failure = healthFailure(r);
+			if (failure) throw new Error(failure);
 			return true;
 		},
 		retry: 2,
-		refetchInterval: (q) => (q.state.status === "error" ? 5_000 : 20_000),
+		refetchInterval: (q) => healthIntervalMs(q.state.status),
 	});
 
-	// Is the plugin ORIGIN reachable from this browser? Distinct from "is the plugin running".
-	//
-	// The console is served with the host's own self-signed certificate, and a browser stores a
-	// certificate exception PER ORIGIN — including the port. So the operator having trusted
-	// https://host:47992 says nothing about https://host:47993, and a certificate interstitial
-	// cannot be shown (let alone accepted) inside an iframe: the frame would just sit blank, with no
-	// way to fix it and nothing on screen explaining why.
-	//
-	// A `no-cors` probe distinguishes the two cases without needing CORS: the response is opaque and
-	// unreadable either way, but a TLS failure REJECTS while an ordinary answer — even a 401 —
-	// resolves. Rejection therefore means "this browser will not talk to that origin yet", which is
-	// a one-time, fixable thing, so we say so and link to it.
+	// Whether this browser talks to the plugin origin, as opposed to whether the plugin runs.
+	// A certificate exception is stored per origin, port included, and an iframe cannot show the
+	// interstitial. A `no-cors` fetch rejects on a TLS failure and resolves on any answer.
 	const reachable = useQuery({
 		queryKey: ["plugin-origin-reachable", pluginOrigin],
 		enabled: !!pluginOrigin,
@@ -149,44 +135,37 @@ export const SectionPlugin: FC = () => {
 		staleTime: 60_000,
 	});
 
-	// The frame must not be mounted until that probe has SETTLED.
-	//
-	// A firewalled port DROPs rather than refuses, so the probe does not fail fast — it hangs for the
-	// browser's whole connect timeout. Mounting the iframe in the meantime puts an empty panel on
-	// screen with nothing to explain it, and that is precisely what a closed 47993 looked like in the
-	// field: a plugin page that "just doesn't load", with the real answer only in devtools. Waiting
-	// costs a placeholder for the milliseconds a reachable origin takes, and buys the explanation.
-	//
-	// Only gate when the probe actually runs: under `vite dev` `pluginOrigin` is "" and the query is
-	// disabled, which leaves it pending forever — gating on that would never render a frame at all.
-	const originProbePending = !!pluginOrigin && reachable.isPending;
+	// The frame mounts after the origin probe settles: a firewalled port drops packets and hangs
+	// for the connect timeout, which would leave an empty panel with no explanation.
+	const body = pluginBody(pluginOrigin, reachable, health);
 
-	// The iframe src is fixed at the initial deep-link path; the plugin's own in-app navigation drives
-	// the console URL via postMessage (below), never the src — so there's no reload loop.
+	// The iframe src stays at the initial deep-link path. The plugin's navigation drives the
+	// console URL by postMessage, never the src, so the frame does not reload.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally pinned to the initial path
 	const initialSrc = useMemo(
 		() => `${pluginOrigin ?? ""}/plugin-ui/${pluginId}/${_splat ?? ""}`,
 		[pluginId, pluginOrigin],
 	);
 
-	// Keep the console address bar in sync with the plugin's internal routing, and hand the frame
-	// the console's palette when it asks and whenever the root's theme attributes change.
+	// Keeps the console address bar in step with the plugin's routing, and hands the frame the
+	// console palette when it asks and whenever the root's theme attributes change.
 	useEffect(() => {
-		// Empty `pluginOrigin` is the vite-dev same-origin arrangement.
+		// An empty `pluginOrigin` is the vite-dev same-origin arrangement.
 		const expected = pluginOrigin || window.location.origin;
 		const postTheme = () =>
 			iframeRef.current?.contentWindow?.postMessage(themeMessage(), expected);
 		const onMessage = (e: MessageEvent) => {
-			if (e.source !== iframeRef.current?.contentWindow) return;
-			// The frame is cross-origin, so this is a real check: only the plugin origin may drive
-			// the console's address bar.
-			if (e.origin !== expected) return;
-			const data = e.data as { type?: string; path?: string };
-			if (data?.type === "pf-ui:theme-request") postTheme();
-			if (data?.type === "pf-ui:navigate" && typeof data.path === "string") {
+			const action = frameAction(
+				e.source === iframeRef.current?.contentWindow,
+				e.origin,
+				expected,
+				e.data,
+			);
+			if (action?.kind === "theme") postTheme();
+			if (action?.kind === "navigate") {
 				navigate({
 					to: "/plugins/$pluginId/$",
-					params: { pluginId, _splat: data.path.replace(/^\//, "") },
+					params: { pluginId, _splat: action.splat },
 					replace: true,
 				});
 			}
@@ -205,20 +184,25 @@ export const SectionPlugin: FC = () => {
 	return (
 		<div className="flex h-[calc(100dvh-7rem)] min-h-[480px] flex-col gap-3 sm:h-[calc(100dvh-5rem)]">
 			{/* Header strip: identity + open-in-new-tab (the plugin stands alone full-window too). */}
-			<div className="flex items-center gap-3">
-				<Icon className="size-5 text-muted-foreground" />
-				<h1 className="text-lg font-semibold">{title}</h1>
+			{/* On a phone the title truncates and the two actions keep their icons only. */}
+			<div className="flex min-w-0 items-center gap-3">
+				<Icon className="size-5 shrink-0 text-muted-foreground" />
+				<h1 className="min-w-0 truncate text-lg font-semibold">{title}</h1>
 				{meta?.version && (
-					<span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+					<span className="hidden shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground sm:inline">
 						v{meta.version}
 					</span>
 				)}
-				{provenance && <TierBadge tier={provenance.tier} />}
+				{provenance && (
+					<TierBadge tier={provenance.tier} className="shrink-0" />
+				)}
 				<Button
 					variant="ghost"
 					size="sm"
-					className="ml-auto"
+					className="ml-auto shrink-0"
 					aria-pressed={isPinned}
+					aria-label={pinLabel}
+					title={pinLabel}
 					onClick={() => setPins(togglePin(pins, pin))}
 				>
 					{isPinned ? (
@@ -226,49 +210,42 @@ export const SectionPlugin: FC = () => {
 					) : (
 						<Pin className="size-4" />
 					)}
-					{isPinned ? m.nav_unpin() : m.nav_pin()}
+					<span className="hidden sm:inline">{pinLabel}</span>
 				</Button>
-				{/* Full-window, on the PLUGIN origin. This link used to be the same escalation as the
-				    iframe with no sandbox involved at all — a top-level document on the console origin,
-				    holding the operator's session. It only stops being that because the origin moved,
-				    which is why the fix could never have been a sandbox attribute. */}
-				{pluginOrigin !== null && pluginOrigin !== undefined && (
+				{/* Full-window, on the plugin origin: never a top-level page on the console's. */}
+				{pluginOrigin != null && (
 					<a
 						href={`${pluginOrigin}/plugin-ui/${pluginId}/`}
 						target="_blank"
 						rel="noreferrer"
-						className="inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+						aria-label={m.plugin_open_new_tab()}
+						title={m.plugin_open_new_tab()}
+						className="inline-flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
 					>
 						<ExternalLink className="size-4" />
-						{m.plugin_open_new_tab()}
+						<span className="hidden sm:inline">{m.plugin_open_new_tab()}</span>
 					</a>
 				)}
 			</div>
 
-			{pluginOrigin === null ? (
+			{body === "unavailable" ? (
 				<UnavailableCard />
-			) : reachable.isError ? (
+			) : body === "untrusted" ? (
 				<UntrustedOriginCard
 					href={`${pluginOrigin}/plugin-ui/${pluginId}/`}
 					onRetry={() => reachable.refetch()}
 				/>
-			) : health.isError ? (
+			) : body === "offline" ? (
 				<OfflineCard title={title} onRetry={() => health.refetch()} />
-			) : health.isSuccess &&
-				!originProbePending &&
-				pluginOrigin !== undefined ? (
+			) : body === "frame" ? (
 				<iframe
 					ref={iframeRef}
 					src={initialSrc}
 					title={title}
 					className="w-full flex-1 rounded-lg border bg-card"
-					// `allow-same-origin` is correct HERE and was the vulnerability BEFORE, because what
-					// counts as "same origin" changed underneath it: the frame now loads from the plugin
-					// origin, so this grants the plugin its OWN origin (storage, its own fetches) rather
-					// than the console's. Removing it would give the frame an opaque origin instead,
-					// which stops the SameSite=Lax session cookie and 302s every plugin asset to /login
-					// — the dead end recorded in 2026-08-05 review H-3. Origin isolation is enforced by
-					// the two listeners (nitro-entry/bun-https.mjs), not by this attribute.
+					// `allow-same-origin` grants the plugin its own origin (storage, fetches). Without it the
+					// frame has an opaque origin and loses the SameSite=Lax session cookie. Isolation comes
+					// from the separate plugin listener (nitro-entry/bun-https.mjs), not this attribute.
 					sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-modals"
 					allow="fullscreen"
 				/>
@@ -289,7 +266,7 @@ export const SectionPlugin: FC = () => {
  */
 const UnavailableCard: FC = () => (
 	<div className="flex flex-1 items-center justify-center rounded-lg border border-dashed">
-		<div className="flex max-w-md flex-col items-center gap-3 p-8 text-center">
+		<div className="flex min-w-0 max-w-md flex-col items-center gap-3 p-4 text-center sm:p-8">
 			<h2 className="text-base font-semibold">
 				{m.plugin_origin_unavailable_title()}
 			</h2>
@@ -311,7 +288,7 @@ const UntrustedOriginCard: FC<{ href: string; onRetry: () => void }> = ({
 	onRetry,
 }) => (
 	<div className="flex flex-1 items-center justify-center rounded-lg border border-dashed">
-		<div className="flex max-w-md flex-col items-center gap-3 p-8 text-center">
+		<div className="flex min-w-0 max-w-md flex-col items-center gap-3 p-4 text-center sm:p-8">
 			<h2 className="text-base font-semibold">
 				{m.plugin_origin_untrusted_title()}
 			</h2>
@@ -338,7 +315,7 @@ const OfflineCard: FC<{ title: string; onRetry: () => void }> = ({
 	onRetry,
 }) => (
 	<div className="flex flex-1 items-center justify-center rounded-lg border border-dashed">
-		<div className="flex max-w-md flex-col items-center gap-3 p-8 text-center">
+		<div className="flex min-w-0 max-w-md flex-col items-center gap-3 p-4 text-center sm:p-8">
 			<h2 className="text-base font-semibold">{m.plugin_offline_title()}</h2>
 			<p className="text-sm text-muted-foreground">
 				<span className="font-medium text-foreground">{title}</span> —{" "}

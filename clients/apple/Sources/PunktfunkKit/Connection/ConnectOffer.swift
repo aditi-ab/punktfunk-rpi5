@@ -35,8 +35,7 @@ public struct ConnectOffer: Equatable, Sendable {
     /// The offer for `effective` at `mode`. The decoder probes are lazy: PyroWave's runs only for
     /// the PyroWave codec, the 10-bit 4:4:4 one only for a 10-bit offer. The caller keeps them off
     /// the main actor. `mac` picks the client caps: the Mac draws the host cursor itself in the
-    /// desktop mouse model; iOS and tvOS run the deadline presenter, whose link reports the latch
-    /// phase.
+    /// desktop mouse model.
     public static func resolve(
         _ effective: EffectiveSettings,
         mode: (width: UInt32, height: UInt32, hz: UInt32),
@@ -49,8 +48,8 @@ public struct ConnectOffer: Equatable, Sendable {
     ) -> ConnectOffer {
         let preferredCodec = PunktfunkConnection.codecByte(effective.codec)
         // PyroWave is a pure opt-in, gated on the Metal probe: a device that fails it falls back
-        // to H.26x and keeps the user's rate. PyroWave itself always sends Automatic (0), so the
-        // host pins its per-mode rate under the operator's ceiling.
+        // to H.26x and keeps the user's rate. Under PyroWave the rate only says Fixed (non-zero)
+        // or Automatic (0); the host pins the player's quality under the operator's ceiling.
         let pyroWave = preferredCodec == PunktfunkConnection.codecPyroWave && pyroWaveDecodes()
         let hdr = effective.hdrEnabled && displayHDR
         // HDR carries the depth; `tenBitSdr` adds it where HDR is off or the display can't show it.
@@ -63,16 +62,13 @@ public struct ConnectOffer: Equatable, Sendable {
         if av1() { videoCodecs |= PunktfunkConnection.codecAV1 }
         if pyroWave { videoCodecs |= PunktfunkConnection.codecPyroWave }
         let desktopMouse = (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop
-        let presentCaps: UInt8 =
-            mac
-            ? (desktopMouse ? PunktfunkConnection.clientCapCursor : 0)
-            : PunktfunkConnection.clientCapPhaseLock
+        let presentCaps: UInt8 = mac && desktopMouse ? PunktfunkConnection.clientCapCursor : 0
         let (audioRateHz, audioBits) = effective.audioFormatChoice.wire
         return ConnectOffer(
             width: mode.width, height: mode.height, hz: mode.hz,
             compositor: PunktfunkConnection.Compositor(
                 rawValue: UInt32(clamping: effective.compositor)) ?? .auto,
-            bitrateKbps: pyroWave ? 0 : UInt32(clamping: effective.bitrateKbps),
+            bitrateKbps: UInt32(clamping: effective.bitrateKbps),
             audioChannels: UInt8(clamping: effective.audioChannels),
             audioRateHz: audioRateHz, audioBits: audioBits,
             hdr: hdr, tenBit: tenBit, want444: effective.enable444,
@@ -91,8 +87,8 @@ public struct ConnectOffer: Equatable, Sendable {
         _ error: Error, hostName: String, pinned: Bool, requestAccess: Bool,
         callerRecovers: Bool
     ) -> String? {
-        if case PunktfunkClientError.rejected(let rejection) = error {
-            return "\(hostName): \(rejection.userMessage)"
+        if case PunktfunkClientError.rejected(let rejection, let said) = error {
+            return "\(hostName): \(said ?? rejection.userMessage)"
         }
         if callerRecovers, !requestAccess { return nil }
         if requestAccess {
