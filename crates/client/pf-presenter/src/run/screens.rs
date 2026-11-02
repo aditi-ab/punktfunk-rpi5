@@ -204,6 +204,11 @@ impl ScreenWindow {
                 Took::Busy(_) => Took::Busy(Some(DecodedImage::Cpu(c))),
                 t => t,
             },
+            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+            DecodedImage::V4l2Planar(c) => match took(p.present(w, FrameInput::Cpu(&c), None)?) {
+                Took::Busy(_) => Took::Busy(Some(DecodedImage::V4l2Planar(c))),
+                t => t,
+            },
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(d) => took(p.present(w, FrameInput::Dmabuf(d), None)?),
             #[cfg(windows)]
