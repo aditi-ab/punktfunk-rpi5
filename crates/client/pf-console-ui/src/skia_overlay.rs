@@ -555,7 +555,10 @@ impl Overlay for SkiaOverlay {
         // (hint/banner) of the output. Keep a generous band around it; a
         // resize scrim, quick ring, or simultaneous top+bottom chrome still
         // requests the full surface.
-        let top = want.stats.is_some() || want.access.is_some() || want.mic_muted;
+        let top = want.stats.is_some()
+            || want.access.is_some()
+            || want.mic_notice.is_some()
+            || !want.audio_mute.is_empty();
         let bottom = want.hint.is_some() || want.notice.is_some() || banner_step > 0;
         let full = want.stats.is_some() || ctx.resizing || ring_key != 0 || (top && bottom);
         let band = ((384.0 * scale).ceil() as u32).min(ctx.height);
