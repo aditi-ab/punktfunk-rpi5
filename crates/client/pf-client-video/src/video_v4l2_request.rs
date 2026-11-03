@@ -13,12 +13,54 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
+use std::time::{Duration, Instant};
 
 pub const DECODER_PIN: &str = "v4l2-request";
 // FFmpeg 6 exposed this as AV_FRAME_FLAG_KEY. Keep the ABI-stable bit value
 // locally so the client still compiles against older development headers used
 // for non-Pi test builds.
 const FRAME_FLAG_KEY: i32 = 1 << 1;
+
+#[derive(Default)]
+struct DecodeSample {
+    phases: [Duration; 4], // Codec, SAND transfer, owned pixel copy, whole call.
+    frames: u64,
+}
+
+struct DecodeTiming {
+    started: Instant,
+    calls: u64,
+    frames: u64,
+    sums: [Duration; 4],
+    peaks: [Duration; 4],
+}
+
+impl DecodeTiming {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            calls: 0,
+            frames: 0,
+            sums: [Duration::ZERO; 4],
+            peaks: [Duration::ZERO; 4],
+        }
+    }
+
+    fn add(&mut self, sample: DecodeSample, now: Instant) -> Option<Self> {
+        self.calls += 1;
+        self.frames += sample.frames;
+        for (i, duration) in sample.phases.into_iter().enumerate() {
+            self.sums[i] += duration;
+            self.peaks[i] = self.peaks[i].max(duration);
+        }
+        (now.duration_since(self.started) >= Duration::from_secs(1))
+            .then(|| std::mem::replace(self, Self::new(now)))
+    }
+
+    fn mean_us(&self, phase: usize) -> f64 {
+        self.sums[phase].as_secs_f64() * 1_000_000.0 / self.calls as f64
+    }
+}
 
 struct AvBuffer(*mut ffi::AVBufferRef);
 
@@ -60,6 +102,7 @@ pub struct V4l2RequestDecoder {
     packet: *mut ffi::AVPacket,
     frame: *mut ffi::AVFrame,
     planar: *mut ffi::AVFrame,
+    timing: Option<DecodeTiming>,
 }
 
 unsafe impl Send for V4l2RequestDecoder {}
@@ -120,6 +163,7 @@ impl V4l2RequestDecoder {
                 packet,
                 frame,
                 planar,
+                timing: None,
             })
         }
     }
@@ -129,35 +173,75 @@ impl V4l2RequestDecoder {
     }
 
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<CpuPlanarFrame>> {
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+        let mut sample = started.map(|_| DecodeSample::default());
+        if started.is_none() {
+            self.timing = None;
+        }
         unsafe {
             let status = ffi::av_new_packet(self.packet, au.len() as i32);
             if status < 0 {
                 return Err(av_error("av_new_packet", status));
             }
             ptr::copy_nonoverlapping(au.as_ptr(), (*self.packet).data, au.len());
+            let codec_started = started.map(|_| Instant::now());
             let status = ffi::avcodec_send_packet(self.ctx, self.packet);
+            if let (Some(at), Some(sample)) = (codec_started, sample.as_mut()) {
+                sample.phases[0] += at.elapsed();
+            }
             ffi::av_packet_unref(self.packet);
             if status < 0 {
                 return Err(av_error("avcodec_send_packet", status));
             }
             let mut output = None;
             loop {
+                let codec_started = started.map(|_| Instant::now());
                 let status = ffi::avcodec_receive_frame(self.ctx, self.frame);
+                if let (Some(at), Some(sample)) = (codec_started, sample.as_mut()) {
+                    sample.phases[0] += at.elapsed();
+                }
                 if status == -libc::EAGAIN {
                     break;
                 }
                 if status < 0 {
                     return Err(av_error("avcodec_receive_frame", status));
                 }
-                let decoded = self.planar_frame();
+                let decoded = self.planar_frame(sample.as_mut());
                 ffi::av_frame_unref(self.frame);
                 output = Some(decoded?);
+                if let Some(sample) = sample.as_mut() {
+                    sample.frames += 1;
+                }
+            }
+            if let (Some(at), Some(mut sample)) = (started, sample) {
+                let now = Instant::now();
+                sample.phases[3] = now.duration_since(at);
+                let timing = self.timing.get_or_insert_with(|| DecodeTiming::new(at));
+                if let Some(window) = timing.add(sample, now) {
+                    tracing::debug!(
+                        calls = window.calls,
+                        frames = window.frames,
+                        window_ms = now.duration_since(window.started).as_millis() as u64,
+                        codec_mean_us = window.mean_us(0),
+                        codec_max_us = window.peaks[0].as_micros() as u64,
+                        transfer_mean_us = window.mean_us(1),
+                        transfer_max_us = window.peaks[1].as_micros() as u64,
+                        copy_mean_us = window.mean_us(2),
+                        copy_max_us = window.peaks[2].as_micros() as u64,
+                        total_mean_us = window.mean_us(3),
+                        total_max_us = window.peaks[3].as_micros() as u64,
+                        "V4L2 Request decode timing per call"
+                    );
+                }
             }
             Ok(output)
         }
     }
 
-    unsafe fn planar_frame(&mut self) -> Result<CpuPlanarFrame> {
+    unsafe fn planar_frame(
+        &mut self,
+        mut timing: Option<&mut DecodeSample>,
+    ) -> Result<CpuPlanarFrame> {
         unsafe {
             if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32 {
                 bail!("V4L2 Request returned a non-DRM frame");
@@ -221,11 +305,16 @@ impl V4l2RequestDecoder {
                     status,
                 ));
             }
+            let transfer_started = timing.as_ref().map(|_| Instant::now());
             let status = ffi::av_hwframe_transfer_data(self.planar, self.frame, 0);
+            if let (Some(at), Some(sample)) = (transfer_started, timing.as_mut()) {
+                sample.phases[1] += at.elapsed();
+            }
             if status < 0 {
                 return Err(av_error("transfer SAND output to planar samples", status));
             }
 
+            let copy_started = timing.as_ref().map(|_| Instant::now());
             let width = (*self.planar).width as u32;
             let height = (*self.planar).height as u32;
             let (chroma_width, chroma_height) = CpuPlanarFrame::chroma_dims(width, height);
@@ -268,7 +357,7 @@ impl V4l2RequestDecoder {
                 }
             }
             let flags = (*self.frame).flags;
-            CpuPlanarFrame::from_i420(
+            let copied = CpuPlanarFrame::from_i420(
                 width,
                 height,
                 planes,
@@ -282,7 +371,11 @@ impl V4l2RequestDecoder {
                 flags & FRAME_FLAG_KEY != 0
                     || (*self.frame).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I,
                 punktfunk_core::reanchor::LocalRecovery::NONE,
-            )
+            );
+            if let (Some(at), Some(sample)) = (copy_started, timing.as_mut()) {
+                sample.phases[2] += at.elapsed();
+            }
+            copied
         }
     }
 }
@@ -300,7 +393,34 @@ fn downshift_10bit(source: &[u8], stride: usize, width: usize, height: usize) ->
 
 #[cfg(test)]
 mod tests {
-    use super::downshift_10bit;
+    use super::{downshift_10bit, DecodeSample, DecodeTiming};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn timing_counts_empty_calls_and_resets_after_each_window() {
+        let at = Instant::now();
+        let mut timing = DecodeTiming::new(at);
+        let sample = |frames, us| DecodeSample {
+            phases: [Duration::from_micros(us); 4],
+            frames,
+        };
+        assert!(timing.add(sample(0, 10), at).is_none());
+        let report = timing
+            .add(sample(2, 30), at + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!((report.calls, report.frames), (2, 2));
+        assert_eq!(report.mean_us(0), 20.0);
+        assert_eq!(report.peaks[0], Duration::from_micros(30));
+        assert_eq!((timing.calls, timing.frames), (0, 0));
+        assert!(timing
+            .add(sample(1, 5), at + Duration::from_millis(1500))
+            .is_none());
+        let report = timing
+            .add(sample(1, 7), at + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(report.mean_us(3), 6.0);
+        assert_eq!(report.peaks[3], Duration::from_micros(7));
+    }
 
     #[test]
     fn ten_bit_transfer_preserves_range_rounding_and_row_padding() {
