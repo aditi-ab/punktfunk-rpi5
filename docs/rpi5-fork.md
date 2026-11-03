@@ -26,6 +26,8 @@ bundle, and [patch rationale](rpi5-patch-rationale.md) before updating the fork.
   early input wakes do not submit extra frames, and idle frames keep their wait.
   Page transitions keep title and hint fades within their screen bands. Spring
   animation time follows elapsed time even when rendering falls below 20 FPS.
+  Efficient eight-bit transitions bound content layers to their recorded drawing,
+  including shadows, while retaining native-resolution text and controls.
 - Audio reconciliation discards delayed packets whose timeline positions already
   played through packet-loss concealment.
 - The native console manages Bluetooth devices through BlueZ; see

@@ -489,11 +489,30 @@ fn chrome_bands(edges: Rect, h: f64, k: f64) -> (Rect, Rect) {
     )
 }
 
+/// Recording has no surface or colour type; only surface-independent eight-bit content uses it.
+fn record_content_layer(layered: bool, efficient: bool, color_type: skia_safe::ColorType) -> bool {
+    layered
+        && efficient
+        && matches!(
+            color_type,
+            skia_safe::ColorType::RGBA8888 | skia_safe::ColorType::BGRA8888
+        )
+}
+
+/// The picture stores device coordinates. Its conservative bounds size the alpha layer.
+fn replay_content(canvas: &Canvas, picture: &Picture, alpha: f64) {
+    canvas.save();
+    canvas.reset_matrix();
+    let mut paint = crate::theme::layer();
+    paint.set_alpha_f(alpha.clamp(0.0, 1.0) as f32);
+    canvas.draw_picture(picture, None, Some(&paint));
+    canvas.restore();
+}
+
 impl LayerEnv<'_> {
-    /// One screen's content as a unit: fade, slide, scale about centre. The band and
-    /// legend stay out of the layer; the returned [`Chrome`] draws them in place, so a
-    /// tab switch or a push never moves the strip. A tab root records the focus targets
-    /// it placed.
+    /// Transformed content, with chrome recorded separately in stationary device space.
+    /// Efficient eight-bit transitions record once and fade within conservative draw bounds.
+    /// Other surfaces retain their backing surface and layer colour semantics.
     #[allow(clippy::too_many_arguments)]
     fn paint(
         &mut self,
@@ -504,29 +523,36 @@ impl LayerEnv<'_> {
         scale: f64,
         band: Band,
     ) -> Chrome {
-        let canvas = self.canvas;
-        // Raise a layer only when alpha/scale/slide actually change. Unbounded
-        // `save_layer` is a full-surface offscreen; Skia does not elide alpha ≥ 1.
-        // Settled SrcOver draws are pixel-identical without the isolation.
+        let destination = self.canvas;
         let layered = alpha < 0.999 || (scale - 1.0).abs() > 0.001 || dy.abs() > 0.001;
-        if layered {
-            crate::theme::save_layer_alpha(canvas, None, alpha.clamp(0.0, 1.0) as f32);
-        } else {
-            // Save anyway: the transform below is undone by the same `restore`.
-            canvas.save();
-        }
-        // A list's own soft edges copy the surface, which has none of this layer: they
-        // would blur the field behind it over the rows. Off for the transition.
-        self.ui.in_layer.set(layered);
         // Pinned chrome records over the whole canvas, past the safe area, so a band's
         // scrim reaches the glass. Read before the slide moves the clip.
-        let edges = canvas
+        let edges = destination
             .local_clip_bounds()
             .unwrap_or_else(|| Rect::from_wh(self.w as f32, self.h as f32));
-        // It records in device space, as this canvas stands before the slide: a focus plate
-        // handing off to or from it, and a blur, then read the rects every layer reads.
-        let base = canvas.local_to_device();
-        let device_edges = canvas.local_to_device_as_3x3().map_rect(edges).0;
+        let base = destination.local_to_device();
+        let device_edges = destination.local_to_device_as_3x3().map_rect(edges).0;
+        let mut recorder = record_content_layer(
+            layered,
+            self.ui.skip_backdrop_blur && !crate::blur::active(self.ui),
+            destination.image_info().color_type(),
+        )
+        .then(PictureRecorder::new);
+        let canvas = if let Some(recorder) = recorder.as_mut() {
+            let canvas = recorder.begin_recording(device_edges, true);
+            canvas.set_matrix(&base);
+            canvas.save();
+            canvas
+        } else {
+            if layered {
+                crate::theme::save_layer_alpha(destination, None, alpha.clamp(0.0, 1.0) as f32);
+            } else {
+                destination.save();
+            }
+            destination
+        };
+        // Surface copies cannot see content inside either kind of transition layer.
+        self.ui.in_layer.set(layered);
         canvas.translate((dx as f32, dy as f32));
         let (cx, cy) = ((self.w / 2.0) as f32, (self.h / 2.0) as f32);
         canvas.translate((cx, cy));
@@ -586,6 +612,12 @@ impl LayerEnv<'_> {
             Vec::new()
         };
         canvas.restore();
+        if let Some(picture) = recorder
+            .as_mut()
+            .and_then(|recorder| recorder.finish_recording_as_picture(None))
+        {
+            replay_content(destination, &picture, alpha);
+        }
         self.ui.in_layer.set(false);
         Chrome {
             alpha,
@@ -793,6 +825,85 @@ mod glyph_style_tests {
 #[cfg(test)]
 mod chrome_layer_tests {
     use super::*;
+
+    #[test]
+    fn content_recording_excludes_hdr_and_surface_dependent_paths() {
+        use skia_safe::ColorType::*;
+        for color in [RGBA8888, BGRA8888] {
+            assert!(record_content_layer(true, true, color));
+            assert!(!record_content_layer(false, true, color));
+            assert!(!record_content_layer(true, false, color));
+        }
+        for color in [RGBA1010102, BGRA1010102, RGBAF16, Unknown] {
+            assert!(!record_content_layer(true, true, color));
+        }
+    }
+
+    #[test]
+    fn recorded_content_preserves_shadows_transforms_insets_and_empty_draws() {
+        use skia_safe::{BlurStyle, Color4f, MaskFilter, RRect};
+        let (width, height) = (640, 400);
+        let info = skia_safe::ImageInfo::new(
+            (width, height),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        for empty in [false, true] {
+            for alpha in [0.0, 0.37, 1.0] {
+                let render = |recorded: bool| {
+                    let mut surface =
+                        skia_safe::surfaces::raster_n32_premul((width, height)).unwrap();
+                    let destination = surface.canvas();
+                    destination.clear(skia_safe::Color::from_rgb(29, 41, 58));
+                    destination.translate((23.5, 17.25));
+                    let base = destination.local_to_device();
+                    let edges = destination.local_clip_bounds().unwrap();
+                    let device_edges = destination.local_to_device_as_3x3().map_rect(edges).0;
+                    let mut recorder = recorded.then(PictureRecorder::new);
+                    let canvas = if let Some(recorder) = recorder.as_mut() {
+                        let canvas = recorder.begin_recording(device_edges, true);
+                        canvas.set_matrix(&base);
+                        canvas.save();
+                        canvas
+                    } else {
+                        crate::theme::save_layer_alpha(destination, None, alpha as f32);
+                        destination
+                    };
+                    canvas.translate((35.25, -4.75));
+                    canvas.scale((0.93, 0.93));
+                    if !empty {
+                        let rect = Rect::from_xywh(44.0, 50.0, 130.0, 64.0);
+                        let rounded = RRect::new_rect_xy(rect, 12.0, 12.0);
+                        let mut shadow = crate::theme::fill(Color4f::new(0.0, 0.0, 0.0, 0.5));
+                        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 4.0, None));
+                        canvas.draw_rrect(rounded, &shadow);
+                        canvas.draw_rrect(
+                            rounded,
+                            &crate::theme::fill(Color4f::new(0.2, 0.6, 0.9, 0.8)),
+                        );
+                    }
+                    canvas.restore();
+                    if let Some(picture) = recorder
+                        .as_mut()
+                        .and_then(|recorder| recorder.finish_recording_as_picture(None))
+                    {
+                        let bounds = picture.cull_rect();
+                        assert!(bounds.width() * bounds.height() < (width * height) as f32 / 4.0);
+                        replay_content(destination, &picture, alpha);
+                        assert_eq!(destination.local_to_device(), base);
+                    }
+                    let mut pixels = vec![0; (width * height * 4) as usize];
+                    assert!(surface.read_pixels(&info, &mut pixels, (width * 4) as usize, (0, 0)));
+                    pixels
+                };
+                assert!(
+                    render(true) == render(false),
+                    "recording changes content pixels"
+                );
+            }
+        }
+    }
 
     #[test]
     fn navigation_keeps_wall_time_at_low_render_rates() {
