@@ -101,6 +101,7 @@ install -D -m 0644 "$here/runtime/kiosk-ssh.conf" "$root/etc/ssh/sshd_config.d/0
 sed -i 's/\r$//' "$root/usr/libexec/punktfunk/kiosk-control" "$root/etc/sudoers.d/punktfunk-kiosk" "$root/etc/ssh/sshd_config.d/00-punktfunk.conf"
 run visudo --check --file /etc/sudoers.d/punktfunk-kiosk
 run install -d -m 0755 /run/sshd
+run ssh-keygen -A
 run /usr/sbin/sshd -T >"$work/ssh-settings.txt"
 for setting in 'permitrootlogin no' 'permitemptypasswords no' 'passwordauthentication yes' 'allowusers punktfunk-admin'; do
     grep -qx "$setting" "$work/ssh-settings.txt" || die "Unexpected SSH setting: $setting"
