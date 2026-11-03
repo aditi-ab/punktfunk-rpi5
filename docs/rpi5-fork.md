@@ -140,6 +140,11 @@ Opaque SDR menus on Broadcom use an image transfer when source and output format
 match. The producer must advertise transfer-source usage and a complete native
 frame. HDR, partial overlays and format changes retain the graphics pass.
 `PUNKTFUNK_RPI_MENU_COPY=0` selects the graphics pass for comparison.
+Broadcom SDR tab changes rasterize each page once, then slide and fade those native
+images. Page content resumes live rendering when the transition settles; input,
+screen state, tabs and pinned controls continue updating throughout. New tab mounts
+and geometry changes discard the images. Navigation within a tab retains live rendering.
+`PUNKTFUNK_RPI_TAB_IMAGES=0` selects live page rendering during tab changes.
 `PUNKTFUNK_RPI_DIRECT_TRANSFER=0` compares against the original planar-copy path.
 `PUNKTFUNK_RPI_DECODE_THREADS=2` tests overlapping decode and transfer. This can
 increase memory contention and reduce presentation throughput at high output

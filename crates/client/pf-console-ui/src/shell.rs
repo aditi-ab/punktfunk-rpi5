@@ -326,6 +326,8 @@ pub(crate) struct Shell {
     hosts: Vec<HostRow>,
     hosts_gen: u64,
     pub(crate) efficient_backdrop: bool,
+    pub(crate) tab_images_enabled: bool,
+    tab_images: render::TabImages,
     /// The host was last told the input test is on.
     pad_testing: bool,
     /// The `host_sort` / `host_grouping` values `hosts` was last arranged by.
@@ -454,6 +456,8 @@ impl Shell {
             hosts: Vec::new(),
             hosts_gen: u64::MAX,
             efficient_backdrop: false,
+            tab_images_enabled: true,
+            tab_images: render::TabImages::default(),
             hosts_order: (None, None),
             pad_testing: false,
             in_stream: false,
@@ -947,8 +951,9 @@ impl Shell {
     }
 
     /// `root` becomes the stack; the current root parks and a pushed screen is dropped.
-    /// What it can focus is unknown until it paints.
+    /// Focus targets and transition images belong to the new mount, never its predecessor.
     fn mount(&mut self, to: Tab, root: Screen) {
+        self.tab_images.clear();
         self.stack.truncate(1);
         self.parked[self.tab.index()] = self.stack.pop();
         self.stack.push(root);

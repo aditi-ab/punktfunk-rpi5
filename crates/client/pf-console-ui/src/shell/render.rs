@@ -9,7 +9,7 @@ use crate::theme::{Fonts, Frame, PanelStroke, EDGE_INSET, W};
 use crate::widgets::{text_tab, tray, Toward};
 use pf_client_core::menu_nav::PadInfo;
 use pf_client_core::trust;
-use skia_safe::{Canvas, Picture, PictureRecorder, Rect};
+use skia_safe::{Canvas, Image, Picture, PictureRecorder, Point, Rect};
 use std::time::Instant;
 
 use super::{
@@ -171,6 +171,19 @@ impl Shell {
             (w - 2.0 * self.ui.edge(k) - chip_w - 12.0 * k).max(w * 0.35)
         };
         let games_ok = self.games_host().is_some();
+        let tab_images = matches!(self.motion, Motion::Tab { .. })
+            && self.tab_images_enabled
+            && record_content_layer(
+                true,
+                self.efficient_backdrop && !crate::blur::active(&self.ui),
+                canvas.image_info().color_type(),
+            )
+            && canvas.image_info().color_space().is_none();
+        if tab_images {
+            self.tab_images.begin(canvas, content, k);
+        } else {
+            self.tab_images.clear();
+        }
         let (tab, strip_focus) = (self.tab, self.strip_focus);
         // A takeover owns B/A while up: the screen's legend would name buttons it ignores.
         let show_hints = self.takeover().is_none();
@@ -200,6 +213,7 @@ impl Shell {
             show_hints,
             cheap: false,
             root_targets: None,
+            tab_images: tab_images.then_some(&mut self.tab_images),
         };
         self.hint_rects.clear();
         // Reduced motion keeps the crossfade (an instant swap loses the only spatial
@@ -460,6 +474,93 @@ struct LayerEnv<'a> {
     cheap: bool,
     /// Focus targets the tab root placed, once its layer paints.
     root_targets: Option<usize>,
+    tab_images: Option<&'a mut TabImages>,
+}
+
+/// Two native page images live only for one tab transition. Screen logic still runs;
+/// dynamic page content becomes live again when the spring settles. Chrome stays live.
+#[derive(Default)]
+pub(super) struct TabImages {
+    key: Option<(skia_safe::ISize, skia_safe::Matrix, Rect, f64)>,
+    pages: Vec<Option<(Image, Point)>>,
+    next: usize,
+}
+
+impl TabImages {
+    /// A new mount or a settled frame releases the previous transition's images.
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Invalidate images when native geometry or the safe-area transform changes.
+    fn begin(&mut self, canvas: &Canvas, content: Rect, k: f64) {
+        let key = (
+            canvas.image_info().dimensions(),
+            canvas.local_to_device_as_3x3(),
+            content,
+            k,
+        );
+        if self.key.as_ref() != Some(&key) {
+            self.clear();
+            self.key = Some(key);
+        }
+        self.next = 0;
+    }
+
+    /// Rasterize a page once at native size, then translate its premultiplied pixels.
+    /// Allocation failures retain live picture replay with the same group opacity.
+    fn draw(&mut self, canvas: &Canvas, picture: &Picture, alpha: f64, dx: f64, dy: f64) {
+        let index = self.next;
+        self.next += 1;
+        if self.pages.len() <= index {
+            self.pages.push(None);
+        }
+        if self.pages[index].is_none() {
+            let bounds: skia_safe::IRect = skia_safe::RoundOut::round_out(&picture.cull_rect());
+            if bounds.width() > 0 && bounds.height() > 0 {
+                let info = skia_safe::ImageInfo::new(
+                    (bounds.width(), bounds.height()),
+                    canvas.image_info().color_type(),
+                    skia_safe::AlphaType::Premul,
+                    None,
+                );
+                if let Some(mut surface) = canvas.new_surface(&info, None) {
+                    surface.canvas().clear(skia_safe::Color::TRANSPARENT);
+                    surface
+                        .canvas()
+                        .translate((-bounds.left as f32, -bounds.top as f32));
+                    surface.canvas().draw_picture(picture, None, None);
+                    self.pages[index] = Some((
+                        surface.image_snapshot(),
+                        Point::new(bounds.left as f32, bounds.top as f32),
+                    ));
+                }
+            }
+        }
+        let matrix = canvas.local_to_device_as_3x3();
+        let zero = matrix.map_point((0.0, 0.0));
+        let moved = matrix.map_point((dx as f32, dy as f32));
+        canvas.save();
+        canvas.reset_matrix();
+        let mut paint = crate::theme::layer();
+        paint.set_alpha_f(alpha.clamp(0.0, 1.0) as f32);
+        let shift = skia_safe::Matrix::translate((moved.x - zero.x, moved.y - zero.y));
+        if let Some((image, origin)) = &self.pages[index] {
+            canvas.concat(&shift);
+            canvas.draw_image_with_sampling_options(
+                image,
+                *origin,
+                skia_safe::SamplingOptions::new(
+                    skia_safe::FilterMode::Linear,
+                    skia_safe::MipmapMode::None,
+                ),
+                Some(&paint),
+            );
+        } else {
+            canvas.draw_picture(picture, Some(&shift), Some(&paint));
+        }
+        canvas.restore();
+    }
 }
 
 /// Opens a bounded fade or a plain save. Invisible content opens neither;
@@ -511,7 +612,7 @@ fn replay_content(canvas: &Canvas, picture: &Picture, alpha: f64) {
 
 impl LayerEnv<'_> {
     /// Transformed content, with chrome recorded separately in stationary device space.
-    /// Efficient eight-bit transitions record once and fade within conservative draw bounds.
+    /// Broadcom tab transitions reuse page images; navigation retains bounded live recording.
     /// Other surfaces retain their backing surface and layer colour semantics.
     #[allow(clippy::too_many_arguments)]
     fn paint(
@@ -533,7 +634,7 @@ impl LayerEnv<'_> {
         let base = destination.local_to_device();
         let device_edges = destination.local_to_device_as_3x3().map_rect(edges).0;
         let mut recorder = record_content_layer(
-            layered,
+            layered || self.tab_images.is_some(),
             self.ui.skip_backdrop_blur && !crate::blur::active(self.ui),
             destination.image_info().color_type(),
         )
@@ -552,8 +653,10 @@ impl LayerEnv<'_> {
             destination
         };
         // Surface copies cannot see content inside either kind of transition layer.
-        self.ui.in_layer.set(layered);
-        canvas.translate((dx as f32, dy as f32));
+        self.ui.in_layer.set(layered || self.tab_images.is_some());
+        if self.tab_images.is_none() {
+            canvas.translate((dx as f32, dy as f32));
+        }
         let (cx, cy) = ((self.w / 2.0) as f32, (self.h / 2.0) as f32);
         canvas.translate((cx, cy));
         canvas.scale((scale as f32, scale as f32));
@@ -616,7 +719,11 @@ impl LayerEnv<'_> {
             .as_mut()
             .and_then(|recorder| recorder.finish_recording_as_picture(None))
         {
-            replay_content(destination, &picture, alpha);
+            if let Some(images) = self.tab_images.as_mut() {
+                images.draw(destination, &picture, alpha, dx, dy);
+            } else {
+                replay_content(destination, &picture, alpha);
+            }
         }
         self.ui.in_layer.set(false);
         Chrome {
@@ -851,7 +958,7 @@ mod chrome_layer_tests {
         );
         for empty in [false, true] {
             for alpha in [0.0, 0.37, 1.0] {
-                let render = |recorded: bool| {
+                let render = |recorded: bool, cached: bool| {
                     let mut surface =
                         skia_safe::surfaces::raster_n32_premul((width, height)).unwrap();
                     let destination = surface.canvas();
@@ -890,7 +997,12 @@ mod chrome_layer_tests {
                     {
                         let bounds = picture.cull_rect();
                         assert!(bounds.width() * bounds.height() < (width * height) as f32 / 4.0);
-                        replay_content(destination, &picture, alpha);
+                        if cached {
+                            let mut images = TabImages::default();
+                            images.draw(destination, &picture, alpha, 0.0, 0.0);
+                        } else {
+                            replay_content(destination, &picture, alpha);
+                        }
                         assert_eq!(destination.local_to_device(), base);
                     }
                     let mut pixels = vec![0; (width * height * 4) as usize];
@@ -898,11 +1010,44 @@ mod chrome_layer_tests {
                     pixels
                 };
                 assert!(
-                    render(true) == render(false),
+                    render(true, false) == render(false, false),
                     "recording changes content pixels"
+                );
+                assert!(
+                    render(true, true)
+                        .iter()
+                        .zip(render(false, false))
+                        .all(|(a, b)| a.abs_diff(b) <= 1),
+                    "cached page changes pixels beyond alpha rounding"
                 );
             }
         }
+    }
+
+    #[test]
+    fn tab_images_expire_on_geometry_changes_and_new_mounts() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((160, 100)).unwrap();
+        let canvas = surface.canvas();
+        let content = Rect::from_wh(160.0, 100.0);
+        let mut recorder = PictureRecorder::new();
+        recorder.begin_recording(content, true).draw_rect(
+            Rect::from_xywh(10.0, 20.0, 30.0, 40.0),
+            &crate::theme::fill(skia_safe::Color4f::new(1.0, 0.0, 0.0, 1.0)),
+        );
+        let picture = recorder.finish_recording_as_picture(None).unwrap();
+        let mut images = TabImages::default();
+        images.begin(canvas, content, 1.0);
+        images.draw(canvas, &picture, 1.0, 0.0, 0.0);
+        let first = images.pages[0].as_ref().unwrap().0.unique_id();
+        images.begin(canvas, content, 1.0);
+        images.draw(canvas, &picture, 0.4, 20.0, 0.0);
+        assert_eq!(first, images.pages[0].as_ref().unwrap().0.unique_id());
+        images.begin(canvas, content, 1.5);
+        assert!(images.pages.is_empty());
+        images.draw(canvas, &picture, 1.0, 0.0, 0.0);
+        images.clear();
+        assert!(images.pages.is_empty());
+        assert!(images.key.is_none());
     }
 
     #[test]
