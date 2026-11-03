@@ -948,7 +948,7 @@ impl LibraryScreen {
         // With a band to treat them, the lines run on up under the chrome as well. A quiet
         // shelf clips at its top: the Hosts row is drawn there.
         let air = PLATE_AIR * k;
-        let bleed = crate::blur::active();
+        let bleed = crate::blur::active(ui);
         let top = if bleed && !(self.embedded && self.quiet) {
             clip.top.min(rect.top)
         } else {

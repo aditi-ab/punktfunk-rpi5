@@ -142,16 +142,21 @@ impl Band {
     }
 }
 
-/// The style this frame draws: the blur everywhere, the reduced interface included — the
-/// pixel treatment stays behind the A/B override until it is wanted.
-fn style() -> Style {
-    OVERRIDE.with(std::cell::Cell::get).unwrap_or(Style::Blur)
+/// Bandwidth-limited GPUs omit backdrop passes; an explicit style override takes priority.
+fn style(ui: &crate::theme::Frame) -> Style {
+    OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(if ui.skip_backdrop_blur {
+            Style::Off
+        } else {
+            Style::Blur
+        })
 }
 
 /// Whether a backdrop draws anything this frame: content may run on under the chrome
 /// only when a band will treat it.
-pub fn active() -> bool {
-    style() != Style::Off
+pub fn active(ui: &crate::theme::Frame) -> bool {
+    style(ui) != Style::Off
 }
 
 /// Soften what `canvas` already holds under `rect` by `band`. Inside a transition layer
@@ -160,7 +165,7 @@ pub fn backdrop(canvas: &Canvas, ui: &crate::theme::Frame, rect: Rect, band: Ban
     if ui.in_layer.get() {
         return;
     }
-    match style() {
+    match style(ui) {
         Style::Off => {}
         Style::Blur => blur(canvas, rect, band),
         Style::Pixel => pixel(canvas, rect, band, true),
@@ -338,6 +343,84 @@ mod tests {
     use super::*;
     use crate::theme::Frame;
     use skia_safe::Color;
+
+    fn pixels(surface: &mut Surface) -> Vec<u8> {
+        let image = surface.image_snapshot();
+        let info = image.image_info();
+        let mut bytes = vec![0; info.compute_min_byte_size()];
+        assert!(image.read_pixels(
+            info,
+            &mut bytes,
+            info.min_row_bytes(),
+            (0, 0),
+            skia_safe::image::CachingHint::Allow,
+        ));
+        bytes
+    }
+
+    #[test]
+    fn bandwidth_limited_backdrop_preserves_pixels_and_clips_content() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((64, 100)).unwrap();
+        surface.canvas().clear(Color::BLACK);
+        let white = crate::theme::fill(Color4f::new(1.0, 1.0, 1.0, 1.0));
+        for x in (0..64).step_by(16) {
+            surface
+                .canvas()
+                .draw_rect(Rect::from_xywh(x as f32, 0.0, 8.0, 100.0), &white);
+        }
+        let before = pixels(&mut surface);
+        let ui = Frame {
+            skip_backdrop_blur: true,
+            ..Frame::default()
+        };
+        let rect = Rect::from_xywh(0.0, 20.0, 64.0, 60.0);
+        assert!(!active(&ui));
+        assert_eq!(
+            crate::widgets::bleed_view(surface.canvas(), &ui, rect),
+            rect
+        );
+        let band = Band {
+            edge: 0.0,
+            clear: 80.0,
+            sigma: 8.0,
+            over: 0.0,
+        };
+        backdrop(surface.canvas(), &ui, rect, band);
+        assert_eq!(pixels(&mut surface), before);
+        let normal = Frame::default();
+        assert!(active(&normal));
+        assert_ne!(
+            crate::widgets::bleed_view(surface.canvas(), &normal, rect),
+            rect
+        );
+        backdrop(surface.canvas(), &normal, rect, band);
+        assert_ne!(pixels(&mut surface), before);
+    }
+
+    #[test]
+    fn capability_fallback_preserves_other_devices_and_explicit_styles() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_style_override(None);
+            }
+        }
+        let _reset = Reset;
+        let reduced = Frame {
+            reduced_ui: true,
+            ..Frame::default()
+        };
+        assert_eq!(style(&reduced), Style::Blur);
+        let efficient = Frame {
+            skip_backdrop_blur: true,
+            ..Frame::default()
+        };
+        for picked in [Style::Blur, Style::Pixel, Style::PixelFlat, Style::Off] {
+            set_style_override(Some(picked));
+            assert_eq!(style(&efficient), picked);
+            assert_eq!(active(&efficient), picked != Style::Off);
+        }
+    }
 
     /// 8 px stripes under a top band: rows at the clear edge keep full contrast, rows at
     /// the screen edge lose nearly all of it, and contrast falls steadily in between.

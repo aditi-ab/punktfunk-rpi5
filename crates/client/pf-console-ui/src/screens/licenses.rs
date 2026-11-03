@@ -216,7 +216,7 @@ impl ScreenView for LicensesScreen {
 
         // With the trays on, the text runs on under the title and the legend and they blur
         // it, as a list does; without them it fades at its own edges.
-        let view = bleed_view(canvas, rect);
+        let view = bleed_view(canvas, ui, rect);
         let paint = || {
             let top = f64::from(rect.top) - self.flick.scroll;
             let first = self
@@ -246,7 +246,7 @@ impl ScreenView for LicensesScreen {
                 );
             }
         };
-        if crate::blur::active() {
+        if crate::blur::active(ui) {
             paint();
         } else {
             soft_scroll(canvas, ui, view, view, self.flick.scrolled(), k, paint);

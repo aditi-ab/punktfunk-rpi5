@@ -87,6 +87,7 @@ impl Shell {
         );
         let side = f64::from(viewport.insets.left);
         self.ui = self.ui.next(self.backdrop.ink, reduce, reduced_ui, side);
+        self.ui.skip_backdrop_blur = self.efficient_backdrop;
         self.pads = pads.to_vec();
         self.glyphs = glyph_style(self.input_source, pad_pref, self.device.platform);
         if let Some(Screen::InputTest(test)) = self.stack.last_mut() {

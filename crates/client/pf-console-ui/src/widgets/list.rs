@@ -464,8 +464,8 @@ const SOFT_EDGE: f64 = 40.0;
 /// The viewport a page scrolls in: out to the layer's top and bottom while the trays can
 /// blur what runs past `rect`, so the page fades under the chrome as a list does, else
 /// `rect` itself.
-pub fn bleed_view(canvas: &Canvas, rect: Rect) -> Rect {
-    if !crate::blur::active() {
+pub fn bleed_view(canvas: &Canvas, ui: &Frame, rect: Rect) -> Rect {
+    if !crate::blur::active(ui) {
         return rect;
     }
     let clip = canvas.local_clip_bounds().unwrap_or(rect);
@@ -1017,7 +1017,7 @@ impl MenuList {
         let air = (PLATE_AIR * k) as f32;
         // Bleeding, the viewport reaches the layer's edges and pads back to `rect`; else it
         // holds the plate's outset. Without a band to treat them, rows stay in their rect.
-        let bleed = self.bleed && crate::blur::active();
+        let bleed = self.bleed && crate::blur::active(ui);
         let view = if bleed {
             let clip = canvas.local_clip_bounds().unwrap_or(rect);
             Rect::from_ltrb(

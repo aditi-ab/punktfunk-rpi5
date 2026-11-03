@@ -162,7 +162,7 @@ impl ScreenView for PaletteScreen {
         let air = (12.0 * k) as f32;
         // The viewport reaches the layer's edges and pads back to `rect`, so cards run under
         // the shell's trays and blur there instead of stopping short.
-        let view = if crate::blur::active() {
+        let view = if crate::blur::active(ui) {
             let clip = canvas.local_clip_bounds().unwrap_or(rect);
             Rect::from_ltrb(
                 rect.left,

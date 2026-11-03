@@ -288,9 +288,10 @@ pub struct Frame {
     /// Travel suppressed this frame. Callers keep the state change and drop the glide.
     /// Never used to skip a haptic: the pulse replaces the motion.
     pub reduce_motion: bool,
-    /// The reduced interface: a TV-class GPU. Passes that read back what is already drawn
-    /// (a backdrop blur) break a tiled GPU's render pass and are skipped.
+    /// The reduced interface resolution selected for this device.
     pub reduced_ui: bool,
+    /// Skip backdrop copies and blur passes on bandwidth-limited GPUs.
+    pub skip_backdrop_blur: bool,
     /// The safe area's left inset, px ([`Frame::edge`]).
     pub side_inset: f64,
     /// The shell is painting a screen into a transition layer. A copy of the surface cannot
@@ -312,6 +313,7 @@ impl Frame {
             ink,
             reduce_motion,
             reduced_ui,
+            skip_backdrop_blur: false,
             side_inset,
             in_layer: Cell::new(false),
             el: crate::el::Ledger::default(),
