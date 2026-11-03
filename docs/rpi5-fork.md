@@ -15,8 +15,9 @@ bundle, and [patch rationale](rpi5-patch-rationale.md) before updating the fork.
   Ten-bit decode output is rounded to eight bits; this is not HDR presentation.
   The kiosk selects this Pi-tested path explicitly; upstream's native V4L2
   backend remains available without replacing it.
-  Two decode threads overlap hardware work with pixel transfer. Each output
-  retains its input timestamps and recovery flags across the buffered frames.
+  Synchronous decoding remains the default. An opt-in two-thread diagnostic can
+  overlap hardware work with pixel transfer; outputs retain their input timestamps
+  and recovery flags across buffered frames.
 - Wayland compositor callbacks pace presentation. Swapchain recreation handles
   updated compositor feedback, and overlay damage limits unnecessary GPU work.
   The kiosk permits two pending callbacks and uses arrival-driven latency mode,
@@ -106,7 +107,9 @@ creating a device. Scroll tests alternate up/down every three seconds.
 For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=1|2` selects the
 pending callback limit. The kiosk uses two; the generic presenter defaults to one.
 `PUNKTFUNK_RPI_DIRECT_TRANSFER=0` compares against the original planar-copy path.
-`PUNKTFUNK_RPI_DECODE_THREADS=1` compares against synchronous hardware decoding.
+`PUNKTFUNK_RPI_DECODE_THREADS=2` tests overlapping decode and transfer. This can
+increase memory contention and reduce presentation throughput at high output
+resolutions, so the default remains one thread.
 The decoder's DEBUG timing separates codec work, SAND transfer and pixel copying
 from the pre-decode queue delay included in streaming statistics.
 

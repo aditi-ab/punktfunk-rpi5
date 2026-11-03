@@ -261,10 +261,10 @@ impl V4l2RequestDecoder {
             }
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.0);
             (*ctx).get_format = Some(pick_drm_prime);
-            let threads = if std::env::var("PUNKTFUNK_RPI_DECODE_THREADS").as_deref() == Ok("1") {
-                1
-            } else {
+            let threads = if std::env::var("PUNKTFUNK_RPI_DECODE_THREADS").as_deref() == Ok("2") {
                 2
+            } else {
+                1
             };
             if threads == 1 {
                 (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
