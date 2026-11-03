@@ -18,7 +18,8 @@ assert "Environment=WESTON_DRM_DISABLE_CURSOR_PLANE=1" in (root / "etc/systemd/s
 assert "WESTON_FORCE_RENDERER=" not in (root / "etc/systemd/system/punktfunk-weston.service").read_text()
 unit = (root / "etc/systemd/system/punktfunk-kiosk.service").read_text()
 for value in ("PUNKTFUNK_DECODER=v4l2-request", "PUNKTFUNK_PRESENT_MODE=immediate",
-              "PUNKTFUNK_SWAPCHAIN_IMAGES=8", "PUNKTFUNK_SDR_8BIT=1", "--browse --fullscreen"):
+              "PUNKTFUNK_SWAPCHAIN_IMAGES=8", "PUNKTFUNK_SDR_8BIT=1",
+              "PUNKTFUNK_WAYLAND_FRAME_DEPTH=2", "PUNKTFUNK_VRR_PACE=0", "--browse --fullscreen"):
     assert value in unit, f"Missing launch setting: {value}"
 assert "HOME=/data" in (root / "etc/default/punktfunk").read_text().splitlines()
 settings = json.loads((root / "data/.config/punktfunk/client-gtk-settings.json").read_text())

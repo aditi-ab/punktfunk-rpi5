@@ -17,6 +17,8 @@ bundle, and [patch rationale](rpi5-patch-rationale.md) before updating the fork.
   backend remains available without replacing it.
 - Wayland compositor callbacks pace presentation. Swapchain recreation handles
   updated compositor feedback, and overlay damage limits unnecessary GPU work.
+  The kiosk permits two pending callbacks and uses arrival-driven latency mode,
+  avoiding a second pacing clock on top of the compositor.
 - Audio reconciliation discards delayed packets whose timeline positions already
   played through packet-loss concealment.
 - The native console manages Bluetooth devices through BlueZ; see
@@ -96,9 +98,11 @@ ordinary keys go to the host. `disconnect`, `stats`, and `ring` use Punktfunk's
 existing Ctrl+Alt+Shift shortcuts. `--dry-run` prints the requested action without
 creating a device. Scroll tests alternate up/down every three seconds.
 
-For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=2` permits two
-pending frame callbacks. The default remains one; this diagnostic override needs
-physical cadence and latency checks before choosing an appliance default.
+For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=1|2` selects the
+pending callback limit. The kiosk uses two; the generic presenter defaults to one.
+`PUNKTFUNK_RPI_DIRECT_TRANSFER=0` compares against the original planar-copy path.
+The decoder's DEBUG timing separates codec work, SAND transfer and pixel copying
+from the pre-decode queue delay included in streaming statistics.
 
 For captures, Weston provides `weston-screenshooter` when started with `--debug`.
 Enable that only for a diagnostic session, run the capture as the kiosk user with

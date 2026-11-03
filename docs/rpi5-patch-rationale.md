@@ -64,6 +64,11 @@ HEVC bitstream decoding remains in the Pi hardware block. The CPU performs the
 required SAND-to-I420 transfer and upload; this must not be described as software
 HEVC decoding. The rung intentionally rejects non-HEVC streams.
 
+For uncropped, even-sized eight-bit frames, the transfer writes directly into
+the owned I420 buffer used by Vulkan upload, avoiding an extra full-picture copy.
+The decoder validates the resulting planes and falls back to the original path
+if the transfer fails. Ten-bit frames retain the existing conversion path.
+
 Primary implementation files are
 [`video_v4l2_request.rs`](../crates/client/pf-client-video/src/video_v4l2_request.rs),
 [`video_ladder.rs`](../crates/client/pf-client-video/src/video_ladder.rs), and

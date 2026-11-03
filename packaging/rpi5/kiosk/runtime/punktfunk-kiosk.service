@@ -16,6 +16,8 @@ Environment=XDG_CONFIG_HOME=/data/.config
 Environment=PUNKTFUNK_DECODER=v4l2-request
 Environment=PUNKTFUNK_PRESENT_MODE=immediate
 Environment=PUNKTFUNK_SDR_8BIT=1
+Environment=PUNKTFUNK_WAYLAND_FRAME_DEPTH=2
+Environment=PUNKTFUNK_VRR_PACE=0
 Environment=PUNKTFUNK_SWAPCHAIN_IMAGES=8
 Environment=PUNKTFUNK_PRESENT_DEBUG=1
 Environment=RUST_LOG=info,pf_client_core::audio=debug,pf_client_core::session=debug
