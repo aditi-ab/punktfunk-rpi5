@@ -509,14 +509,26 @@ fn consumed_compositor_credit(before: Option<usize>, after: Option<usize>) -> bo
         .is_some_and(|(before, after)| after < before)
 }
 
-/// Fill spare compositor credit only after a changed frame consumed one slot.
-fn immediate_browse_redraw(
-    last_changed_shown: bool,
+fn browse_period(measured_ns: Option<u64>, native_hz: u32) -> Duration {
+    let ns = measured_ns
+        .filter(|ns| (1_000_000..=100_000_000).contains(ns))
+        .unwrap_or_else(|| 1_000_000_000 / u64::from(if native_hz == 0 { 60 } else { native_hz }));
+    Duration::from_nanos(ns)
+}
+
+/// Wait from the previous render's start, so rendering consumes the refresh budget.
+fn browse_frame_wait(
+    last_start: Option<Instant>,
+    now: Instant,
+    period: Duration,
     browse: bool,
     compositor_credit: Option<usize>,
     redraw_due: bool,
-) -> bool {
-    last_changed_shown && browse && redraw_due && compositor_credit.is_some_and(|credit| credit > 0)
+) -> Option<Duration> {
+    if !browse || !redraw_due || !compositor_credit.is_some_and(|credit| credit > 0) {
+        return None;
+    }
+    last_start.map(|start| period.saturating_sub(now.saturating_duration_since(start)))
 }
 
 fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
@@ -537,29 +549,29 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
         ModeCtl::Browse(_) => None,
     };
 
-    let mut browse_followup = false;
+    let mut last_browse_start = None;
     // A closure, so an error exit (device lost, a failed resize) still reaches the teardown.
     let outcome = (|| -> Result<Outcome> {
         Ok('main: loop {
-            // Poll while a changed console frame has spare callback credit; otherwise
-            // wait for input, frame wakes or the next paced deadline. An unchanged or
-            // unarmed present ends the immediate sequence.
-            let immediate = immediate_browse_redraw(
-                std::mem::take(&mut browse_followup),
+            // The menu uses one native refresh budget, including render work. Callback
+            // credit bounds submissions; input can wake early without drawing early.
+            let menu_wait = browse_frame_wait(
+                last_browse_start,
+                Instant::now(),
+                browse_period(sh.presenter.measured_refresh_ns(), sh.native.refresh_hz),
                 sh.browse && stream.is_none(),
                 sh.presenter.compositor_frame_credit(),
                 sh.overlay
                     .as_ref()
                     .is_some_and(|overlay| overlay.redraw_due()),
             );
-            let timeout = if immediate {
-                Duration::ZERO
+            let timeout = if let Some(wait) = menu_wait {
+                wait.min(Duration::from_millis(15))
             } else if sh.presenter.compositor_frame_ready() {
                 stream
                     .as_ref()
                     .map_or(Duration::from_millis(15), |st| st.wake_timeout())
             } else {
-                // The compositor callback wakes SDL; a due frame cannot bypass its gate.
                 Duration::from_millis(15)
             };
             let first = wait_event(&mut sh.event_pump, timeout);
@@ -608,6 +620,26 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
                 sh.stream_tick(st);
             }
             sh.ring_tick(&mut stream);
+            let render_started = Instant::now();
+            // Input can wake a full budget before its deadline. No frame was attempted,
+            // so retain that deadline until a callback grants credit.
+            if sh.browse && stream.is_none() && sh.presenter.compositor_frame_credit() == Some(0) {
+                continue;
+            }
+            if browse_frame_wait(
+                last_browse_start,
+                render_started,
+                browse_period(sh.presenter.measured_refresh_ns(), sh.native.refresh_hz),
+                sh.browse && stream.is_none(),
+                sh.presenter.compositor_frame_credit(),
+                sh.overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.redraw_due()),
+            )
+            .is_some_and(|wait| !wait.is_zero())
+            {
+                continue;
+            }
             sh.overlay_tick(&mut stream)?;
 
             let presented_video = match stream.as_mut() {
@@ -618,7 +650,8 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
                 sh.screens_tick(st);
             }
 
-            browse_followup = sh.present_overlay_alone(&stream, presented_video)?;
+            let shown = sh.present_overlay_alone(&stream, presented_video)?;
+            last_browse_start = shown.then_some(render_started);
         })
     })();
 
@@ -684,48 +717,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn burst_is_bounded_by_callback_budget() {
-        let mut credit = 2;
-        let mut burst = 0;
-        while immediate_browse_redraw(true, true, Some(credit), true) {
-            credit -= 1;
-            burst += 1;
+    fn early_callback_and_input_wakes_do_not_draw_an_extra_frame() {
+        let start = Instant::now();
+        let period = Duration::from_millis(16);
+        for elapsed in [0, 2, 7, 15] {
+            // Available credit can grow on a callback without advancing the deadline.
+            for credit in [1, 2] {
+                assert_eq!(
+                    browse_frame_wait(
+                        Some(start),
+                        start + Duration::from_millis(elapsed),
+                        period,
+                        true,
+                        Some(credit),
+                        true
+                    ),
+                    Some(Duration::from_millis(16 - elapsed))
+                );
+            }
         }
-        assert_eq!(burst, 2);
-        // One completion releases exactly one extra submit, never a fresh depth-two burst.
-        credit += 1;
-        assert!(immediate_browse_redraw(true, true, Some(credit), true));
-        credit -= 1;
-        assert!(!immediate_browse_redraw(true, true, Some(credit), true));
-    }
-    #[test]
-    fn idle_slot_and_failed_present_stop_followups() {
-        assert!(!immediate_browse_redraw(true, true, Some(2), false));
-        // An expired idle timer permits one new frame; painting it resets the timer.
-        assert!(immediate_browse_redraw(true, true, Some(2), true));
-        assert!(!immediate_browse_redraw(true, true, Some(1), false));
-        // A stale/minimized attempt does not consume a callback but must end the burst.
-        assert!(!immediate_browse_redraw(false, true, Some(2), true));
-    }
-    #[test]
-    fn unpaced_and_streaming_paths_cannot_spin() {
-        assert!(!immediate_browse_redraw(true, true, None, true));
-        assert!(!immediate_browse_redraw(true, false, Some(2), true));
-        assert!(!immediate_browse_redraw(false, true, Some(2), true));
+        assert_eq!(
+            browse_frame_wait(Some(start), start + period, period, true, Some(2), true),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
-    fn failed_callback_arming_cannot_start_an_immediate_loop() {
+    fn rendering_time_is_subtracted_from_the_native_refresh_budget() {
+        let start = Instant::now();
+        for hz in [60, 120] {
+            let period = browse_period(None, hz);
+            let work = Duration::from_millis(3);
+            assert_eq!(
+                browse_frame_wait(Some(start), start + work, period, true, Some(1), true),
+                Some(period - work)
+            );
+        }
+        assert_eq!(
+            browse_period(Some(16_683_350), 60),
+            Duration::from_nanos(16_683_350)
+        );
+        assert_eq!(browse_period(Some(0), 120), browse_period(None, 120));
+        assert_eq!(browse_period(None, 0), browse_period(None, 60));
+    }
+
+    #[test]
+    fn overruns_reanchor_without_catch_up_bursts() {
+        let start = Instant::now();
+        let period = Duration::from_millis(16);
+        let late = start + Duration::from_millis(45);
+        assert_eq!(
+            browse_frame_wait(Some(start), late, period, true, Some(2), true),
+            Some(Duration::ZERO)
+        );
+        // A successful overdue frame records its actual start, never the old deadline.
+        assert_eq!(
+            browse_frame_wait(
+                Some(late),
+                late + Duration::from_millis(3),
+                period,
+                true,
+                Some(1),
+                true
+            ),
+            Some(Duration::from_millis(13))
+        );
+    }
+
+    #[test]
+    fn unchanged_unpaced_streaming_and_unarmed_frames_keep_normal_waits() {
+        let now = Instant::now();
+        let period = Duration::from_millis(16);
+        for (last, browse, credit, due) in [
+            (None, true, Some(2), true),
+            (Some(now), true, None, true),
+            (Some(now), true, Some(0), true),
+            (Some(now), false, Some(2), true),
+            (Some(now), true, Some(2), false),
+        ] {
+            assert_eq!(
+                browse_frame_wait(last, now, period, browse, credit, due),
+                None
+            );
+        }
         for (before, after) in [(Some(2), Some(2)), (None, None), (Some(2), None)] {
-            assert!(!immediate_browse_redraw(
-                consumed_compositor_credit(before, after),
-                true,
-                after,
-                true,
-            ));
+            let shown = consumed_compositor_credit(before, after);
+            assert_eq!(
+                browse_frame_wait(shown.then_some(now), now, period, true, after, true),
+                None
+            );
         }
         assert!(consumed_compositor_credit(Some(2), Some(1)));
-        assert!(consumed_compositor_credit(Some(1), Some(0)));
     }
 
     /// KDE fractional scaling advertises points; "Native" must recover the panel pixels.

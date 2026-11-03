@@ -22,8 +22,8 @@ bundle, and [patch rationale](rpi5-patch-rationale.md) before updating the fork.
   updated compositor feedback, and overlay damage limits unnecessary GPU work.
   The kiosk permits two pending callbacks and uses arrival-driven latency mode,
   avoiding a second pacing clock on top of the compositor.
-  Animated menus fill available callback slots without an extra timer delay;
-  unchanged idle frames keep their existing wait.
+  Animated menus use native refresh deadlines that include rendering time;
+  early input wakes do not submit extra frames, and idle frames keep their wait.
 - Audio reconciliation discards delayed packets whose timeline positions already
   played through packet-loss concealment.
 - The native console manages Bluetooth devices through BlueZ; see
