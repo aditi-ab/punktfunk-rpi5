@@ -39,11 +39,13 @@ struct Slot {
     width: u32,
     height: u32,
     ten_bit: bool,
+    opaque: bool,
 }
 
 impl Slot {
     fn frame(&self) -> OverlayFrame {
         OverlayFrame {
+            opaque: self.opaque,
             image: self.image,
             view: self.view,
             format: self.format,
@@ -440,7 +442,8 @@ impl Overlay for SkiaOverlay {
             let idle = self.shell.as_ref().is_some_and(Shell::idle)
                 && self.console_at.is_some_and(|t| t.elapsed() < IDLE_FRAME);
             if let Some(slot) = self.slots[self.current].as_ref().filter(|s| {
-                idle && (s.width, s.height, s.ten_bit) == (ctx.width, ctx.height, ctx.ten_bit)
+                idle && s.opaque
+                    && (s.width, s.height, s.ten_bit) == (ctx.width, ctx.height, ctx.ten_bit)
             }) {
                 return Ok(Some(slot.frame()));
             }
@@ -466,6 +469,7 @@ impl Overlay for SkiaOverlay {
                 ctx.pad_pref,
                 ctx.pads,
             );
+            slot.opaque = true;
             {
                 // Queue external sync vs FFmpeg's pump-thread submits (same queue).
                 let _q = gpu.queue_lock.guard();
@@ -572,6 +576,7 @@ impl Overlay for SkiaOverlay {
         let gpu = self.gpu.as_mut().expect("init ran");
         let slot = self.slots[next].as_mut().expect("just ensured");
 
+        slot.opaque = false;
         let canvas = slot.surface.canvas();
         canvas.clear(Color4f::new(0.0, 0.0, 0.0, 0.0));
         // Size the face per drawer, don't scale the canvas: Skia hints at the
@@ -806,6 +811,7 @@ impl SkiaOverlay {
             width,
             height,
             ten_bit,
+            opaque: false,
         });
         Ok(())
     }

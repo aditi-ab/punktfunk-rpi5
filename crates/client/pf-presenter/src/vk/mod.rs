@@ -198,11 +198,12 @@ enum DirectSrc {
     Pyro,
 }
 
-/// Premultiplied-alpha quad blended over the swapchain image after the video blit.
-/// Recorded only when an overlay frame arrives.
+/// Overlay quad: alpha blends stream chrome or replaces the image with an opaque console.
 #[derive(Default)]
 struct OverlayPipe {
     pass: gpu::Pass,
+    opaque_pass: vk::RenderPass,
+    opaque_pipeline: vk::Pipeline,
     desc_set: vk::DescriptorSet,
 }
 

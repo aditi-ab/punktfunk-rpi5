@@ -115,6 +115,7 @@ impl PresentError {
 
 /// What one present draws, decided after acquire and before recording.
 struct FramePlan {
+    opaque_overlay: bool,
     /// The swapchain image this frame draws into.
     index: u32,
     /// The composite's source and its picture size: the video image, or on Windows a D3D11
@@ -134,6 +135,20 @@ struct FramePlan {
 }
 
 impl FramePlan {
+    fn for_opaque_overlay(index: u32) -> Self {
+        Self {
+            opaque_overlay: true,
+            index,
+            source: None,
+            placement: None,
+            filtered: None,
+            last: None,
+            direct: None,
+            #[cfg(windows)]
+            slot: None,
+        }
+    }
+
     /// The direct target, or the video image the composite places afterwards.
     fn csc_target(&self, v: &VideoImage) -> CscTarget {
         self.direct.unwrap_or_else(|| video_target(v))
@@ -268,7 +283,14 @@ impl Presenter {
         if let Some(o) = overlay {
             self.bind_overlay(o);
         }
-        let plan = self.plan(&lane, index)?;
+        let opaque_overlay = overlay.is_some_and(|o| {
+            o.replaces_video(
+                redraw,
+                self.targets.extent.width,
+                self.targets.extent.height,
+            )
+        }) && (index as usize) < self.targets.overlay.framebuffers.len();
+        let plan = self.plan(&lane, index, opaque_overlay)?;
 
         // SAFETY: `cmd_buf` is owned and idle (fence wait above) and records from `begin` to
         // `end` here, which is every record fn's precondition. Recording names images, views
@@ -280,8 +302,14 @@ impl Presenter {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            let native_wait = self.record_lane(&lane, &plan, cpu_offsets);
-            let swap_layout = self.record_composite(&plan);
+            let (native_wait, swap_layout) = if plan.opaque_overlay {
+                (None, vk::ImageLayout::UNDEFINED)
+            } else {
+                (
+                    self.record_lane(&lane, &plan, cpu_offsets),
+                    self.record_composite(&plan),
+                )
+            };
             self.record_overlay(overlay, &plan, swap_layout);
             self.device.end_command_buffer(self.cmd_buf)?;
             native_wait
@@ -513,10 +541,12 @@ impl Presenter {
 
     /// Place the picture on swapchain image `index`. Fractional scales use the device's
     /// filter policy; exact scales bypass it. Direct CSC draws an uncropped picture into
-    /// the overlay framebuffer, including the bilinear fallback. Other paths retain a
-    /// video image. CPU planes record their direct draw for `Redraw`; hardware frames
-    /// carry it into `park`.
-    fn plan(&mut self, lane: &Lane, index: u32) -> Result<FramePlan> {
+    /// the overlay framebuffer, including the bilinear fallback. An opaque console redraw
+    /// skips video planning. Other redraws retain the picture and its direct CSC planes.
+    fn plan(&mut self, lane: &Lane, index: u32, opaque_overlay: bool) -> Result<FramePlan> {
+        if opaque_overlay {
+            return Ok(FramePlan::for_opaque_overlay(index));
+        }
         let redraw = matches!(lane, Lane::Redraw);
         #[cfg(windows)]
         let slot = match lane {
@@ -602,6 +632,7 @@ impl Presenter {
             self.log_placement(w, h, &p, path);
         }
         Ok(FramePlan {
+            opaque_overlay,
             index,
             source,
             placement,
@@ -1158,22 +1189,30 @@ impl Presenter {
                 height: o.scissor_height,
             },
         };
-        // SAFETY: `cmd_buf` is recording (`# Safety` above); the pipe, its framebuffer for
-        // `index` and its set are owned here, and the set points at `overlay`.
+        let (render_pass, pipeline) = if plan.opaque_overlay {
+            (
+                self.overlay_pipe.opaque_pass,
+                self.overlay_pipe.opaque_pipeline,
+            )
+        } else {
+            (
+                self.overlay_pipe.pass.render_pass,
+                self.overlay_pipe.pass.pipeline,
+            )
+        };
+        // SAFETY: both passes are compatible with the owned framebuffer; the descriptor
+        // points at the flushed overlay. The opaque pass writes every pixel without LOAD.
         unsafe {
             self.device.cmd_begin_render_pass(
                 self.cmd_buf,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.overlay_pipe.pass.render_pass)
+                    .render_pass(render_pass)
                     .framebuffer(self.targets.overlay.framebuffers[index])
                     .render_area(damage),
                 vk::SubpassContents::INLINE,
             );
-            self.device.cmd_bind_pipeline(
-                self.cmd_buf,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.overlay_pipe.pass.pipeline,
-            );
+            self.device
+                .cmd_bind_pipeline(self.cmd_buf, vk::PipelineBindPoint::GRAPHICS, pipeline);
             self.device.cmd_set_viewport(
                 self.cmd_buf,
                 0,
@@ -1323,7 +1362,7 @@ impl Presenter {
         self.state.on_submit();
         // A real frame from any other lane ends the D3D11 picture; `Redraw` keeps it.
         #[cfg(windows)]
-        {
+        if !plan.opaque_overlay {
             self.retained_slot = plan.slot;
         }
         Ok(())
@@ -1793,6 +1832,20 @@ fn csc_depth_packing_or_8bit(raw: RawVkFormat) -> (u8, bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn opaque_redraw_has_no_video_work() {
+        let plan = super::FramePlan::for_opaque_overlay(2);
+        assert!(plan.opaque_overlay);
+        assert_eq!(plan.index, 2);
+        assert!(plan.source.is_none());
+        assert!(plan.placement.is_none());
+        assert!(plan.filtered.is_none());
+        assert!(plan.last.is_none());
+        assert!(plan.direct.is_none());
+        #[cfg(windows)]
+        assert!(plan.slot.is_none());
+    }
+
     use super::*;
 
     /// The loop reads the marker under whatever context is added on the way up.

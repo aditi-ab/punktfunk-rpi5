@@ -82,6 +82,27 @@ impl OverlayPipe {
                     .set_layouts(&set_layouts),
             )
         }?[0];
+        // Compatible attachments let both passes use the same swapchain framebuffers.
+        self.opaque_pass = color_pass(
+            device,
+            format,
+            vk::AttachmentLoadOp::DONT_CARE,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+        )
+        .context("opaque overlay render pass")?;
+        let shader = if pq {
+            pf_client_core::video_csc_spv::OVERLAY_PQ_FRAG
+        } else {
+            pf_client_core::video_csc_spv::OVERLAY_FRAG
+        };
+        self.opaque_pipeline = build_fullscreen_pipeline(
+            device,
+            self.opaque_pass,
+            self.pass.pipeline_layout,
+            shader,
+            false,
+        )?;
         self.pass.pipeline = build_fullscreen_pipeline(
             device,
             self.pass.render_pass,
@@ -96,8 +117,15 @@ impl OverlayPipe {
         Ok(())
     }
 
-    /// [`Pass::destroy`](super::gpu::Pass::destroy): the set goes with the pool.
+    /// Release both compatible pipelines before their shared layout and descriptor pool.
     pub(super) fn destroy(&mut self, device: &ash::Device) {
+        // SAFETY: these handles are owned here; callers wait for their submissions.
+        unsafe {
+            device.destroy_pipeline(self.opaque_pipeline, None);
+            device.destroy_render_pass(self.opaque_pass, None);
+        }
+        self.opaque_pipeline = vk::Pipeline::null();
+        self.opaque_pass = vk::RenderPass::null();
         self.pass.destroy(device);
     }
 }

@@ -83,6 +83,8 @@ pub struct FrameCtx<'a> {
 /// `SHADER_READ_ONLY_OPTIMAL`. A stale `width`×`height` during resize
 /// stretches for one frame.
 pub struct OverlayFrame {
+    /// Every pixel is opaque; only the full console sets this.
+    pub opaque: bool,
     pub image: vk::Image,
     pub view: vk::ImageView,
     /// The image's format; the native Wayland lane copies it into a buffer of the same.
@@ -92,6 +94,20 @@ pub struct OverlayFrame {
     /// Vertical pixel band containing non-transparent overlay content.
     pub scissor_y: u32,
     pub scissor_height: u32,
+}
+
+impl OverlayFrame {
+    /// Only a full opaque redraw may discard the picture underneath it.
+    pub(crate) fn replaces_video(&self, redraw: bool, width: u32, height: u32) -> bool {
+        redraw
+            && self.opaque
+            && width > 0
+            && height > 0
+            && self.width == width
+            && self.height == height
+            && self.scissor_y == 0
+            && self.scissor_height == height
+    }
 }
 
 // Shared with the Android GL host; lives in `pf_client_core::console`
@@ -161,5 +177,38 @@ pub trait Overlay {
     /// Drain one ring command. Each iteration while streaming.
     fn take_ring_command(&mut self) -> Option<RingCommand> {
         None
+    }
+}
+
+#[cfg(test)]
+mod opaque_tests {
+    use super::*;
+
+    #[test]
+    fn only_opaque_full_cover_redraw_discards_video() {
+        let mut frame = OverlayFrame {
+            opaque: true,
+            image: vk::Image::null(),
+            view: vk::ImageView::null(),
+            format: vk::Format::R8G8B8A8_UNORM,
+            width: 2560,
+            height: 1440,
+            scissor_y: 0,
+            scissor_height: 1440,
+        };
+        assert!(frame.replaces_video(true, 2560, 1440));
+        assert!(!frame.replaces_video(false, 2560, 1440));
+        assert!(!frame.replaces_video(true, 3840, 1600));
+        frame.opaque = false;
+        assert!(!frame.replaces_video(true, 2560, 1440));
+        frame.opaque = true;
+        frame.scissor_height = 300;
+        assert!(!frame.replaces_video(true, 2560, 1440));
+        frame.scissor_height = 1440;
+        frame.scissor_y = 1;
+        assert!(!frame.replaces_video(true, 2560, 1440));
+        frame.scissor_y = 0;
+        frame.width = 0;
+        assert!(!frame.replaces_video(true, 0, 1440));
     }
 }

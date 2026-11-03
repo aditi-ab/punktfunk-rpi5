@@ -2701,3 +2701,41 @@ fn an_explainer_reaches_the_shells_tray_in() {
     assert_eq!(pin.view().foot(&ctx), None);
     assert_eq!(pin.pinned(1.0, &ctx), (0.0, 0.0));
 }
+
+#[test]
+fn console_covers_transparent_pixels_during_navigation() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let (w, h) = (480, 300);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.efficient_backdrop = true;
+    let info = skia_safe::ImageInfo::new(
+        (w, h),
+        skia_safe::ColorType::RGBA8888,
+        skia_safe::AlphaType::Premul,
+        None,
+    );
+    let mut pixels = vec![0; (w * h * 4) as usize];
+    for step in 0..3 {
+        if step == 1 {
+            s.handle_menu(MenuEvent::Tertiary);
+        } else if step == 2 {
+            finish_motion(&mut s);
+        }
+        surface.canvas().clear(skia_safe::Color::TRANSPARENT);
+        s.render(
+            surface.canvas(),
+            w as u32,
+            h as u32,
+            &fonts,
+            None,
+            None,
+            &[],
+        );
+        assert!(surface.read_pixels(&info, &mut pixels, (w * 4) as usize, (0, 0)));
+        assert!(
+            pixels.chunks_exact(4).all(|p| p[3] == 255),
+            "transparent console pixel at step {step}"
+        );
+    }
+}
