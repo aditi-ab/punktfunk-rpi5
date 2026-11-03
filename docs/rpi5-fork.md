@@ -136,10 +136,6 @@ On Broadcom GPUs the animated background uses a 192-pixel shader target long edg
 text, controls and transition layers retain the native viewport. For comparisons,
 `PUNKTFUNK_RPI_FIELD_EDGE=96` selects a smaller background target. Diagnostic
 values from 64 through 192 are accepted; invalid values use the default.
-Opaque SDR menus on Broadcom use an image transfer when source and output formats
-match. The producer must advertise transfer-source usage and a complete native
-frame. HDR, partial overlays and format changes retain the graphics pass.
-`PUNKTFUNK_RPI_MENU_COPY=0` selects the graphics pass for comparison.
 Broadcom SDR tab changes rasterize each page once, then slide and fade those native
 images. Page content resumes live rendering when the transition settles; input,
 screen state, tabs and pinned controls continue updating throughout. New tab mounts

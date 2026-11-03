@@ -1025,6 +1025,37 @@ mod chrome_layer_tests {
     }
 
     #[test]
+    fn tab_image_translation_keeps_insets_and_group_alpha() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((80, 60)).unwrap();
+        {
+            let canvas = surface.canvas();
+            canvas.clear(skia_safe::Color::TRANSPARENT);
+            canvas.translate((3.0, 7.0));
+            let mut recorder = PictureRecorder::new();
+            let recorded = recorder.begin_recording(Rect::from_wh(80.0, 60.0), true);
+            recorded.set_matrix(&canvas.local_to_device());
+            recorded.draw_rect(
+                Rect::from_xywh(10.0, 10.0, 20.0, 20.0),
+                &crate::theme::fill(skia_safe::Color4f::new(1.0, 0.0, 0.0, 1.0)),
+            );
+            let picture = recorder.finish_recording_as_picture(None).unwrap();
+            TabImages::default().draw(canvas, &picture, 0.5, 20.0, 0.0);
+        }
+        let info = skia_safe::ImageInfo::new(
+            (80, 60),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        let mut pixels = vec![0u8; 80 * 60 * 4];
+        assert!(surface.read_pixels(&info, &mut pixels, 80 * 4, (0, 0)));
+        assert_eq!(pixels[(22 * 80 + 18) * 4 + 3], 0);
+        let moved = &pixels[(22 * 80 + 38) * 4..][..4];
+        assert!(moved[0].abs_diff(128) <= 1 && moved[3].abs_diff(128) <= 1);
+        assert_eq!(&moved[1..3], &[0, 0]);
+    }
+
+    #[test]
     fn tab_images_expire_on_geometry_changes_and_new_mounts() {
         let mut surface = skia_safe::surfaces::raster_n32_premul((160, 100)).unwrap();
         let canvas = surface.canvas();

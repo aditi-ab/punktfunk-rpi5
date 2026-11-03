@@ -757,7 +757,6 @@ impl Presenter {
     /// window. `instance_extensions` is `VideoSubsystem::vulkan_instance_extensions()`;
     /// `knobs` are the shell's, kept for the per-frame and rebuild paths. Each object lands
     /// in a [`Bringup`] as it is made, so a failed step destroys everything before it.
-    /// Broadcom's opaque-menu transfer is selected once; each frame still checks compatibility.
     pub(crate) fn new(
         window: &sdl3::video::Window,
         instance_extensions: &[String],
@@ -988,8 +987,6 @@ impl Presenter {
             last_fence_us: 0,
             last_acquire_us: 0,
             last_present_us: 0,
-            copy_opaque_overlay: caps.dev_props.vendor_id == 0x14e4
-                && std::env::var("PUNKTFUNK_RPI_MENU_COPY").ok().as_deref() != Some("0"),
             queue_lock,
             hdr10_format,
             hdr_active: false,

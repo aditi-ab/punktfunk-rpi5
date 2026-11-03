@@ -85,8 +85,6 @@ pub struct FrameCtx<'a> {
 pub struct OverlayFrame {
     /// Every pixel is opaque; only the full console sets this.
     pub opaque: bool,
-    /// The producer created this single-sample image with TRANSFER_SRC usage.
-    pub transfer_src: bool,
     pub image: vk::Image,
     pub view: vk::ImageView,
     /// The image's format; the native Wayland lane copies it into a buffer of the same.
@@ -99,17 +97,6 @@ pub struct OverlayFrame {
 }
 
 impl OverlayFrame {
-    /// Copy only a complete SDR menu with identical channel order and pixel size.
-    pub(crate) fn copies_to(&self, format: vk::Format, width: u32, height: u32) -> bool {
-        self.transfer_src
-            && self.replaces_video(true, width, height)
-            && self.format == format
-            && matches!(
-                format,
-                vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
-            )
-    }
-
     /// Only a full opaque redraw may discard the picture underneath it.
     pub(crate) fn replaces_video(&self, redraw: bool, width: u32, height: u32) -> bool {
         redraw
@@ -206,7 +193,6 @@ mod opaque_tests {
     fn only_opaque_full_cover_redraw_discards_video() {
         let mut frame = OverlayFrame {
             opaque: true,
-            transfer_src: true,
             image: vk::Image::null(),
             view: vk::ImageView::null(),
             format: vk::Format::R8G8B8A8_UNORM,
@@ -216,23 +202,12 @@ mod opaque_tests {
             scissor_height: 1440,
         };
         assert!(frame.replaces_video(true, 2560, 1440));
-        assert!(frame.copies_to(vk::Format::R8G8B8A8_UNORM, 2560, 1440));
-        assert!(!frame.copies_to(vk::Format::B8G8R8A8_UNORM, 2560, 1440));
-        assert!(!frame.copies_to(frame.format, 3840, 1600));
-        frame.transfer_src = false;
-        assert!(!frame.copies_to(frame.format, 2560, 1440));
-        frame.transfer_src = true;
-        frame.format = vk::Format::R16G16B16A16_SFLOAT;
-        assert!(!frame.copies_to(frame.format, 2560, 1440));
-        frame.format = vk::Format::R8G8B8A8_UNORM;
         assert!(!frame.replaces_video(false, 2560, 1440));
         assert!(!frame.replaces_video(true, 3840, 1600));
         frame.opaque = false;
-        assert!(!frame.copies_to(frame.format, 2560, 1440));
         assert!(!frame.replaces_video(true, 2560, 1440));
         frame.opaque = true;
         frame.scissor_height = 300;
-        assert!(!frame.copies_to(frame.format, 2560, 1440));
         assert!(!frame.replaces_video(true, 2560, 1440));
         frame.scissor_height = 1440;
         frame.scissor_y = 1;

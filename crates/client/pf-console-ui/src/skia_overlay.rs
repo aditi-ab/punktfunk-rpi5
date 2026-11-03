@@ -48,15 +48,13 @@ struct Slot {
     height: u32,
     ten_bit: bool,
     opaque: bool,
-    transfer_src: bool,
 }
 
 impl Slot {
-    /// Publish the image's actual usage so the presenter can choose a safe transfer.
+    /// Describe the native overlay image and the band its pixels occupy.
     fn frame(&self) -> OverlayFrame {
         OverlayFrame {
             opaque: self.opaque,
-            transfer_src: self.transfer_src,
             image: self.image,
             view: self.view,
             format: self.format,
@@ -846,7 +844,6 @@ impl SkiaOverlay {
             height,
             ten_bit,
             opaque: false,
-            transfer_src,
         });
         Ok(())
     }
