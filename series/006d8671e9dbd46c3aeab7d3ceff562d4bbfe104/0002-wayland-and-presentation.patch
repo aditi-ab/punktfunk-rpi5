@@ -1,0 +1,1517 @@
+diff --git a/crates/client/pf-presenter/Cargo.toml b/crates/client/pf-presenter/Cargo.toml
+index 149da1745ade7066defef30efcd7feb07145c9be..c3c8b4522fa8d838ab8e202a8445875e12b18f44 100644
+--- a/crates/client/pf-presenter/Cargo.toml
++++ b/crates/client/pf-presenter/Cargo.toml
+@@ -95,6 +95,7 @@ windows-sys = { workspace = true, features = [
+ # backend in pf-client-core; ON by default, matching pf-client-core's default.
+ default = ["pyrowave"]
+ pyrowave = ["pf-client-core/pyrowave"]
++rpi5-v4l2-request = ["pf-client-core/rpi5-v4l2-request", "sdl3/build-from-source"]
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/client/pf-presenter/src/backend.rs b/crates/client/pf-presenter/src/backend.rs
+index 29c9acc25c7b34deea24045f5f71b078631adff9..b72f2130c0caf17834285018a6e9456b6b8e080d 100644
+--- a/crates/client/pf-presenter/src/backend.rs
++++ b/crates/client/pf-presenter/src/backend.rs
+@@ -361,6 +361,20 @@ mod presenter {
+             each!(self, p => p.presents_outstanding())
+         }
+ 
++        /// Wayland callback readiness; other display backends are always ready.
++        pub(crate) fn compositor_frame_ready(&self) -> bool {
++            vk_or!(self, p => p.compositor_frame_ready(), true)
++        }
++
++        pub(crate) fn compositor_frame_credit(&self) -> Option<usize> {
++            vk_or!(self, p => p.compositor_frame_credit(), None)
++        }
++
++        #[cfg(target_os = "linux")]
++        pub(crate) fn set_compositor_wake(&self, cb: Box<dyn Fn() + Send>) {
++            each!(self, p => p.set_compositor_wake(cb))
++        }
++
+         pub(crate) fn set_present_wake(&self, cb: Box<dyn Fn() + Send>) {
+             each!(self, p => p.set_present_wake(cb))
+         }
+diff --git a/crates/client/pf-presenter/src/overlay.rs b/crates/client/pf-presenter/src/overlay.rs
+index ef83d1f5bd1ec22e62341074de8c4374da1ad3a9..2b0786cc8893e0fedd598e796d1fc71a1139891d 100644
+--- a/crates/client/pf-presenter/src/overlay.rs
++++ b/crates/client/pf-presenter/src/overlay.rs
+@@ -83,12 +83,31 @@ pub struct FrameCtx<'a> {
+ /// `SHADER_READ_ONLY_OPTIMAL`. A stale `width`×`height` during resize
+ /// stretches for one frame.
+ pub struct OverlayFrame {
++    /// Every pixel is opaque; only the full console sets this.
++    pub opaque: bool,
+     pub image: vk::Image,
+     pub view: vk::ImageView,
+     /// The image's format; the native Wayland lane copies it into a buffer of the same.
+     pub format: vk::Format,
+     pub width: u32,
+     pub height: u32,
++    /// Vertical pixel band containing non-transparent overlay content.
++    pub scissor_y: u32,
++    pub scissor_height: u32,
++}
++
++impl OverlayFrame {
++    /// Only a full opaque redraw may discard the picture underneath it.
++    pub(crate) fn replaces_video(&self, redraw: bool, width: u32, height: u32) -> bool {
++        redraw
++            && self.opaque
++            && width > 0
++            && height > 0
++            && self.width == width
++            && self.height == height
++            && self.scissor_y == 0
++            && self.scissor_height == height
++    }
+ }
+ 
+ // Shared with the Android GL host; lives in `pf_client_core::console`
+@@ -136,6 +155,11 @@ pub trait Overlay {
+         false
+     }
+ 
++    /// A fresh console image can be drawn now; cached idle frames return false.
++    fn redraw_due(&self) -> bool {
++        false
++    }
++
+     /// Once per presenter iteration. Re-render (flush + `SHADER_READ_ONLY`) only
+     /// on content or size change. The returned image stays untouched until the
+     /// next `frame()` — one frame in flight; a ring of two is enough.
+@@ -160,3 +184,36 @@ pub trait Overlay {
+         None
+     }
+ }
++
++#[cfg(test)]
++mod opaque_tests {
++    use super::*;
++
++    #[test]
++    fn only_opaque_full_cover_redraw_discards_video() {
++        let mut frame = OverlayFrame {
++            opaque: true,
++            image: vk::Image::null(),
++            view: vk::ImageView::null(),
++            format: vk::Format::R8G8B8A8_UNORM,
++            width: 2560,
++            height: 1440,
++            scissor_y: 0,
++            scissor_height: 1440,
++        };
++        assert!(frame.replaces_video(true, 2560, 1440));
++        assert!(!frame.replaces_video(false, 2560, 1440));
++        assert!(!frame.replaces_video(true, 3840, 1600));
++        frame.opaque = false;
++        assert!(!frame.replaces_video(true, 2560, 1440));
++        frame.opaque = true;
++        frame.scissor_height = 300;
++        assert!(!frame.replaces_video(true, 2560, 1440));
++        frame.scissor_height = 1440;
++        frame.scissor_y = 1;
++        assert!(!frame.replaces_video(true, 2560, 1440));
++        frame.scissor_y = 0;
++        frame.width = 0;
++        assert!(!frame.replaces_video(true, 0, 1440));
++    }
++}
+diff --git a/crates/client/pf-presenter/src/present_pace.rs b/crates/client/pf-presenter/src/present_pace.rs
+index e4fc943846ce58f201b80a9ec8115e1d2332f49d..c1a14a4bdfa46f2e6a53f011ee3111a1637ad34e 100644
+--- a/crates/client/pf-presenter/src/present_pace.rs
++++ b/crates/client/pf-presenter/src/present_pace.rs
+@@ -539,7 +539,7 @@ impl SourcePacer {
+     /// `None` under the unpaced latency intent: arrival-driven, so the loop never carries
+     /// an estimate built from samples it then ignored. Called at submit, not take:
+     /// dropped frames are part of the arrival process; folding only survivors hides
+-    /// the jitter.
++    /// the jitter. Latency bounds the hold to one source interval, including offset drift.
+     pub(crate) fn due_ns(
+         &mut self,
+         smoothing: bool,
+@@ -548,8 +548,16 @@ impl SourcePacer {
+         frame_interval_ns: i64,
+     ) -> Option<i64> {
+         (smoothing || self.paces_latency()).then(|| {
+-            self.clock
+-                .due_ns(src_pts_ns, ready_ns as i64, frame_interval_ns)
++            let due = self
++                .clock
++                .due_ns(src_pts_ns, ready_ns as i64, frame_interval_ns);
++            // The offset can lag a draining decode queue by many frames. Latency must
++            // release within one source interval even while that estimate catches up.
++            if !smoothing && frame_interval_ns > 0 {
++                due.min((ready_ns as i64).saturating_add(frame_interval_ns))
++            } else {
++                due
++            }
+         })
+     }
+ 
+@@ -595,6 +603,11 @@ impl SourcePacer {
+         matches!(self.mode, PaceMode::VrrLatency | PaceMode::GridLatency)
+     }
+ 
++    /// These presents use latch slots, so skipped slots cannot measure a slower panel.
++    pub(crate) fn uses_latch_grid(&self, smoothing: bool) -> bool {
++        (smoothing || self.paces_latency()) && !self.free_running()
++    }
++
+     /// Re-anchor on the next frame (display change, accepted mode switch). Measured
+     /// jitter survives: it describes the link, not the stream.
+     pub(crate) fn reset(&mut self) {
+@@ -925,6 +938,34 @@ mod tests {
+         assert_eq!(c.anchor_ns(), t);
+     }
+ 
++    #[test]
++    fn fixed_latency_skipped_slots_do_not_teach_half_refresh() {
++        const PERIOD: u64 = 16_666_666;
++        for smoothing in [false, true] {
++            let mut pacer = SourcePacer::new(true, true);
++            pacer.follow(Cadence::Fixed, true, smoothing);
++            let mut clock = LatchClock::new(60);
++            let mut t = 1_000_000_000;
++            for spacing in [2 * PERIOD, PERIOD, 2 * PERIOD] {
++                for _ in 0..GRID_OBSERVE_EVERY * 10 {
++                    t += spacing;
++                    clock.note_batch(&[t], pacer.uses_latch_grid(smoothing));
++                }
++                assert_eq!(clock.period_ns(), PERIOD);
++            }
++            pacer.follow(Cadence::Variable, true, smoothing);
++            for _ in 0..GRID_OBSERVE_EVERY * 10 {
++                t += 2 * PERIOD;
++                clock.note_batch(&[t], pacer.uses_latch_grid(smoothing));
++            }
++            assert_eq!(
++                clock.period_ns(),
++                2 * PERIOD,
++                "free-running stamps still learn"
++            );
++        }
++    }
++
+     /// A Deck set to 60 Hz still claims its 90 Hz panel. The first batch off the claim's
+     /// grid sets the real period, and a later burst of doubled frames — three claim
+     /// periods each — never brings the claim back. Before anything is learned a doubled
+@@ -1355,6 +1396,97 @@ mod tests {
+         assert!(!off.paces_latency());
+     }
+ 
++    #[test]
++    fn latency_recovers_when_a_decode_backlog_drains() {
++        use crate::slot_pick::{Pick, SlotPick};
++        const PERIOD: u64 = 16_666_666;
++        const BASE: u64 = 1_000_000_000;
++        for verdict in [Cadence::Fixed, Cadence::Variable] {
++            let mut pacer = SourcePacer::new(true, true);
++            pacer.follow(verdict, true, false);
++            let mut previous_ready = 0;
++            for i in 0..300 {
++                let pts = BASE + i * PERIOD;
++                previous_ready = pts + 150_000_000;
++                pacer.due_ns(false, pts, previous_ready, PERIOD as i64);
++            }
++            let start = previous_ready;
++            let mut arrivals = std::collections::VecDeque::new();
++            for i in 300..360 {
++                let pts = BASE + i * PERIOD;
++                // The queued decoder catches up without time moving backwards.
++                let ready = (previous_ready + 1_000_000).max(pts + 10_000_000);
++                arrivals.push_back((pts, ready));
++                previous_ready = ready;
++            }
++            let mut store = FrameStore::new(0);
++            store.set_paced(true);
++            let mut slots = SlotPick::default();
++            let mut last_vend = start;
++            let mut vended = 0;
++            for now in (start..=previous_ready + 3 * PERIOD).step_by(200_000) {
++                while arrivals.front().is_some_and(|&(_, ready)| ready <= now) {
++                    let (pts, ready) = arrivals.pop_front().unwrap();
++                    let due = pacer.due_ns(false, pts, ready, PERIOD as i64).unwrap();
++                    store.submit(due);
++                }
++                let due = |due: &i64| *due <= now as i64;
++                let frame = if pacer.free_running() {
++                    store.take(due)
++                } else {
++                    let front = store.front().map(|&due| due.max(0) as u64);
++                    match slots.pick(
++                        now,
++                        PERIOD,
++                        front,
++                        |t| (t / PERIOD + 1) * PERIOD,
++                        || store.take_due_bounded(due),
++                    ) {
++                        Pick::Vend(frame) => Some(frame),
++                        _ => None,
++                    }
++                };
++                if frame.is_some() {
++                    assert!(
++                        now - last_vend <= 4 * PERIOD,
++                        "{verdict:?}: stalled after backlog drained"
++                    );
++                    last_vend = now;
++                    vended += 1;
++                }
++            }
++            assert!(
++                vended >= 40,
++                "{verdict:?}: only {vended} frames escaped the paced store"
++            );
++        }
++    }
++
++    #[test]
++    fn smoothness_keeps_the_source_clock_due_time_after_backlog() {
++        for verdict in [Cadence::Fixed, Cadence::Variable] {
++            let mut pacer = SourcePacer::new(true, true);
++            pacer.follow(verdict, true, true);
++            let mut ready = 0;
++            for i in 0..300 {
++                let pts = 1_000_000_000 + i * 16_666_666;
++                ready = pts + 150_000_000;
++                pacer.due_ns(true, pts, ready, 16_666_666);
++            }
++            let mut due = 0;
++            for i in 300..310 {
++                let pts = 1_000_000_000 + i * 16_666_666;
++                ready = (ready + 1_000_000).max(pts + 10_000_000);
++                due = pacer.due_ns(true, pts, ready, 16_666_666).unwrap();
++            }
++            assert!(
++                due > ready as i64 + 16_666_666,
++                "{verdict:?}: smoothness retains its source-clock hold"
++            );
++            assert_eq!(pacer.free_running(), verdict == Cadence::Variable);
++        }
++    }
++
+     /// The tail policy reaches the clock where frames go out at their due time: a late
+     /// frame widens the hold. On a grid the lead is the slack and the tail stays out.
+     #[test]
+diff --git a/crates/client/pf-presenter/src/run/mod.rs b/crates/client/pf-presenter/src/run/mod.rs
+index c6deffbd52fb7e5728ba2342649b63c10b51255f..e3662159865b677789d8a7c8f175d2b57c39fa4d 100644
+--- a/crates/client/pf-presenter/src/run/mod.rs
++++ b/crates/client/pf-presenter/src/run/mod.rs
+@@ -503,6 +503,34 @@ fn wait_event(pump: &mut sdl3::EventPump, timeout: Duration) -> Option<Event> {
+     pump.wait_event_timeout(timeout)
+ }
+ 
++fn consumed_compositor_credit(before: Option<usize>, after: Option<usize>) -> bool {
++    before
++        .zip(after)
++        .is_some_and(|(before, after)| after < before)
++}
++
++fn browse_period(measured_ns: Option<u64>, native_hz: u32) -> Duration {
++    let ns = measured_ns
++        .filter(|ns| (1_000_000..=100_000_000).contains(ns))
++        .unwrap_or_else(|| 1_000_000_000 / u64::from(if native_hz == 0 { 60 } else { native_hz }));
++    Duration::from_nanos(ns)
++}
++
++/// Wait from the previous render's start, so rendering consumes the refresh budget.
++fn browse_frame_wait(
++    last_start: Option<Instant>,
++    now: Instant,
++    period: Duration,
++    browse: bool,
++    compositor_credit: Option<usize>,
++    redraw_due: bool,
++) -> Option<Duration> {
++    if !browse || !redraw_due || !compositor_credit.is_some_and(|credit| credit > 0) {
++        return None;
++    }
++    last_start.map(|start| period.saturating_sub(now.saturating_duration_since(start)))
++}
++
+ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
+     let mut sh = Shell::open(opts, matches!(mode, ModeCtl::Browse(_)))?;
+     let mut stream: Option<StreamState> = match &mut mode {
+@@ -521,15 +549,31 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
+         ModeCtl::Browse(_) => None,
+     };
+ 
++    let mut last_browse_start = None;
+     // A closure, so an error exit (device lost, a failed resize) still reaches the teardown.
+     let outcome = (|| -> Result<Outcome> {
+         Ok('main: loop {
+-            // Block in SDL's wait: input/window events and decoded frames (FrameWake) all
+-            // land in this queue. The timeout only bounds stop-flag/pump-tick latency.
+-            // Smoothness tightens it to the next latch-slot deadline.
+-            let timeout = stream
+-                .as_ref()
+-                .map_or(Duration::from_millis(15), |st| st.wake_timeout());
++            // The menu uses one native refresh budget, including render work. Callback
++            // credit bounds submissions; input can wake early without drawing early.
++            let menu_wait = browse_frame_wait(
++                last_browse_start,
++                Instant::now(),
++                browse_period(sh.presenter.measured_refresh_ns(), sh.native.refresh_hz),
++                sh.browse && stream.is_none(),
++                sh.presenter.compositor_frame_credit(),
++                sh.overlay
++                    .as_ref()
++                    .is_some_and(|overlay| overlay.redraw_due()),
++            );
++            let timeout = if let Some(wait) = menu_wait {
++                wait.min(Duration::from_millis(15))
++            } else if sh.presenter.compositor_frame_ready() {
++                stream
++                    .as_ref()
++                    .map_or(Duration::from_millis(15), |st| st.wake_timeout())
++            } else {
++                Duration::from_millis(15)
++            };
+             let first = wait_event(&mut sh.event_pump, timeout);
+             let mut queued: Vec<Event> = Vec::new();
+             if let Some(e) = first {
+@@ -576,6 +620,26 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
+                 sh.stream_tick(st);
+             }
+             sh.ring_tick(&mut stream);
++            let render_started = Instant::now();
++            // Input can wake a full budget before its deadline. No frame was attempted,
++            // so retain that deadline until a callback grants credit.
++            if sh.browse && stream.is_none() && sh.presenter.compositor_frame_credit() == Some(0) {
++                continue;
++            }
++            if browse_frame_wait(
++                last_browse_start,
++                render_started,
++                browse_period(sh.presenter.measured_refresh_ns(), sh.native.refresh_hz),
++                sh.browse && stream.is_none(),
++                sh.presenter.compositor_frame_credit(),
++                sh.overlay
++                    .as_ref()
++                    .is_some_and(|overlay| overlay.redraw_due()),
++            )
++            .is_some_and(|wait| !wait.is_zero())
++            {
++                continue;
++            }
+             sh.overlay_tick(&mut stream)?;
+ 
+             let presented_video = match stream.as_mut() {
+@@ -586,7 +650,8 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
+                 sh.screens_tick(st);
+             }
+ 
+-            sh.present_overlay_alone(&stream, presented_video)?;
++            let shown = sh.present_overlay_alone(&stream, presented_video)?;
++            last_browse_start = shown.then_some(render_started);
+         })
+     })();
+ 
+@@ -651,6 +716,100 @@ fn in_gamescope() -> bool {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn early_callback_and_input_wakes_do_not_draw_an_extra_frame() {
++        let start = Instant::now();
++        let period = Duration::from_millis(16);
++        for elapsed in [0, 2, 7, 15] {
++            // Available credit can grow on a callback without advancing the deadline.
++            for credit in [1, 2] {
++                assert_eq!(
++                    browse_frame_wait(
++                        Some(start),
++                        start + Duration::from_millis(elapsed),
++                        period,
++                        true,
++                        Some(credit),
++                        true
++                    ),
++                    Some(Duration::from_millis(16 - elapsed))
++                );
++            }
++        }
++        assert_eq!(
++            browse_frame_wait(Some(start), start + period, period, true, Some(2), true),
++            Some(Duration::ZERO)
++        );
++    }
++
++    #[test]
++    fn rendering_time_is_subtracted_from_the_native_refresh_budget() {
++        let start = Instant::now();
++        for hz in [60, 120] {
++            let period = browse_period(None, hz);
++            let work = Duration::from_millis(3);
++            assert_eq!(
++                browse_frame_wait(Some(start), start + work, period, true, Some(1), true),
++                Some(period - work)
++            );
++        }
++        assert_eq!(
++            browse_period(Some(16_683_350), 60),
++            Duration::from_nanos(16_683_350)
++        );
++        assert_eq!(browse_period(Some(0), 120), browse_period(None, 120));
++        assert_eq!(browse_period(None, 0), browse_period(None, 60));
++    }
++
++    #[test]
++    fn overruns_reanchor_without_catch_up_bursts() {
++        let start = Instant::now();
++        let period = Duration::from_millis(16);
++        let late = start + Duration::from_millis(45);
++        assert_eq!(
++            browse_frame_wait(Some(start), late, period, true, Some(2), true),
++            Some(Duration::ZERO)
++        );
++        // A successful overdue frame records its actual start, never the old deadline.
++        assert_eq!(
++            browse_frame_wait(
++                Some(late),
++                late + Duration::from_millis(3),
++                period,
++                true,
++                Some(1),
++                true
++            ),
++            Some(Duration::from_millis(13))
++        );
++    }
++
++    #[test]
++    fn unchanged_unpaced_streaming_and_unarmed_frames_keep_normal_waits() {
++        let now = Instant::now();
++        let period = Duration::from_millis(16);
++        for (last, browse, credit, due) in [
++            (None, true, Some(2), true),
++            (Some(now), true, None, true),
++            (Some(now), true, Some(0), true),
++            (Some(now), false, Some(2), true),
++            (Some(now), true, Some(2), false),
++        ] {
++            assert_eq!(
++                browse_frame_wait(last, now, period, browse, credit, due),
++                None
++            );
++        }
++        for (before, after) in [(Some(2), Some(2)), (None, None), (Some(2), None)] {
++            let shown = consumed_compositor_credit(before, after);
++            assert_eq!(
++                browse_frame_wait(shown.then_some(now), now, period, true, after, true),
++                None
++            );
++        }
++        assert!(consumed_compositor_credit(Some(2), Some(1)));
++    }
++
+     /// KDE fractional scaling advertises points; "Native" must recover the panel pixels.
+     #[test]
+     fn native_is_the_panels_pixels_under_fractional_wayland_scaling() {
+diff --git a/crates/client/pf-presenter/src/run/pace.rs b/crates/client/pf-presenter/src/run/pace.rs
+index bed5c9560f4ff8f6732fe23b8fee240604074826..3cb5aebd50e70b4f9fe4453dfc883783cacec83e 100644
+--- a/crates/client/pf-presenter/src/run/pace.rs
++++ b/crates/client/pf-presenter/src/run/pace.rs
+@@ -50,9 +50,12 @@ impl Shell {
+                 st.store.take(due)
+             }
+         };
+-        let action = st
+-            .pace
+-            .step(&mut st.slots, &mut st.gate, &facts, slot_after, take);
++        let action = if self.presenter.compositor_frame_ready() {
++            st.pace
++                .step(&mut st.slots, &mut st.gate, &facts, slot_after, take)
++        } else {
++            PaceAction::Wait
++        };
+         let presented = match action {
+             PaceAction::Vend { frame, aim_ns } => self.present_vended(st, frame, aim_ns, now_ns)?,
+             PaceAction::Park(frame) => {
+@@ -179,8 +182,7 @@ impl Shell {
+         st.win.start = Instant::now();
+         // Under MAILBOX a missed latch leaves no stamp: the successor replaces the frame and
+         // the engine reports it unshown. Both feed the margin, for either intent on a grid.
+-        let on_grid =
+-            (st.store.is_smoothing() || st.pacer.paces_latency()) && !st.pacer.free_running();
++        let on_grid = st.pacer.uses_latch_grid(st.store.is_smoothing());
+         // From a settled window only: a stream still ramping, or arrival jitter past an
+         // eighth of a period, misses latches for reasons of its own and would widen the
+         // margin to its cap in the first seconds of every session.
+@@ -364,7 +366,11 @@ impl StreamState {
+             }
+         }
+         if !estimated {
+-            self.clock.note_batch(&stamps, self.store.is_smoothing());
++            // Both fixed-grid intents choose their own spacing; missed slots are not refresh.
++            self.clock.note_batch(
++                &stamps,
++                self.pacer.uses_latch_grid(self.store.is_smoothing()),
++            );
+         }
+         // VRR probe: healthy-window stamps only, against the display mode's period (the
+         // learned one adopts a slow stream's cadence as "the grid").
+@@ -504,6 +510,23 @@ impl StreamState {
+                 });
+                 (Rung::Software, res)
+             }
++            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++            DecodedImage::V4l2Planar(c) => {
++                self.hdr = c.color.is_pq();
++                // Software lane uploads planes into the same planar CSC pass as
++                // hardware, so PQ is tone-mapped there too.
++                self.hdr_untonemapped = false;
++                // The lane borrows its frame, and the borrow ends inside `map`, so a busy
++                // frame goes back whole from here.
++                let res = presenter
++                    .present(window, FrameInput::Cpu(&c), overlay)
++                    .map(Shown::of);
++                let res = res.map(|s| match s {
++                    Shown::Busy(_, on) => Shown::Busy(Some(DecodedImage::V4l2Planar(c)), on),
++                    s => s,
++                });
++                (Rung::Software, res)
++            }
+             // VAAPI output: dmabuf fds plus a plane layout. Import and failure-
+             // streak demotion are the same contract as the other hardware arms.
+             #[cfg(target_os = "linux")]
+diff --git a/crates/client/pf-presenter/src/run/screens.rs b/crates/client/pf-presenter/src/run/screens.rs
+index dfd953b9f69e0228d11b9a3d3433f823b25e127f..d3b4330e8e0d6f6560a13b7e69bb2ce669f1175a 100644
+--- a/crates/client/pf-presenter/src/run/screens.rs
++++ b/crates/client/pf-presenter/src/run/screens.rs
+@@ -204,6 +204,11 @@ impl ScreenWindow {
+                 Took::Busy(_) => Took::Busy(Some(DecodedImage::Cpu(c))),
+                 t => t,
+             },
++            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++            DecodedImage::V4l2Planar(c) => match took(p.present(w, FrameInput::Cpu(&c), None)?) {
++                Took::Busy(_) => Took::Busy(Some(DecodedImage::V4l2Planar(c))),
++                t => t,
++            },
+             #[cfg(target_os = "linux")]
+             DecodedImage::NativeDmabuf(d) => took(p.present(w, FrameInput::Dmabuf(d), None)?),
+             #[cfg(windows)]
+diff --git a/crates/client/pf-presenter/src/run/shell.rs b/crates/client/pf-presenter/src/run/shell.rs
+index 7b102c4a92dd3fc0eb27786ca14dccbe5fa59af3..aae5ba5b131fe8f7ab4d5ba0b5ed6f60ca4abb4a 100644
+--- a/crates/client/pf-presenter/src/run/shell.rs
++++ b/crates/client/pf-presenter/src/run/shell.rs
+@@ -135,6 +135,13 @@ impl Shell {
+                 let _ = sender.push_custom_event(FrameWake);
+             }));
+         }
++        #[cfg(target_os = "linux")]
++        {
++            let sender = events.event_sender();
++            presenter.set_compositor_wake(Box::new(move || {
++                let _ = sender.push_custom_event(FrameWake);
++            }));
++        }
+         // Browse is "ready" the moment the library window presents — there may never be a
+         // stream. Single mode announces on the first video frame instead.
+         if opts.json_status && browse {
+@@ -350,7 +357,7 @@ impl Shell {
+             }
+         }
+         self.screen_saver_tick(stream.as_ref());
+-        if self.overlay.is_some() {
++        if self.presenter.compositor_frame_ready() && self.overlay.is_some() {
+             let facts = self.overlay_facts(stream.as_ref());
+             if let Some(o) = self.overlay.as_mut() {
+                 match o.frame(&facts.ctx()) {
+@@ -404,12 +411,16 @@ impl Shell {
+     /// Present the overlay alone when no video frame carried it: every pass across a
+     /// resize scrim (the host's rebuild gap), and once per change while browsing or
+     /// after a mid-stream picture has gone still. An idle console hands back the same
+-    /// image, so browsing presents only what the overlay re-rendered.
++    /// image, so browsing presents only what the overlay re-rendered. True means a
++    /// changed browse frame was shown and consumed callback credit.
+     pub(super) fn present_overlay_alone(
+         &mut self,
+         stream: &Option<StreamState>,
+         presented_video: bool,
+-    ) -> Result<()> {
++    ) -> Result<bool> {
++        if !self.presenter.compositor_frame_ready() {
++            return Ok(false);
++        }
+         let resize_scrim = stream.as_ref().is_some_and(|s| s.resize_overlay.active());
+         let browse_idle = self.browse && stream.as_ref().is_none_or(|s| s.connector.is_none());
+         let still_picture = stream.as_ref().is_some_and(|s| s.last_video.is_some())
+@@ -423,13 +434,18 @@ impl Shell {
+             if browse_idle {
+                 self.presenter.leave_hdr(&self.window)?;
+             }
+-            self.presenter.present(
++            let credit = self.presenter.compositor_frame_credit();
++            let shown = self.presenter.present(
+                 &self.window,
+                 FrameInput::Redraw,
+                 self.overlay_frame.as_ref(),
+             )?;
++            let remaining = self.presenter.compositor_frame_credit();
++            return Ok(browse_changed
++                && matches!(shown, Presented::Shown)
++                && consumed_compositor_credit(credit, remaining));
+         }
+-        Ok(())
++        Ok(false)
+     }
+ }
+ 
+diff --git a/crates/client/pf-presenter/src/scale.rs b/crates/client/pf-presenter/src/scale.rs
+index 113e56495393f23e8b8e939677dba4ba33aefaf1..c0cc6f3211759186f4b53bbf506bcc9b99b940e5 100644
+--- a/crates/client/pf-presenter/src/scale.rs
++++ b/crates/client/pf-presenter/src/scale.rs
+@@ -61,6 +61,12 @@ pub fn needs_filter(p: &Placement) -> bool {
+     !p.is_empty() && (fractional(p.kernel_x()) || fractional(p.kernel_y()))
+ }
+ 
++/// Broadcom uses bilinear CSC or blits instead of the two-pass float intermediate.
++/// Placement stays unchanged, including native output size, aspect and crop.
++pub(crate) fn use_high_order_filter(p: &Placement, vendor_id: Option<u32>) -> bool {
++    vendor_id != Some(0x14e4) && needs_filter(p)
++}
++
+ fn kernel_id(k: Kernel) -> i32 {
+     match k {
+         Kernel::Copy | Kernel::Nearest => 0,
+@@ -417,6 +423,27 @@ mod tests {
+ 
+     type Px = [f32; 4];
+ 
++    #[test]
++    fn broadcom_fractional_scaling_keeps_placement_without_float_passes() {
++        for view in [(1920, 1080), (3840, 1600), (3840, 2160)] {
++            for fit in [VideoFit::Fit, VideoFit::Crop] {
++                let p = place(fit, view, (2560, 1440));
++                assert!(needs_filter(&p));
++                assert!(!use_high_order_filter(&p, Some(0x14e4)));
++                for vendor in [None, Some(0x8086), Some(0x1002), Some(0x10de)] {
++                    assert!(use_high_order_filter(&p, vendor));
++                }
++                assert!(p.dst_w <= view.0 && p.dst_h <= view.1);
++            }
++        }
++        for view in [(1920, 1080), (3840, 2160)] {
++            let p = place(VideoFit::Fit, view, (1920, 1080));
++            for vendor in [None, Some(0x14e4), Some(0x8086)] {
++                assert!(!use_high_order_filter(&p, vendor));
++            }
++        }
++    }
++
+     /// `scale.frag`'s arithmetic on the CPU, pass for pass. Pixel centres sit at +0.5, as
+     /// `gl_FragCoord` does.
+     fn reference(src: &[Px], frame: (u32, u32), view: (u32, u32), p: &Placement) -> Vec<Px> {
+diff --git a/crates/client/pf-presenter/src/vk/mod.rs b/crates/client/pf-presenter/src/vk/mod.rs
+index 82be199a6ed8f65c51ee686ff23543392850c208..2fd77d0287663cf615eb7e8b5cec4e0ed0e2525c 100644
+--- a/crates/client/pf-presenter/src/vk/mod.rs
++++ b/crates/client/pf-presenter/src/vk/mod.rs
+@@ -42,6 +42,8 @@ mod setup;
+ mod sync_timeline;
+ mod targets;
+ pub(crate) mod timing_ext;
++#[cfg(target_os = "linux")]
++mod wayland_frame;
+ 
+ #[cfg(windows)]
+ pub(crate) use setup::probe_import;
+@@ -196,11 +198,12 @@ enum DirectSrc {
+     Pyro,
+ }
+ 
+-/// Premultiplied-alpha quad blended over the swapchain image after the video blit.
+-/// Recorded only when an overlay frame arrives.
++/// Overlay quad: alpha blends stream chrome or replaces the image with an opaque console.
+ #[derive(Default)]
+ struct OverlayPipe {
+     pass: gpu::Pass,
++    opaque_pass: vk::RenderPass,
++    opaque_pipeline: vk::Pipeline,
+     desc_set: vk::DescriptorSet,
+ }
+ 
+@@ -318,6 +321,7 @@ pub struct Presenter {
+     owner: crate::reconfig_model::Owner,
+     /// The submit in flight, the held image.
+     state: crate::swapchain_state::SwapchainState,
++    acquire_suboptimal: bool,
+     /// The glass instruments, their lifecycle with the swapchain, the present ids.
+     glass: crate::glass::GlassClock,
+     /// Exclusive fullscreen, opt-in: the swapchain owns the monitor's flips.
+@@ -326,6 +330,10 @@ pub struct Presenter {
+     video_fit: punktfunk_core::video_fit::VideoFit,
+     /// Extent, frame size and draw path of the last logged placement.
+     placement_logged: Option<(vk::Extent2D, u32, u32, &'static str)>,
++    /// Weston repaint gate for immediate WSI, independent of present-wait timing.
++    /// Boxed so listener data remains stable.
++    #[cfg(target_os = "linux")]
++    wayland_frame: Option<Box<wayland_frame::WaylandFramePacer>>,
+     /// Wayland lane that hands a dma-buf to the compositor as the window's own buffer.
+     #[cfg(target_os = "linux")]
+     native: Option<crate::wl_native::NativeLane>,
+@@ -1198,6 +1206,39 @@ impl Presenter {
+         self.native.as_mut().map_or((0, 0), |l| l.take_zero_copy())
+     }
+ 
++    /// True when Wayland opens the next repaint. Present-wait measures completion
++    /// independently; paths without compositor pacing remain ready.
++    pub(crate) fn compositor_frame_ready(&self) -> bool {
++        #[cfg(target_os = "linux")]
++        if let Some(pacer) = &self.wayland_frame {
++            return pacer.ready();
++        }
++        true
++    }
++
++    /// Remaining callback slots; no pacer is distinct from an open budget.
++    pub(crate) fn compositor_frame_credit(&self) -> Option<usize> {
++        #[cfg(target_os = "linux")]
++        if let Some(pacer) = &self.wayland_frame {
++            return Some(pacer.available());
++        }
++        None
++    }
++
++    #[cfg(target_os = "linux")]
++    pub(crate) fn set_compositor_wake(&self, cb: Box<dyn Fn() + Send>) {
++        if let Some(pacer) = &self.wayland_frame {
++            pacer.set_wake(cb);
++        }
++    }
++
++    #[cfg(target_os = "linux")]
++    fn arm_compositor_frame(&self) {
++        if let Some(pacer) = &self.wayland_frame {
++            pacer.arm();
++        }
++    }
++
+     /// Claim the just-submitted present for on-glass timing. Call right after a
+     /// `present()` that returned `true`, with that frame's capture + decode stamps.
+     /// No-op when timing is inactive.
+diff --git a/crates/client/pf-presenter/src/vk/overlay_pipe.rs b/crates/client/pf-presenter/src/vk/overlay_pipe.rs
+index bdcb69c7b9fd8b6083305cf04e2e288371810fe2..dee4f507d189e8b617ae4ae9e13ed6e3f2adf9e0 100644
+--- a/crates/client/pf-presenter/src/vk/overlay_pipe.rs
++++ b/crates/client/pf-presenter/src/vk/overlay_pipe.rs
+@@ -82,6 +82,27 @@ impl OverlayPipe {
+                     .set_layouts(&set_layouts),
+             )
+         }?[0];
++        // Compatible attachments let both passes use the same swapchain framebuffers.
++        self.opaque_pass = color_pass(
++            device,
++            format,
++            vk::AttachmentLoadOp::DONT_CARE,
++            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
++            vk::ImageLayout::PRESENT_SRC_KHR,
++        )
++        .context("opaque overlay render pass")?;
++        let shader = if pq {
++            pf_client_core::video_csc_spv::OVERLAY_PQ_FRAG
++        } else {
++            pf_client_core::video_csc_spv::OVERLAY_FRAG
++        };
++        self.opaque_pipeline = build_fullscreen_pipeline(
++            device,
++            self.opaque_pass,
++            self.pass.pipeline_layout,
++            shader,
++            false,
++        )?;
+         self.pass.pipeline = build_fullscreen_pipeline(
+             device,
+             self.pass.render_pass,
+@@ -96,8 +117,15 @@ impl OverlayPipe {
+         Ok(())
+     }
+ 
+-    /// [`Pass::destroy`](super::gpu::Pass::destroy): the set goes with the pool.
++    /// Release both compatible pipelines before their shared layout and descriptor pool.
+     pub(super) fn destroy(&mut self, device: &ash::Device) {
++        // SAFETY: these handles are owned here; callers wait for their submissions.
++        unsafe {
++            device.destroy_pipeline(self.opaque_pipeline, None);
++            device.destroy_render_pass(self.opaque_pass, None);
++        }
++        self.opaque_pipeline = vk::Pipeline::null();
++        self.opaque_pass = vk::RenderPass::null();
+         self.pass.destroy(device);
+     }
+ }
+diff --git a/crates/client/pf-presenter/src/vk/present.rs b/crates/client/pf-presenter/src/vk/present.rs
+index 49f8d9e94797e49ace8c0cc0b2e26dad8b4a5752..09ef590b350142cf2694dd2b16417d96627bc979 100644
+--- a/crates/client/pf-presenter/src/vk/present.rs
++++ b/crates/client/pf-presenter/src/vk/present.rs
+@@ -115,6 +115,7 @@ impl PresentError {
+ 
+ /// What one present draws, decided after acquire and before recording.
+ struct FramePlan {
++    opaque_overlay: bool,
+     /// The swapchain image this frame draws into.
+     index: u32,
+     /// The composite's source and its picture size: the video image, or on Windows a D3D11
+@@ -134,6 +135,20 @@ struct FramePlan {
+ }
+ 
+ impl FramePlan {
++    fn for_opaque_overlay(index: u32) -> Self {
++        Self {
++            opaque_overlay: true,
++            index,
++            source: None,
++            placement: None,
++            filtered: None,
++            last: None,
++            direct: None,
++            #[cfg(windows)]
++            slot: None,
++        }
++    }
++
+     /// The direct target, or the video image the composite places afterwards.
+     fn csc_target(&self, v: &VideoImage) -> CscTarget {
+         self.direct.unwrap_or_else(|| video_target(v))
+@@ -190,6 +205,11 @@ impl Presenter {
+             .placement_logged
+             .is_none_or(|(_, w, h, was)| (w, h, was) != (width, height, path));
+         self.placement_logged = Some(key);
++        let kernel = if path == "filtered" || !crate::scale::needs_filter(p) {
++            (p.kernel_x().name(), p.kernel_y().name())
++        } else {
++            ("bilinear", "bilinear")
++        };
+         macro_rules! log_placement {
+             ($level:ident) => {
+                 tracing::$level!(
+@@ -200,7 +220,7 @@ impl Presenter {
+                     dst = ?(p.dst_x, p.dst_y, p.dst_w, p.dst_h),
+                     src = ?(p.src_x, p.src_y, p.src_w, p.src_h),
+                     scale = ?(p.scale_x, p.scale_y),
+-                    kernel = ?(p.kernel_x().name(), p.kernel_y().name()),
++                    kernel = ?kernel,
+                     "video placement"
+                 )
+             };
+@@ -212,8 +232,8 @@ impl Presenter {
+         }
+     }
+ 
+-    /// Present one frame. `Stale` means the swapchain is out of date — the caller
+-    /// recreates it (current window state) and may retry. `Busy` hands the frame back:
++    /// Present one frame. `Stale` means the swapchain was recreated and the caller
++    /// may retry. `Busy` hands the frame back:
+     /// the swapchain has no image yet (FIFO with no glass stamps to gate on), so the
+     /// caller keeps the frame and tries again shortly instead of blocking on the queue.
+     /// The phases run in the module doc's order, which is the contract.
+@@ -263,7 +283,14 @@ impl Presenter {
+         if let Some(o) = overlay {
+             self.bind_overlay(o);
+         }
+-        let plan = self.plan(&lane, index)?;
++        let opaque_overlay = overlay.is_some_and(|o| {
++            o.replaces_video(
++                redraw,
++                self.targets.extent.width,
++                self.targets.extent.height,
++            )
++        }) && (index as usize) < self.targets.overlay.framebuffers.len();
++        let plan = self.plan(&lane, index, opaque_overlay)?;
+ 
+         // SAFETY: `cmd_buf` is owned and idle (fence wait above) and records from `begin` to
+         // `end` here, which is every record fn's precondition. Recording names images, views
+@@ -275,8 +302,14 @@ impl Presenter {
+                 &vk::CommandBufferBeginInfo::default()
+                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+             )?;
+-            let native_wait = self.record_lane(&lane, &plan, cpu_offsets);
+-            let swap_layout = self.record_composite(&plan);
++            let (native_wait, swap_layout) = if plan.opaque_overlay {
++                (None, vk::ImageLayout::UNDEFINED)
++            } else {
++                (
++                    self.record_lane(&lane, &plan, cpu_offsets),
++                    self.record_composite(&plan),
++                )
++            };
+             self.record_overlay(overlay, &plan, swap_layout);
+             self.device.end_command_buffer(self.cmd_buf)?;
+             native_wait
+@@ -334,7 +367,10 @@ impl Presenter {
+                     vk::Fence::null(),
+                 )
+             } {
+-                Ok((index, _)) => self.state.acquired = Some(index),
++                Ok((index, suboptimal)) => {
++                    self.state.acquired = Some(index);
++                    self.acquire_suboptimal = suboptimal;
++                }
+                 Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
+                     return Ok(ControlFlow::Break(Presented::Busy(input, BusyOn::Acquire)));
+                 }
+@@ -407,7 +443,7 @@ impl Presenter {
+     fn acquire(&mut self) -> Result<Option<u32>> {
+         let started = std::time::Instant::now();
+         let acquired = match self.state.acquired {
+-            Some(index) => Ok((index, false)),
++            Some(index) => Ok((index, self.acquire_suboptimal)),
+             None => {
+                 // With a present waiter, each call holds the swapchain for one bounded slice.
+                 let timeout = if self.glass.has_waiter() {
+@@ -435,7 +471,7 @@ impl Presenter {
+                 }
+             }
+         };
+-        let (index, _suboptimal) = match acquired {
++        let (index, suboptimal) = match acquired {
+             Ok(r) => r,
+             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => return Ok(None),
+@@ -446,6 +482,7 @@ impl Presenter {
+             }
+         };
+         self.state.acquired = Some(index);
++        self.acquire_suboptimal = suboptimal;
+         self.last_acquire_us = started.elapsed().as_micros() as u32;
+         Ok(Some(index))
+     }
+@@ -502,14 +539,14 @@ impl Presenter {
+         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+     }
+ 
+-    /// Where the picture lands on swapchain image `index` and which path draws it. A
+-    /// fractional scale goes through the filter ladder (`scale.rs`); whole-number scales
+-    /// blit exactly. Both shader paths draw through the overlay's framebuffers, so those
+-    /// must exist. Direct CSC into the swapchain image takes the whole picture at an exact
+-    /// scale, from a lane that samples on this device; everything else takes the video
+-    /// image. A real frame from the CPU planes records what it drew direct for the next
+-    /// `Redraw`; a hardware frame carries that into `park`.
+-    fn plan(&mut self, lane: &Lane, index: u32) -> Result<FramePlan> {
++    /// Place the picture on swapchain image `index`. Fractional scales use the device's
++    /// filter policy; exact scales bypass it. Direct CSC draws an uncropped picture into
++    /// the overlay framebuffer, including the bilinear fallback. An opaque console redraw
++    /// skips video planning. Other redraws retain the picture and its direct CSC planes.
++    fn plan(&mut self, lane: &Lane, index: u32, opaque_overlay: bool) -> Result<FramePlan> {
++        if opaque_overlay {
++            return Ok(FramePlan::for_opaque_overlay(index));
++        }
+         let redraw = matches!(lane, Lane::Redraw);
+         #[cfg(windows)]
+         let slot = match lane {
+@@ -529,7 +566,14 @@ impl Presenter {
+             .filter(|p| !p.is_empty());
+         let targets_ready = self.targets.overlay.framebuffers.len() == self.targets.images.len();
+         let filtered = match (placement, &self.video) {
+-            (Some(p), Some(v)) if !from_slot && targets_ready && crate::scale::needs_filter(&p) => {
++            (Some(p), Some(v))
++                if !from_slot
++                    && targets_ready
++                    && crate::scale::use_high_order_filter(
++                        &p,
++                        self.video_export.as_ref().map(|v| v.vendor_id),
++                    ) =>
++            {
+                 self.scale
+                     .prepare(&self.device, &self.mem_props, v.height, &p, v.view)?;
+                 Some(p)
+@@ -588,6 +632,7 @@ impl Presenter {
+             self.log_placement(w, h, &p, path);
+         }
+         Ok(FramePlan {
++            opaque_overlay,
+             index,
+             source,
+             placement,
+@@ -1134,26 +1179,40 @@ impl Presenter {
+             swap_layout,
+             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+         );
+-        let full = vk::Rect2D {
+-            offset: vk::Offset2D { x: 0, y: 0 },
+-            extent: self.targets.extent,
++        let damage = vk::Rect2D {
++            offset: vk::Offset2D {
++                x: 0,
++                y: o.scissor_y as i32,
++            },
++            extent: vk::Extent2D {
++                width: self.targets.extent.width,
++                height: o.scissor_height,
++            },
+         };
+-        // SAFETY: `cmd_buf` is recording (`# Safety` above); the pipe, its framebuffer for
+-        // `index` and its set are owned here, and the set points at `overlay`.
++        let (render_pass, pipeline) = if plan.opaque_overlay {
++            (
++                self.overlay_pipe.opaque_pass,
++                self.overlay_pipe.opaque_pipeline,
++            )
++        } else {
++            (
++                self.overlay_pipe.pass.render_pass,
++                self.overlay_pipe.pass.pipeline,
++            )
++        };
++        // SAFETY: both passes are compatible with the owned framebuffer; the descriptor
++        // points at the flushed overlay. The opaque pass writes every pixel without LOAD.
+         unsafe {
+             self.device.cmd_begin_render_pass(
+                 self.cmd_buf,
+                 &vk::RenderPassBeginInfo::default()
+-                    .render_pass(self.overlay_pipe.pass.render_pass)
++                    .render_pass(render_pass)
+                     .framebuffer(self.targets.overlay.framebuffers[index])
+-                    .render_area(full),
++                    .render_area(damage),
+                 vk::SubpassContents::INLINE,
+             );
+-            self.device.cmd_bind_pipeline(
+-                self.cmd_buf,
+-                vk::PipelineBindPoint::GRAPHICS,
+-                self.overlay_pipe.pass.pipeline,
+-            );
++            self.device
++                .cmd_bind_pipeline(self.cmd_buf, vk::PipelineBindPoint::GRAPHICS, pipeline);
+             self.device.cmd_set_viewport(
+                 self.cmd_buf,
+                 0,
+@@ -1166,7 +1225,7 @@ impl Presenter {
+                     max_depth: 1.0,
+                 }],
+             );
+-            self.device.cmd_set_scissor(self.cmd_buf, 0, &[full]);
++            self.device.cmd_set_scissor(self.cmd_buf, 0, &[damage]);
+             self.device.cmd_bind_descriptor_sets(
+                 self.cmd_buf,
+                 vk::PipelineBindPoint::GRAPHICS,
+@@ -1303,7 +1362,7 @@ impl Presenter {
+         self.state.on_submit();
+         // A real frame from any other lane ends the D3D11 picture; `Redraw` keeps it.
+         #[cfg(windows)]
+-        {
++        if !plan.opaque_overlay {
+             self.retained_slot = plan.slot;
+         }
+         Ok(())
+@@ -1431,6 +1490,8 @@ impl Presenter {
+         // Same queue external-sync as the submit. Scoped tightly: OUT_OF_DATE
+         // re-enters the lock via the rebuild's queue drain. The swapchain
+         // guard comes first, so a waiter slice never holds off decode submits.
++        #[cfg(target_os = "linux")]
++        self.arm_compositor_frame();
+         let present_res = {
+             let _swapchain = self.glass.swapchain_guard();
+             let _q = self.queue_lock.guard();
+@@ -1441,8 +1502,17 @@ impl Presenter {
+         };
+         self.last_present_us = present_started.elapsed().as_micros() as u32;
+         match present_res {
+-            Ok(_) => {
++            Ok(present_suboptimal) => {
+                 self.glass.sent(self.targets.swapchain, asked);
++                if self.acquire_suboptimal || present_suboptimal {
++                    tracing::info!(
++                        acquire_suboptimal = self.acquire_suboptimal,
++                        present_suboptimal,
++                        "swapchain suboptimal after compositor feedback; recreating"
++                    );
++                    self.reconfigure(Input::OutOfDate, window)
++                        .context(PresentError::Window)?;
++                }
+                 Ok(Presented::Shown)
+             }
+             // The driver counted its result queue differently: stop asking, and take
+@@ -1762,6 +1832,20 @@ fn csc_depth_packing_or_8bit(raw: RawVkFormat) -> (u8, bool) {
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn opaque_redraw_has_no_video_work() {
++        let plan = super::FramePlan::for_opaque_overlay(2);
++        assert!(plan.opaque_overlay);
++        assert_eq!(plan.index, 2);
++        assert!(plan.source.is_none());
++        assert!(plan.placement.is_none());
++        assert!(plan.filtered.is_none());
++        assert!(plan.last.is_none());
++        assert!(plan.direct.is_none());
++        #[cfg(windows)]
++        assert!(plan.slot.is_none());
++    }
++
+     use super::*;
+ 
+     /// The loop reads the marker under whatever context is added on the way up.
+diff --git a/crates/client/pf-presenter/src/vk/reconfig.rs b/crates/client/pf-presenter/src/vk/reconfig.rs
+index e160bf0f408338ef5d6dd4f03aef1dbb2edc2211..79a15848ef2d20376f5ffea51ed0b07a44319411 100644
+--- a/crates/client/pf-presenter/src/vk/reconfig.rs
++++ b/crates/client/pf-presenter/src/vk/reconfig.rs
+@@ -293,6 +293,7 @@ impl Presenter {
+             unsafe { self.device.queue_wait_idle(self.queue) }
+                 .with_context(|| format!("vkQueueWaitIdle ({why})"))?;
+         }
++        self.acquire_suboptimal = false;
+         self.glass.retire();
+         Ok(())
+     }
+@@ -304,10 +305,21 @@ impl Presenter {
+         caps: &vk::SurfaceCapabilitiesKHR,
+         extent: vk::Extent2D,
+     ) -> vk::SwapchainCreateInfoKHR<'static> {
+-        let mut min_images = caps.min_image_count + 1;
++        let requested_images = std::env::var("PUNKTFUNK_SWAPCHAIN_IMAGES")
++            .ok()
++            .and_then(|value| value.parse::<u32>().ok())
++            .unwrap_or(0);
++        let mut min_images = (caps.min_image_count + 1).max(requested_images);
+         if caps.max_image_count > 0 {
+             min_images = min_images.min(caps.max_image_count);
+         }
++        tracing::info!(
++            surface_min_images = caps.min_image_count,
++            surface_max_images = caps.max_image_count,
++            requested_images,
++            swapchain_images = min_images,
++            "swapchain image count"
++        );
+         // Present-id2/present-wait2 are asked for per swapchain, and so are engine stamps.
+         let mut flags = vk::SwapchainCreateFlagsKHR::empty();
+         if self.glass.id2() {
+diff --git a/crates/client/pf-presenter/src/vk/setup.rs b/crates/client/pf-presenter/src/vk/setup.rs
+index 47a4efece1ed075f7fa1299aff072942e90f03db..d5262a4d0a5b80b9833aa58250bc199e8b27ca7f 100644
+--- a/crates/client/pf-presenter/src/vk/setup.rs
++++ b/crates/client/pf-presenter/src/vk/setup.rs
+@@ -951,6 +951,11 @@ impl Presenter {
+         let m = b.into_parts();
+         #[cfg(target_os = "linux")]
+         let native_timelines = m.hw.as_ref().is_some_and(|h| h.timelines.is_some());
++        #[cfg(target_os = "linux")]
++        // Completion stamps do not schedule the compositor's next repaint.
++        let wayland_frame = (present_mode == vk::PresentModeKHR::IMMEDIATE)
++            .then(|| super::wayland_frame::WaylandFramePacer::new(window))
++            .flatten();
+         let mut p = Presenter {
+             entry,
+             instance,
+@@ -1003,6 +1008,7 @@ impl Presenter {
+             video: None,
+             owner: crate::reconfig_model::Owner::Swapchain,
+             state: crate::swapchain_state::SwapchainState::new(),
++            acquire_suboptimal: false,
+             glass: {
+                 let glass = crate::glass::GlassClock::new(timing, m.present_timer, present_id2);
+                 #[cfg(windows)]
+@@ -1023,6 +1029,8 @@ impl Presenter {
+             video_fit: Default::default(),
+             placement_logged: None,
+             #[cfg(target_os = "linux")]
++            wayland_frame,
++            #[cfg(target_os = "linux")]
+             native: if crate::wl_native::enabled() {
+                 crate::wl_native::NativeLane::new(window, native_timelines).unwrap_or_else(|e| {
+                     tracing::warn!(error = %format!("{e:#}"), "native scanout lane unavailable");
+diff --git a/crates/client/pf-presenter/src/vk/wayland_frame.rs b/crates/client/pf-presenter/src/vk/wayland_frame.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3505b559e20722bddf713a1a4efa276b62875f65
+--- /dev/null
++++ b/crates/client/pf-presenter/src/vk/wayland_frame.rs
+@@ -0,0 +1,295 @@
++//! Wayland repaint-clock gate for immediate Vulkan WSI presentation.
++
++#![cfg(target_os = "linux")]
++
++use std::ffi::{c_char, c_int, c_uint, c_void};
++use std::ptr;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::Mutex;
++use std::time::Instant;
++
++#[repr(C)]
++struct WlProxy {
++    _private: [u8; 0],
++}
++
++#[repr(C)]
++struct WlInterface {
++    _private: [u8; 0],
++}
++
++#[repr(C)]
++struct WlCallbackListener {
++    done: unsafe extern "C" fn(*mut c_void, *mut WlProxy, u32),
++}
++
++#[link(name = "wayland-client")]
++unsafe extern "C" {
++    static wl_callback_interface: WlInterface;
++    fn wl_proxy_get_version(proxy: *mut WlProxy) -> c_uint;
++    fn wl_proxy_marshal_flags(
++        proxy: *mut WlProxy,
++        opcode: c_uint,
++        interface: *const WlInterface,
++        version: c_uint,
++        flags: c_uint,
++        ...
++    ) -> *mut WlProxy;
++    fn wl_proxy_add_listener(
++        proxy: *mut WlProxy,
++        implementation: *mut c_void,
++        data: *mut c_void,
++    ) -> c_int;
++    fn wl_proxy_destroy(proxy: *mut WlProxy);
++}
++
++const WL_SURFACE_FRAME: c_uint = 3;
++
++fn frame_depth(value: Option<&str>) -> usize {
++    if value == Some("2") {
++        2
++    } else {
++        1
++    }
++}
++
++/// Each pending proxy consumes one slot until that exact callback completes.
++struct PendingCallbacks<T> {
++    slots: [Option<T>; 2],
++    depth: usize,
++}
++
++impl<T: Copy + Eq> PendingCallbacks<T> {
++    fn new(depth: usize) -> Self {
++        Self {
++            slots: [None; 2],
++            depth: depth.clamp(1, 2),
++        }
++    }
++
++    fn available(&self) -> usize {
++        self.slots[..self.depth]
++            .iter()
++            .filter(|slot| slot.is_none())
++            .count()
++    }
++
++    fn ready(&self) -> bool {
++        self.available() > 0
++    }
++
++    fn insert(&mut self, callback: T) -> bool {
++        let Some(slot) = self.slots[..self.depth].iter_mut().find(|s| s.is_none()) else {
++            return false;
++        };
++        *slot = Some(callback);
++        true
++    }
++
++    fn complete(&mut self, callback: T) -> bool {
++        let Some(slot) = self.slots.iter_mut().find(|s| **s == Some(callback)) else {
++            return false;
++        };
++        slot.take();
++        true
++    }
++}
++
++pub(super) struct WaylandFramePacer {
++    surface: *mut WlProxy,
++    pending: Mutex<PendingCallbacks<*mut WlProxy>>,
++    wake: Mutex<Option<Box<dyn Fn() + Send>>>,
++    arms: AtomicU64,
++    completions: AtomicU64,
++    report: Mutex<(Instant, u64, u64)>,
++}
++
++impl WaylandFramePacer {
++    pub(super) fn new(window: &sdl3::video::Window) -> Option<Box<Self>> {
++        if std::env::var("PUNKTFUNK_WAYLAND_FRAME_PACING")
++            .ok()
++            .as_deref()
++            == Some("0")
++        {
++            tracing::info!("Wayland frame pacing disabled by environment");
++            return None;
++        }
++        let key = b"SDL.window.wayland.surface\0";
++        // SAFETY: SDL owns the window and property set for this call. The returned
++        // wl_surface remains owned by SDL and lives for the window's lifetime.
++        let surface = unsafe {
++            let props = sdl3::sys::video::SDL_GetWindowProperties(window.raw());
++            sdl3::sys::properties::SDL_GetPointerProperty(
++                props,
++                key.as_ptr().cast::<c_char>(),
++                ptr::null_mut(),
++            )
++        } as *mut WlProxy;
++        if surface.is_null() {
++            tracing::info!("SDL window is not Wayland; compositor frame pacing unavailable");
++            return None;
++        }
++        let depth = frame_depth(
++            std::env::var("PUNKTFUNK_WAYLAND_FRAME_DEPTH")
++                .ok()
++                .as_deref(),
++        );
++        tracing::info!(depth, "Wayland compositor frame pacing active");
++        Some(Box::new(Self {
++            surface,
++            pending: Mutex::new(PendingCallbacks::new(depth)),
++            wake: Mutex::new(None),
++            arms: AtomicU64::new(0),
++            completions: AtomicU64::new(0),
++            report: Mutex::new((Instant::now(), 0, 0)),
++        }))
++    }
++
++    pub(super) fn ready(&self) -> bool {
++        self.pending.lock().unwrap().ready()
++    }
++
++    pub(super) fn available(&self) -> usize {
++        self.pending.lock().unwrap().available()
++    }
++
++    pub(super) fn set_wake(&self, wake: Box<dyn Fn() + Send>) {
++        *self.wake.lock().unwrap() = Some(wake);
++    }
++
++    /// Each commit takes one budget slot and its own callback. Vulkan WSI commits
++    /// immediately after this call; SDL dispatches callbacks on the same main thread.
++    pub(super) fn arm(&self) {
++        let mut pending = self.pending.lock().unwrap();
++        if !pending.ready() {
++            return;
++        }
++        // SAFETY: `surface` is SDL's live wl_surface. FRAME creates a wl_callback
++        // using the surface proxy's version and event queue (SDL's default queue).
++        let callback = unsafe {
++            wl_proxy_marshal_flags(
++                self.surface,
++                WL_SURFACE_FRAME,
++                &raw const wl_callback_interface,
++                wl_proxy_get_version(self.surface),
++                0,
++            )
++        };
++        if callback.is_null() {
++            return;
++        }
++        if !pending.insert(callback) {
++            // SAFETY: this newly created proxy has no listener or pending owner.
++            unsafe { wl_proxy_destroy(callback) };
++            return;
++        }
++        static LISTENER: WlCallbackListener = WlCallbackListener { done };
++        // SAFETY: callback is newly created; `self` is boxed and therefore stable
++        // for the presenter's lifetime. Drop destroys any outstanding callback.
++        let rc = unsafe {
++            wl_proxy_add_listener(
++                callback,
++                (&raw const LISTENER).cast_mut().cast::<c_void>(),
++                (self as *const Self).cast_mut().cast::<c_void>(),
++            )
++        };
++        if rc != 0 {
++            pending.complete(callback);
++            // SAFETY: listener installation failed; no callback can name this proxy.
++            unsafe { wl_proxy_destroy(callback) };
++        } else {
++            self.arms.fetch_add(1, Ordering::Relaxed);
++        }
++    }
++}
++
++unsafe extern "C" fn done(data: *mut c_void, callback: *mut WlProxy, _time_ms: u32) {
++    // SAFETY: listener data points at the boxed pacer; SDL dispatches this on the
++    // presenter's main thread, and Drop removes a pending proxy before freeing it.
++    let this = unsafe { &*(data.cast::<WaylandFramePacer>()) };
++    if !this.pending.lock().unwrap().complete(callback) {
++        return;
++    }
++    // SAFETY: this exact proxy was pending, and completing it removed its only owner.
++    unsafe { wl_proxy_destroy(callback) };
++    let completed = this.completions.fetch_add(1, Ordering::Relaxed) + 1;
++    let armed = this.arms.load(Ordering::Relaxed);
++    let mut report = this.report.lock().unwrap();
++    let elapsed = report.0.elapsed();
++    if elapsed.as_secs_f64() >= 1.0 {
++        tracing::info!(
++            armed = armed - report.1,
++            completed = completed - report.2,
++            elapsed_ms = elapsed.as_millis() as u64,
++            "Wayland frame pacing window"
++        );
++        *report = (Instant::now(), armed, completed);
++    }
++    drop(report);
++    if let Some(wake) = this.wake.lock().unwrap().as_ref() {
++        wake();
++    }
++}
++
++impl Drop for WaylandFramePacer {
++    fn drop(&mut self) {
++        let pending = self.pending.get_mut().unwrap();
++        for callback in pending.slots.iter_mut().filter_map(Option::take) {
++            // SAFETY: SDL dispatch and drop share the main thread; destroying each proxy
++            // removes its listener before the boxed pacer is freed.
++            unsafe { wl_proxy_destroy(callback) };
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    #[test]
++    fn available_credit_follows_each_callback() {
++        let mut pending = super::PendingCallbacks::new(2);
++        assert_eq!(pending.available(), 2);
++        assert!(pending.insert(1));
++        assert!(pending.insert(2));
++        assert_eq!(pending.available(), 0);
++        assert!(pending.complete(1));
++        assert_eq!(pending.available(), 1);
++        assert!(!pending.complete(1));
++        assert_eq!(pending.available(), 1);
++        assert!(pending.insert(3));
++        assert_eq!(pending.available(), 0);
++    }
++
++    use super::*;
++
++    #[test]
++    fn each_callback_frees_only_its_own_budget_slot() {
++        let mut pending = PendingCallbacks::new(2);
++        assert!(pending.insert(10));
++        assert!(pending.ready());
++        assert!(pending.insert(20));
++        assert!(!pending.ready());
++        assert!(!pending.insert(30));
++        assert!(!pending.complete(99));
++        assert!(pending.complete(20));
++        assert!(pending.ready());
++        assert!(pending.insert(30));
++        assert!(!pending.complete(20));
++        assert!(!pending.ready());
++        assert!(pending.complete(10));
++        assert!(pending.complete(30));
++        assert!(pending.ready());
++        assert!(pending.slots.iter().all(Option::is_none));
++    }
++
++    #[test]
++    fn default_budget_stays_one_and_only_two_opts_in() {
++        for value in [None, Some("1"), Some("0"), Some("3"), Some("invalid")] {
++            let mut pending = PendingCallbacks::new(frame_depth(value));
++            assert!(pending.insert(1));
++            assert!(!pending.insert(2));
++            assert!(pending.complete(1));
++            assert!(pending.ready());
++        }
++        assert_eq!(frame_depth(Some("2")), 2);
++    }
++}
