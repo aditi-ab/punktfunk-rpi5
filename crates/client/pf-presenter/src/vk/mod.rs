@@ -289,6 +289,8 @@ pub struct Presenter {
     last_fence_us: u32,
     last_acquire_us: u32,
     last_present_us: u32,
+    /// Broadcom can transfer an identical opaque SDR menu without a fragment pass.
+    copy_opaque_overlay: bool,
     /// External-sync lock over this device's queues, shared with decode and the overlay.
     /// The decoder submits on this same graphics queue from the pump thread; every
     /// `vkQueueSubmit` / `vkQueuePresentKHR` / wait-idle here must hold it or the

@@ -9,7 +9,7 @@ use crate::theme::{Fonts, Frame, PanelStroke, EDGE_INSET, W};
 use crate::widgets::{text_tab, tray, Toward};
 use pf_client_core::menu_nav::PadInfo;
 use pf_client_core::trust;
-use skia_safe::{Canvas, Image, Picture, PictureRecorder, Point, Rect};
+use skia_safe::{Canvas, Picture, PictureRecorder, Rect};
 use std::time::Instant;
 
 use super::{
@@ -136,16 +136,7 @@ impl Shell {
         if (self.backdrop.bg_mix - bg_target).abs() < 0.005 {
             self.backdrop.bg_mix = bg_target;
         }
-        let deferred = record_content_layer(
-            motion_p.is_some(),
-            self.efficient_backdrop && self.content_prepass && !crate::blur::active(&self.ui),
-            canvas.image_info().color_type(),
-        );
-        let background_matrix = canvas.local_to_device();
-        let field_t = self.field_clock(t);
-        if !deferred {
-            self.draw_aurora(canvas, full_w, full_h, t, self.backdrop.bg_mix);
-        }
+        self.draw_aurora(canvas, full_w, full_h, t, self.backdrop.bg_mix);
         // Translate only when inset: with none this is the desktop canvas, and
         // screenshot dumps stay byte-identical.
         let inset = ins.left != 0.0 || ins.top != 0.0;
@@ -209,7 +200,6 @@ impl Shell {
             show_hints,
             cheap: false,
             root_targets: None,
-            pending: deferred.then(Vec::new),
         };
         self.hint_rects.clear();
         // Reduced motion keeps the crossfade (an instant swap loses the only spatial
@@ -291,26 +281,6 @@ impl Shell {
                 let n = self.stack.len();
                 let top = &mut self.stack[n - 1];
                 chrome.push(env.paint(top, 1.0, 0.0, 0.0, 1.0, band(n - 1)));
-            }
-        }
-        if let Some(pending) = env.pending.take() {
-            let prepared: Vec<_> = pending
-                .into_iter()
-                .map(|(picture, alpha)| prepare_content(canvas, picture, alpha))
-                .collect();
-            canvas.save();
-            canvas.set_matrix(&background_matrix);
-            self.backdrop.draw(
-                canvas,
-                full_w,
-                full_h,
-                field_t,
-                self.backdrop.bg_mix,
-                self.efficient_backdrop || reduced_ui,
-            );
-            canvas.restore();
-            for content in prepared {
-                content.replay(canvas);
             }
         }
         // Only a settled top screen publishes hint hit-boxes: mid-transition two legends
@@ -490,7 +460,6 @@ struct LayerEnv<'a> {
     cheap: bool,
     /// Focus targets the tab root placed, once its layer paints.
     root_targets: Option<usize>,
-    pending: Option<Vec<(Picture, f64)>>,
 }
 
 /// Opens a bounded fade or a plain save. Invisible content opens neither;
@@ -540,61 +509,9 @@ fn replay_content(canvas: &Canvas, picture: &Picture, alpha: f64) {
     canvas.restore();
 }
 
-struct PreparedContent {
-    picture: Picture,
-    image: Option<(Image, Point)>,
-    alpha: f64,
-}
-
-/// Finish integer-bounded layers before native composition to avoid parent store/load passes.
-fn prepare_content(canvas: &Canvas, picture: Picture, alpha: f64) -> PreparedContent {
-    let bounds: skia_safe::IRect = skia_safe::RoundOut::round_out(&picture.cull_rect());
-    let image = (bounds.width() > 0 && bounds.height() > 0)
-        .then(|| {
-            let info = skia_safe::ImageInfo::new(
-                (bounds.width(), bounds.height()),
-                canvas.image_info().color_type(),
-                skia_safe::AlphaType::Premul,
-                canvas.image_info().color_space(),
-            );
-            let mut surface = canvas.new_surface(&info, None)?;
-            surface.canvas().clear(skia_safe::Color::TRANSPARENT);
-            surface
-                .canvas()
-                .translate((-bounds.left as f32, -bounds.top as f32));
-            surface.canvas().draw_picture(&picture, None, None);
-            Some((
-                surface.image_snapshot(),
-                Point::new(bounds.left as f32, bounds.top as f32),
-            ))
-        })
-        .flatten();
-    PreparedContent {
-        picture,
-        image,
-        alpha,
-    }
-}
-
-impl PreparedContent {
-    /// Images contain native device pixels; a failed allocation retains picture replay.
-    fn replay(self, canvas: &Canvas) {
-        if let Some((image, origin)) = self.image {
-            canvas.save();
-            canvas.reset_matrix();
-            let mut paint = crate::theme::layer();
-            paint.set_alpha_f(self.alpha.clamp(0.0, 1.0) as f32);
-            canvas.draw_image(&image, origin, Some(&paint));
-            canvas.restore();
-        } else {
-            replay_content(canvas, &self.picture, self.alpha);
-        }
-    }
-}
-
 impl LayerEnv<'_> {
     /// Transformed content, with chrome recorded separately in stationary device space.
-    /// Efficient eight-bit transitions prepare bounded layers before drawing the background.
+    /// Efficient eight-bit transitions record once and fade within conservative draw bounds.
     /// Other surfaces retain their backing surface and layer colour semantics.
     #[allow(clippy::too_many_arguments)]
     fn paint(
@@ -616,7 +533,7 @@ impl LayerEnv<'_> {
         let base = destination.local_to_device();
         let device_edges = destination.local_to_device_as_3x3().map_rect(edges).0;
         let mut recorder = record_content_layer(
-            layered || self.pending.is_some(),
+            layered,
             self.ui.skip_backdrop_blur && !crate::blur::active(self.ui),
             destination.image_info().color_type(),
         )
@@ -635,7 +552,7 @@ impl LayerEnv<'_> {
             destination
         };
         // Surface copies cannot see content inside either kind of transition layer.
-        self.ui.in_layer.set(layered || self.pending.is_some());
+        self.ui.in_layer.set(layered);
         canvas.translate((dx as f32, dy as f32));
         let (cx, cy) = ((self.w / 2.0) as f32, (self.h / 2.0) as f32);
         canvas.translate((cx, cy));
@@ -699,11 +616,7 @@ impl LayerEnv<'_> {
             .as_mut()
             .and_then(|recorder| recorder.finish_recording_as_picture(None))
         {
-            if let Some(pending) = self.pending.as_mut() {
-                pending.push((picture, alpha));
-            } else {
-                replay_content(destination, &picture, alpha);
-            }
+            replay_content(destination, &picture, alpha);
         }
         self.ui.in_layer.set(false);
         Chrome {
@@ -938,7 +851,7 @@ mod chrome_layer_tests {
         );
         for empty in [false, true] {
             for alpha in [0.0, 0.37, 1.0] {
-                let render = |recorded: bool, prepass: bool| {
+                let render = |recorded: bool| {
                     let mut surface =
                         skia_safe::surfaces::raster_n32_premul((width, height)).unwrap();
                     let destination = surface.canvas();
@@ -977,11 +890,7 @@ mod chrome_layer_tests {
                     {
                         let bounds = picture.cull_rect();
                         assert!(bounds.width() * bounds.height() < (width * height) as f32 / 4.0);
-                        if prepass {
-                            prepare_content(destination, picture, alpha).replay(destination);
-                        } else {
-                            replay_content(destination, &picture, alpha);
-                        }
+                        replay_content(destination, &picture, alpha);
                         assert_eq!(destination.local_to_device(), base);
                     }
                     let mut pixels = vec![0; (width * height * 4) as usize];
@@ -989,17 +898,8 @@ mod chrome_layer_tests {
                     pixels
                 };
                 assert!(
-                    render(true, false) == render(false, false),
+                    render(true) == render(false),
                     "recording changes content pixels"
-                );
-                let expected = render(false, false);
-                let actual = render(true, true);
-                assert!(
-                    expected
-                        .iter()
-                        .zip(&actual)
-                        .all(|(a, b)| a.abs_diff(*b) <= 1),
-                    "prepared content changes pixels beyond alpha rounding"
                 );
             }
         }

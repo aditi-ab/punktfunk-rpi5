@@ -151,7 +151,7 @@ fn console_redraw_deadline_stops_idle_followups() {
 #[test]
 fn rpi_backdrop_override_is_bounded() {
     for value in [None, Some("0"), Some("NaN"), Some("193"), Some("-1")] {
-        assert_eq!(super::rpi_field_edge(value), 96);
+        assert_eq!(super::rpi_field_edge(value), 192);
     }
     for edge in [64, 96, 128, 192] {
         assert_eq!(super::rpi_field_edge(Some(&edge.to_string())), edge);

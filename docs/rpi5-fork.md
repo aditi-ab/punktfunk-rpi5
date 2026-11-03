@@ -132,15 +132,14 @@ Run parser regression tests with
 
 For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=1|2` selects the
 pending callback limit. The kiosk uses two; the generic presenter defaults to one.
-On Broadcom GPUs the animated background uses a 96-pixel shader target long edge;
+On Broadcom GPUs the animated background uses a 192-pixel shader target long edge;
 text, controls and transition layers retain the native viewport. For comparisons,
-`PUNKTFUNK_RPI_FIELD_EDGE=192` restores the earlier background target. Diagnostic
+`PUNKTFUNK_RPI_FIELD_EDGE=96` selects a smaller background target. Diagnostic
 values from 64 through 192 are accepted; invalid values use the default.
-Eight-bit menu transitions prepare their content layers before composing the
-background. This avoids repeatedly storing and loading the native target between
-layers. Group opacity, shadows and device-pixel coordinates are retained.
-`PUNKTFUNK_RPI_CONTENT_PREPASS=0` restores the earlier ordering for comparisons;
-HDR and surface-dependent rendering keep their existing path.
+Opaque SDR menus on Broadcom use an image transfer when source and output formats
+match. The producer must advertise transfer-source usage and a complete native
+frame. HDR, partial overlays and format changes retain the graphics pass.
+`PUNKTFUNK_RPI_MENU_COPY=0` selects the graphics pass for comparison.
 `PUNKTFUNK_RPI_DIRECT_TRANSFER=0` compares against the original planar-copy path.
 `PUNKTFUNK_RPI_DECODE_THREADS=2` tests overlapping decode and transfer. This can
 increase memory contention and reduce presentation throughput at high output

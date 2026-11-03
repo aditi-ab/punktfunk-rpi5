@@ -1135,8 +1135,69 @@ impl Presenter {
         vk::ImageLayout::TRANSFER_DST_OPTIMAL
     }
 
-    /// Blend `overlay` over `plan`'s swapchain image, which the overlay pass leaves ready to
-    /// present; without one, move the image from `swap_layout` to PRESENT_SRC. An HDR
+    /// Transfer native menu pixels without sampling or blending; restore Skia's layout.
+    ///
+    /// # Safety
+    /// The command buffer records after Skia's submit on this queue. `src` is a
+    /// single-sample TRANSFER_SRC image matching the acquired swapchain destination.
+    /// Both images remain live through this submission's fence; acquire waits include TRANSFER.
+    unsafe fn copy_menu(&self, src: vk::Image, dst: vk::Image, old: vk::ImageLayout) {
+        barrier(
+            &self.device,
+            self.cmd_buf,
+            src,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        barrier(
+            &self.device,
+            self.cmd_buf,
+            dst,
+            old,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        let layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .layer_count(1);
+        let region = vk::ImageCopy::default()
+            .src_subresource(layers)
+            .dst_subresource(layers)
+            .extent(vk::Extent3D {
+                width: self.targets.extent.width,
+                height: self.targets.extent.height,
+                depth: 1,
+            });
+        // SAFETY: the barriers establish transfer layouts; usage, size, format and
+        // lifetime follow this method's contract. The existing submit waits on acquire.
+        unsafe {
+            self.device.cmd_copy_image(
+                self.cmd_buf,
+                src,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+        }
+        barrier(
+            &self.device,
+            self.cmd_buf,
+            src,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+        barrier(
+            &self.device,
+            self.cmd_buf,
+            dst,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+        );
+    }
+
+    /// Copy a matching opaque SDR menu on Broadcom; otherwise blend the overlay.
+    /// Both paths leave the swapchain ready to present. Without an overlay, move
+    /// the image from `swap_layout` to PRESENT_SRC. An HDR
     /// switch swaps in a fresh overlay pipe and leaves the swapchain to
     /// `recreate_swapchain`, which keeps the old one while the window has no extent (a
     /// display-topology flip). Until that recreate lands the pipe has no framebuffers:
@@ -1163,6 +1224,20 @@ impl Presenter {
             );
             return;
         };
+        if self.copy_opaque_overlay
+            && plan.opaque_overlay
+            && !self.hdr_active
+            && o.copies_to(
+                self.targets.format.format,
+                self.targets.extent.width,
+                self.targets.extent.height,
+            )
+        {
+            // SAFETY: the frame is a matching transfer source, the acquired swapchain a
+            // transfer destination; both live until this submission's existing fence.
+            unsafe { self.copy_menu(o.image, swap_image, swap_layout) };
+            return;
+        }
         // Skia flushed on this queue: same-layout barrier is execution
         // + memory only (cross-submit visibility).
         barrier(

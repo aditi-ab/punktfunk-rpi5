@@ -26,12 +26,12 @@ use std::time::{Duration, Instant};
 /// An idle console redraws at most this often. 30 Hz keeps the aurora moving.
 const IDLE_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
-/// Bound diagnostic overrides to the supported low-cost backdrop sizes.
+/// Keep the measured 192-pixel default and bound diagnostic backdrop overrides.
 fn rpi_field_edge(value: Option<&str>) -> u16 {
     value
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|edge| (64..=192).contains(edge))
-        .unwrap_or(96)
+        .unwrap_or(192)
 }
 
 /// Long enough to read the exit hint; the last `BANNER_FADE_S` fade out.
@@ -48,12 +48,15 @@ struct Slot {
     height: u32,
     ten_bit: bool,
     opaque: bool,
+    transfer_src: bool,
 }
 
 impl Slot {
+    /// Publish the image's actual usage so the presenter can choose a safe transfer.
     fn frame(&self) -> OverlayFrame {
         OverlayFrame {
             opaque: self.opaque,
+            transfer_src: self.transfer_src,
             image: self.image,
             view: self.view,
             format: self.format,
@@ -228,10 +231,6 @@ impl Overlay for SkiaOverlay {
         {
             let edge = rpi_field_edge(std::env::var("PUNKTFUNK_RPI_FIELD_EDGE").ok().as_deref());
             shell.set_efficient_backdrop(f64::from(edge));
-            shell.content_prepass = std::env::var("PUNKTFUNK_RPI_CONTENT_PREPASS")
-                .ok()
-                .as_deref()
-                != Some("0");
             tracing::info!(
                 edge,
                 "Broadcom GPU: cached backdrop with native-resolution controls"
@@ -832,6 +831,10 @@ impl SkiaOverlay {
             )
         }
         .context("overlay image view")?;
+        let transfer_src =
+            image_info.image_usage_flags & avk::ImageUsageFlags::TRANSFER_SRC.as_raw() != 0
+                && image_info.sample_count == 1;
+        tracing::debug!(width, height, format = ?image_info.format, transfer_src, "console render target");
         self.slots[i] = Some(Slot {
             surface,
             image,
@@ -841,6 +844,7 @@ impl SkiaOverlay {
             height,
             ten_bit,
             opaque: false,
+            transfer_src,
         });
         Ok(())
     }
