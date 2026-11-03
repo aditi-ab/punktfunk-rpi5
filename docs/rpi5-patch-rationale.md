@@ -236,6 +236,18 @@ runtime bug patches:
 Documentation and repository-identification commits are intentionally omitted
 from that implementation table but remain visible in the base-to-tag Git log.
 
+## Broadcom rendering bandwidth
+
+Fractional video scaling uses bilinear sampling on Broadcom. Uncropped frames
+combine color conversion and scaling directly into the output; cropped frames
+use the existing bilinear blit. Output resolution, aspect ratio, and crop remain
+unchanged. Other GPUs retain the high-order filter ladder.
+
+The console omits progressive backdrop blur and scroll fade layers on Broadcom.
+Scroll contents remain clipped to their viewport, with text at native resolution.
+The kiosk selects an eight-bit SDR swapchain; HDR-to-SDR conversion remains a
+separate workload requiring physical performance checks.
+
 ## Kiosk integration
 
 The image builder in `packaging/rpi5/kiosk` supplies Weston, Vulkan, PipeWire,

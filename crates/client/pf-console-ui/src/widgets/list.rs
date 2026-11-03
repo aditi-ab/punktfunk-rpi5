@@ -477,9 +477,8 @@ pub fn bleed_view(canvas: &Canvas, ui: &Frame, rect: Rect) -> Rect {
     )
 }
 
-/// Paints a scroller through `paint` inside `view`, with soft edges where content hides
-/// past `rect`: `scrolled` is its offset and reach. A scroller at rest on its top keeps a
-/// crisp top; pinned text past it sits on the field, never on a row.
+/// Paints a scroller inside `view`. Bandwidth-limited GPUs clip without an offscreen;
+/// other devices fade content past `rect` according to its offset and reach.
 pub fn soft_scroll(
     canvas: &Canvas,
     ui: &Frame,
@@ -489,6 +488,13 @@ pub fn soft_scroll(
     k: f64,
     paint: impl FnOnce(),
 ) {
+    if ui.skip_backdrop_blur && !crate::blur::active(ui) {
+        canvas.save();
+        canvas.clip_rect(view, None, false);
+        paint();
+        canvas.restore();
+        return;
+    }
     let soft = (SOFT_EDGE * k) as f32;
     let above = (offset / soft).clamp(0.0, 1.0);
     let below = ((max - offset) / soft).clamp(0.0, 1.0);
@@ -1585,6 +1591,37 @@ fn chevron(canvas: &Canvas, ui: &Frame, x: f64, cy: f64, r: f64, left: bool, alp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bandwidth_limited_scroll_clips_without_a_fade() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((32, 32)).unwrap();
+        let ui = Frame {
+            skip_backdrop_blur: true,
+            ..Frame::default()
+        };
+        let view = Rect::from_xywh(4.0, 4.0, 24.0, 24.0);
+        let canvas = surface.canvas();
+        canvas.clear(skia_safe::Color::BLACK);
+        let saves = canvas.save_count();
+        soft_scroll(canvas, &ui, view, view, (50.0, 100.0), 1.0, || {
+            canvas.draw_rect(
+                Rect::from_wh(32.0, 32.0),
+                &crate::theme::fill(skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0)),
+            );
+        });
+        assert_eq!(canvas.save_count(), saves);
+        let bytes = read_back(&mut surface, 32, 32);
+        for y in 0..32 {
+            for x in 0..32 {
+                let want = if (4..28).contains(&x) && (4..28).contains(&y) {
+                    255
+                } else {
+                    0
+                };
+                assert_eq!(bytes[(y * 32 + x) * 4], want, "pixel {x},{y}");
+            }
+        }
+    }
 
     #[test]
     fn menu_list_moves_and_recoils() {

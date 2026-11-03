@@ -24,7 +24,9 @@ bundle, and [patch rationale](rpi5-patch-rationale.md) before updating the fork.
 - The kiosk starts Punktfunk directly under Weston, with PipeWire audio and a
   software cursor backend that avoids the observed Pi hardware-cursor crash.
 - The kiosk uses an eight-bit SDR swapchain. Broadcom menus omit progressive
-  backdrop blurs while retaining native-resolution text and controls.
+  backdrop blurs and scroll fade layers while retaining native-resolution text
+  and controls. Fractional video scaling uses bilinear sampling on Broadcom,
+  avoiding the floating-point intermediate and high-order filter passes.
 
 ## Build the portable bundle
 

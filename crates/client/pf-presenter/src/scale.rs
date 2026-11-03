@@ -61,6 +61,12 @@ pub fn needs_filter(p: &Placement) -> bool {
     !p.is_empty() && (fractional(p.kernel_x()) || fractional(p.kernel_y()))
 }
 
+/// Broadcom uses bilinear CSC or blits instead of the two-pass float intermediate.
+/// Placement stays unchanged, including native output size, aspect and crop.
+pub(crate) fn use_high_order_filter(p: &Placement, vendor_id: Option<u32>) -> bool {
+    vendor_id != Some(0x14e4) && needs_filter(p)
+}
+
 fn kernel_id(k: Kernel) -> i32 {
     match k {
         Kernel::Copy | Kernel::Nearest => 0,
@@ -416,6 +422,27 @@ mod tests {
     use punktfunk_core::video_fit::{place, VideoFit};
 
     type Px = [f32; 4];
+
+    #[test]
+    fn broadcom_fractional_scaling_keeps_placement_without_float_passes() {
+        for view in [(1920, 1080), (3840, 1600), (3840, 2160)] {
+            for fit in [VideoFit::Fit, VideoFit::Crop] {
+                let p = place(fit, view, (2560, 1440));
+                assert!(needs_filter(&p));
+                assert!(!use_high_order_filter(&p, Some(0x14e4)));
+                for vendor in [None, Some(0x8086), Some(0x1002), Some(0x10de)] {
+                    assert!(use_high_order_filter(&p, vendor));
+                }
+                assert!(p.dst_w <= view.0 && p.dst_h <= view.1);
+            }
+        }
+        for view in [(1920, 1080), (3840, 2160)] {
+            let p = place(VideoFit::Fit, view, (1920, 1080));
+            for vendor in [None, Some(0x14e4), Some(0x8086)] {
+                assert!(!use_high_order_filter(&p, vendor));
+            }
+        }
+    }
 
     /// `scale.frag`'s arithmetic on the CPU, pass for pass. Pixel centres sit at +0.5, as
     /// `gl_FragCoord` does.

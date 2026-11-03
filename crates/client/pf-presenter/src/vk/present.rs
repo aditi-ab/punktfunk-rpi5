@@ -190,6 +190,11 @@ impl Presenter {
             .placement_logged
             .is_none_or(|(_, w, h, was)| (w, h, was) != (width, height, path));
         self.placement_logged = Some(key);
+        let kernel = if path == "filtered" || !crate::scale::needs_filter(p) {
+            (p.kernel_x().name(), p.kernel_y().name())
+        } else {
+            ("bilinear", "bilinear")
+        };
         macro_rules! log_placement {
             ($level:ident) => {
                 tracing::$level!(
@@ -200,7 +205,7 @@ impl Presenter {
                     dst = ?(p.dst_x, p.dst_y, p.dst_w, p.dst_h),
                     src = ?(p.src_x, p.src_y, p.src_w, p.src_h),
                     scale = ?(p.scale_x, p.scale_y),
-                    kernel = ?(p.kernel_x().name(), p.kernel_y().name()),
+                    kernel = ?kernel,
                     "video placement"
                 )
             };
@@ -506,13 +511,11 @@ impl Presenter {
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 
-    /// Where the picture lands on swapchain image `index` and which path draws it. A
-    /// fractional scale goes through the filter ladder (`scale.rs`); whole-number scales
-    /// blit exactly. Both shader paths draw through the overlay's framebuffers, so those
-    /// must exist. Direct CSC into the swapchain image takes the whole picture at an exact
-    /// scale, from a lane that samples on this device; everything else takes the video
-    /// image. A real frame from the CPU planes records what it drew direct for the next
-    /// `Redraw`; a hardware frame carries that into `park`.
+    /// Place the picture on swapchain image `index`. Fractional scales use the device's
+    /// filter policy; exact scales bypass it. Direct CSC draws an uncropped picture into
+    /// the overlay framebuffer, including the bilinear fallback. Other paths retain a
+    /// video image. CPU planes record their direct draw for `Redraw`; hardware frames
+    /// carry it into `park`.
     fn plan(&mut self, lane: &Lane, index: u32) -> Result<FramePlan> {
         let redraw = matches!(lane, Lane::Redraw);
         #[cfg(windows)]
@@ -533,7 +536,14 @@ impl Presenter {
             .filter(|p| !p.is_empty());
         let targets_ready = self.targets.overlay.framebuffers.len() == self.targets.images.len();
         let filtered = match (placement, &self.video) {
-            (Some(p), Some(v)) if !from_slot && targets_ready && crate::scale::needs_filter(&p) => {
+            (Some(p), Some(v))
+                if !from_slot
+                    && targets_ready
+                    && crate::scale::use_high_order_filter(
+                        &p,
+                        self.video_export.as_ref().map(|v| v.vendor_id),
+                    ) =>
+            {
                 self.scale
                     .prepare(&self.device, &self.mem_props, v.height, &p, v.view)?;
                 Some(p)
