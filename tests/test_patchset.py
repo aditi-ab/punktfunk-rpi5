@@ -32,6 +32,7 @@ class PatchsetTests(unittest.TestCase):
         (self.source / 'delete.txt').unlink()
         (self.source / 'backend.so').write_bytes(bytes(range(256)))
         (self.source / 'new.sh').write_text('#!/bin/sh\nexit 0\n')
+        (self.source / 'new.sh').chmod(0o755)
         p.git(self.source, 'add', '.')
         p.git(self.source, 'update-index', '--chmod=+x', 'new.sh')
         self.commit('fork')
