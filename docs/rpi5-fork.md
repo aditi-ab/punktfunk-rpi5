@@ -15,10 +15,14 @@ bundle, and [patch rationale](rpi5-patch-rationale.md) before updating the fork.
   Ten-bit decode output is rounded to eight bits; this is not HDR presentation.
   The kiosk selects this Pi-tested path explicitly; upstream's native V4L2
   backend remains available without replacing it.
+  Two decode threads overlap hardware work with pixel transfer. Each output
+  retains its input timestamps and recovery flags across the buffered frames.
 - Wayland compositor callbacks pace presentation. Swapchain recreation handles
   updated compositor feedback, and overlay damage limits unnecessary GPU work.
   The kiosk permits two pending callbacks and uses arrival-driven latency mode,
   avoiding a second pacing clock on top of the compositor.
+  Animated menus fill available callback slots without an extra timer delay;
+  unchanged idle frames keep their existing wait.
 - Audio reconciliation discards delayed packets whose timeline positions already
   played through packet-loss concealment.
 - The native console manages Bluetooth devices through BlueZ; see
@@ -102,6 +106,7 @@ creating a device. Scroll tests alternate up/down every three seconds.
 For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=1|2` selects the
 pending callback limit. The kiosk uses two; the generic presenter defaults to one.
 `PUNKTFUNK_RPI_DIRECT_TRANSFER=0` compares against the original planar-copy path.
+`PUNKTFUNK_RPI_DECODE_THREADS=1` compares against synchronous hardware decoding.
 The decoder's DEBUG timing separates codec work, SAND transfer and pixel copying
 from the pre-decode queue delay included in streaming statistics.
 

@@ -105,6 +105,8 @@ git -C "${ffmpeg_source}" checkout --detach "${ffmpeg_ref}"
     cargo_release test --locked --release -p pf-client-core -p pf-client-video -p pf-console-ui -p pf-presenter \
         --no-default-features \
         --features pf-presenter/rpi5-v4l2-request,pf-console-ui/vulkan-overlay --lib
+    cargo_release test --locked --release -p punktfunk-core \
+        --no-default-features --features quic --lib delayed_recovery_tests
 )
 
 install -m 0755 "${target_dir}/release/punktfunk" "${bundle}/punktfunk"

@@ -70,6 +70,12 @@ The decoder validates the resulting planes and falls back to the original path
 if the transfer fails. Ten-bit frames use NEON rounded narrowing into the final
 packed buffer, preserving the original pixel values without intermediate planes.
 
+Two FFmpeg frame threads allow hardware decoding to overlap CPU transfer. Input
+tokens retain each picture's timestamps, flags and recovery generation; a bounded
+ledger prevents metadata from silently drifting between pictures. Idle draining
+waits for a real input pause, and recovery checks reject old delayed pictures
+under the same lock that processes new loss events.
+
 Primary implementation files are
 [`video_v4l2_request.rs`](../crates/client/pf-client-video/src/video_v4l2_request.rs),
 [`video_ladder.rs`](../crates/client/pf-client-video/src/video_ladder.rs), and
