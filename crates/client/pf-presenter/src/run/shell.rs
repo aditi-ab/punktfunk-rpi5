@@ -411,14 +411,15 @@ impl Shell {
     /// Present the overlay alone when no video frame carried it: every pass across a
     /// resize scrim (the host's rebuild gap), and once per change while browsing or
     /// after a mid-stream picture has gone still. An idle console hands back the same
-    /// image, so browsing presents only what the overlay re-rendered.
+    /// image, so browsing presents only what the overlay re-rendered. True means a
+    /// changed browse frame was shown and consumed callback credit.
     pub(super) fn present_overlay_alone(
         &mut self,
         stream: &Option<StreamState>,
         presented_video: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if !self.presenter.compositor_frame_ready() {
-            return Ok(());
+            return Ok(false);
         }
         let resize_scrim = stream.as_ref().is_some_and(|s| s.resize_overlay.active());
         let browse_idle = self.browse && stream.as_ref().is_none_or(|s| s.connector.is_none());
@@ -433,13 +434,18 @@ impl Shell {
             if browse_idle {
                 self.presenter.leave_hdr(&self.window)?;
             }
-            self.presenter.present(
+            let credit = self.presenter.compositor_frame_credit();
+            let shown = self.presenter.present(
                 &self.window,
                 FrameInput::Redraw,
                 self.overlay_frame.as_ref(),
             )?;
+            let remaining = self.presenter.compositor_frame_credit();
+            return Ok(browse_changed
+                && matches!(shown, Presented::Shown)
+                && consumed_compositor_credit(credit, remaining));
         }
-        Ok(())
+        Ok(false)
     }
 }
 

@@ -133,3 +133,18 @@ fn empty_or_offscreen_chrome_has_no_render_area() {
         assert_eq!(damage.finish().1, 0);
     }
 }
+
+#[test]
+fn console_redraw_deadline_stops_idle_followups() {
+    assert!(console_redraw_due(true, false, Some(Duration::ZERO)));
+    assert!(console_redraw_due(true, true, None));
+    assert!(!console_redraw_due(
+        true,
+        true,
+        Some(IDLE_FRAME - Duration::from_nanos(1))
+    ));
+    assert!(console_redraw_due(true, true, Some(IDLE_FRAME)));
+    // A freshly rendered idle frame resets its deadline, even with spare credit.
+    assert!(!console_redraw_due(true, true, Some(Duration::ZERO)));
+    assert!(!console_redraw_due(false, false, None));
+}

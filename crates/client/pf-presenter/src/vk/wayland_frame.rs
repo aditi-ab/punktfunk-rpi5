@@ -67,8 +67,15 @@ impl<T: Copy + Eq> PendingCallbacks<T> {
         }
     }
 
+    fn available(&self) -> usize {
+        self.slots[..self.depth]
+            .iter()
+            .filter(|slot| slot.is_none())
+            .count()
+    }
+
     fn ready(&self) -> bool {
-        self.slots[..self.depth].iter().any(Option::is_none)
+        self.available() > 0
     }
 
     fn insert(&mut self, callback: T) -> bool {
@@ -140,6 +147,10 @@ impl WaylandFramePacer {
 
     pub(super) fn ready(&self) -> bool {
         self.pending.lock().unwrap().ready()
+    }
+
+    pub(super) fn available(&self) -> usize {
+        self.pending.lock().unwrap().available()
     }
 
     pub(super) fn set_wake(&self, wake: Box<dyn Fn() + Send>) {
@@ -233,6 +244,21 @@ impl Drop for WaylandFramePacer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn available_credit_follows_each_callback() {
+        let mut pending = super::PendingCallbacks::new(2);
+        assert_eq!(pending.available(), 2);
+        assert!(pending.insert(1));
+        assert!(pending.insert(2));
+        assert_eq!(pending.available(), 0);
+        assert!(pending.complete(1));
+        assert_eq!(pending.available(), 1);
+        assert!(!pending.complete(1));
+        assert_eq!(pending.available(), 1);
+        assert!(pending.insert(3));
+        assert_eq!(pending.available(), 0);
+    }
+
     use super::*;
 
     #[test]

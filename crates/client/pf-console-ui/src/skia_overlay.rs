@@ -431,6 +431,14 @@ impl Overlay for SkiaOverlay {
         }
     }
 
+    fn redraw_due(&self) -> bool {
+        console_redraw_due(
+            self.console_visible(),
+            self.shell.as_ref().is_some_and(Shell::idle),
+            self.console_at.map(|at| at.elapsed()),
+        )
+    }
+
     fn frame(&mut self, ctx: &FrameCtx) -> Result<Option<OverlayFrame>> {
         // The window may have moved to another display since the last frame.
         if let Some(shell) = &mut self.shell {
@@ -439,8 +447,7 @@ impl Overlay for SkiaOverlay {
         // Full-screen and opaque; the aurora animates every frame. Idle, the slot on glass
         // is handed back until `IDLE_FRAME` passes, and the presenter skips its present.
         if self.console_visible() {
-            let idle = self.shell.as_ref().is_some_and(Shell::idle)
-                && self.console_at.is_some_and(|t| t.elapsed() < IDLE_FRAME);
+            let idle = !self.redraw_due();
             if let Some(slot) = self.slots[self.current].as_ref().filter(|s| {
                 idle && s.opaque
                     && (s.width, s.height, s.ten_bit) == (ctx.width, ctx.height, ctx.ten_bit)
@@ -692,6 +699,10 @@ impl Overlay for SkiaOverlay {
             ..self.slots[next].as_ref().expect("just rendered").frame()
         }))
     }
+}
+
+fn console_redraw_due(visible: bool, idle: bool, age: Option<Duration>) -> bool {
+    visible && (!idle || age.is_none_or(|age| age >= IDLE_FRAME))
 }
 
 /// Seconds since the ring last drew (spring clock). Cap so a paused loop does not snap.

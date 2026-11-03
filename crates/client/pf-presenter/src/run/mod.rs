@@ -503,6 +503,22 @@ fn wait_event(pump: &mut sdl3::EventPump, timeout: Duration) -> Option<Event> {
     pump.wait_event_timeout(timeout)
 }
 
+fn consumed_compositor_credit(before: Option<usize>, after: Option<usize>) -> bool {
+    before
+        .zip(after)
+        .is_some_and(|(before, after)| after < before)
+}
+
+/// Fill spare compositor credit only after a changed frame consumed one slot.
+fn immediate_browse_redraw(
+    last_changed_shown: bool,
+    browse: bool,
+    compositor_credit: Option<usize>,
+    redraw_due: bool,
+) -> bool {
+    last_changed_shown && browse && redraw_due && compositor_credit.is_some_and(|credit| credit > 0)
+}
+
 fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
     let mut sh = Shell::open(opts, matches!(mode, ModeCtl::Browse(_)))?;
     let mut stream: Option<StreamState> = match &mut mode {
@@ -521,13 +537,24 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
         ModeCtl::Browse(_) => None,
     };
 
+    let mut browse_followup = false;
     // A closure, so an error exit (device lost, a failed resize) still reaches the teardown.
     let outcome = (|| -> Result<Outcome> {
         Ok('main: loop {
-            // Block in SDL's wait: input/window events and decoded frames (FrameWake) all
-            // land in this queue. The timeout only bounds stop-flag/pump-tick latency.
-            // Smoothness tightens it to the next latch-slot deadline.
-            let timeout = if sh.presenter.compositor_frame_ready() {
+            // Poll while a changed console frame has spare callback credit; otherwise
+            // wait for input, frame wakes or the next paced deadline. An unchanged or
+            // unarmed present ends the immediate sequence.
+            let immediate = immediate_browse_redraw(
+                std::mem::take(&mut browse_followup),
+                sh.browse && stream.is_none(),
+                sh.presenter.compositor_frame_credit(),
+                sh.overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.redraw_due()),
+            );
+            let timeout = if immediate {
+                Duration::ZERO
+            } else if sh.presenter.compositor_frame_ready() {
                 stream
                     .as_ref()
                     .map_or(Duration::from_millis(15), |st| st.wake_timeout())
@@ -591,7 +618,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
                 sh.screens_tick(st);
             }
 
-            sh.present_overlay_alone(&stream, presented_video)?;
+            browse_followup = sh.present_overlay_alone(&stream, presented_video)?;
         })
     })();
 
@@ -655,6 +682,51 @@ fn in_gamescope() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn burst_is_bounded_by_callback_budget() {
+        let mut credit = 2;
+        let mut burst = 0;
+        while immediate_browse_redraw(true, true, Some(credit), true) {
+            credit -= 1;
+            burst += 1;
+        }
+        assert_eq!(burst, 2);
+        // One completion releases exactly one extra submit, never a fresh depth-two burst.
+        credit += 1;
+        assert!(immediate_browse_redraw(true, true, Some(credit), true));
+        credit -= 1;
+        assert!(!immediate_browse_redraw(true, true, Some(credit), true));
+    }
+    #[test]
+    fn idle_slot_and_failed_present_stop_followups() {
+        assert!(!immediate_browse_redraw(true, true, Some(2), false));
+        // An expired idle timer permits one new frame; painting it resets the timer.
+        assert!(immediate_browse_redraw(true, true, Some(2), true));
+        assert!(!immediate_browse_redraw(true, true, Some(1), false));
+        // A stale/minimized attempt does not consume a callback but must end the burst.
+        assert!(!immediate_browse_redraw(false, true, Some(2), true));
+    }
+    #[test]
+    fn unpaced_and_streaming_paths_cannot_spin() {
+        assert!(!immediate_browse_redraw(true, true, None, true));
+        assert!(!immediate_browse_redraw(true, false, Some(2), true));
+        assert!(!immediate_browse_redraw(false, true, Some(2), true));
+    }
+
+    #[test]
+    fn failed_callback_arming_cannot_start_an_immediate_loop() {
+        for (before, after) in [(Some(2), Some(2)), (None, None), (Some(2), None)] {
+            assert!(!immediate_browse_redraw(
+                consumed_compositor_credit(before, after),
+                true,
+                after,
+                true,
+            ));
+        }
+        assert!(consumed_compositor_credit(Some(2), Some(1)));
+        assert!(consumed_compositor_credit(Some(1), Some(0)));
+    }
 
     /// KDE fractional scaling advertises points; "Native" must recover the panel pixels.
     #[test]

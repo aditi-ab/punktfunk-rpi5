@@ -155,6 +155,11 @@ pub trait Overlay {
         false
     }
 
+    /// A fresh console image can be drawn now; cached idle frames return false.
+    fn redraw_due(&self) -> bool {
+        false
+    }
+
     /// Once per presenter iteration. Re-render (flush + `SHADER_READ_ONLY`) only
     /// on content or size change. The returned image stays untouched until the
     /// next `frame()` — one frame in flight; a ring of two is enough.

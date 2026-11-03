@@ -366,6 +366,10 @@ mod presenter {
             vk_or!(self, p => p.compositor_frame_ready(), true)
         }
 
+        pub(crate) fn compositor_frame_credit(&self) -> Option<usize> {
+            vk_or!(self, p => p.compositor_frame_credit(), None)
+        }
+
         #[cfg(target_os = "linux")]
         pub(crate) fn set_compositor_wake(&self, cb: Box<dyn Fn() + Send>) {
             each!(self, p => p.set_compositor_wake(cb))

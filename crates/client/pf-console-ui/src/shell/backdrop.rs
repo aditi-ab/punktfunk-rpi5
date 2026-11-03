@@ -201,6 +201,10 @@ impl Backdrop {
         }
         match cache {
             Some(c) => {
+                // The field shader writes alpha 1 everywhere; replace the old background
+                // without loading it for a full-surface SrcOver blend.
+                let mut paint = crate::theme::shaded();
+                paint.set_blend_mode(skia_safe::BlendMode::Src);
                 canvas.draw_image_rect_with_sampling_options(
                     c.surface.image_snapshot(),
                     None,
@@ -209,7 +213,7 @@ impl Backdrop {
                         skia_safe::FilterMode::Linear,
                         skia_safe::MipmapMode::None,
                     ),
-                    &crate::theme::shaded(),
+                    &paint,
                 );
             }
             // Stale with nothing cached means the shader rejected — the direct path's
@@ -291,4 +295,57 @@ fn compile_mesh(
         [ink.scrim.r, ink.scrim.g, ink.scrim.b, ink.scrim.a],
         ink,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opaque_field_replacement_matches_src_over_pixel_for_pixel() {
+        let (w, h) = (384, 160);
+        let info = skia_safe::ImageInfo::new(
+            (w, h),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        for palette in ["violet", "paper"] {
+            let backdrop = Backdrop::new(palette, 0.0).unwrap();
+            for calm in [0.0, 1.0] {
+                let mut actual = skia_safe::surfaces::raster(&info, None, None).unwrap();
+                let mut reference = skia_safe::surfaces::raster(&info, None, None).unwrap();
+                let previous = Color4f::new(0.7, 0.1, 0.4, 0.5);
+                actual.canvas().clear(previous);
+                reference.canvas().clear(previous);
+                backdrop.draw(actual.canvas(), w as f64, h as f64, 1.0, calm, true);
+                let image = backdrop
+                    .field
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .surface
+                    .image_snapshot();
+                reference.canvas().draw_image_rect_with_sampling_options(
+                    image,
+                    None,
+                    Rect::from_wh(w as f32, h as f32),
+                    skia_safe::SamplingOptions::new(
+                        skia_safe::FilterMode::Linear,
+                        skia_safe::MipmapMode::None,
+                    ),
+                    &crate::theme::shaded(),
+                );
+                let mut a = vec![0; (w * h * 4) as usize];
+                let mut b = a.clone();
+                assert!(actual.read_pixels(&info, &mut a, (w * 4) as usize, (0, 0)));
+                assert!(reference.read_pixels(&info, &mut b, (w * 4) as usize, (0, 0)));
+                assert!(
+                    a == b,
+                    "{palette} calm={calm}: replacing the background changed pixels"
+                );
+                assert!(a.chunks_exact(4).all(|p| p[3] == 255));
+            }
+        }
+    }
 }

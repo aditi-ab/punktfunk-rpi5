@@ -1216,6 +1216,15 @@ impl Presenter {
         true
     }
 
+    /// Remaining callback slots; no pacer is distinct from an open budget.
+    pub(crate) fn compositor_frame_credit(&self) -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        if let Some(pacer) = &self.wayland_frame {
+            return Some(pacer.available());
+        }
+        None
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn set_compositor_wake(&self, cb: Box<dyn Fn() + Send>) {
         if let Some(pacer) = &self.wayland_frame {
