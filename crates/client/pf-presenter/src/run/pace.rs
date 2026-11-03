@@ -182,8 +182,7 @@ impl Shell {
         st.win.start = Instant::now();
         // Under MAILBOX a missed latch leaves no stamp: the successor replaces the frame and
         // the engine reports it unshown. Both feed the margin, for either intent on a grid.
-        let on_grid =
-            (st.store.is_smoothing() || st.pacer.paces_latency()) && !st.pacer.free_running();
+        let on_grid = st.pacer.uses_latch_grid(st.store.is_smoothing());
         // From a settled window only: a stream still ramping, or arrival jitter past an
         // eighth of a period, misses latches for reasons of its own and would widen the
         // margin to its cap in the first seconds of every session.
@@ -367,7 +366,11 @@ impl StreamState {
             }
         }
         if !estimated {
-            self.clock.note_batch(&stamps, self.store.is_smoothing());
+            // Both fixed-grid intents choose their own spacing; missed slots are not refresh.
+            self.clock.note_batch(
+                &stamps,
+                self.pacer.uses_latch_grid(self.store.is_smoothing()),
+            );
         }
         // VRR probe: healthy-window stamps only, against the display mode's period (the
         // learned one adopts a slow stream's cadence as "the grid").

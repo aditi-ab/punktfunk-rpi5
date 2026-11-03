@@ -595,6 +595,11 @@ impl SourcePacer {
         matches!(self.mode, PaceMode::VrrLatency | PaceMode::GridLatency)
     }
 
+    /// These presents use latch slots, so skipped slots cannot measure a slower panel.
+    pub(crate) fn uses_latch_grid(&self, smoothing: bool) -> bool {
+        (smoothing || self.paces_latency()) && !self.free_running()
+    }
+
     /// Re-anchor on the next frame (display change, accepted mode switch). Measured
     /// jitter survives: it describes the link, not the stream.
     pub(crate) fn reset(&mut self) {
@@ -923,6 +928,34 @@ mod tests {
             "single-stamp batches must still feed the grid learner"
         );
         assert_eq!(c.anchor_ns(), t);
+    }
+
+    #[test]
+    fn fixed_latency_skipped_slots_do_not_teach_half_refresh() {
+        const PERIOD: u64 = 16_666_666;
+        for smoothing in [false, true] {
+            let mut pacer = SourcePacer::new(true, true);
+            pacer.follow(Cadence::Fixed, true, smoothing);
+            let mut clock = LatchClock::new(60);
+            let mut t = 1_000_000_000;
+            for spacing in [2 * PERIOD, PERIOD, 2 * PERIOD] {
+                for _ in 0..GRID_OBSERVE_EVERY * 10 {
+                    t += spacing;
+                    clock.note_batch(&[t], pacer.uses_latch_grid(smoothing));
+                }
+                assert_eq!(clock.period_ns(), PERIOD);
+            }
+            pacer.follow(Cadence::Variable, true, smoothing);
+            for _ in 0..GRID_OBSERVE_EVERY * 10 {
+                t += 2 * PERIOD;
+                clock.note_batch(&[t], pacer.uses_latch_grid(smoothing));
+            }
+            assert_eq!(
+                clock.period_ns(),
+                2 * PERIOD,
+                "free-running stamps still learn"
+            );
+        }
     }
 
     /// A Deck set to 60 Hz still claims its 90 Hz panel. The first batch off the claim's
