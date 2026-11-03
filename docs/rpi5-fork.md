@@ -24,6 +24,8 @@ bundle, and [patch rationale](rpi5-patch-rationale.md) before updating the fork.
   avoiding a second pacing clock on top of the compositor.
   Animated menus use native refresh deadlines that include rendering time;
   early input wakes do not submit extra frames, and idle frames keep their wait.
+  Page transitions keep title and hint fades within their screen bands. Spring
+  animation time follows elapsed time even when rendering falls below 20 FPS.
 - Audio reconciliation discards delayed packets whose timeline positions already
   played through packet-loss concealment.
 - The native console manages Bluetooth devices through BlueZ; see
@@ -95,6 +97,7 @@ is installed.
 sudo python3 rpi5-ui-probe.py shortcut disconnect
 sudo python3 rpi5-ui-probe.py tap down --count 2
 sudo python3 rpi5-ui-probe.py scroll --seconds 20
+sudo python3 rpi5-ui-probe.py tabs --seconds 20
 sudo python3 rpi5-ui-probe.py shortcut stats
 ```
 
@@ -103,6 +106,7 @@ ordinary keys go to the host. `disconnect`, `stats`, and `ring` use Punktfunk's
 existing Ctrl+Alt+Shift shortcuts. `--dry-run` prints the requested action without
 creating a device. Scroll tests alternate up/down every three seconds.
 `tap pageup` and `tap pagedown` switch the console's tabs.
+`tabs` alternates those keys to measure page transitions separately from scrolling.
 
 For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=1|2` selects the
 pending callback limit. The kiosk uses two; the generic presenter defaults to one.

@@ -26,10 +26,12 @@ def arguments():
     shortcut.add_argument("key", choices=SHORTCUTS)
     scroll = commands.add_parser("scroll")
     scroll.add_argument("--seconds", type=float, default=20)
+    tabs = commands.add_parser("tabs", help="Alternate page tabs to exercise transitions")
+    tabs.add_argument("--seconds", type=float, default=20)
     args = parser.parse_args()
     if args.action == "tap" and not 1 <= args.count <= 100:
         parser.error("count must be between 1 and 100")
-    if args.action == "scroll" and not 0 < args.seconds <= 60:
+    if args.action in ("scroll", "tabs") and not 0 < args.seconds <= 60:
         parser.error("seconds must be between 0 and 60")
     return args
 
@@ -95,6 +97,13 @@ def main():
             for _ in range(args.count):
                 keyboard.tap(KEYS[args.key])
                 time.sleep(0.15)
+        elif args.action == "tabs":
+            started = time.monotonic()
+            step = 0
+            while time.monotonic() - started < args.seconds:
+                keyboard.tap(KEYS["pagedown" if step % 2 == 0 else "pageup"])
+                step += 1
+                time.sleep(0.54)
         else:
             started = time.monotonic()
             while time.monotonic() - started < args.seconds:

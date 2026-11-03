@@ -23,6 +23,11 @@ use crate::glyphs::{Hint, HintKey, HINT_PAD};
 const STRIP_TOP: f64 = 32.0;
 const STRIP_H: f64 = 36.0;
 
+/// Springs substep internally; only long pauses limit elapsed animation time.
+fn animation_dt(elapsed: f64) -> f64 {
+    elapsed.clamp(0.0, 0.25)
+}
+
 impl Shell {
     #[allow(clippy::too_many_arguments)]
     /// Test helper: no insets, default scale. Hosts call [`Self::render_in`].
@@ -63,7 +68,7 @@ impl Shell {
         let dt = self
             .last_frame
             .replace(now)
-            .map_or(1.0 / 60.0, |t| (now - t).as_secs_f64().clamp(0.0, 0.05));
+            .map_or(1.0 / 60.0, |t| animation_dt((now - t).as_secs_f64()));
         #[cfg(test)]
         let dt = match self.fake_clock.as_mut() {
             Some((t, step)) => {
@@ -457,18 +462,31 @@ struct LayerEnv<'a> {
     root_targets: Option<usize>,
 }
 
-/// Opens a draw at `alpha`: a layer when faded, a plain save when whole. False, and
-/// nothing opened, when there is nothing to see; the caller restores only on true.
-fn open_at(canvas: &Canvas, alpha: f64) -> bool {
+/// Opens a bounded fade or a plain save. Invisible content opens neither;
+/// the caller restores only on true. Unknown bounds preserve the canvas clip.
+fn open_at(canvas: &Canvas, alpha: f64, bounds: Option<Rect>) -> bool {
     if alpha < 0.001 {
         return false;
     }
     if alpha < 0.999 {
-        crate::theme::save_layer_alpha(canvas, None, alpha as f32);
+        crate::theme::save_layer_alpha(canvas, bounds, alpha as f32);
     } else {
         canvas.save();
     }
     true
+}
+
+/// Full-width chrome bands retain the safe-area margins and the legend's panel edges.
+fn chrome_bands(edges: Rect, h: f64, k: f64) -> (Rect, Rect) {
+    (
+        Rect::from_ltrb(edges.left, edges.top, edges.right, (TOP_BAND * k) as f32),
+        Rect::from_ltrb(
+            edges.left,
+            (h - BOTTOM_BAND * k) as f32,
+            edges.right,
+            edges.bottom,
+        ),
+    )
 }
 
 impl LayerEnv<'_> {
@@ -579,15 +597,16 @@ impl LayerEnv<'_> {
         }
     }
 
-    /// The band and legend over every layer, drawn after content so a list scrolls up
-    /// under them. The strip's strength is the sum of the layers asking for it, so two
-    /// roots crossing hold it at full. Returns the last legend's hit-boxes.
+    /// Stationary chrome over the content. Titles and legends fade within their bands;
+    /// pinned recordings and the focus plate retain the full clip for their effects.
+    /// Crossing roots share one full-strength strip. Returns the last legend's hit-boxes.
     fn chrome(&mut self, layers: &[Chrome]) -> Vec<(HintKey, Rect)> {
         let canvas = self.canvas;
         // Trays out to the screen's edges, past the safe area, behind the band and legend,
         // reaching in as far as the screens' own pinned chrome: one ramp, never two stacked.
         let (k, content) = (self.k, self.content);
         let edges = canvas.local_clip_bounds().unwrap_or(content);
+        let (title_bounds, hint_bounds) = chrome_bands(edges, self.h, k);
         let (into_top, into_bottom) = tray_reach(layers);
         let top = Rect::from_ltrb(edges.left, edges.top, edges.right, content.top + into_top);
         tray(canvas, self.ui, top, Toward::Top, k);
@@ -598,7 +617,7 @@ impl LayerEnv<'_> {
             let Some(pic) = &c.pinned_pic else {
                 continue;
             };
-            if open_at(canvas, c.alpha) {
+            if open_at(canvas, c.alpha, None) {
                 // Recorded in device space (`paint`).
                 canvas.reset_matrix();
                 canvas.draw_picture(pic, None, None);
@@ -610,7 +629,7 @@ impl LayerEnv<'_> {
             .filter(|c| c.band == Band::Strip)
             .map(|c| c.alpha)
             .sum();
-        if open_at(canvas, strip.min(1.0)) {
+        if open_at(canvas, strip.min(1.0), None) {
             self.draw_strip(canvas);
             canvas.restore();
         }
@@ -618,7 +637,7 @@ impl LayerEnv<'_> {
             let Some(title) = c.title.as_deref() else {
                 continue;
             };
-            if open_at(canvas, c.alpha) {
+            if open_at(canvas, c.alpha, Some(title_bounds)) {
                 let k = self.k;
                 let (x, top) = (self.ui.edge(k), 18.0 * k);
                 let size = 30.0 * k;
@@ -637,7 +656,7 @@ impl LayerEnv<'_> {
         }
         let mut rects = Vec::new();
         for c in layers.iter().filter(|c| !c.hints.is_empty()) {
-            if open_at(canvas, c.alpha) {
+            if open_at(canvas, c.alpha, Some(hint_bounds)) {
                 let (k, glyphs) = (self.k, self.glyphs);
                 let (x, bottom) = (self.ui.edge(k) - HINT_PAD * k, self.h - 18.0 * k);
                 let bar = hint_bar(canvas, self.ui, self.fonts, &c.hints, glyphs, x, bottom, k);
@@ -768,6 +787,89 @@ mod glyph_style_tests {
             glyph_style(Some(InputSource::Pad), None, Platform::Android),
             GlyphStyle::Remote
         );
+    }
+}
+
+#[cfg(test)]
+mod chrome_layer_tests {
+    use super::*;
+
+    #[test]
+    fn navigation_keeps_wall_time_at_low_render_rates() {
+        for fps in [5, 10, 15, 60, 120] {
+            let dt = 1.0 / f64::from(fps);
+            let mut spring = crate::anim::Spring::rest(0.0);
+            let mut elapsed = 0.0;
+            while spring.pos < 0.95 && elapsed < 2.0 {
+                spring.step_spec(1.0, crate::anim::springs::NAV, animation_dt(dt));
+                elapsed += dt;
+            }
+            assert!(
+                elapsed <= 0.3 + dt,
+                "navigation slowed at {fps} fps: {elapsed}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_title_and_hint_fades_preserve_pixels_with_insets() {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut ui = Frame::default();
+        ui.skip_backdrop_blur = true;
+        let hints = [
+            Hint::new(HintKey::Confirm, "Choose"),
+            Hint::new(HintKey::Back, "Back"),
+        ];
+        for (width, height) in [(960, 540), (1920, 800)] {
+            let k = f64::from(height) / 800.0;
+            let h = f64::from(height - 34);
+            for style in [GlyphStyle::Keyboard, GlyphStyle::Shapes] {
+                let pixels = |bounded: bool| {
+                    let mut surface =
+                        skia_safe::surfaces::raster_n32_premul((width, height)).unwrap();
+                    let canvas = surface.canvas();
+                    canvas.clear(skia_safe::Color::from_rgb(29, 41, 58));
+                    canvas.translate((23.0, 17.0));
+                    let edges = canvas.local_clip_bounds().unwrap();
+                    let (title, legend) = chrome_bands(edges, h, k);
+                    fonts.begin_frame();
+                    assert!(open_at(canvas, 0.37, bounded.then_some(title)));
+                    fonts.heading(
+                        canvas,
+                        "Settings and connected devices",
+                        W::Bold,
+                        30.0 * k,
+                        ui.fg(1.0),
+                        ui.edge(k),
+                        18.0 * k,
+                        f64::from(width) * 0.6,
+                    );
+                    canvas.restore();
+                    assert!(open_at(canvas, 0.63, bounded.then_some(legend)));
+                    hint_bar(
+                        canvas,
+                        &ui,
+                        &fonts,
+                        &hints,
+                        style,
+                        ui.edge(k) - HINT_PAD * k,
+                        h - 18.0 * k,
+                        k,
+                    );
+                    canvas.restore();
+                    let info = skia_safe::ImageInfo::new(
+                        (width, height),
+                        skia_safe::ColorType::RGBA8888,
+                        skia_safe::AlphaType::Premul,
+                        None,
+                    );
+                    let mut pixels = vec![0; (width * height * 4) as usize];
+                    assert!(surface.read_pixels(&info, &mut pixels, (width * 4) as usize, (0, 0)));
+                    pixels
+                };
+                assert!(pixels(true) == pixels(false), "chrome bounds change pixels");
+            }
+        }
     }
 }
 
