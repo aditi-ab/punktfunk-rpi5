@@ -110,6 +110,26 @@ creating a device. Scroll tests alternate up/down every three seconds.
 `tap pageup` and `tap pagedown` switch the console's tabs.
 `tabs` alternates those keys to measure page transitions separately from scrolling.
 
+For repeatable cadence measurements, place `tools/rpi5-frame-check.py` beside the
+probe on the Pi. After confirming that the console menu is open, run:
+
+```sh
+sudo python3 rpi5-frame-check.py menu.trace --capture --tabs --seconds 20
+python3 rpi5-frame-check.py menu.trace --min-transition-fps 30
+```
+
+Capture uses a private tracing instance and removes it afterwards. Output paths
+must be new. Omit `--tabs` for passive delivery measurements without input.
+The JSON separates whole-capture cadence from the first 300 ms of each tab switch,
+with frame intervals and transition stalls. Select `--crtc` for multiple displays.
+Overflow, interrupted captures and partial transitions fail instead of producing
+a passing result. Set thresholds from a matching display mode and software build.
+DRM deliveries measure display cadence, not proof that each frame has new content.
+The optional threshold exits nonzero for low cadence or absent transition markers.
+
+Run parser regression tests with
+`python3 -m unittest discover -s tools -p test_rpi5_frame_check.py -v`.
+
 For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=1|2` selects the
 pending callback limit. The kiosk uses two; the generic presenter defaults to one.
 `PUNKTFUNK_RPI_DIRECT_TRANSFER=0` compares against the original planar-copy path.

@@ -1,0 +1,19 @@
+name: Raspberry Pi diagnostic tools
+on:
+  push:
+    paths:
+      - 'tools/rpi5-frame-check.py'
+      - 'tools/test_rpi5_frame_check.py'
+      - '.github/workflows/rpi5-diagnostics.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tools -p test_rpi5_frame_check.py -v
