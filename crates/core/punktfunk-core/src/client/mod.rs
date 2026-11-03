@@ -1028,20 +1028,34 @@ impl NativeClient {
             .admit
     }
 
-    /// [`recovery_on_frame`](Self::recovery_on_frame) by index, with the gap ahead of the AU
-    /// for the receiver rule. Report a sliced AU once, on its first part: parts repeat the
-    /// index.
+    /// Admit an AU by index and report its preceding gap. Sliced AUs report only their first part.
     pub fn recovery_on_au(&self, index: u32, complete: bool, decode_order: u64) -> Arrival {
-        let arrived = RecoveryEvent::Arrived {
+        self.recovery_on_au_with_generation(index, complete, decode_order)
+            .0
+    }
+
+    /// Admit an AU and capture its resulting loss generation under the same lock.
+    pub fn recovery_on_au_with_generation(
+        &self,
+        index: u32,
+        complete: bool,
+        decode_order: u64,
+    ) -> (Arrival, u64) {
+        let (step, generation) = recovery_admission_generation(
+            &self.shared.recovery,
+            self.shared.frames_dropped.load(Ordering::Relaxed),
             index,
             complete,
             decode_order,
-        };
-        let step = self.recovery_step(arrived, true);
-        Arrival {
-            admit: step.admit,
-            gap: step.gap,
-        }
+        );
+        send_recovery(&self.shared, step.ask);
+        (
+            Arrival {
+                admit: step.admit,
+                gap: step.gap,
+            },
+            generation,
+        )
     }
 
     /// One decoded picture: whether to show it, and whether the lift came from an
@@ -2465,6 +2479,26 @@ mod keep_awake_tests {
     }
 }
 
+fn recovery_admission_generation(
+    recovery: &Mutex<RecoveryDriver>,
+    dropped: u64,
+    index: u32,
+    complete: bool,
+    decode_order: u64,
+) -> (recovery::RecoveryStep, u64) {
+    let mut recovery = recovery.lock().unwrap();
+    recovery.engage(dropped);
+    let step = recovery.step(
+        RecoveryEvent::Arrived {
+            index,
+            complete,
+            decode_order,
+        },
+        Instant::now(),
+    );
+    (step, recovery.arms())
+}
+
 fn decoded_recovery_at_generation(
     recovery: &Mutex<RecoveryDriver>,
     dropped: u64,
@@ -2482,6 +2516,37 @@ fn decoded_recovery_at_generation(
 #[cfg(test)]
 mod delayed_recovery_tests {
     use super::*;
+
+    #[test]
+    fn loss_after_admission_keeps_the_original_input_generation() {
+        let recovery = Mutex::new(RecoveryDriver::default());
+        let (admission, generation) = recovery_admission_generation(&recovery, 0, 10, true, 0);
+        assert!(admission.admit);
+        recovery
+            .lock()
+            .unwrap()
+            .step(RecoveryEvent::Lost, Instant::now());
+        assert_ne!(recovery.lock().unwrap().arms(), generation);
+        let old_keyframe = Decoded {
+            flags: crate::packet::USER_FLAG_RECOVERY_ANCHOR,
+            keyframe: true,
+            evidence: crate::reanchor::AnchorEvidence::Unavailable,
+            local: crate::reanchor::LocalRecovery::NONE,
+            decode_order: None,
+        };
+        assert!(decoded_recovery_at_generation(&recovery, 0, old_keyframe, generation).is_none());
+    }
+
+    #[test]
+    fn gap_admission_returns_its_newly_armed_generation() {
+        let recovery = Mutex::new(RecoveryDriver::default());
+        let (_, before_gap) = recovery_admission_generation(&recovery, 0, 10, true, 0);
+        let (admission, after_gap) = recovery_admission_generation(&recovery, 0, 12, true, 1);
+        assert!(admission.admit);
+        assert_eq!(admission.gap, 1);
+        assert_ne!(after_gap, before_gap);
+        assert_eq!(after_gap, recovery.lock().unwrap().arms());
+    }
 
     #[test]
     fn delayed_keyframe_cannot_heal_loss_armed_while_waiting_for_recovery_lock() {

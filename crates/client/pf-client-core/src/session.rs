@@ -1493,8 +1493,8 @@ impl Pump {
         });
     }
 
-    /// Admit one AU, attach its timing and recovery generation, then process every
-    /// completed picture with the metadata its decoder retained.
+    /// Admit one AU with its atomic recovery generation, then process completed pictures
+    /// with the timestamps and flags their decoder retained.
     fn on_frame(&mut self, frame: Frame) -> Pass {
         if let Some(format) = frame.new_format {
             self.codec_ask = None;
@@ -1519,10 +1519,12 @@ impl Pump {
         };
         // A straggler a reference codec rewinds on, or a partial a newer frame beat, is
         // dropped before decode; a gap arms the freeze and core asks for the range.
-        if !self
-            .connector
-            .recovery_on_frame(&frame, self.decoder.decode_order())
-        {
+        let (admission, recovery_generation) = self.connector.recovery_on_au_with_generation(
+            frame.frame_index,
+            frame.complete,
+            self.decoder.decode_order(),
+        );
+        if !admission.admit {
             return Pass::Skip;
         }
         if let Some(d) = self.au_dump.as_mut() {
@@ -1536,7 +1538,7 @@ impl Pump {
             pts_ns: frame.pts_ns,
             received_ns,
             flags: frame.flags,
-            recovery_generation: self.connector.recovery_arms(),
+            recovery_generation,
         };
         let decoded = self
             .decoder
