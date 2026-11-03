@@ -1,0 +1,6 @@
+*.patch -text
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+series text eol=lf
+CURRENT text eol=lf
