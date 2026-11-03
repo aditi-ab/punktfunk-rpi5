@@ -1054,6 +1054,25 @@ impl NativeClient {
         }
     }
 
+    /// Check a buffered picture's loss generation and apply its recovery marks under one lock.
+    pub fn recovery_on_decoded_at_generation(
+        &self,
+        decoded: Decoded,
+        generation: u64,
+    ) -> Option<Shown> {
+        let step = decoded_recovery_at_generation(
+            &self.shared.recovery,
+            self.shared.frames_dropped.load(Ordering::Relaxed),
+            decoded,
+            generation,
+        )?;
+        send_recovery(&self.shared, step.ask);
+        Some(Shown {
+            hold: step.hold,
+            forgive_chain: step.forgive_chain,
+        })
+    }
+
     /// One AU produced no picture: a wedged decoder with no reassembler drop. Three in a
     /// row arm the freeze and ask for an IDR.
     pub fn recovery_on_no_output(&self) {
@@ -2443,5 +2462,53 @@ mod keep_awake_tests {
             KEEP_AWAKE_INPUT - Duration::from_secs(1)
         ));
         assert!(!holds_screen_awake(false, long));
+    }
+}
+
+fn decoded_recovery_at_generation(
+    recovery: &Mutex<RecoveryDriver>,
+    dropped: u64,
+    decoded: Decoded,
+    generation: u64,
+) -> Option<recovery::RecoveryStep> {
+    let mut recovery = recovery.lock().unwrap();
+    recovery.engage(dropped);
+    if recovery.arms() != generation {
+        return None;
+    }
+    Some(recovery.step(RecoveryEvent::Decoded(decoded), Instant::now()))
+}
+
+#[cfg(test)]
+mod delayed_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_keyframe_cannot_heal_loss_armed_while_waiting_for_recovery_lock() {
+        let recovery = Arc::new(Mutex::new(RecoveryDriver::default()));
+        let mut held = recovery.lock().unwrap();
+        held.engage(0);
+        let before_loss = held.arms();
+        let decoded = Decoded {
+            flags: 0,
+            keyframe: true,
+            evidence: crate::reanchor::AnchorEvidence::Unavailable,
+            local: crate::reanchor::LocalRecovery::NONE,
+            decode_order: None,
+        };
+        let pending = recovery.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            decoded_recovery_at_generation(&pending, 0, decoded, before_loss)
+        });
+        ready_rx.recv().unwrap();
+        held.step(RecoveryEvent::Lost, Instant::now());
+        let after_loss = held.arms();
+        assert_ne!(before_loss, after_loss);
+        drop(held);
+        assert!(worker.join().unwrap().is_none());
+        let current = decoded_recovery_at_generation(&recovery, 0, decoded, after_loss).unwrap();
+        assert!(!current.hold);
     }
 }

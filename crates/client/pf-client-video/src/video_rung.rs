@@ -11,7 +11,7 @@ use anyhow::Result;
 use punktfunk_core::au::{AuBuf, AuMemory};
 use std::sync::Arc;
 
-use crate::video::DecodedImage;
+use crate::video::{DecodeBatch, DecodeMetadata, DecodedImage, TaggedImage};
 use crate::video_caps::NativeRung;
 use crate::video_software::SoftwareDecoder;
 use crate::video_types::DecodeHealth;
@@ -41,6 +41,30 @@ pub(crate) trait Rung {
         complete: bool,
     ) -> Result<Option<DecodedImage>> {
         self.decode(&au, user_flags, complete)
+    }
+
+    fn decode_tagged_au(
+        &mut self,
+        au: AuBuf,
+        complete: bool,
+        metadata: DecodeMetadata,
+    ) -> Result<DecodeBatch> {
+        Ok(DecodeBatch {
+            images: self
+                .decode_au(au, metadata.flags, complete)?
+                .into_iter()
+                .map(|image| TaggedImage {
+                    image,
+                    metadata,
+                    delayed: false,
+                })
+                .collect(),
+            priming: false,
+        })
+    }
+
+    fn drain_tagged(&mut self) -> Result<DecodeBatch> {
+        Ok(DecodeBatch::default())
     }
 
     /// Memory this rung reads AUs from in place, for the session to lend; `None` = the
@@ -291,5 +315,82 @@ impl Rung for crate::video_v4l2_request::V4l2RequestDecoder {
 
     fn decode(&mut self, au: &[u8], _: u32, _: bool) -> Result<Option<DecodedImage>> {
         Ok(Self::decode(self, au)?.map(DecodedImage::V4l2Planar))
+    }
+
+    fn decode_tagged_au(
+        &mut self,
+        au: AuBuf,
+        _: bool,
+        metadata: DecodeMetadata,
+    ) -> Result<DecodeBatch> {
+        Self::decode_tagged(self, Some((&au, metadata)))
+    }
+
+    fn drain_tagged(&mut self) -> Result<DecodeBatch> {
+        Self::decode_tagged(self, None)
+    }
+}
+
+#[cfg(test)]
+mod tagged_tests {
+    use super::*;
+    use crate::video::{ColorDesc, CpuPlanarFrame};
+
+    struct Synchronous;
+
+    impl Rung for Synchronous {
+        fn id(&self) -> Option<NativeRung> {
+            None
+        }
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn decode(
+            &mut self,
+            au: &[u8],
+            flags: u32,
+            complete: bool,
+        ) -> Result<Option<DecodedImage>> {
+            anyhow::ensure!(
+                au == [9] && flags == 7 && complete,
+                "unexpected synchronous input"
+            );
+            Ok(Some(DecodedImage::Cpu(CpuPlanarFrame::from_i420(
+                2,
+                2,
+                [&[1, 2, 3, 4], &[5], &[6]],
+                [2, 1, 1],
+                ColorDesc {
+                    primaries: 1,
+                    transfer: 1,
+                    matrix: 1,
+                    full_range: false,
+                },
+                false,
+                punktfunk_core::reanchor::LocalRecovery::NONE,
+            )?)))
+        }
+    }
+
+    #[test]
+    fn synchronous_adapter_preserves_current_metadata_and_errors() {
+        let metadata = DecodeMetadata {
+            pts_ns: 12,
+            received_ns: 15,
+            flags: 7,
+            recovery_generation: 4,
+        };
+        let mut rung = Synchronous;
+        let batch = rung
+            .decode_tagged_au(vec![9].into(), true, metadata)
+            .unwrap();
+        assert_eq!(batch.images.len(), 1);
+        assert_eq!(batch.images[0].metadata, metadata);
+        assert!(!batch.images[0].delayed);
+        assert!(!batch.priming);
+        assert!(rung.drain_tagged().unwrap().images.is_empty());
+        assert!(rung
+            .decode_tagged_au(vec![8].into(), true, metadata)
+            .is_err());
     }
 }

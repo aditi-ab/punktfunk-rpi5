@@ -10,7 +10,7 @@
 //! audio plane in `audio` / `design/hi-res-audio.md`.
 
 use crate::audio;
-use crate::video::{DecodedFrame, DecodedImage, Decoder};
+use crate::video::{DecodeBatch, DecodeMetadata, DecodedFrame, DecodedImage, Decoder};
 use punktfunk_core::client::{ConnectParams, Decoded, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 pub use punktfunk_core::reject::WAKE_SETTLE;
@@ -1079,8 +1079,8 @@ pub fn start_screen(
     }
 }
 
-/// Pull, decode and hand on one further screen's frames. A decoder opens at the first frame
-/// and at each new format; a lost picture asks the host for a keyframe on that screen alone.
+/// Decode a further screen with each picture's original timestamps across delayed output.
+/// A missing decoder or decode fault asks for a keyframe on this screen alone.
 fn screen_pump(
     connector: &NativeClient,
     screen: u8,
@@ -1096,7 +1096,18 @@ fn screen_pump(
     while !stop.load(Ordering::SeqCst) {
         let frame = match connector.next_screen_frame(screen, Duration::from_millis(20)) {
             Ok(frame) => frame,
-            Err(PunktfunkError::NoFrame) => continue,
+            Err(PunktfunkError::NoFrame) => {
+                if let Some(dec) = decoder.as_mut() {
+                    match dec.drain_tagged() {
+                        Ok(batch) => hand_screen_batch(dec, batch, frame_tx),
+                        Err(_) => connector.request_screen_keyframe(screen),
+                    }
+                    if dec.take_keyframe_request() {
+                        connector.request_screen_keyframe(screen);
+                    }
+                }
+                continue;
+            }
             Err(_) => return,
         };
         let changed = frame
@@ -1125,17 +1136,18 @@ fn screen_pump(
         let Some(dec) = decoder.as_mut() else {
             continue;
         };
-        match dec.decode_au(frame.data, frame.flags, frame.complete) {
-            Ok(Some(image)) => {
-                wait_hw_done(dec, &hw_done_of(&image));
-                let _ = frame_tx.force_send(DecodedFrame {
-                    pts_ns: frame.pts_ns,
-                    decoded_ns: now_ns(),
-                    repeat: false,
-                    image,
-                });
-            }
-            Ok(None) => {}
+        let metadata = DecodeMetadata {
+            pts_ns: frame.pts_ns,
+            received_ns: if frame.received_ns > 0 {
+                frame.received_ns
+            } else {
+                now_ns()
+            },
+            flags: frame.flags,
+            recovery_generation: 0,
+        };
+        match dec.decode_tagged_au(frame.data, frame.complete, metadata) {
+            Ok(batch) => hand_screen_batch(dec, batch, frame_tx),
             Err(e) => {
                 tracing::debug!(error = %e, screen, "screen decode error (asking for a keyframe)");
                 connector.request_screen_keyframe(screen);
@@ -1144,6 +1156,22 @@ fn screen_pump(
         if dec.take_keyframe_request() {
             connector.request_screen_keyframe(screen);
         }
+    }
+}
+
+fn hand_screen_batch(
+    decoder: &mut Decoder,
+    batch: DecodeBatch,
+    frames: &async_channel::Sender<DecodedFrame>,
+) {
+    for output in batch.images {
+        wait_hw_done(decoder, &hw_done_of(&output.image));
+        let _ = frames.force_send(DecodedFrame {
+            pts_ns: output.metadata.pts_ns,
+            decoded_ns: now_ns(),
+            repeat: false,
+            image: output.image,
+        });
     }
 }
 
@@ -1332,9 +1360,8 @@ struct Pump {
 }
 
 impl Pump {
-    /// Pull, decode and hand on frames until the session ends. `Some` is the reason the
-    /// user reads. Each pass ends with the host-timing drain and the 1-second window,
-    /// unless its AU was dropped before decode. Loss recovery ticks in core's own pump.
+    /// Pull AUs and hand on completed pictures until the session ends. Idle polls drain
+    /// buffered pictures after the decoder's grace period; core owns loss recovery ticks.
     fn run(&mut self) -> Option<String> {
         let wake = self.connector.clone();
         self.decoder
@@ -1382,7 +1409,23 @@ impl Pump {
                     Pass::Skip => continue,
                     Pass::End(end) => return end,
                 },
-                Err(PunktfunkError::NoFrame) => {}
+                Err(PunktfunkError::NoFrame) => {
+                    match self.decoder.drain_tagged() {
+                        Ok(batch) => self.on_batch(batch),
+                        Err(e) => {
+                            let codec = self.connector.video_format().codec;
+                            if let Some(ev) = exhausted(&e, codec, self.advertised_codecs) {
+                                if let Pass::End(end) = self.fall_back(ev) {
+                                    return end;
+                                }
+                            }
+                            self.connector.recovery_on_no_output();
+                        }
+                    }
+                    if let Pass::End(end) = self.after_decode() {
+                        return end;
+                    }
+                }
                 Err(PunktfunkError::Closed) => return self.on_closed(),
                 Err(e) => {
                     tracing::warn!(error = %e, "session pump failed");
@@ -1450,8 +1493,8 @@ impl Pump {
         });
     }
 
-    /// One AU off the wire: order it, decode it, then demote or ask for a keyframe as
-    /// the decoder says.
+    /// Admit one AU, attach its timing and recovery generation, then process every
+    /// completed picture with the metadata its decoder retained.
     fn on_frame(&mut self, frame: Frame) -> Pass {
         if let Some(format) = frame.new_format {
             self.codec_ask = None;
@@ -1489,13 +1532,23 @@ impl Pump {
         }
         let mut frame = frame;
         let data = std::mem::take(&mut frame.data);
-        let decoded = self.decoder.decode_au(data, frame.flags, frame.complete);
+        let metadata = DecodeMetadata {
+            pts_ns: frame.pts_ns,
+            received_ns,
+            flags: frame.flags,
+            recovery_generation: self.connector.recovery_arms(),
+        };
+        let decoded = self
+            .decoder
+            .decode_tagged_au(data, frame.complete, metadata);
         self.lend_au_memory();
         match decoded {
-            Ok(Some(image)) => self.on_decoded(image, &frame, received_ns),
-            // No output under one-in/one-out LOW_DELAY means wedged on missing
-            // references with no reassembler drop. Three in a row ask for an IDR.
-            Ok(None) => self.connector.recovery_on_no_output(),
+            Ok(batch) => {
+                if batch.images.is_empty() && !batch.priming {
+                    self.connector.recovery_on_no_output();
+                }
+                self.on_batch(batch);
+            }
             Err(e) => {
                 // Last rung gone for this codec. Feeding more AUs would freeze the
                 // screen forever. End; the terminal event carries the retry.
@@ -1591,25 +1644,41 @@ impl Pump {
         Pass::Drain
     }
 
-    /// A decoded picture: settle the freeze gate, then hand the previous frame in flight
-    /// on before this one is handed on or queued.
-    fn on_decoded(&mut self, image: DecodedImage, frame: &Frame, received_ns: u64) {
+    fn on_batch(&mut self, batch: DecodeBatch) {
+        for output in batch.images {
+            self.on_decoded(output.image, output.metadata, output.delayed);
+        }
+    }
+
+    /// Settle recovery with this picture's input flags, then hand it on with its timestamps.
+    fn on_decoded(&mut self, image: DecodedImage, metadata: DecodeMetadata, delayed: bool) {
         let evidence = image.anchor_evidence();
         if evidence == punktfunk_core::reanchor::AnchorEvidence::ReferencesDamaged
-            && frame.flags & punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR != 0
+            && metadata.flags & punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR != 0
         {
             tracing::debug!(
                 "refused a host recovery anchor: this AU predicts from a picture this decoder \
                  had to conceal — holding for a real IDR"
             );
         }
-        let shown = self.connector.recovery_on_decoded(Decoded {
-            flags: frame.flags,
+        let decoded = Decoded {
+            flags: metadata.flags,
             keyframe: image.is_keyframe(),
             evidence,
             local: image.local_recovery(),
             decode_order: image.decode_order(),
-        });
+        };
+        let shown = if delayed {
+            let Some(shown) = self
+                .connector
+                .recovery_on_decoded_at_generation(decoded, metadata.recovery_generation)
+            else {
+                return;
+            };
+            shown
+        } else {
+            self.connector.recovery_on_decoded(decoded)
+        };
         // A heal by intra refresh: the planner's damaged-chain marks are stale from
         // here, or every later host anchor is refused until an IDR.
         if shown.forgive_chain {
@@ -1639,10 +1708,10 @@ impl Pump {
         }
         let next = InFlight {
             hw: hw_fence,
-            received_ns,
-            pts_ns: frame.pts_ns,
+            received_ns: metadata.received_ns,
+            pts_ns: metadata.pts_ns,
             repeat: self.marks_repeats
-                && frame.flags & punktfunk_core::packet::USER_FLAG_REPEAT != 0,
+                && metadata.flags & punktfunk_core::packet::USER_FLAG_REPEAT != 0,
             image: present.then_some(image),
         };
         // This AU is submitted; the one before it goes on first, in order.

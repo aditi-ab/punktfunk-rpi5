@@ -67,6 +67,26 @@ pub struct DecodedFrame {
     pub image: DecodedImage,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodeMetadata {
+    pub pts_ns: u64,
+    pub received_ns: u64,
+    pub flags: u32,
+    pub recovery_generation: u64,
+}
+
+pub struct TaggedImage {
+    pub image: DecodedImage,
+    pub metadata: DecodeMetadata,
+    pub delayed: bool,
+}
+
+#[derive(Default)]
+pub struct DecodeBatch {
+    pub images: Vec<TaggedImage>,
+    pub priming: bool,
+}
+
 /// Re-export so the presenter names every frame type through `video::`.
 #[cfg(windows)]
 pub use crate::video_d3d11::{
@@ -1191,18 +1211,52 @@ impl Decoder {
         )
     }
 
+    /// Feed an AU with the metadata its eventual pictures must retain.
+    pub fn decode_tagged_au(
+        &mut self,
+        au: punktfunk_core::au::AuBuf,
+        complete: bool,
+        metadata: DecodeMetadata,
+    ) -> Result<DecodeBatch> {
+        let mut priming = false;
+        let batch = self.feed(
+            |rung| {
+                let batch = rung.decode_tagged_au(au, complete, metadata)?;
+                priming = batch.priming;
+                Ok((!batch.images.is_empty()).then_some(batch))
+            },
+            complete,
+        )?;
+        Ok(batch.unwrap_or(DecodeBatch {
+            images: Vec::new(),
+            priming,
+        }))
+    }
+
+    /// Finish buffered pictures when input pauses without flushing reference frames.
+    pub fn drain_tagged(&mut self) -> Result<DecodeBatch> {
+        Ok(self
+            .feed(
+                |rung| {
+                    let batch = rung.drain_tagged()?;
+                    Ok((!batch.images.is_empty()).then_some(batch))
+                },
+                true,
+            )?
+            .unwrap_or_default())
+    }
+
     /// Memory the rung reads AUs from in place, for the session to lend; `None` = the heap.
     pub fn au_memory(&self) -> Option<std::sync::Arc<dyn punktfunk_core::au::AuMemory>> {
         self.rung.au_memory()
     }
 
-    /// Run one decode through the rung, counting a picture as a handover for the
-    /// retiring rung.
-    fn feed(
+    /// Run a decode operation through the rung. Successful output advances retirement.
+    fn feed<T>(
         &mut self,
-        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<DecodedImage>>,
+        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<T>>,
         complete: bool,
-    ) -> Result<Option<DecodedImage>> {
+    ) -> Result<Option<T>> {
         let out = self.decode_frame_inner(feed, complete);
         if let (Ok(Some(_)), Some(r)) = (&out, self.retiring.as_mut()) {
             r.1 += 1;
@@ -1213,11 +1267,11 @@ impl Decoder {
         out
     }
 
-    fn decode_frame_inner(
+    fn decode_frame_inner<T>(
         &mut self,
-        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<DecodedImage>>,
+        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<T>>,
         complete: bool,
-    ) -> Result<Option<DecodedImage>> {
+    ) -> Result<Option<T>> {
         let result = feed(self.rung.as_mut());
         // PyroWave and the CPU rung have nothing below them: their error is the pump's.
         let Some(from) = self.rung.id().filter(|r| *r != NativeRung::Software) else {

@@ -5,10 +5,11 @@
 //! planar 8/10-bit samples. Ten-bit samples are rounded to eight bits for the
 //! existing I420 Vulkan upload path; stream colour metadata stays attached.
 
-use crate::video::CpuPlanarFrame;
+use crate::video::{CpuPlanarFrame, DecodeBatch, DecodeMetadata, DecodedImage, TaggedImage};
 use crate::video_color::ColorDesc;
 use anyhow::{bail, Result};
 use ffmpeg_sys_next as ffi;
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -21,6 +22,66 @@ pub const DECODER_PIN: &str = "v4l2-request";
 // locally so the client still compiles against older development headers used
 // for non-Pi test builds.
 const FRAME_FLAG_KEY: i32 = 1 << 1;
+const MAX_PENDING: usize = 8;
+const IDLE_DRAIN_AFTER: Duration = Duration::from_millis(50);
+
+fn idle_drain_due(last_input: Option<Instant>, now: Instant) -> bool {
+    last_input.is_some_and(|at| now.saturating_duration_since(at) >= IDLE_DRAIN_AFTER)
+}
+
+struct InputLedger {
+    pending: VecDeque<(i64, DecodeMetadata)>,
+    next: i64,
+    accepted: usize,
+    yielded: bool,
+    delay: usize,
+}
+
+impl InputLedger {
+    fn new(delay: usize) -> Self {
+        Self {
+            pending: VecDeque::with_capacity(MAX_PENDING),
+            next: 1,
+            accepted: 0,
+            yielded: false,
+            delay,
+        }
+    }
+
+    fn token(&self) -> Result<i64> {
+        anyhow::ensure!(
+            self.pending.len() < MAX_PENDING && self.next < i64::MAX,
+            "decode metadata queue exhausted"
+        );
+        Ok(self.next)
+    }
+
+    fn accept(&mut self, metadata: DecodeMetadata) {
+        self.pending.push_back((self.next, metadata));
+        self.next += 1;
+        self.accepted = self.accepted.saturating_add(1);
+    }
+
+    fn take(&mut self, token: i64) -> Result<DecodeMetadata> {
+        let index = self
+            .pending
+            .iter()
+            .position(|(id, _)| *id == token)
+            .ok_or_else(|| anyhow::anyhow!("decoded frame has no accepted input token"))?;
+        self.yielded = true;
+        Ok(self.pending.remove(index).unwrap().1)
+    }
+
+    fn priming(&self) -> bool {
+        !self.yielded && self.accepted > 0 && self.accepted <= self.delay
+    }
+
+    fn reset(&mut self) {
+        self.pending.clear();
+        self.accepted = 0;
+        self.yielded = false;
+    }
+}
 
 #[derive(Default)]
 struct DecodeSample {
@@ -166,6 +227,8 @@ pub struct V4l2RequestDecoder {
     planar: *mut ffi::AVFrame,
     timing: Option<DecodeTiming>,
     direct_transfer: bool,
+    inputs: InputLedger,
+    last_input: Option<Instant>,
 }
 
 unsafe impl Send for V4l2RequestDecoder {}
@@ -198,8 +261,18 @@ impl V4l2RequestDecoder {
             }
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.0);
             (*ctx).get_format = Some(pick_drm_prime);
-            (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
-            (*ctx).thread_count = 1;
+            let threads = if std::env::var("PUNKTFUNK_RPI_DECODE_THREADS").as_deref() == Ok("1") {
+                1
+            } else {
+                2
+            };
+            if threads == 1 {
+                (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+            } else {
+                (*ctx).flags &= !(ffi::AV_CODEC_FLAG_LOW_DELAY as i32);
+            }
+            (*ctx).thread_count = threads;
+            (*ctx).thread_type = ffi::FF_THREAD_FRAME as i32;
             (*ctx).extra_hw_frames = 4;
             let status = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if status < 0 {
@@ -220,6 +293,16 @@ impl V4l2RequestDecoder {
                 bail!("allocate FFmpeg packet/frame storage");
             }
             (*planar).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+            let delay = if (*ctx).active_thread_type & ffi::FF_THREAD_FRAME as i32 != 0 {
+                1
+            } else {
+                0
+            };
+            tracing::info!(
+                threads = (*ctx).thread_count,
+                delay,
+                "V4L2 Request decode pipeline configured"
+            );
             Ok(Self {
                 ctx,
                 _hw_device: hw_device,
@@ -229,6 +312,8 @@ impl V4l2RequestDecoder {
                 timing: None,
                 direct_transfer: std::env::var("PUNKTFUNK_RPI_DIRECT_TRANSFER").as_deref()
                     != Ok("0"),
+                inputs: InputLedger::new(delay),
+                last_input: None,
             })
         }
     }
@@ -238,68 +323,172 @@ impl V4l2RequestDecoder {
     }
 
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<CpuPlanarFrame>> {
+        let batch = self.decode_tagged_mode(Some((au, DecodeMetadata::default())), true)?;
+        anyhow::ensure!(
+            batch.images.len() <= 1,
+            "untagged decode returned multiple pictures"
+        );
+        Ok(batch
+            .images
+            .into_iter()
+            .next()
+            .map(|output| match output.image {
+                DecodedImage::V4l2Planar(frame) => frame,
+                _ => unreachable!(),
+            }))
+    }
+
+    pub fn decode_tagged(&mut self, input: Option<(&[u8], DecodeMetadata)>) -> Result<DecodeBatch> {
+        self.decode_tagged_mode(input, false)
+    }
+
+    fn decode_tagged_mode(
+        &mut self,
+        input: Option<(&[u8], DecodeMetadata)>,
+        synchronous: bool,
+    ) -> Result<DecodeBatch> {
+        if input.is_none()
+            && (self.inputs.pending.is_empty() || !idle_drain_due(self.last_input, Instant::now()))
+        {
+            return Ok(DecodeBatch::default());
+        }
         let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let mut sample = started.map(|_| DecodeSample::default());
         if started.is_none() {
             self.timing = None;
         }
+        let result = self.decode_tagged_inner(input, sample.as_mut(), synchronous);
+        if result.is_err() {
+            unsafe {
+                ffi::av_packet_unref(self.packet);
+                ffi::av_frame_unref(self.frame);
+                ffi::avcodec_flush_buffers(self.ctx);
+            }
+            self.inputs.reset();
+            self.last_input = None;
+        }
+        if let (Some(at), Some(mut sample)) = (started, sample) {
+            let now = Instant::now();
+            sample.phases[3] = now.duration_since(at);
+            let timing = self.timing.get_or_insert_with(|| DecodeTiming::new(at));
+            if let Some(window) = timing.add(sample, now) {
+                tracing::debug!(
+                    calls = window.calls,
+                    frames = window.frames,
+                    window_ms = now.duration_since(window.started).as_millis() as u64,
+                    codec_mean_us = window.mean_us(0),
+                    codec_max_us = window.peaks[0].as_micros() as u64,
+                    transfer_mean_us = window.mean_us(1),
+                    transfer_max_us = window.peaks[1].as_micros() as u64,
+                    copy_mean_us = window.mean_us(2),
+                    copy_max_us = window.peaks[2].as_micros() as u64,
+                    total_mean_us = window.mean_us(3),
+                    total_max_us = window.peaks[3].as_micros() as u64,
+                    "V4L2 Request decode timing per call"
+                );
+            }
+        }
+        result
+    }
+
+    fn decode_tagged_inner(
+        &mut self,
+        input: Option<(&[u8], DecodeMetadata)>,
+        mut timing: Option<&mut DecodeSample>,
+        synchronous: bool,
+    ) -> Result<DecodeBatch> {
+        let mut batch = DecodeBatch::default();
         unsafe {
-            let status = ffi::av_new_packet(self.packet, au.len() as i32);
-            if status < 0 {
-                return Err(av_error("av_new_packet", status));
+            if let Some((au, metadata)) = input {
+                let token = self.inputs.token()?;
+                let size = i32::try_from(au.len())
+                    .map_err(|_| anyhow::anyhow!("decode packet exceeds FFmpeg size limit"))?;
+                let status = ffi::av_new_packet(self.packet, size);
+                if status < 0 {
+                    return Err(av_error("allocate decode packet", status));
+                }
+                ptr::copy_nonoverlapping(au.as_ptr(), (*self.packet).data, au.len());
+                (*self.packet).pts = token;
+                (*self.packet).dts = token;
+                let mut accepted = false;
+                for attempt in 0..2 {
+                    let at = timing.as_ref().map(|_| Instant::now());
+                    let status = ffi::avcodec_send_packet(self.ctx, self.packet);
+                    if let (Some(at), Some(sample)) = (at, timing.as_mut()) {
+                        sample.phases[0] += at.elapsed();
+                    }
+                    if status == -libc::EAGAIN && attempt == 0 {
+                        self.receive_tagged(&mut batch, 0, timing.as_deref_mut())?;
+                        anyhow::ensure!(
+                            !batch.images.is_empty(),
+                            "decode send and receive both need input"
+                        );
+                        continue;
+                    }
+                    if status < 0 {
+                        return Err(av_error("submit decode packet", status));
+                    }
+                    self.inputs.accept(metadata);
+                    self.last_input = Some(Instant::now());
+                    accepted = true;
+                    break;
+                }
+                ffi::av_packet_unref(self.packet);
+                anyhow::ensure!(accepted, "decode packet was not accepted");
             }
-            ptr::copy_nonoverlapping(au.as_ptr(), (*self.packet).data, au.len());
-            let codec_started = started.map(|_| Instant::now());
-            let status = ffi::avcodec_send_packet(self.ctx, self.packet);
-            if let (Some(at), Some(sample)) = (codec_started, sample.as_mut()) {
-                sample.phases[0] += at.elapsed();
-            }
-            ffi::av_packet_unref(self.packet);
-            if status < 0 {
-                return Err(av_error("avcodec_send_packet", status));
-            }
-            let mut output = None;
+            let flags = if input.is_none() || synchronous {
+                ffi::AV_CODEC_RECEIVE_FRAME_FLAG_SYNCHRONOUS
+            } else {
+                0
+            };
+            self.receive_tagged(&mut batch, flags, timing)?;
+        }
+        anyhow::ensure!(
+            input.is_some() || !batch.images.is_empty() || self.inputs.pending.is_empty(),
+            "idle decode drain returned no pending picture"
+        );
+        batch.priming = input.is_some() && batch.images.is_empty() && self.inputs.priming();
+        Ok(batch)
+    }
+
+    unsafe fn receive_tagged(
+        &mut self,
+        batch: &mut DecodeBatch,
+        flags: u32,
+        mut timing: Option<&mut DecodeSample>,
+    ) -> Result<()> {
+        unsafe {
             loop {
-                let codec_started = started.map(|_| Instant::now());
-                let status = ffi::avcodec_receive_frame(self.ctx, self.frame);
-                if let (Some(at), Some(sample)) = (codec_started, sample.as_mut()) {
+                let at = timing.as_ref().map(|_| Instant::now());
+                let status = ffi::avcodec_receive_frame_flags(self.ctx, self.frame, flags);
+                if let (Some(at), Some(sample)) = (at, timing.as_mut()) {
                     sample.phases[0] += at.elapsed();
                 }
                 if status == -libc::EAGAIN {
-                    break;
+                    return Ok(());
                 }
                 if status < 0 {
-                    return Err(av_error("avcodec_receive_frame", status));
+                    return Err(av_error("receive decoded frame", status));
                 }
-                let decoded = self.planar_frame(sample.as_mut());
+                let decoded = (|| {
+                    anyhow::ensure!(
+                        batch.images.len() < MAX_PENDING,
+                        "decode output batch exceeded limit"
+                    );
+                    let metadata = self.inputs.take((*self.frame).pts)?;
+                    let image = DecodedImage::V4l2Planar(self.planar_frame(timing.as_deref_mut())?);
+                    Ok(TaggedImage {
+                        image,
+                        metadata,
+                        delayed: self.inputs.delay > 0,
+                    })
+                })();
                 ffi::av_frame_unref(self.frame);
-                output = Some(decoded?);
-                if let Some(sample) = sample.as_mut() {
+                batch.images.push(decoded?);
+                if let Some(sample) = timing.as_mut() {
                     sample.frames += 1;
                 }
             }
-            if let (Some(at), Some(mut sample)) = (started, sample) {
-                let now = Instant::now();
-                sample.phases[3] = now.duration_since(at);
-                let timing = self.timing.get_or_insert_with(|| DecodeTiming::new(at));
-                if let Some(window) = timing.add(sample, now) {
-                    tracing::debug!(
-                        calls = window.calls,
-                        frames = window.frames,
-                        window_ms = now.duration_since(window.started).as_millis() as u64,
-                        codec_mean_us = window.mean_us(0),
-                        codec_max_us = window.peaks[0].as_micros() as u64,
-                        transfer_mean_us = window.mean_us(1),
-                        transfer_max_us = window.peaks[1].as_micros() as u64,
-                        copy_mean_us = window.mean_us(2),
-                        copy_max_us = window.peaks[2].as_micros() as u64,
-                        total_mean_us = window.mean_us(3),
-                        total_max_us = window.peaks[3].as_micros() as u64,
-                        "V4L2 Request decode timing per call"
-                    );
-                }
-            }
-            Ok(output)
         }
     }
 
@@ -579,11 +768,82 @@ unsafe fn downshift_10bit_neon(source: &[u8], target: &mut [u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        direct_transfer_dimensions, downshift_10bit_into, DecodeSample, DecodeTiming,
-        PackedTransfer,
+        direct_transfer_dimensions, downshift_10bit_into, idle_drain_due, DecodeSample,
+        DecodeTiming, InputLedger, PackedTransfer, MAX_PENDING,
     };
+    use crate::video::DecodeMetadata;
     use ffmpeg_sys_next as ffi;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn delayed_outputs_match_accepted_inputs_not_the_latest_packet() {
+        let mut inputs = InputLedger::new(1);
+        let first = DecodeMetadata {
+            pts_ns: 100,
+            received_ns: 110,
+            flags: 7,
+            recovery_generation: 3,
+        };
+        let second = DecodeMetadata {
+            pts_ns: 200,
+            received_ns: 220,
+            flags: 8,
+            recovery_generation: 4,
+        };
+        let token = inputs.token().unwrap();
+        assert_eq!(inputs.token().unwrap(), token);
+        inputs.accept(first);
+        assert!(inputs.priming());
+        let next = inputs.token().unwrap();
+        inputs.accept(second);
+        assert!(!inputs.priming());
+        assert_eq!(inputs.take(next).unwrap(), second);
+        assert_eq!(inputs.take(token).unwrap(), first);
+        assert!(inputs.take(token).is_err());
+        assert!(!inputs.priming());
+    }
+
+    #[test]
+    fn metadata_and_priming_are_bounded_and_reset_discards_old_tokens() {
+        let mut inputs = InputLedger::new(1);
+        assert!(!inputs.priming());
+        for _ in 0..MAX_PENDING {
+            assert!(inputs.token().is_ok());
+            inputs.accept(DecodeMetadata::default());
+        }
+        assert!(inputs.token().is_err());
+        assert!(!inputs.priming());
+        inputs.reset();
+        assert!(inputs.pending.is_empty());
+        assert!(!inputs.priming());
+        assert!(inputs.take(1).is_err());
+        assert_eq!(inputs.token().unwrap(), MAX_PENDING as i64 + 1);
+        inputs.accept(DecodeMetadata::default());
+        assert!(inputs.priming());
+        let mut single = InputLedger::new(0);
+        single.accept(DecodeMetadata::default());
+        assert!(!single.priming());
+    }
+
+    #[test]
+    fn idle_drain_preserves_regular_cadence_but_releases_an_isolated_frame() {
+        let start = Instant::now();
+        assert!(!idle_drain_due(None, start));
+        for period in [8, 17] {
+            let mut last = start;
+            for _ in 0..120 {
+                let arrival = last + Duration::from_millis(period);
+                assert!(!idle_drain_due(Some(last), arrival));
+                last = arrival;
+            }
+            assert!(!idle_drain_due(
+                Some(last),
+                last + Duration::from_millis(49)
+            ));
+            assert!(idle_drain_due(Some(last), last + Duration::from_millis(50)));
+            assert!(idle_drain_due(Some(last), last + Duration::from_millis(70)));
+        }
+    }
 
     #[test]
     fn direct_transfer_requires_even_uncropped_dimensions() {
