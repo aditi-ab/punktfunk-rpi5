@@ -144,8 +144,9 @@ Commit [`012df8d7`](https://github.com/aditi-ab/punktfunk-rpi5/commit/012df8d710
 carries `scissor_y` and `scissor_height` from
 [`skia_overlay.rs`](../crates/client/pf-console-ui/src/skia_overlay.rs) through the
 overlay frame into the Vulkan render pass. Normal top and bottom chrome use a
-bounded band. Resize scrims, the quick ring, and simultaneous top-and-bottom
-chrome retain a full-surface pass so content is not clipped.
+bounded band derived from their painted bounds. Statistics follow their selected
+corner and fitted font size; combined notices extend the band to contain them.
+Resize scrims and the quick ring retain a full-surface pass.
 
 This changes overlay drawing cost only. It does not change stream bitrate,
 decoding, capture cadence, or display mode.

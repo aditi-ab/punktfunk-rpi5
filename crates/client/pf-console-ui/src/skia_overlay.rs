@@ -104,6 +104,7 @@ pub struct SkiaOverlay {
     /// Slot of the last returned frame; the next render takes the other.
     current: usize,
     drawn: Drawn,
+    drawn_band: (u32, u32),
     /// Stats OSD face: Geist, as the console.
     font: Option<Font>,
     fonts: Option<Fonts>,
@@ -147,6 +148,7 @@ impl SkiaOverlay {
             slots: [None, None],
             current: 0,
             drawn: Drawn::default(),
+            drawn_band: (0, 0),
             font: None,
             fonts: None,
             shell: None,
@@ -551,31 +553,18 @@ impl Overlay for SkiaOverlay {
             resize_step,
             ring: ring_key,
         };
-        // Most stream chrome occupies only the top (stats/badges) or bottom
-        // (hint/banner) of the output. Keep a generous band around it; a
-        // resize scrim, quick ring, or simultaneous top+bottom chrome still
-        // requests the full surface.
-        let top = want.stats.is_some()
-            || want.access.is_some()
-            || want.mic_notice.is_some()
-            || !want.audio_mute.is_empty();
-        let bottom = want.hint.is_some() || want.notice.is_some() || banner_step > 0;
-        let full = want.stats.is_some() || ctx.resizing || ring_key != 0 || (top && bottom);
-        let band = ((384.0 * scale).ceil() as u32).min(ctx.height);
-        let (scissor_y, scissor_height) = if full {
-            (0, ctx.height)
-        } else if top {
-            (0, band)
-        } else {
-            (ctx.height.saturating_sub(band), band)
-        };
         if want == self.drawn {
+            let (scissor_y, scissor_height) = self.drawn_band;
+            if scissor_height == 0 {
+                return Ok(None);
+            }
             return Ok(self.slots[self.current].as_ref().map(|slot| OverlayFrame {
                 scissor_y,
                 scissor_height,
                 ..slot.frame()
             }));
         }
+        let mut damage = DamageBand::new(ctx.height, ctx.resizing || ring_key != 0);
 
         // Other slot: the presenter may still be sampling this one (one frame in flight).
         let next = 1 - self.current;
@@ -599,7 +588,14 @@ impl Overlay for SkiaOverlay {
         if let Some(stats) = &want.stats {
             let osd_scale = scale * ctx.stats_scale.clamp(0.5, 4.0);
             let size = (ctx.width, ctx.height);
-            draw_osd_panel(canvas, font, stats, size, osd_scale, ctx.stats_corner);
+            damage.include(draw_osd_panel(
+                canvas,
+                font,
+                stats,
+                size,
+                osd_scale,
+                ctx.stats_corner,
+            ));
         }
         // Top-right, stacked in a fixed order, and top-left while the stats panel holds the
         // top right: never under the panel or the bottom pill, even at stats Off. A host
@@ -609,28 +605,39 @@ impl Overlay for SkiaOverlay {
         if let Some(muted) = want.mic_notice {
             let at = (ctx.width, row, left);
             let text = punktfunk_core::client::mic_mute_label(muted);
-            corner_pill(canvas, font, text, muted, at, scale);
+            damage.include(corner_pill(canvas, font, text, muted, at, scale));
             row += 1;
         }
         if !want.audio_mute.is_empty() {
             let at = (ctx.width, row, left);
-            corner_pill(canvas, font, &want.audio_mute, true, at, scale);
+            damage.include(corner_pill(canvas, font, &want.audio_mute, true, at, scale));
             row += 1;
         }
         // The access chip (preset label + countdown) stacks under them. A full-control
         // permanent session has none.
         if let Some(access) = &want.access {
-            corner_pill(canvas, font, access, false, (ctx.width, row, left), scale);
+            damage.include(corner_pill(
+                canvas,
+                font,
+                access,
+                false,
+                (ctx.width, row, left),
+                scale,
+            ));
         }
         // Access toast outranks the capture hint for its few seconds.
         if let Some(notice) = &want.notice {
-            draw_hint_pill(canvas, font, notice, ctx.width, ctx.height, 1.0, scale);
+            damage.include(draw_hint_pill(
+                canvas, font, notice, ctx.width, ctx.height, 1.0, scale,
+            ));
         } else if let Some(hint) = &want.hint {
-            draw_hint_pill(canvas, font, hint, ctx.width, ctx.height, 1.0, scale);
+            damage.include(draw_hint_pill(
+                canvas, font, hint, ctx.width, ctx.height, 1.0, scale,
+            ));
         } else if banner_step > 0 {
             // The exit hint, fading out.
             if let Some(text) = &self.banner_text {
-                draw_hint_pill(
+                damage.include(draw_hint_pill(
                     canvas,
                     font,
                     text,
@@ -638,7 +645,7 @@ impl Overlay for SkiaOverlay {
                     ctx.height,
                     banner_alpha as f32,
                     scale,
-                );
+                ));
             }
         }
 
@@ -669,6 +676,11 @@ impl Overlay for SkiaOverlay {
 
         self.current = next;
         self.drawn = want;
+        self.drawn_band = damage.finish();
+        let (scissor_y, scissor_height) = self.drawn_band;
+        if scissor_height == 0 {
+            return Ok(None);
+        }
         Ok(Some(OverlayFrame {
             scissor_y,
             scissor_height,
@@ -799,6 +811,34 @@ impl SkiaOverlay {
     }
 }
 
+/// The vertical union of painted chrome, including one pixel for antialiasing.
+struct DamageBand {
+    height: u32,
+    top: u32,
+    bottom: u32,
+}
+
+impl DamageBand {
+    fn new(height: u32, full: bool) -> Self {
+        Self {
+            height,
+            top: if full { 0 } else { height },
+            bottom: if full { height } else { 0 },
+        }
+    }
+
+    fn include(&mut self, rect: Rect) {
+        let top = (rect.top - 1.0).floor().clamp(0.0, self.height as f32) as u32;
+        let bottom = (rect.bottom + 1.0).ceil().clamp(0.0, self.height as f32) as u32;
+        self.top = self.top.min(top);
+        self.bottom = self.bottom.max(bottom);
+    }
+
+    fn finish(self) -> (u32, u32) {
+        (self.top, self.bottom.saturating_sub(self.top))
+    }
+}
+
 /// SDL scancode → [`Key`](crate::input::Key). `None` = unused; the run loop keeps it.
 fn key_of(sc: sdl3::keyboard::Scancode) -> Option<crate::input::Key> {
     use crate::input::Key as K;
@@ -848,7 +888,7 @@ pub(crate) fn exit_hint(pad: bool) -> &'static str {
     }
 }
 
-/// Stats OSD: translucent rounded panel in `corner`, one line each, painted by role.
+/// Paint the stats panel and return its bounds for the compositor scissor.
 fn draw_osd_panel(
     canvas: &Canvas,
     base_font: &Font,
@@ -856,7 +896,7 @@ fn draw_osd_panel(
     (width, height): (u32, u32),
     scale: f32,
     corner: HudCorner,
-) {
+) -> Rect {
     // Width is linear in scale; measure once, then fit so Detailed-tier lines stay in-window.
     let width_at = |s: f32| {
         let font = chrome_font(base_font, s);
@@ -905,6 +945,7 @@ fn draw_osd_panel(
             &fill(role_color(line.role)),
         );
     }
+    panel
 }
 
 /// Headline bright, breakdowns softer, asides dimmer, warnings in status red.
@@ -917,10 +958,7 @@ fn role_color(role: Role) -> Color4f {
     }
 }
 
-/// A standing pill in a top corner, `row` pills down: words, led by an error-colour dot when
-/// `dot`. `at` is the window width, the row and whether it sits top-left. Drawn from state,
-/// not from the stats text, so it survives stats Off. Words, not a mute glyph Geist lacks.
-/// Every pill is one line tall, so rows stack on one pitch.
+/// Paint a top-corner badge and return its bounds. Rows share one vertical pitch.
 fn corner_pill(
     canvas: &Canvas,
     base_font: &Font,
@@ -928,7 +966,7 @@ fn corner_pill(
     dot: bool,
     (width, row, left): (u32, usize, bool),
     scale: f32,
-) {
+) -> Rect {
     // Short; it fits any stream window, so take the display scale as-is.
     let font = &chrome_font(base_font, scale);
     let (_, metrics) = font.metrics();
@@ -962,6 +1000,7 @@ fn corner_pill(
         font,
         &fill(Color4f::new(1.0, 1.0, 1.0, 0.92)),
     );
+    Rect::from_xywh(x, y, w, h)
 }
 
 /// Mid-stream resize cover: full-screen scrim + spinner + "Resizing…". The overlay
@@ -996,8 +1035,7 @@ fn draw_resize_scrim(
     );
 }
 
-/// Capture hint / start banner: centered pill near the bottom. `scale` is the
-/// display UI scale (size already rides in `font`).
+/// Paint a bottom hint or banner and return its bounds after fitting its text.
 fn draw_hint_pill(
     canvas: &Canvas,
     base_font: &Font,
@@ -1006,7 +1044,7 @@ fn draw_hint_pill(
     height: u32,
     alpha: f32,
     scale: f32,
-) {
+) -> Rect {
     // Capture hint already fills most of a 1280 px window at 100 %; fit to the
     // window (4 % gutter) so 2× scale does not overrun both edges.
     let pill_w =
@@ -1032,4 +1070,9 @@ fn draw_hint_pill(
         font,
         &fill(Color4f::new(1.0, 1.0, 1.0, 0.92 * alpha)),
     );
+    Rect::from_xywh(x, y, w, h)
 }
+
+#[cfg(test)]
+#[path = "skia_overlay_tests.rs"]
+mod tests;
