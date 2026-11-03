@@ -45,6 +45,13 @@ jobs:
             libxtst-dev llvm-dev nasm ninja-build patchelf pkg-config python3 \
             wayland-protocols
 
+      - name: Verify the separately stored downstream patch snapshot
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git clone --depth 1 --branch codex/rpi5-patches https://github.com/aditi-ab/punktfunk-rpi5.git "$RUNNER_TEMP/rpi5-patches"
+          python3 "$RUNNER_TEMP/rpi5-patches/tools/patchset.py" verify \
+            --source "$GITHUB_WORKSPACE" --expect-head
+
       - name: Restore ARM64 build cache
         uses: actions/cache/restore@v4
         with:

@@ -125,6 +125,26 @@ its Wayland environment, and remove the temporary compositor override afterwards
 
 ## Update and publish
 
+The complete downstream delta lives separately on this repository's
+[`codex/rpi5-patches`](https://github.com/aditi-ab/punktfunk-rpi5/tree/codex/rpi5-patches)
+maintenance branch, checked out in its own directory. Do not merge that branch into
+the source branch. Upstream release tags remain unchanged.
+Its immutable snapshots contain ordered binary-safe patches, upstream/source
+commits, checksums and an exact-tree replay check. This includes source fixes,
+Bluetooth/SSH/system menus, kiosk services, Weston integration and release tooling.
+
+After committing and pushing a fork change, run from the separate patch checkout:
+
+```sh
+python3 tools/patchset.py export --source /path/to/punktfunk-rpi5 --base "$upstream_tag"
+python3 tools/patchset.py verify --source /path/to/punktfunk-rpi5 --expect-head
+```
+
+Commit and push the patch checkout before tagging the fork release. Release builds
+fail when their exact source snapshot is absent or cannot recreate the tagged tree.
+On a new upstream base, follow the patch branch's porting procedure; an old
+patch applying cleanly does not replace compatibility and hardware tests.
+
 1. Fetch the canonical upstream repository at
    `https://git.unom.io/unom/punktfunk.git` and select a named release tag.
 2. Create an integration branch from the current fork tip. Merge the selected

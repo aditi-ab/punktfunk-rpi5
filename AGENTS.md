@@ -2,6 +2,14 @@
 
 Guidance for coding agents working in this repository.
 
+## Raspberry Pi downstream changes
+
+Keep every downstream change on this repository's separate `codex/rpi5-patches`
+maintenance branch, using its own checkout. After committing source changes, export and verify the complete delta
+against the explicit upstream release; commit and push the immutable patch snapshot
+before tagging a fork release. The release workflow requires an exact replay of
+the tagged tree. Follow `docs/rpi5-fork.md` for commands and upgrade review.
+
 ## Writing
 
 `scripts/ci/check-writing.sh` fails the PR. If it fails: shorten. Do not add `writing-ok`
