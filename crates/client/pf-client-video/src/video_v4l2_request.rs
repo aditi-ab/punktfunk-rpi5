@@ -9,6 +9,7 @@ use crate::video::CpuPlanarFrame;
 use crate::video_color::ColorDesc;
 use anyhow::{bail, Result};
 use ffmpeg_sys_next as ffi;
+use std::ffi::c_void;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::ptr;
@@ -81,6 +82,67 @@ impl Drop for AvBuffer {
 
 unsafe impl Send for AvBuffer {}
 
+struct PackedTransfer<'a> {
+    frame: *mut ffi::AVFrame,
+    _bytes: &'a mut [u8],
+}
+
+unsafe extern "C" fn borrowed_pixels(_opaque: *mut c_void, _data: *mut u8) {}
+
+impl<'a> PackedTransfer<'a> {
+    // SAFETY: frame is exclusively borrowed until this guard drops; FFmpeg's
+    // synchronous transfer does not retain the destination buffer reference.
+    unsafe fn new(
+        frame: *mut ffi::AVFrame,
+        bytes: &'a mut [u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let (offsets, total) = CpuPlanarFrame::packed_layout(width, height)?;
+        anyhow::ensure!(
+            bytes.len() == total,
+            "packed transfer buffer length mismatch"
+        );
+        anyhow::ensure!(
+            width <= i32::MAX as u32 && height <= i32::MAX as u32,
+            "packed transfer dimensions exceed FFmpeg limits"
+        );
+        let data = bytes.as_mut_ptr();
+        let guard = Self {
+            frame,
+            _bytes: bytes,
+        };
+        unsafe {
+            ffi::av_frame_unref(frame);
+            (*frame).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+            (*frame).width = width as i32;
+            (*frame).height = height as i32;
+            (*frame).buf[0] =
+                ffi::av_buffer_create(data, total, Some(borrowed_pixels), ptr::null_mut(), 0);
+            anyhow::ensure!(
+                !(*frame).buf[0].is_null(),
+                "allocate packed transfer buffer reference"
+            );
+            for (i, offset) in offsets.into_iter().enumerate() {
+                (*frame).data[i] = data.add(offset);
+                (*frame).linesize[i] = if i == 0 { width } else { width.div_ceil(2) } as i32;
+            }
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for PackedTransfer<'_> {
+    fn drop(&mut self) {
+        // The Vec owns the pixels. Clear all FFmpeg references before its borrow ends.
+        unsafe { ffi::av_frame_unref(self.frame) };
+    }
+}
+
+fn direct_transfer_dimensions(width: i32, height: i32, crop: [usize; 4]) -> bool {
+    width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0 && crop == [0; 4]
+}
+
 unsafe extern "C" fn pick_drm_prime(
     _ctx: *mut ffi::AVCodecContext,
     mut formats: *const ffi::AVPixelFormat,
@@ -103,6 +165,7 @@ pub struct V4l2RequestDecoder {
     frame: *mut ffi::AVFrame,
     planar: *mut ffi::AVFrame,
     timing: Option<DecodeTiming>,
+    direct_transfer: bool,
 }
 
 unsafe impl Send for V4l2RequestDecoder {}
@@ -164,6 +227,8 @@ impl V4l2RequestDecoder {
                 frame,
                 planar,
                 timing: None,
+                direct_transfer: std::env::var("PUNKTFUNK_RPI_DIRECT_TRANSFER").as_deref()
+                    != Ok("0"),
             })
         }
     }
@@ -277,6 +342,27 @@ impl V4l2RequestDecoder {
                 bail!("no supported planar SAND transfer format");
             }
             let ten_bit = format == ffi::AVPixelFormat::AV_PIX_FMT_YUV420P10LE;
+            if self.direct_transfer
+                && !ten_bit
+                && direct_transfer_dimensions(
+                    (*self.frame).width,
+                    (*self.frame).height,
+                    [
+                        (*self.frame).crop_left,
+                        (*self.frame).crop_top,
+                        (*self.frame).crop_right,
+                        (*self.frame).crop_bottom,
+                    ],
+                )
+            {
+                match self.packed_frame(timing.as_deref_mut()) {
+                    Ok(frame) => return Ok(frame),
+                    Err(error) => {
+                        self.direct_transfer = false;
+                        tracing::warn!(%error, "packed SAND transfer disabled; using planar copy");
+                    }
+                }
+            }
             if (*self.planar).buf[0].is_null()
                 || (*self.planar).width != (*self.frame).width
                 || (*self.planar).height != (*self.frame).height
@@ -378,6 +464,63 @@ impl V4l2RequestDecoder {
             copied
         }
     }
+
+    unsafe fn packed_frame(
+        &mut self,
+        mut timing: Option<&mut DecodeSample>,
+    ) -> Result<CpuPlanarFrame> {
+        unsafe {
+            let width = (*self.frame).width as u32;
+            let height = (*self.frame).height as u32;
+            let (_, total) = CpuPlanarFrame::packed_layout(width, height)?;
+            let copy_started = timing.as_ref().map(|_| Instant::now());
+            let mut data = vec![0; total];
+            let destination = PackedTransfer::new(self.planar, &mut data, width, height)?;
+            if let (Some(at), Some(sample)) = (copy_started, timing.as_mut()) {
+                sample.phases[2] += at.elapsed();
+            }
+            let transfer_started = timing.as_ref().map(|_| Instant::now());
+            let status = ffi::av_hwframe_transfer_data(destination.frame, self.frame, 0);
+            if let (Some(at), Some(sample)) = (transfer_started, timing.as_mut()) {
+                sample.phases[1] += at.elapsed();
+            }
+            if status < 0 {
+                return Err(av_error("transfer SAND output to packed samples", status));
+            }
+            anyhow::ensure!(
+                (*destination.frame).width == width as i32
+                    && (*destination.frame).height == height as i32
+                    && (*destination.frame).format == ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32,
+                "packed transfer changed picture layout"
+            );
+            let (offsets, _) = CpuPlanarFrame::packed_layout(width, height)?;
+            let base = destination._bytes.as_ptr();
+            for (i, offset) in offsets.into_iter().enumerate() {
+                anyhow::ensure!(
+                    (*destination.frame).data[i].cast_const() == base.add(offset)
+                        && (*destination.frame).linesize[i]
+                            == if i == 0 { width } else { width / 2 } as i32,
+                    "packed transfer changed plane {i} layout"
+                );
+            }
+            drop(destination);
+            CpuPlanarFrame::from_packed(
+                width,
+                height,
+                data,
+                ColorDesc {
+                    primaries: (*self.frame).color_primaries as u8,
+                    transfer: (*self.frame).color_trc as u8,
+                    matrix: (*self.frame).colorspace as u8,
+                    full_range: (*self.frame).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG,
+                },
+                (*self.frame).flags & FRAME_FLAG_KEY != 0
+                    || (*self.frame).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I,
+                punktfunk_core::reanchor::LocalRecovery::NONE,
+                "software",
+            )
+        }
+    }
 }
 
 fn downshift_10bit(source: &[u8], stride: usize, width: usize, height: usize) -> Vec<u8> {
@@ -393,8 +536,59 @@ fn downshift_10bit(source: &[u8], stride: usize, width: usize, height: usize) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{downshift_10bit, DecodeSample, DecodeTiming};
+    use super::{
+        direct_transfer_dimensions, downshift_10bit, DecodeSample, DecodeTiming, PackedTransfer,
+    };
+    use ffmpeg_sys_next as ffi;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn direct_transfer_requires_even_uncropped_dimensions() {
+        assert!(direct_transfer_dimensions(130, 4, [0; 4]));
+        assert!(direct_transfer_dimensions(3840, 2160, [0; 4]));
+        for (w, h) in [(0, 4), (-2, 4), (130, 0), (129, 4), (130, 3)] {
+            assert!(!direct_transfer_dimensions(w, h, [0; 4]));
+        }
+        for i in 0..4 {
+            let mut crop = [0; 4];
+            crop[i] = 2;
+            assert!(!direct_transfer_dimensions(130, 4, crop));
+        }
+    }
+
+    #[test]
+    fn packed_transfer_releases_references_on_success_and_error() {
+        unsafe {
+            let mut frame = ffi::av_frame_alloc();
+            assert!(!frame.is_null());
+            let mut data = vec![0; 130 * 4 * 3 / 2];
+            let address = data.as_ptr();
+            {
+                let destination = PackedTransfer::new(frame, &mut data, 130, 4).unwrap();
+                assert_eq!(ffi::av_buffer_get_ref_count((*frame).buf[0]), 1);
+                for (i, length) in [520, 130, 130].into_iter().enumerate() {
+                    std::ptr::write_bytes((*destination.frame).data[i], (i + 1) as u8, length);
+                }
+            }
+            assert!((*frame).buf[0].is_null());
+            assert!((*frame).data[0].is_null());
+            assert_eq!(data.as_ptr(), address);
+            assert!(data[..520].iter().all(|&v| v == 1));
+            assert!(data[520..650].iter().all(|&v| v == 2));
+            assert!(data[650..].iter().all(|&v| v == 3));
+            let fail = |bytes: &mut [u8]| -> anyhow::Result<()> {
+                let _destination = PackedTransfer::new(frame, bytes, 130, 4)?;
+                anyhow::bail!("injected transfer failure");
+            };
+            assert!(fail(&mut data).is_err());
+            assert!((*frame).buf[0].is_null());
+            assert!((*frame).data[0].is_null());
+            data.fill(7);
+            assert_eq!(data[779], 7);
+            assert!(PackedTransfer::new(frame, &mut data[..779], 130, 4).is_err());
+            ffi::av_frame_free(&mut frame);
+        }
+    }
 
     #[test]
     fn timing_counts_empty_calls_and_resets_after_each_window() {

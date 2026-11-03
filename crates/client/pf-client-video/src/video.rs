@@ -359,6 +359,51 @@ pub struct CpuPlanarFrame {
 }
 
 impl CpuPlanarFrame {
+    #[cfg(any(test, all(target_os = "linux", feature = "rpi5-v4l2-request")))]
+    pub(crate) fn packed_layout(width: u32, height: u32) -> Result<([usize; 3], usize)> {
+        anyhow::ensure!(width > 0 && height > 0, "empty picture {width}x{height}");
+        let (cw, ch) = Self::chroma_dims(width, height);
+        let y = width
+            .checked_mul(height)
+            .context("I420 luma size overflow")? as usize;
+        let c = cw.checked_mul(ch).context("I420 chroma size overflow")? as usize;
+        let cr = y.checked_add(c).context("I420 plane offset overflow")?;
+        let total = cr.checked_add(c).context("I420 buffer size overflow")?;
+        anyhow::ensure!(
+            total <= isize::MAX as usize,
+            "I420 buffer exceeds allocation limit"
+        );
+        Ok(([0, y, cr], total))
+    }
+
+    /// Take one packed I420 allocation without copying its planes.
+    #[cfg(any(test, all(target_os = "linux", feature = "rpi5-v4l2-request")))]
+    pub(crate) fn from_packed(
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+        color: ColorDesc,
+        keyframe: bool,
+        recovery: punktfunk_core::reanchor::LocalRecovery,
+        path: &'static str,
+    ) -> Result<Self> {
+        let (offsets, total) = Self::packed_layout(width, height)?;
+        anyhow::ensure!(
+            data.len() == total,
+            "I420 buffer length disagrees with dimensions"
+        );
+        Ok(Self {
+            width,
+            height,
+            data,
+            offsets,
+            color,
+            keyframe,
+            recovery,
+            path,
+        })
+    }
+
     /// Chroma plane size for 4:2:0, rounding up — an odd luma dimension still
     /// has a chroma sample covering its last row/column.
     pub fn chroma_dims(width: u32, height: u32) -> (u32, u32) {
@@ -1223,6 +1268,67 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::video_caps::tests::decode_device;
+
+    #[test]
+    fn packed_frame_keeps_allocation_planes_and_metadata() {
+        let color = ColorDesc {
+            primaries: 9,
+            transfer: 16,
+            matrix: 9,
+            full_range: true,
+        };
+        let recovery = punktfunk_core::reanchor::LocalRecovery {
+            sei_here: true,
+            is_recovery_point: true,
+        };
+        // Include odd dimensions and widths with a partial 128-byte SAND stripe.
+        for (width, height) in [(5, 3), (130, 4), (2560, 1440)] {
+            let (offsets, total) = CpuPlanarFrame::packed_layout(width, height).unwrap();
+            let data: Vec<u8> = (0..total).map(|i| i as u8).collect();
+            let address = data.as_ptr();
+            let frame = CpuPlanarFrame::from_packed(
+                width,
+                height,
+                data,
+                color,
+                true,
+                recovery,
+                "test-packed",
+            )
+            .unwrap();
+            assert_eq!(frame.data.as_ptr(), address);
+            assert_eq!(frame.offsets, offsets);
+            assert_eq!(frame.color, color);
+            assert!(frame.keyframe);
+            assert_eq!(frame.path, "test-packed");
+            assert_eq!(frame.recovery, recovery);
+            assert_eq!(frame.plane(2).last(), Some(&((total - 1) as u8)));
+        }
+    }
+
+    #[test]
+    fn packed_frame_refuses_invalid_geometry_or_length() {
+        assert!(CpuPlanarFrame::packed_layout(0, 2).is_err());
+        assert!(CpuPlanarFrame::packed_layout(u32::MAX, 2).is_err());
+        let color = ColorDesc {
+            primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            full_range: false,
+        };
+        for length in [11, 13] {
+            assert!(CpuPlanarFrame::from_packed(
+                4,
+                2,
+                vec![0; length],
+                color,
+                false,
+                punktfunk_core::reanchor::LocalRecovery::NONE,
+                "test"
+            )
+            .is_err());
+        }
+    }
 
     /// A new format rebuilds onto a rung for its codec. One nothing here decodes leaves the
     /// decoder as it was, with the typed refusal the pump turns into a codec ask.
