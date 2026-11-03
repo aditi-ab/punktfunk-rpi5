@@ -539,7 +539,7 @@ impl SourcePacer {
     /// `None` under the unpaced latency intent: arrival-driven, so the loop never carries
     /// an estimate built from samples it then ignored. Called at submit, not take:
     /// dropped frames are part of the arrival process; folding only survivors hides
-    /// the jitter.
+    /// the jitter. Latency bounds the hold to one source interval, including offset drift.
     pub(crate) fn due_ns(
         &mut self,
         smoothing: bool,
@@ -548,8 +548,16 @@ impl SourcePacer {
         frame_interval_ns: i64,
     ) -> Option<i64> {
         (smoothing || self.paces_latency()).then(|| {
-            self.clock
-                .due_ns(src_pts_ns, ready_ns as i64, frame_interval_ns)
+            let due = self
+                .clock
+                .due_ns(src_pts_ns, ready_ns as i64, frame_interval_ns);
+            // The offset can lag a draining decode queue by many frames. Latency must
+            // release within one source interval even while that estimate catches up.
+            if !smoothing && frame_interval_ns > 0 {
+                due.min((ready_ns as i64).saturating_add(frame_interval_ns))
+            } else {
+                due
+            }
         })
     }
 
@@ -1386,6 +1394,97 @@ mod tests {
         );
         off.follow(Cadence::Variable, true, false);
         assert!(!off.paces_latency());
+    }
+
+    #[test]
+    fn latency_recovers_when_a_decode_backlog_drains() {
+        use crate::slot_pick::{Pick, SlotPick};
+        const PERIOD: u64 = 16_666_666;
+        const BASE: u64 = 1_000_000_000;
+        for verdict in [Cadence::Fixed, Cadence::Variable] {
+            let mut pacer = SourcePacer::new(true, true);
+            pacer.follow(verdict, true, false);
+            let mut previous_ready = 0;
+            for i in 0..300 {
+                let pts = BASE + i * PERIOD;
+                previous_ready = pts + 150_000_000;
+                pacer.due_ns(false, pts, previous_ready, PERIOD as i64);
+            }
+            let start = previous_ready;
+            let mut arrivals = std::collections::VecDeque::new();
+            for i in 300..360 {
+                let pts = BASE + i * PERIOD;
+                // The queued decoder catches up without time moving backwards.
+                let ready = (previous_ready + 1_000_000).max(pts + 10_000_000);
+                arrivals.push_back((pts, ready));
+                previous_ready = ready;
+            }
+            let mut store = FrameStore::new(0);
+            store.set_paced(true);
+            let mut slots = SlotPick::default();
+            let mut last_vend = start;
+            let mut vended = 0;
+            for now in (start..=previous_ready + 3 * PERIOD).step_by(200_000) {
+                while arrivals.front().is_some_and(|&(_, ready)| ready <= now) {
+                    let (pts, ready) = arrivals.pop_front().unwrap();
+                    let due = pacer.due_ns(false, pts, ready, PERIOD as i64).unwrap();
+                    store.submit(due);
+                }
+                let due = |due: &i64| *due <= now as i64;
+                let frame = if pacer.free_running() {
+                    store.take(due)
+                } else {
+                    let front = store.front().map(|&due| due.max(0) as u64);
+                    match slots.pick(
+                        now,
+                        PERIOD,
+                        front,
+                        |t| (t / PERIOD + 1) * PERIOD,
+                        || store.take_due_bounded(due),
+                    ) {
+                        Pick::Vend(frame) => Some(frame),
+                        _ => None,
+                    }
+                };
+                if frame.is_some() {
+                    assert!(
+                        now - last_vend <= 4 * PERIOD,
+                        "{verdict:?}: stalled after backlog drained"
+                    );
+                    last_vend = now;
+                    vended += 1;
+                }
+            }
+            assert!(
+                vended >= 40,
+                "{verdict:?}: only {vended} frames escaped the paced store"
+            );
+        }
+    }
+
+    #[test]
+    fn smoothness_keeps_the_source_clock_due_time_after_backlog() {
+        for verdict in [Cadence::Fixed, Cadence::Variable] {
+            let mut pacer = SourcePacer::new(true, true);
+            pacer.follow(verdict, true, true);
+            let mut ready = 0;
+            for i in 0..300 {
+                let pts = 1_000_000_000 + i * 16_666_666;
+                ready = pts + 150_000_000;
+                pacer.due_ns(true, pts, ready, 16_666_666);
+            }
+            let mut due = 0;
+            for i in 300..310 {
+                let pts = 1_000_000_000 + i * 16_666_666;
+                ready = (ready + 1_000_000).max(pts + 10_000_000);
+                due = pacer.due_ns(true, pts, ready, 16_666_666).unwrap();
+            }
+            assert!(
+                due > ready as i64 + 16_666_666,
+                "{verdict:?}: smoothness retains its source-clock hold"
+            );
+            assert_eq!(pacer.free_running(), verdict == Cadence::Variable);
+        }
     }
 
     /// The tail policy reaches the clock where frames go out at their due time: a late
