@@ -97,6 +97,7 @@ Run navigation commands only after confirming the kiosk view: during streaming,
 ordinary keys go to the host. `disconnect`, `stats`, and `ring` use Punktfunk's
 existing Ctrl+Alt+Shift shortcuts. `--dry-run` prints the requested action without
 creating a device. Scroll tests alternate up/down every three seconds.
+`tap pageup` and `tap pagedown` switch the console's tabs.
 
 For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=1|2` selects the
 pending callback limit. The kiosk uses two; the generic presenter defaults to one.

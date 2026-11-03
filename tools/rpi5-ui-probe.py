@@ -9,6 +9,7 @@ import time
 KEYS = {
     "up": 103, "down": 108, "left": 105, "right": 106,
     "enter": 28, "escape": 1, "tab": 15, "home": 102, "end": 107,
+    "pageup": 104, "pagedown": 109,
 }
 SHORTCUTS = {"disconnect": 32, "stats": 31, "ring": 24}
 MODIFIERS = (29, 56, 42)  # Ctrl, Alt, Shift.

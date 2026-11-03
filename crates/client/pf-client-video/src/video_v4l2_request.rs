@@ -411,7 +411,6 @@ impl V4l2RequestDecoder {
             ];
             let mut planes: [&[u8]; 3] = [&[]; 3];
             let mut strides = [0usize; 3];
-            let mut converted: [Vec<u8>; 3] = std::array::from_fn(|_| Vec::new());
             for index in 0..3 {
                 if (*self.planar).data[index].is_null() || (*self.planar).linesize[index] <= 0 {
                     bail!("planar transfer returned an invalid plane {index}");
@@ -428,36 +427,34 @@ impl V4l2RequestDecoder {
                     (rows - 1) * stride + row_bytes,
                 );
             }
-            if ten_bit {
+            let color = ColorDesc {
+                primaries: (*self.frame).color_primaries as u8,
+                transfer: (*self.frame).color_trc as u8,
+                matrix: (*self.frame).colorspace as u8,
+                full_range: (*self.frame).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG,
+            };
+            let keyframe = (*self.frame).flags & FRAME_FLAG_KEY != 0
+                || (*self.frame).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I;
+            let recovery = punktfunk_core::reanchor::LocalRecovery::NONE;
+            let copied = if ten_bit {
+                let (offsets, total) = CpuPlanarFrame::packed_layout(width, height)?;
+                let mut data = vec![0; total];
                 for index in 0..3 {
-                    converted[index] = downshift_10bit(
+                    let end = offsets.get(index + 1).copied().unwrap_or(total);
+                    downshift_10bit_into(
                         planes[index],
                         strides[index],
                         dimensions[index].0 as usize,
                         dimensions[index].1 as usize,
-                    );
+                        &mut data[offsets[index]..end],
+                    )?;
                 }
-                for index in 0..3 {
-                    planes[index] = &converted[index];
-                    strides[index] = dimensions[index].0 as usize;
-                }
-            }
-            let flags = (*self.frame).flags;
-            let copied = CpuPlanarFrame::from_i420(
-                width,
-                height,
-                planes,
-                strides,
-                ColorDesc {
-                    primaries: (*self.frame).color_primaries as u8,
-                    transfer: (*self.frame).color_trc as u8,
-                    matrix: (*self.frame).colorspace as u8,
-                    full_range: (*self.frame).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG,
-                },
-                flags & FRAME_FLAG_KEY != 0
-                    || (*self.frame).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I,
-                punktfunk_core::reanchor::LocalRecovery::NONE,
-            );
+                CpuPlanarFrame::from_packed(
+                    width, height, data, color, keyframe, recovery, "software",
+                )
+            } else {
+                CpuPlanarFrame::from_i420(width, height, planes, strides, color, keyframe, recovery)
+            };
             if let (Some(at), Some(sample)) = (copy_started, timing.as_mut()) {
                 sample.phases[2] += at.elapsed();
             }
@@ -523,21 +520,67 @@ impl V4l2RequestDecoder {
     }
 }
 
-fn downshift_10bit(source: &[u8], stride: usize, width: usize, height: usize) -> Vec<u8> {
-    let mut result = Vec::with_capacity(width * height);
+fn downshift_10bit_into(
+    source: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    target: &mut [u8],
+) -> Result<()> {
+    let row_bytes = width
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("ten-bit row size overflow"))?;
+    let required = height
+        .checked_sub(1)
+        .and_then(|rows| rows.checked_mul(stride))
+        .and_then(|size| size.checked_add(row_bytes));
+    anyhow::ensure!(
+        width > 0
+            && stride >= row_bytes
+            && required.is_some_and(|size| size <= source.len())
+            && width.checked_mul(height) == Some(target.len()),
+        "invalid ten-bit plane layout"
+    );
     for row in 0..height {
-        for sample in source[row * stride..row * stride + width * 2].chunks_exact(2) {
+        let source = &source[row * stride..row * stride + row_bytes];
+        let target = &mut target[row * width..(row + 1) * width];
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        // SAFETY: AArch64 supplies NEON; complete eight-sample chunks fit both slices.
+        let done = unsafe { downshift_10bit_neon(source, target) };
+        #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+        let done = 0;
+        for (sample, output) in source[done * 2..].chunks_exact(2).zip(&mut target[done..]) {
             let value = u16::from_le_bytes([sample[0], sample[1]]);
-            result.push(((u32::from(value) + 2) >> 2).min(255) as u8);
+            *output = ((u32::from(value) + 2) >> 2).min(255) as u8;
         }
     }
-    result
+    Ok(())
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+unsafe fn downshift_10bit_neon(source: &[u8], target: &mut [u8]) -> usize {
+    use std::arch::aarch64::{vld1q_u8, vqrshrn_n_u16, vreinterpretq_u16_u8, vst1_u8};
+    let chunks = (source.len() / 16).min(target.len() / 8);
+    for chunk in 0..chunks {
+        // SAFETY: each chunk reads 16 valid bytes and writes eight. Byte loads
+        // accept unaligned planes; rounded saturating narrowing matches the scalar path.
+        unsafe {
+            let samples = vreinterpretq_u16_u8(vld1q_u8(source.as_ptr().add(chunk * 16)));
+            vst1_u8(
+                target.as_mut_ptr().add(chunk * 8),
+                vqrshrn_n_u16::<2>(samples),
+            );
+        }
+    }
+    chunks * 8
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        direct_transfer_dimensions, downshift_10bit, DecodeSample, DecodeTiming, PackedTransfer,
+        direct_transfer_dimensions, downshift_10bit_into, DecodeSample, DecodeTiming,
+        PackedTransfer,
     };
     use ffmpeg_sys_next as ffi;
     use std::time::{Duration, Instant};
@@ -617,16 +660,74 @@ mod tests {
     }
 
     #[test]
+    fn ten_bit_downshift_matches_every_u16_value() {
+        let input: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        let mut output = vec![0; 65536];
+        downshift_10bit_into(&input, input.len(), output.len(), 1, &mut output).unwrap();
+        for (value, actual) in output.into_iter().enumerate() {
+            assert_eq!(
+                actual,
+                (((value as u32 + 2) >> 2).min(255)) as u8,
+                "sample {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn ten_bit_downshift_handles_unaligned_padded_rows_and_vector_tails() {
+        for width in [1, 3, 7, 8, 9, 15, 17, 130] {
+            let height = 3;
+            let stride = width * 2 + 3;
+            let mut input = vec![0xaa; 1 + (height - 1) * stride + width * 2];
+            let mut expected = Vec::new();
+            for row in 0..height {
+                for column in 0..width {
+                    let value = ((row * width + column) * 911 + 31) as u16;
+                    let at = 1 + row * stride + column * 2;
+                    input[at..at + 2].copy_from_slice(&value.to_le_bytes());
+                    expected.push(((u32::from(value) + 2) >> 2).min(255) as u8);
+                }
+            }
+            let mut output = vec![0x55; 2 + width * height];
+            downshift_10bit_into(
+                &input[1..],
+                stride,
+                width,
+                height,
+                &mut output[1..1 + width * height],
+            )
+            .unwrap();
+            assert_eq!(&output[1..1 + width * height], expected.as_slice());
+            assert_eq!((output[0], output[1 + width * height]), (0x55, 0x55));
+        }
+    }
+
+    #[test]
+    fn ten_bit_downshift_rejects_short_planes_and_invalid_geometry() {
+        let mut output = [0; 8];
+        for (stride, width, height) in [
+            (7, 4, 2),
+            (8, 0, 2),
+            (8, 4, 0),
+            (8, usize::MAX, 2),
+            (usize::MAX, 4, 3),
+        ] {
+            assert!(downshift_10bit_into(&[0; 16], stride, width, height, &mut output).is_err());
+        }
+        assert!(downshift_10bit_into(&[0; 15], 8, 4, 2, &mut output).is_err());
+        assert!(downshift_10bit_into(&[0; 16], 8, 4, 2, &mut output[..7]).is_err());
+    }
+
+    #[test]
     fn ten_bit_transfer_preserves_range_rounding_and_row_padding() {
         let samples = [0u16, 64, 512, 940, 1023, 65535, 1, 2, 3, 4, 1022];
         let bytes: Vec<u8> = samples
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        assert_eq!(
-            downshift_10bit(&bytes, 12, 5, 2),
-            [0, 16, 128, 235, 255, 0, 1, 1, 1, 255]
-        );
+        let mut output = vec![0; 10];
+        downshift_10bit_into(&bytes, 12, 5, 2, &mut output).unwrap();
+        assert_eq!(output, [0, 16, 128, 235, 255, 0, 1, 1, 1, 255]);
     }
 }
 
