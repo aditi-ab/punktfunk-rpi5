@@ -26,6 +26,14 @@ use std::time::{Duration, Instant};
 /// An idle console redraws at most this often. 30 Hz keeps the aurora moving.
 const IDLE_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
+/// Bound diagnostic overrides to the supported low-cost backdrop sizes.
+fn rpi_field_edge(value: Option<&str>) -> u16 {
+    value
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|edge| (64..=192).contains(edge))
+        .unwrap_or(96)
+}
+
 /// Long enough to read the exit hint; the last `BANNER_FADE_S` fade out.
 const BANNER_S: f64 = 6.0;
 const BANNER_FADE_S: f64 = 0.6;
@@ -213,11 +221,17 @@ impl Overlay for SkiaOverlay {
                 .instance
                 .get_physical_device_properties(shared.physical_device)
         };
-        if let Some(shell) = &mut self.shell {
-            shell.efficient_backdrop = properties.vendor_id == 0x14e4;
-            if shell.efficient_backdrop {
-                tracing::info!("Broadcom GPU: cached backdrop with native-resolution controls");
-            }
+        if let Some(shell) = self
+            .shell
+            .as_mut()
+            .filter(|_| properties.vendor_id == 0x14e4)
+        {
+            let edge = rpi_field_edge(std::env::var("PUNKTFUNK_RPI_FIELD_EDGE").ok().as_deref());
+            shell.set_efficient_backdrop(f64::from(edge));
+            tracing::info!(
+                edge,
+                "Broadcom GPU: cached backdrop with native-resolution controls"
+            );
         }
         // Skia resolves Vulkan entry points through us (same ash dispatch). The
         // DirectContext bakes the table in `make_vulkan`; this closure dies with `init`.

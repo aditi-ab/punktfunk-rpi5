@@ -1727,6 +1727,12 @@ impl Shell {
         }
     }
 
+    /// Limit the shader target on bandwidth-limited GPUs without resizing the controls.
+    pub(crate) fn set_efficient_backdrop(&mut self, edge: f64) {
+        self.efficient_backdrop = true;
+        self.backdrop.reduced_edge = edge;
+    }
+
     fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
         // One clock read: the takeover's `draw_aurora` inherits it.
         let t = self.field_clock(t);

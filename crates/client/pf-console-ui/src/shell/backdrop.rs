@@ -18,6 +18,8 @@ const FIELD_EDGE_REDUCED: f64 = 192.0;
 pub(super) const FIELD_STEP: f64 = 0.04;
 
 pub(super) struct Backdrop {
+    /// Long edge of the reduced shader target; controls keep their native viewport.
+    pub(super) reduced_edge: f64,
     mesh: RuntimeEffect,
     /// Palette id baked into `mesh`. [`Self::sync`] recompiles when
     /// `settings.ui_palette` moves.
@@ -48,6 +50,7 @@ impl Backdrop {
     pub(super) fn new(palette_id: &str, bg_mix: f64) -> Result<Backdrop> {
         let (mesh, mesh_lift, mesh_scrim, ink) = build_mesh(palette_id)?;
         Ok(Backdrop {
+            reduced_edge: FIELD_EDGE_REDUCED,
             mesh,
             mesh_palette: palette_id.to_string(),
             mesh_os: None,
@@ -130,12 +133,11 @@ impl Backdrop {
             })
     }
 
-    /// The field over `w`×`h` at clock `t`. The reduced interface takes a smaller buffer and
-    /// one pass over the sphere.
+    /// Draw the field with a bounded shader target; the final blit covers the native canvas.
     pub(super) fn draw(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64, reduced: bool) {
         let mut cache = self.field.borrow_mut();
         let (edge, passes) = if reduced {
-            (FIELD_EDGE_REDUCED, 1.0)
+            (self.reduced_edge, 1.0)
         } else {
             (FIELD_EDGE, 2.0)
         };

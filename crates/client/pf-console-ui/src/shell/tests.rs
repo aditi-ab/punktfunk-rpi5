@@ -1826,6 +1826,13 @@ fn the_backdrop_caches_its_field() {
         Some((192, 120))
     );
     assert_eq!(s.last_full, (1280.0, 800.0));
+    s.set_efficient_backdrop(96.0);
+    s.render(surface.canvas(), 1280, 800, &fonts, None, None, &pads);
+    assert_eq!(
+        s.backdrop.field.borrow().as_ref().map(|c| c.size),
+        Some((96, 60))
+    );
+    assert_eq!(s.last_full, (1280.0, 800.0));
 }
 
 /// Bounding box of lit pixels: `(left, right, bottom)`. White ink on black, any channel.

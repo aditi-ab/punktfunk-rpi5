@@ -132,6 +132,10 @@ Run parser regression tests with
 
 For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=1|2` selects the
 pending callback limit. The kiosk uses two; the generic presenter defaults to one.
+On Broadcom GPUs the animated background uses a 96-pixel shader target long edge;
+text, controls and transition layers retain the native viewport. For comparisons,
+`PUNKTFUNK_RPI_FIELD_EDGE=192` restores the earlier background target. Diagnostic
+values from 64 through 192 are accepted; invalid values use the default.
 `PUNKTFUNK_RPI_DIRECT_TRANSFER=0` compares against the original planar-copy path.
 `PUNKTFUNK_RPI_DECODE_THREADS=2` tests overlapping decode and transfer. This can
 increase memory contention and reduce presentation throughput at high output
