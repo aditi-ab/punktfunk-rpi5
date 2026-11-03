@@ -688,7 +688,12 @@ impl LayerEnv<'_> {
             pinned = screen.pinned(self.k, &ctx);
             if pinned != (0.0, 0.0) {
                 let mut rec = PictureRecorder::new();
-                let rc = rec.begin_recording(device_edges, false);
+                let bounded = record_content_layer(
+                    true,
+                    self.ui.skip_backdrop_blur && !crate::blur::active(self.ui),
+                    destination.image_info().color_type(),
+                );
+                let rc = rec.begin_recording(device_edges, bounded);
                 rc.set_matrix(&base);
                 screen.render_pinned(rc, self.content, self.k, self.dt, self.fonts, &ctx);
                 pinned_pic = rec.finish_recording_as_picture(None);
@@ -737,7 +742,7 @@ impl LayerEnv<'_> {
     }
 
     /// Stationary chrome over the content. Titles and legends fade within their bands;
-    /// pinned recordings and the focus plate retain the full clip for their effects.
+    /// Surface-independent pinned controls fade within their recorded effect bounds.
     /// Crossing roots share one full-strength strip. Returns the last legend's hit-boxes.
     fn chrome(&mut self, layers: &[Chrome]) -> Vec<(HintKey, Rect)> {
         let canvas = self.canvas;
@@ -756,7 +761,16 @@ impl LayerEnv<'_> {
             let Some(pic) = &c.pinned_pic else {
                 continue;
             };
-            if open_at(canvas, c.alpha, None) {
+            if c.alpha < 0.001 {
+                continue;
+            }
+            if record_content_layer(
+                c.alpha < 0.999,
+                self.ui.skip_backdrop_blur && !crate::blur::active(self.ui),
+                canvas.image_info().color_type(),
+            ) {
+                replay_content(canvas, pic, c.alpha);
+            } else if open_at(canvas, c.alpha, None) {
                 // Recorded in device space (`paint`).
                 canvas.reset_matrix();
                 canvas.draw_picture(pic, None, None);
