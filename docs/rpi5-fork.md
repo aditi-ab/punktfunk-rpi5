@@ -75,6 +75,29 @@ ARM64 runs natively; other architectures also require `qemu-aarch64-static`.
 Output includes the complete `.img.xz`, checksums, package inventory, and build
 report. Booting and streaming on a physical Pi remain separate acceptance checks.
 
+## Repeatable UI diagnostics
+
+Copy `tools/rpi5-ui-probe.py` to the Pi and run it through an authenticated SSH
+session with `sudo python3`. It creates a temporary keyboard through `/dev/uinput`
+and removes it when the command ends. No daemon or additional network listener
+is installed.
+
+```sh
+sudo python3 rpi5-ui-probe.py shortcut disconnect
+sudo python3 rpi5-ui-probe.py tap down --count 2
+sudo python3 rpi5-ui-probe.py scroll --seconds 20
+sudo python3 rpi5-ui-probe.py shortcut stats
+```
+
+Run navigation commands only after confirming the kiosk view: during streaming,
+ordinary keys go to the host. `disconnect`, `stats`, and `ring` use Punktfunk's
+existing Ctrl+Alt+Shift shortcuts. `--dry-run` prints the requested action without
+creating a device. Scroll tests alternate up/down every three seconds.
+
+For captures, Weston provides `weston-screenshooter` when started with `--debug`.
+Enable that only for a diagnostic session, run the capture as the kiosk user with
+its Wayland environment, and remove the temporary compositor override afterwards.
+
 ## Update and publish
 
 1. Fetch the canonical upstream repository at
