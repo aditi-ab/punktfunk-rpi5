@@ -326,6 +326,7 @@ pub(crate) struct Shell {
     hosts: Vec<HostRow>,
     hosts_gen: u64,
     pub(crate) efficient_backdrop: bool,
+    pub(crate) content_prepass: bool,
     /// The host was last told the input test is on.
     pad_testing: bool,
     /// The `host_sort` / `host_grouping` values `hosts` was last arranged by.
@@ -454,6 +455,7 @@ impl Shell {
             hosts: Vec::new(),
             hosts_gen: u64::MAX,
             efficient_backdrop: false,
+            content_prepass: true,
             hosts_order: (None, None),
             pad_testing: false,
             in_stream: false,

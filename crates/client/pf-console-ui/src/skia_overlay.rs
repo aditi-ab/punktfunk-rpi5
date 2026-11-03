@@ -228,6 +228,10 @@ impl Overlay for SkiaOverlay {
         {
             let edge = rpi_field_edge(std::env::var("PUNKTFUNK_RPI_FIELD_EDGE").ok().as_deref());
             shell.set_efficient_backdrop(f64::from(edge));
+            shell.content_prepass = std::env::var("PUNKTFUNK_RPI_CONTENT_PREPASS")
+                .ok()
+                .as_deref()
+                != Some("0");
             tracing::info!(
                 edge,
                 "Broadcom GPU: cached backdrop with native-resolution controls"

@@ -136,6 +136,11 @@ On Broadcom GPUs the animated background uses a 96-pixel shader target long edge
 text, controls and transition layers retain the native viewport. For comparisons,
 `PUNKTFUNK_RPI_FIELD_EDGE=192` restores the earlier background target. Diagnostic
 values from 64 through 192 are accepted; invalid values use the default.
+Eight-bit menu transitions prepare their content layers before composing the
+background. This avoids repeatedly storing and loading the native target between
+layers. Group opacity, shadows and device-pixel coordinates are retained.
+`PUNKTFUNK_RPI_CONTENT_PREPASS=0` restores the earlier ordering for comparisons;
+HDR and surface-dependent rendering keep their existing path.
 `PUNKTFUNK_RPI_DIRECT_TRANSFER=0` compares against the original planar-copy path.
 `PUNKTFUNK_RPI_DECODE_THREADS=2` tests overlapping decode and transfer. This can
 increase memory contention and reduce presentation throughput at high output
