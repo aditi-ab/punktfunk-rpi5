@@ -19,6 +19,7 @@ pub mod audio;
 #[path = "audio_wasapi.rs"]
 pub mod audio;
 pub mod bluetooth;
+pub mod kiosk;
 // Playback counters both audio backends publish. Atomics only: the PipeWire callback is the graph's realtime loop.
 #[cfg(desktop)]
 pub mod audio_vitals;

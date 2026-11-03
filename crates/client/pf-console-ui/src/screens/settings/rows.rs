@@ -132,6 +132,8 @@ pub enum RowId {
     /// Action row: jumps to the Controllers tab.
     Controllers,
     Bluetooth,
+    Ssh,
+    SystemInformation,
     /// Action row: the stream's keys, chords and gestures, read-only.
     StreamControls,
     /// Action row: asks the host to open the platform licences screen.
@@ -461,12 +463,11 @@ pub(crate) fn reduce_ui_res(
 // The sections, the rows a player touches most first and the [`advanced`] ones last. A child
 // row sits right under the switch it dims or drops with. Presets is empty here: its rows come
 // from the catalog.
-pub(super) const TABS: [(&str, &[RowId]); 7] = [
+pub(super) const TABS: [(&str, &[RowId]); 8] = [
     (
         "General",
         &[
             RowId::StartIn,
-            RowId::Bluetooth,
             RowId::AutoWake,
             RowId::FullscreenMode,
             RowId::Fullscreen,
@@ -563,15 +564,20 @@ pub(super) const TABS: [(&str, &[RowId]); 7] = [
         "About",
         &[RowId::Version, RowId::StreamControls, RowId::Licenses],
     ),
+    (
+        "Raspberry Pi",
+        &[RowId::Bluetooth, RowId::Ssh, RowId::SystemInformation],
+    ),
 ];
 
 /// The Presets section — catalog-built, not [`TABS`] rows.
 pub(super) const PRESETS_TAB: usize = 5;
+pub(super) const PI_TAB: usize = 7;
 
 /// Strip length for the shell's raster walk. `cfg(test)`: a shipping build
 /// would warn it dead, and this crate treats warnings as errors.
 #[cfg(test)]
-pub(crate) const TAB_COUNT: usize = TABS.len();
+pub(crate) const TAB_COUNT: usize = PI_TAB;
 
 /// Sizes by family; the Resolution row lists one family at a time.
 use punktfunk_core::resolutions::{family_of, nearest_in, Family, SAFE_AREA_LABEL, SCREEN_LABEL};
@@ -854,7 +860,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         // Offered wherever there is a second UI to fall back to: Android's touch home,
         // webOS's cursor shell. `row_applies` still needs `fallback_ui` from the host.
         RowId::GamepadUi | RowId::GamepadUiMode => &[Android, WebOS, Apple],
-        RowId::Bluetooth => &[Desktop],
+        RowId::Bluetooth | RowId::Ssh | RowId::SystemInformation => &[Desktop],
         // A pad list: real on a TV, and on Apple its Controllers screen.
         RowId::Controllers => &[Android, WebOS, Apple],
         // Apps a phone or TV can put in the background; `row_applies` drops the Mac.
@@ -957,6 +963,7 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
             !ctx.device.tv
         }
         RowId::Bluetooth => pf_client_core::bluetooth::snapshot().available,
+        RowId::Ssh | RowId::SystemInformation => pf_client_core::kiosk::available(),
         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
         RowId::PyroWaveQuality => pyrowave_rate(ctx),
         // Needs `fallback_ui`; otherwise off strands the user with no UI.
@@ -1135,6 +1142,7 @@ pub(super) fn row_icon(id: RowId) -> &'static str {
         | RowId::DsCapture
         | RowId::Bluetooth
         | RowId::Controllers => "gamepad-2",
+        RowId::Ssh | RowId::SystemInformation => "info",
         RowId::SystemButtons | RowId::GuideGesture => "house",
         RowId::PhoneGyro => "rotate-cw",
         RowId::SecondScreen | RowId::Screen | RowId::Screens => "monitor",
@@ -1270,6 +1278,8 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             return RowSpec::action("New preset\u{2026}", true);
         }
         RowId::Bluetooth => return RowSpec::action("Bluetooth devices", true),
+        RowId::Ssh => return RowSpec::action("SSH", true),
+        RowId::SystemInformation => return RowSpec::action("System information", true),
         RowId::Controllers => return RowSpec::action("Controllers", true),
         // The count is the tab's; `SettingsScreen::spec` writes it in.
         RowId::AdvancedChanged => return RowSpec::action("Advanced settings changed", true),
@@ -1577,6 +1587,8 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::Preset(_)
         | RowId::NewPreset
         | RowId::Bluetooth
+        | RowId::Ssh
+        | RowId::SystemInformation
         | RowId::Controllers
         | RowId::AdvancedChanged
         | RowId::StreamControls
@@ -1946,6 +1958,8 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             }
         },
         RowId::Bluetooth => "Pair, connect or forget Bluetooth devices.",
+        RowId::Ssh => "Turn remote access on or off and view connection details.",
+        RowId::SystemInformation => "View network addresses, connection and device status.",
         RowId::Controllers => "The controllers connected here, their grants and a rumble test.",
         RowId::StreamControls => {
             "The keys, controller chords and gestures that work while you stream."
@@ -2283,6 +2297,8 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::Preset(_)
         | RowId::NewPreset
         | RowId::Bluetooth
+        | RowId::Ssh
+        | RowId::SystemInformation
         | RowId::Controllers
         | RowId::AdvancedChanged
         | RowId::StreamControls

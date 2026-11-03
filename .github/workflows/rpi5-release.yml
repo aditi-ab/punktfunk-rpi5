@@ -60,7 +60,17 @@ jobs:
       - name: Build the portable ARM64 bundle
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          export PF_CONSOLE_DUMP="$GITHUB_WORKSPACE/ui-checks"
           bash packaging/rpi5/build-release.sh "$RELEASE_TAG" dist
+
+      - name: Keep appliance menu test renders
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi5-menu-checks
+          path: ui-checks/*.png
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Save ARM64 build cache
         if: always()

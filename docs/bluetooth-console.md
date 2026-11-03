@@ -1,6 +1,6 @@
 # Native Linux Bluetooth settings
 
-Settings → Controller → Bluetooth opens the console's device manager when a
+Settings → Raspberry Pi → Bluetooth opens the kiosk's device manager when a
 BlueZ adapter is available. It uses the same menus, keyboard, controller input
 and pointer handling as the rest of Punktfunk. A USB keyboard/controller is
 needed to pair the first wireless controller.
@@ -43,4 +43,5 @@ available as `cargo run -p pf-client-core --example bluetooth_probe
 --no-default-features --features desktop -- --scan` on a BlueZ machine.
 
 Image packaging supplies standard Linux Bluetooth/audio services and the
-Punktfunk bundle. The same UI and backend run in the portable client.
+Punktfunk bundle. The same UI and backend run in the portable client; outside
+the kiosk image, Bluetooth remains under Controller settings.

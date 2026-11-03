@@ -1,0 +1,141 @@
+#!/usr/bin/python3 -I
+"""Fixed appliance operations for the controller settings menu."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import secrets
+import socket
+import subprocess
+import sys
+
+ADMIN = "punktfunk-admin"
+ACTIONS = {"status", "ssh-enable", "ssh-disable", "ssh-reset-password"}
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"}
+
+
+def command(*args, input=None, required=True):
+    """Keep credentials on stdin and command failures out of the menu response."""
+    result = subprocess.run(args, input=input, text=True, capture_output=True,
+                            timeout=15, cwd="/", env=ENV, check=False)
+    if required and result.returncode:
+        raise RuntimeError("Couldn't change SSH. Try again.")
+    return result
+
+
+def read(path, fallback=""):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return fallback
+
+
+def active():
+    return command("/usr/bin/systemctl", "is-active", "--quiet", "ssh.service",
+                   required=False).returncode == 0
+
+
+def status():
+    """Report addresses and appliance state without reading authentication data."""
+    addresses = []
+    try:
+        links = json.loads(command("/usr/sbin/ip", "-j", "address", "show", "up",
+                                   required=False).stdout or "[]")
+        addresses = [entry["local"] for link in links for entry in link.get("addr_info", [])
+                     if entry.get("scope") == "global" and "local" in entry]
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        pass
+    connection = "Disconnected"
+    try:
+        result = command("/usr/bin/nmcli", "-t", "--escape", "no", "-f",
+                         "DEVICE,TYPE,STATE,CONNECTION", "device", "status", required=False)
+        connected = []
+        for line in result.stdout.splitlines():
+            fields = line.split(":", 3)
+            if len(fields) == 4 and fields[2] == "connected" and fields[1] != "loopback":
+                kind = "Wi-Fi" if fields[1] == "wifi" else fields[1].capitalize()
+                connected.append(f"{kind}: {fields[3]} ({fields[0]})")
+        connection = "; ".join(connected) or connection
+    except (OSError, subprocess.TimeoutExpired):
+        connection = "Unavailable"
+    release = dict(line.split("=", 1) for line in read("/etc/punktfunk-kiosk-release").splitlines()
+                   if "=" in line)
+    try:
+        temperature = float(read("/sys/class/thermal/thermal_zone0/temp")) / 1000
+    except ValueError:
+        temperature = None
+    try:
+        uptime = int(float(read("/proc/uptime", "0").split()[0]))
+    except (ValueError, IndexError):
+        uptime = 0
+    return {"available": True, "hostname": socket.gethostname(),
+            "version": release.get("RELEASE_TAG", "Unknown"),
+            "ip_addresses": addresses, "connection": connection,
+            "temperature_c": temperature, "uptime_seconds": uptime,
+            "ssh_enabled": active(), "ssh_user": ADMIN, "ssh_port": 22}
+
+
+def password():
+    """Generate a per-device credential and never send it through process arguments."""
+    try:
+        pwd.getpwnam(ADMIN)
+    except KeyError:
+        command("/usr/sbin/useradd", "--create-home", "--user-group", "--shell",
+                "/bin/bash", "--groups", "sudo", ADMIN)
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    value = "".join(secrets.choice(alphabet) for _ in range(20))
+    command("/usr/sbin/chpasswd", input=f"{ADMIN}:{value}\n")
+    return value
+
+
+def change(action):
+    """Serialize mutations; a failed enable leaves no listening SSH service."""
+    with open("/run/punktfunk-kiosk-control.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if action == "ssh-disable":
+            command("/usr/bin/systemctl", "disable", "--now", "ssh.service", "ssh.socket")
+            try:
+                pwd.getpwnam(ADMIN)
+                command("/usr/bin/passwd", "--lock", ADMIN)
+                command("/usr/bin/loginctl", "terminate-user", ADMIN, required=False)
+            except KeyError:
+                pass
+            return None
+        if action == "ssh-reset-password" and not active():
+            raise RuntimeError("Turn on SSH before changing its password.")
+        try:
+            value = password()
+            command("/usr/bin/ssh-keygen", "-A")
+            command("/usr/bin/install", "-d", "-m", "0755", "/run/sshd")
+            command("/usr/sbin/sshd", "-t")
+            command("/usr/bin/systemctl", "enable", "--now", "ssh.service")
+            return value
+        except Exception:
+            command("/usr/bin/systemctl", "disable", "--now", "ssh.service", required=False)
+            command("/usr/bin/passwd", "--lock", ADMIN, required=False)
+            raise
+
+
+def main(argv):
+    if len(argv) != 1 or argv[0] not in ACTIONS:
+        print(json.dumps({"error": "Unknown appliance action."}))
+        return 2
+    if os.geteuid() != 0:
+        print(json.dumps({"error": "Couldn't access appliance settings."}))
+        return 1
+    try:
+        value = change(argv[0]) if argv[0] != "status" else None
+        result = status()
+        if value is not None:
+            result["password"] = value
+        print(json.dumps(result))
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+        message = str(error) if isinstance(error, RuntimeError) else "Couldn't read or change appliance settings. Try again."
+        print(json.dumps({"error": message}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

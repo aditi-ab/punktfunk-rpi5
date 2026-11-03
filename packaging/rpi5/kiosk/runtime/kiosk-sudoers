@@ -1,0 +1,1 @@
+punktfunk ALL=(root) NOPASSWD: /usr/libexec/punktfunk/kiosk-control status, /usr/libexec/punktfunk/kiosk-control ssh-enable, /usr/libexec/punktfunk/kiosk-control ssh-disable, /usr/libexec/punktfunk/kiosk-control ssh-reset-password

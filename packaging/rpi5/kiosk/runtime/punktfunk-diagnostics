@@ -10,6 +10,14 @@ output=$(mktemp /data/logs/punktfunk-diagnostics.XXXXXX.txt)
     id punktfunk
     echo '=== Network ==='
     ip -brief address
+    echo '=== Display and CPU state ==='
+    for state in /sys/kernel/debug/dri/*/state; do
+        [[ -r "$state" ]] && cat "$state"
+    done
+    for value in /sys/class/thermal/thermal_zone*/temp /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
+        [[ -r "$value" ]] && printf '%s: %s\n' "$value" "$(cat "$value")"
+    done
+    if command -v vcgencmd >/dev/null; then vcgencmd get_throttled; fi
     echo '=== Service configuration ==='
     systemctl show punktfunk-kiosk.service -p User -p Group -p SupplementaryGroups -p Environment -p ExecStart
     echo '=== Device ownership and kiosk read/write access ==='

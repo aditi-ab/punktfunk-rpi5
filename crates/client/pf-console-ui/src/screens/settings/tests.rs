@@ -108,7 +108,7 @@ fn sections_match_the_shared_vectors() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    let got: Vec<&str> = TABS.iter().map(|(name, _)| *name).collect();
+    let got: Vec<&str> = TABS[..PI_TAB].iter().map(|(name, _)| *name).collect();
     assert_eq!(got, want, "the sections' names and order");
 }
 
@@ -407,7 +407,7 @@ fn a_press_on_a_pill_selects_that_tab() {
     let mut s = SettingsScreen::with_presets(Vec::new());
     rendered(&mut s);
     assert_eq!(s.tab, 0);
-    for target in [3, 1, TABS.len() - 1, 0] {
+    for target in [3, 1, PI_TAB - 1, 0] {
         let pill = s.strip.pill(target).expect("the strip drew every pill");
         with_ctx(|ctx| {
             let mut fx = Outbox::default();
@@ -1417,7 +1417,6 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
     assert_eq!(
         off_android,
         vec![
-            RowId::Bluetooth,
             RowId::FullscreenMode,
             RowId::Fullscreen,
             RowId::Screens,
@@ -1436,6 +1435,9 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::Pad,
             // A present Steam Controller 2 is captured; only Apple asks first.
             RowId::Sc2Passthrough,
+            RowId::Bluetooth,
+            RowId::Ssh,
+            RowId::SystemInformation,
         ]
     );
     // Every row reaches at least one platform: a row listed in a tab and offered nowhere
@@ -1747,7 +1749,7 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 74, "{seen:?}");
+    assert_eq!(seen.len(), 76, "{seen:?}");
     assert!(
         !seen.contains(&RowId::AdvancedChanged),
         "built per tab, never listed"
@@ -1819,7 +1821,7 @@ fn shoulders_cycle_tabs_and_keep_each_cursor() {
     s.menu(MenuEvent::JumpBack, &mut ctx, &mut fx);
     assert_eq!((s.tab, s.list.cursor), (0, 3), "Stream kept its place");
     s.menu(MenuEvent::JumpBack, &mut ctx, &mut fx);
-    assert_eq!(s.tab, TABS.len() - 1, "About, the last");
+    assert_eq!(s.tab, PI_TAB - 1, "About, the last");
     assert_eq!(s.list.cursor, 0);
     s.menu(MenuEvent::JumpForward, &mut ctx, &mut fx);
     assert_eq!(s.tab, 0);
@@ -1842,11 +1844,7 @@ fn dpad_alone_reaches_every_tab() {
     assert!(s.strip_focus, "switching keeps the strip focused");
     s.menu(MenuEvent::Move(MenuDir::Left), &mut ctx, &mut fx);
     s.menu(MenuEvent::Move(MenuDir::Left), &mut ctx, &mut fx);
-    assert_eq!(
-        s.tab,
-        TABS.len() - 1,
-        "the strip wraps like the shoulders do"
-    );
+    assert_eq!(s.tab, PI_TAB - 1, "the strip wraps like the shoulders do");
     s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
     assert!(!s.strip_focus, "Down drops back into the list");
     s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
@@ -1969,7 +1967,7 @@ fn about_opens_the_stream_controls_where_the_client_has_them() {
     let library = crate::library::LibraryShared::default();
     let mut ctx = Ctx::test(&mut settings, &library);
     let mut s = SettingsScreen::with_presets(Vec::new());
-    s.tab = TABS.len() - 1;
+    s.tab = PI_TAB - 1;
     let ids = s.row_ids(&ctx);
     s.list.cursor = ids
         .iter()
@@ -2223,4 +2221,16 @@ fn the_licences_row_opens_the_console_screen_on_webos() {
     assert!(matches!(fx.nav, Some(crate::screens::Nav::Push(ref b))
         if matches!(**b, Screen::Licenses(_))));
     assert_eq!(fx.cmds, vec![crate::model::ConsoleCmd::LoadLicenses]);
+}
+
+#[test]
+fn appliance_rows_live_only_in_the_raspberry_pi_section() {
+    assert_eq!(TABS[PI_TAB].0, "Raspberry Pi");
+    assert_eq!(
+        TABS[PI_TAB].1,
+        &[RowId::Bluetooth, RowId::Ssh, RowId::SystemInformation]
+    );
+    assert!(TABS[..PI_TAB].iter().all(|(_, rows)| !rows
+        .iter()
+        .any(|id| matches!(id, RowId::Bluetooth | RowId::Ssh | RowId::SystemInformation))));
 }

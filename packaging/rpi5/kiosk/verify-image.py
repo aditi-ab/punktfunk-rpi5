@@ -35,7 +35,20 @@ assert (root / "etc/systemd/system/graphical.target.wants/punktfunk-session.targ
 for unit_name in ("userconfig.service", "getty@tty1.service"):
     assert (root / "etc/systemd/system" / unit_name).readlink() == pathlib.Path("/dev/null")
 for name in ("ssh.service", "sshd.service", "ssh.socket"):
-    assert (root / "etc/systemd/system" / name).readlink() == pathlib.Path("/dev/null")
+    path = root / "etc/systemd/system" / name
+    assert not path.is_symlink() or path.readlink() != pathlib.Path("/dev/null"), "Menu must be able to start SSH"
+    assert not list((root / "etc/systemd/system").glob(f"*.wants/{name}")), "SSH must start disabled"
+assert not (root / "home/punktfunk-admin").exists(), "Create the SSH account only when enabled"
+control = root / "usr/libexec/punktfunk/kiosk-control"
+assert control.is_file() and control.stat().st_uid == 0
+assert control.stat().st_mode & 0o022 == 0, "Appliance helper must not be writable by the kiosk"
+assert control.read_text().startswith("#!/usr/bin/python3 -I\n")
+sudoers = root / "etc/sudoers.d/punktfunk-kiosk"
+assert sudoers.stat().st_mode & 0o777 == 0o440
+assert "kiosk-control ssh-enable" in sudoers.read_text()
+ssh_config = (root / "etc/ssh/sshd_config.d/00-punktfunk.conf").read_text()
+for setting in ("PermitRootLogin no", "PermitEmptyPasswords no", "AllowUsers punktfunk-admin"):
+    assert setting in ssh_config
 for home in (root / "root", root / "home", root / "data"):
     assert not list(home.rglob("authorized_keys*")), "Public images must not ship authorized keys"
 assert not (root / "home/debug").exists()

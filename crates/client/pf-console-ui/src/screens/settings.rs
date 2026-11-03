@@ -159,6 +159,10 @@ impl SettingsScreen {
                 .1
                 .iter()
                 .copied()
+                .chain(
+                    (self.tab == 4 && !pf_client_core::kiosk::available())
+                        .then_some(RowId::Bluetooth),
+                )
                 .filter(|id| row_on(*id, ctx.device.platform) && row_applies(*id, ctx))
                 // The Mac's picker stands in for the toggle, which presets keep.
                 .filter(|id| !(*id == RowId::Fullscreen && is_mac(ctx)));
@@ -243,14 +247,22 @@ impl SettingsScreen {
         self.list.row_rect(i)
     }
 
+    fn tab_count(&self) -> usize {
+        if pf_client_core::kiosk::available() {
+            TABS.len()
+        } else {
+            PI_TAB
+        }
+    }
+
     fn switch_tab(&mut self, delta: i32, ctx: &Ctx) -> Option<MenuPulse> {
-        let n = TABS.len() as i32;
+        let n = self.tab_count() as i32;
         self.show_tab((self.tab as i32 + delta).rem_euclid(n) as usize, ctx)
     }
 
     /// Park the outgoing tab's cursor, then jump. Pointer pills name a tab outright.
     fn show_tab(&mut self, tab: usize, ctx: &Ctx) -> Option<MenuPulse> {
-        if tab >= TABS.len() {
+        if tab >= self.tab_count() {
             return None;
         }
         self.tab_cursors[self.tab] = self.list.cursor;
@@ -364,6 +376,21 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
+            RowId::Ssh | RowId::SystemInformation => {
+                return match msg {
+                    ListMsg::Activate => {
+                        let page = if focused == RowId::Ssh {
+                            super::kiosk::Page::Ssh
+                        } else {
+                            super::kiosk::Page::Information
+                        };
+                        fx.push(Screen::Kiosk(super::kiosk::KioskScreen::new(page)));
+                        pulse
+                    }
+                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                };
+            }
             RowId::Bluetooth => {
                 return match msg {
                     ListMsg::Activate => {
@@ -465,7 +492,10 @@ impl SettingsScreen {
         let list_rect = self.list_rect(rect, k);
         let col = column(ui, list_rect, k);
         let inner = f64::from(col.left) + 16.0 * k;
-        let labels: Vec<&str> = TABS.iter().map(|(name, _)| *name).collect();
+        let labels: Vec<&str> = TABS[..self.tab_count()]
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
         self.strip.render(
             canvas,
             ui,
@@ -659,6 +689,8 @@ impl ScreenView for SettingsScreen {
             }
             Some(
                 RowId::Bluetooth
+                | RowId::Ssh
+                | RowId::SystemInformation
                 | RowId::Controllers
                 | RowId::StreamControls
                 | RowId::Licenses

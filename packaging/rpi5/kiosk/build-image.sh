@@ -73,7 +73,8 @@ run apt-get install -y --no-install-recommends \
     weston=14.0.2-1 libweston-14-0=14.0.2-1 libgl1-mesa-dri mesa-vulkan-drivers libvulkan1 libwayland-client0 libxkbcommon0 \
     libfontconfig1 libfreetype6 libopus0 libasound2t64 libpipewire-0.3-0 \
     libva-drm2 libva-x11-2 libdrm2 libgbm1 libstdc++6 libudev1 \
-    pipewire wireplumber libspa-0.2-bluetooth rtkit dbus libpam-systemd network-manager bluez v4l-utils
+    pipewire wireplumber libspa-0.2-bluetooth rtkit dbus libpam-systemd network-manager bluez v4l-utils \
+    openssh-server sudo python3 iproute2
 run apt-get clean
 bash "$here/install-weston-cursor-backend.sh" "$root"
 rm -rf "$root/var/lib/apt/lists/"*
@@ -94,6 +95,16 @@ run passwd --lock root
 run passwd --lock punktfunk
 install -D -m 0755 "$here/runtime/punktfunk-diagnostics" "$root/usr/local/bin/punktfunk-diagnostics"
 sed -i 's/\r$//' "$root/usr/local/bin/punktfunk-diagnostics"
+install -D -m 0755 "$here/runtime/kiosk-control" "$root/usr/libexec/punktfunk/kiosk-control"
+install -D -m 0440 "$here/runtime/kiosk-sudoers" "$root/etc/sudoers.d/punktfunk-kiosk"
+install -D -m 0644 "$here/runtime/kiosk-ssh.conf" "$root/etc/ssh/sshd_config.d/00-punktfunk.conf"
+sed -i 's/\r$//' "$root/usr/libexec/punktfunk/kiosk-control" "$root/etc/sudoers.d/punktfunk-kiosk" "$root/etc/ssh/sshd_config.d/00-punktfunk.conf"
+run visudo --check --file /etc/sudoers.d/punktfunk-kiosk
+run install -d -m 0755 /run/sshd
+run /usr/sbin/sshd -T >"$work/ssh-settings.txt"
+for setting in 'permitrootlogin no' 'permitemptypasswords no' 'passwordauthentication yes' 'allowusers punktfunk-admin'; do
+    grep -qx "$setting" "$work/ssh-settings.txt" || die "Unexpected SSH setting: $setting"
+done
 units="$root/etc/systemd/system"
 for name in dbus weston pipewire wireplumber; do
     install -m 0644 "$here/runtime/punktfunk-$name.service" "$units/"
@@ -104,7 +115,7 @@ sed -i 's/\r$//' "$units"/punktfunk-*.service
 install -d "$units/punktfunk-kiosk.service.d"
 cat >"$units/punktfunk-kiosk.service.d/diagnostics.conf" <<'EOF'
 [Service]
-Environment=RUST_LOG=info,pf_client_video=debug,pf_client_video::video_v4l2_request=trace,pf_client_core::session=debug,pf_client_core::audio=debug
+Environment=RUST_LOG=info,pf_client_video=debug,pf_client_video::video_v4l2_request=trace,pf_client_core::session=debug,pf_client_core::audio=debug,pf_console_ui::skia_overlay=debug
 StandardOutput=journal
 StandardError=journal
 LogRateLimitIntervalSec=0
@@ -181,7 +192,9 @@ sed -i 's/127.0.1.1.*/127.0.1.1 punktfunk-pi/' "$root/etc/hosts"
 run systemctl enable punktfunk-session.target NetworkManager.service bluetooth.service
 run systemctl set-default graphical.target
 run systemctl mask userconfig.service getty@tty1.service serial-getty@serial0.service
-run systemctl mask ssh.service ssh.socket sshd.service regenerate_ssh_host_keys.service
+run systemctl unmask ssh.service ssh.socket sshd.service
+run systemctl disable ssh.service ssh.socket
+run systemctl mask regenerate_ssh_host_keys.service
 rm -f "$root/boot/firmware/ssh" "$root/boot/firmware/ssh.txt"
 install -m 0644 "$here/runtime/lite-runtime.conf" "$units/punktfunk-kiosk.service.d/runtime.conf"
 install -m 0644 "$here/runtime/punktfunk-clock-ready.service" "$units/"
@@ -196,6 +209,7 @@ install -d "$root/etc/systemd/journald.conf.d"
 printf '[Journal]\nStorage=persistent\nSystemMaxUse=32M\n' >"$root/etc/systemd/journald.conf.d/kiosk.conf"
 printf 'BASE=raspios-trixie-2026-09-15\nRELEASE_TAG=%s\nPUNKTFUNK_VERSION=%s\nFORK_COMMIT=%s\n' "$tag" "${tag#v}" "$release_commit" >"$root/etc/punktfunk-kiosk-release"
 log 'Checking runtime dependencies, service graph and image space.'
+python3 -m unittest discover -s "$here"
 run /opt/punktfunk-rpi5/punktfunk --help >"$work/cli-help.txt"
 run ldd /opt/punktfunk-rpi5/punktfunk-session >"$work/linkage.txt"
 ! grep -q 'not found' "$work/linkage.txt" || { cat "$work/linkage.txt"; die 'Missing session library'; }
@@ -231,7 +245,7 @@ mv "$output.xz.tmp" "$output.xz"
 cp "$work/packages.txt" "$output.packages.txt"
 {
     printf 'Release: %s\nCommit: %s\nBase: %s\nBase SHA256: %s\n' "$tag" "$release_commit" "$base_url" "$base_sha"
-    printf 'Remote login: disabled; no authorized keys\n'
+    printf 'Remote login: disabled by default; enable in Raspberry Pi settings; no shipped credentials or authorized keys\n'
     sha256sum "$bundle" "$here/weston-14.0.2-rpi5-cursor-drm-backend.so"
     cat "$work/space.txt"
 } >"$output.build.txt"

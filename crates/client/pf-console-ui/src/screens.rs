@@ -7,6 +7,7 @@
 pub(crate) mod add_host;
 pub(crate) mod bind_preset;
 pub(crate) mod bluetooth;
+pub(crate) mod kiosk;
 pub(crate) mod card_menu;
 pub(crate) mod collections;
 pub(crate) mod controls;
@@ -447,6 +448,7 @@ pub(crate) enum Screen {
     Library(library::LibraryScreen),
     Settings(settings::SettingsScreen),
     Bluetooth(bluetooth::BluetoothScreen),
+    Kiosk(kiosk::KioskScreen),
     AddHost(add_host::AddHostScreen),
     Pair(pair::PairScreen),
     PinHosts(pin_hosts::PinHostsScreen),
@@ -560,6 +562,7 @@ impl Screen {
             Screen::AddHost(s) => s,
             Screen::Pair(s) => s,
             Screen::Bluetooth(s) => s,
+            Screen::Kiosk(s) => s,
             Screen::PinHosts(s) => s,
             Screen::BindPreset(s) => s,
             Screen::Players(s) => s,
@@ -590,6 +593,7 @@ impl Screen {
             Screen::AddHost(s) => s,
             Screen::Pair(s) => s,
             Screen::Bluetooth(s) => s,
+            Screen::Kiosk(s) => s,
             Screen::PinHosts(s) => s,
             Screen::BindPreset(s) => s,
             Screen::Players(s) => s,

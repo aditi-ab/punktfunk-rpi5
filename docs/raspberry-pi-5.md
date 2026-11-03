@@ -21,8 +21,17 @@ Use Raspberry Pi Imager's **Use custom** option to write the `.img.xz` to your
 chosen microSD card or USB drive. Writing replaces the contents of that drive.
 Connect HDMI, Ethernet, and a USB controller or keyboard, then boot the Pi 5.
 The image starts Punktfunk directly; pair a host from the home screen. Ethernet
-uses DHCP. Bluetooth controllers can be paired from Settings after first boot.
-Remote login is disabled by default and no shared login credentials are supplied.
+uses DHCP. Open **Settings → Raspberry Pi** for Bluetooth, SSH, and system
+information. Bluetooth controllers can be paired there after first boot.
+
+SSH is off by default. Enabling it creates a device-specific password and shows
+the login command for `punktfunk-admin`. Keep the password before leaving the
+screen; reset it from the SSH page if needed. The account can use `sudo` with
+that password. Disable SSH from the same page when finished. Root login is disabled.
+
+System information shows the hostname, IP addresses, connection, installed
+version, temperature, and uptime. These appliance pages require the kiosk image;
+installing the portable bundle alone does not install system-management services.
 
 The image contains the portable bundle built from the same release tag and commit,
 a Raspberry Pi OS Lite system, Weston, the Pi graphics drivers, PipeWire, and BlueZ.
