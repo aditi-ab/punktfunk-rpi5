@@ -94,6 +94,10 @@ ordinary keys go to the host. `disconnect`, `stats`, and `ring` use Punktfunk's
 existing Ctrl+Alt+Shift shortcuts. `--dry-run` prints the requested action without
 creating a device. Scroll tests alternate up/down every three seconds.
 
+For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=2` permits two
+pending frame callbacks. The default remains one; this diagnostic override needs
+physical cadence and latency checks before choosing an appliance default.
+
 For captures, Weston provides `weston-screenshooter` when started with `--debug`.
 Enable that only for a diagnostic session, run the capture as the kiosk user with
 its Wayland environment, and remove the temporary compositor override afterwards.

@@ -4,7 +4,7 @@
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -45,10 +45,52 @@ unsafe extern "C" {
 
 const WL_SURFACE_FRAME: c_uint = 3;
 
+fn frame_depth(value: Option<&str>) -> usize {
+    if value == Some("2") {
+        2
+    } else {
+        1
+    }
+}
+
+/// Each pending proxy consumes one slot until that exact callback completes.
+struct PendingCallbacks<T> {
+    slots: [Option<T>; 2],
+    depth: usize,
+}
+
+impl<T: Copy + Eq> PendingCallbacks<T> {
+    fn new(depth: usize) -> Self {
+        Self {
+            slots: [None; 2],
+            depth: depth.clamp(1, 2),
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.slots[..self.depth].iter().any(Option::is_none)
+    }
+
+    fn insert(&mut self, callback: T) -> bool {
+        let Some(slot) = self.slots[..self.depth].iter_mut().find(|s| s.is_none()) else {
+            return false;
+        };
+        *slot = Some(callback);
+        true
+    }
+
+    fn complete(&mut self, callback: T) -> bool {
+        let Some(slot) = self.slots.iter_mut().find(|s| **s == Some(callback)) else {
+            return false;
+        };
+        slot.take();
+        true
+    }
+}
+
 pub(super) struct WaylandFramePacer {
     surface: *mut WlProxy,
-    callback: AtomicPtr<WlProxy>,
-    ready: AtomicBool,
+    pending: Mutex<PendingCallbacks<*mut WlProxy>>,
     wake: Mutex<Option<Box<dyn Fn() + Send>>>,
     arms: AtomicU64,
     completions: AtomicU64,
@@ -80,11 +122,15 @@ impl WaylandFramePacer {
             tracing::info!("SDL window is not Wayland; compositor frame pacing unavailable");
             return None;
         }
-        tracing::info!("Wayland compositor frame pacing active");
+        let depth = frame_depth(
+            std::env::var("PUNKTFUNK_WAYLAND_FRAME_DEPTH")
+                .ok()
+                .as_deref(),
+        );
+        tracing::info!(depth, "Wayland compositor frame pacing active");
         Some(Box::new(Self {
             surface,
-            callback: AtomicPtr::new(ptr::null_mut()),
-            ready: AtomicBool::new(true),
+            pending: Mutex::new(PendingCallbacks::new(depth)),
             wake: Mutex::new(None),
             arms: AtomicU64::new(0),
             completions: AtomicU64::new(0),
@@ -93,17 +139,18 @@ impl WaylandFramePacer {
     }
 
     pub(super) fn ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.pending.lock().unwrap().ready()
     }
 
     pub(super) fn set_wake(&self, wake: Box<dyn Fn() + Send>) {
         *self.wake.lock().unwrap() = Some(wake);
     }
 
-    /// Attach a one-shot frame request to the next wl_surface commit, which is
-    /// performed by vkQueuePresentKHR immediately after this call.
+    /// Each commit takes one budget slot and its own callback. Vulkan WSI commits
+    /// immediately after this call; SDL dispatches callbacks on the same main thread.
     pub(super) fn arm(&self) {
-        if !self.ready.swap(false, Ordering::AcqRel) {
+        let mut pending = self.pending.lock().unwrap();
+        if !pending.ready() {
             return;
         }
         // SAFETY: `surface` is SDL's live wl_surface. FRAME creates a wl_callback
@@ -118,11 +165,13 @@ impl WaylandFramePacer {
             )
         };
         if callback.is_null() {
-            self.ready.store(true, Ordering::Release);
             return;
         }
-        self.callback.store(callback, Ordering::Release);
-        self.arms.fetch_add(1, Ordering::Relaxed);
+        if !pending.insert(callback) {
+            // SAFETY: this newly created proxy has no listener or pending owner.
+            unsafe { wl_proxy_destroy(callback) };
+            return;
+        }
         static LISTENER: WlCallbackListener = WlCallbackListener { done };
         // SAFETY: callback is newly created; `self` is boxed and therefore stable
         // for the presenter's lifetime. Drop destroys any outstanding callback.
@@ -134,9 +183,11 @@ impl WaylandFramePacer {
             )
         };
         if rc != 0 {
-            self.callback.store(ptr::null_mut(), Ordering::Release);
+            pending.complete(callback);
+            // SAFETY: listener installation failed; no callback can name this proxy.
             unsafe { wl_proxy_destroy(callback) };
-            self.ready.store(true, Ordering::Release);
+        } else {
+            self.arms.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -145,9 +196,11 @@ unsafe extern "C" fn done(data: *mut c_void, callback: *mut WlProxy, _time_ms: u
     // SAFETY: listener data points at the boxed pacer; SDL dispatches this on the
     // presenter's main thread, and Drop removes a pending proxy before freeing it.
     let this = unsafe { &*(data.cast::<WaylandFramePacer>()) };
-    this.callback.store(ptr::null_mut(), Ordering::Release);
+    if !this.pending.lock().unwrap().complete(callback) {
+        return;
+    }
+    // SAFETY: this exact proxy was pending, and completing it removed its only owner.
     unsafe { wl_proxy_destroy(callback) };
-    this.ready.store(true, Ordering::Release);
     let completed = this.completions.fetch_add(1, Ordering::Relaxed) + 1;
     let armed = this.arms.load(Ordering::Relaxed);
     let mut report = this.report.lock().unwrap();
@@ -169,9 +222,48 @@ unsafe extern "C" fn done(data: *mut c_void, callback: *mut WlProxy, _time_ms: u
 
 impl Drop for WaylandFramePacer {
     fn drop(&mut self) {
-        let callback = self.callback.swap(ptr::null_mut(), Ordering::AcqRel);
-        if !callback.is_null() {
+        let pending = self.pending.get_mut().unwrap();
+        for callback in pending.slots.iter_mut().filter_map(Option::take) {
+            // SAFETY: SDL dispatch and drop share the main thread; destroying each proxy
+            // removes its listener before the boxed pacer is freed.
             unsafe { wl_proxy_destroy(callback) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_callback_frees_only_its_own_budget_slot() {
+        let mut pending = PendingCallbacks::new(2);
+        assert!(pending.insert(10));
+        assert!(pending.ready());
+        assert!(pending.insert(20));
+        assert!(!pending.ready());
+        assert!(!pending.insert(30));
+        assert!(!pending.complete(99));
+        assert!(pending.complete(20));
+        assert!(pending.ready());
+        assert!(pending.insert(30));
+        assert!(!pending.complete(20));
+        assert!(!pending.ready());
+        assert!(pending.complete(10));
+        assert!(pending.complete(30));
+        assert!(pending.ready());
+        assert!(pending.slots.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn default_budget_stays_one_and_only_two_opts_in() {
+        for value in [None, Some("1"), Some("0"), Some("3"), Some("invalid")] {
+            let mut pending = PendingCallbacks::new(frame_depth(value));
+            assert!(pending.insert(1));
+            assert!(!pending.insert(2));
+            assert!(pending.complete(1));
+            assert!(pending.ready());
+        }
+        assert_eq!(frame_depth(Some("2")), 2);
     }
 }
