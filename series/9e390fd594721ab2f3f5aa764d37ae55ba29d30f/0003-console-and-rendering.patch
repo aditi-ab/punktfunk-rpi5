@@ -1,0 +1,3076 @@
+diff --git a/clients/session/src/console.rs b/clients/session/src/console.rs
+index 2dfc851c2660a95403efdf3e52f0851393972319..ed7adca9ffa2da988b5e99897c4aa4ab784b9e7f 100644
+--- a/clients/session/src/console.rs
++++ b/clients/session/src/console.rs
+@@ -234,6 +234,7 @@ impl Launcher {
+ }
+ 
+ pub fn run(target: Option<&str>) -> u8 {
++    pf_client_core::bluetooth::start();
+     // Publish the desktop's theme to the shell ("Follow system theme"), and keep it
+     // current: a 2 s poll, the same interval and reason as the GTK shell and the web
+     // console — `~/.local/state/omarchy/current` is a SYMLINK `omarchy-theme-set`
+diff --git a/crates/client/pf-console-ui/Cargo.toml b/crates/client/pf-console-ui/Cargo.toml
+index 6b8bfe76fe7b1b6e03859a76277a4ee70b750add..178612796d40408031b3b1794dd85681b9318dd7 100644
+--- a/crates/client/pf-console-ui/Cargo.toml
++++ b/crates/client/pf-console-ui/Cargo.toml
+@@ -43,7 +43,7 @@ metal = ["skia-safe/metal", "skia-safe/ganesh"]
+ 
+ # Same Linux+Windows gating as the rest of the client stack.
+ [target.'cfg(any(target_os = "linux", windows))'.dependencies]
+-pf-presenter = { path = "../pf-presenter", optional = true }
++pf-presenter = { path = "../pf-presenter", optional = true, default-features = false }
+ # MenuEvent/MenuPulse (the gamepad service's menu mode drives the library).
+ # `default-features = false` like every other consumer (pf-presenter, cli, session, clients/windows):
+ # pf-client-core's default is `pyrowave`, which compiles the vendored PyroWave C++ — fatal on
+diff --git a/crates/client/pf-console-ui/src/blur.rs b/crates/client/pf-console-ui/src/blur.rs
+index 7cc4f57f2b44dfe2e3b8a0e50febe9db6ecf7681..348fdd6fb53e4f458c2a39a129737fd71a7b87b3 100644
+--- a/crates/client/pf-console-ui/src/blur.rs
++++ b/crates/client/pf-console-ui/src/blur.rs
+@@ -142,16 +142,21 @@ impl Band {
+     }
+ }
+ 
+-/// The style this frame draws: the blur everywhere, the reduced interface included — the
+-/// pixel treatment stays behind the A/B override until it is wanted.
+-fn style() -> Style {
+-    OVERRIDE.with(std::cell::Cell::get).unwrap_or(Style::Blur)
++/// Bandwidth-limited GPUs omit backdrop passes; an explicit style override takes priority.
++fn style(ui: &crate::theme::Frame) -> Style {
++    OVERRIDE
++        .with(std::cell::Cell::get)
++        .unwrap_or(if ui.skip_backdrop_blur {
++            Style::Off
++        } else {
++            Style::Blur
++        })
+ }
+ 
+ /// Whether a backdrop draws anything this frame: content may run on under the chrome
+ /// only when a band will treat it.
+-pub fn active() -> bool {
+-    style() != Style::Off
++pub fn active(ui: &crate::theme::Frame) -> bool {
++    style(ui) != Style::Off
+ }
+ 
+ /// Soften what `canvas` already holds under `rect` by `band`. Inside a transition layer
+@@ -160,7 +165,7 @@ pub fn backdrop(canvas: &Canvas, ui: &crate::theme::Frame, rect: Rect, band: Ban
+     if ui.in_layer.get() {
+         return;
+     }
+-    match style() {
++    match style(ui) {
+         Style::Off => {}
+         Style::Blur => blur(canvas, rect, band),
+         Style::Pixel => pixel(canvas, rect, band, true),
+@@ -339,6 +344,84 @@ mod tests {
+     use crate::theme::Frame;
+     use skia_safe::Color;
+ 
++    fn pixels(surface: &mut Surface) -> Vec<u8> {
++        let image = surface.image_snapshot();
++        let info = image.image_info();
++        let mut bytes = vec![0; info.compute_min_byte_size()];
++        assert!(image.read_pixels(
++            info,
++            &mut bytes,
++            info.min_row_bytes(),
++            (0, 0),
++            skia_safe::image::CachingHint::Allow,
++        ));
++        bytes
++    }
++
++    #[test]
++    fn bandwidth_limited_backdrop_preserves_pixels_and_clips_content() {
++        let mut surface = skia_safe::surfaces::raster_n32_premul((64, 100)).unwrap();
++        surface.canvas().clear(Color::BLACK);
++        let white = crate::theme::fill(Color4f::new(1.0, 1.0, 1.0, 1.0));
++        for x in (0..64).step_by(16) {
++            surface
++                .canvas()
++                .draw_rect(Rect::from_xywh(x as f32, 0.0, 8.0, 100.0), &white);
++        }
++        let before = pixels(&mut surface);
++        let ui = Frame {
++            skip_backdrop_blur: true,
++            ..Frame::default()
++        };
++        let rect = Rect::from_xywh(0.0, 20.0, 64.0, 60.0);
++        assert!(!active(&ui));
++        assert_eq!(
++            crate::widgets::bleed_view(surface.canvas(), &ui, rect),
++            rect
++        );
++        let band = Band {
++            edge: 0.0,
++            clear: 80.0,
++            sigma: 8.0,
++            over: 0.0,
++        };
++        backdrop(surface.canvas(), &ui, rect, band);
++        assert_eq!(pixels(&mut surface), before);
++        let normal = Frame::default();
++        assert!(active(&normal));
++        assert_ne!(
++            crate::widgets::bleed_view(surface.canvas(), &normal, rect),
++            rect
++        );
++        backdrop(surface.canvas(), &normal, rect, band);
++        assert_ne!(pixels(&mut surface), before);
++    }
++
++    #[test]
++    fn capability_fallback_preserves_other_devices_and_explicit_styles() {
++        struct Reset;
++        impl Drop for Reset {
++            fn drop(&mut self) {
++                set_style_override(None);
++            }
++        }
++        let _reset = Reset;
++        let reduced = Frame {
++            reduced_ui: true,
++            ..Frame::default()
++        };
++        assert_eq!(style(&reduced), Style::Blur);
++        let efficient = Frame {
++            skip_backdrop_blur: true,
++            ..Frame::default()
++        };
++        for picked in [Style::Blur, Style::Pixel, Style::PixelFlat, Style::Off] {
++            set_style_override(Some(picked));
++            assert_eq!(style(&efficient), picked);
++            assert_eq!(active(&efficient), picked != Style::Off);
++        }
++    }
++
+     /// 8 px stripes under a top band: rows at the clear edge keep full contrast, rows at
+     /// the screen edge lose nearly all of it, and contrast falls steadily in between.
+     #[test]
+diff --git a/crates/client/pf-console-ui/src/screens.rs b/crates/client/pf-console-ui/src/screens.rs
+index acca7c73cda888b5de817338feece8f37ab52705..0a8d6652593d8c1c4e515bc5f2c6cfbdfaa6a8d6 100644
+--- a/crates/client/pf-console-ui/src/screens.rs
++++ b/crates/client/pf-console-ui/src/screens.rs
+@@ -6,6 +6,8 @@
+ 
+ pub(crate) mod add_host;
+ pub(crate) mod bind_preset;
++pub(crate) mod bluetooth;
++pub(crate) mod kiosk;
+ pub(crate) mod card_menu;
+ pub(crate) mod collections;
+ pub(crate) mod controls;
+@@ -445,6 +447,8 @@ pub(crate) enum Screen {
+     Home(home::HomeScreen),
+     Library(library::LibraryScreen),
+     Settings(settings::SettingsScreen),
++    Bluetooth(bluetooth::BluetoothScreen),
++    Kiosk(kiosk::KioskScreen),
+     AddHost(add_host::AddHostScreen),
+     Pair(pair::PairScreen),
+     PinHosts(pin_hosts::PinHostsScreen),
+@@ -557,6 +561,8 @@ impl Screen {
+             Screen::Settings(s) => s,
+             Screen::AddHost(s) => s,
+             Screen::Pair(s) => s,
++            Screen::Bluetooth(s) => s,
++            Screen::Kiosk(s) => s,
+             Screen::PinHosts(s) => s,
+             Screen::BindPreset(s) => s,
+             Screen::Players(s) => s,
+@@ -586,6 +592,8 @@ impl Screen {
+             Screen::Settings(s) => s,
+             Screen::AddHost(s) => s,
+             Screen::Pair(s) => s,
++            Screen::Bluetooth(s) => s,
++            Screen::Kiosk(s) => s,
+             Screen::PinHosts(s) => s,
+             Screen::BindPreset(s) => s,
+             Screen::Players(s) => s,
+diff --git a/crates/client/pf-console-ui/src/screens/bluetooth.rs b/crates/client/pf-console-ui/src/screens/bluetooth.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..05f65f72fb793b0e3689c1e1f9f9704f5cbbb2f9
+--- /dev/null
++++ b/crates/client/pf-console-ui/src/screens/bluetooth.rs
+@@ -0,0 +1,666 @@
++//! Bluetooth devices and pairing use the native console widgets.
++
++use crate::glyphs::{Hint, HintKey};
++use crate::pointer::Pointer;
++use crate::screens::{Ctx, Outbox};
++use crate::theme::{Fonts, W};
++use crate::widgets::{KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
++use pf_client_core::bluetooth::{self, Command, Device, PromptKind, Snapshot};
++use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
++use skia_safe::{Canvas, Rect};
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++enum Row {
++    Power,
++    Scan,
++    Device(String),
++    Connect(String),
++    Disconnect(String),
++    Pair(String),
++    Forget(String),
++    ConfirmForget(String),
++    Cancel,
++    Input,
++    Accept,
++    Reject,
++    ClearError,
++    Empty,
++}
++
++pub(crate) struct BluetoothScreen {
++    pub(crate) list: MenuList,
++    rows: Vec<Row>,
++    selected: Option<String>,
++    forget: Option<String>,
++    prompt_id: Option<u64>,
++    keyboard: Keyboard,
++    input: String,
++    editing: bool,
++    passkey: bool,
++}
++
++impl BluetoothScreen {
++    pub(crate) fn new() -> Self {
++        Self {
++            list: MenuList::new(),
++            rows: Vec::new(),
++            selected: None,
++            forget: None,
++            prompt_id: None,
++            keyboard: Keyboard::new(),
++            input: String::new(),
++            editing: false,
++            passkey: false,
++        }
++    }
++
++    fn sync(&mut self, state: &Snapshot) {
++        let id = state.prompt.as_ref().map(|p| p.id);
++        if self.prompt_id != id {
++            self.prompt_id = id;
++            self.input.clear();
++            self.editing = false;
++            self.list.cursor = 0;
++            self.rows.clear();
++        }
++        self.passkey = state
++            .prompt
++            .as_ref()
++            .is_some_and(|p| matches!(p.kind, PromptKind::Passkey));
++        if self
++            .selected
++            .as_ref()
++            .is_some_and(|path| !state.devices.iter().any(|d| &d.path == path))
++        {
++            self.selected = None;
++            self.forget = None;
++        }
++        let next = self.roles(state);
++        let focused = self.rows.get(self.list.cursor);
++        self.list.cursor = focused
++            .and_then(|r| next.iter().position(|n| n == r))
++            .unwrap_or(0);
++        self.rows = next;
++    }
++
++    fn roles(&self, state: &Snapshot) -> Vec<Row> {
++        if let Some(prompt) = &state.prompt {
++            return match prompt.kind {
++                PromptKind::Pin | PromptKind::Passkey => vec![Row::Input, Row::Accept, Row::Reject],
++                PromptKind::Display { .. } => vec![Row::Reject],
++                _ => vec![Row::Reject, Row::Accept],
++            };
++        }
++        if let Some(path) = &self.forget {
++            return vec![Row::Cancel, Row::ConfirmForget(path.clone())];
++        }
++        if let Some(device) = self
++            .selected
++            .as_ref()
++            .and_then(|path| state.devices.iter().find(|d| &d.path == path))
++        {
++            let mut rows = vec![if device.connected {
++                Row::Disconnect(device.path.clone())
++            } else if device.paired {
++                Row::Connect(device.path.clone())
++            } else {
++                Row::Pair(device.path.clone())
++            }];
++            if device.paired {
++                rows.push(Row::Forget(device.path.clone()));
++            }
++            if state.busy && !device.paired {
++                rows.push(Row::Reject);
++            }
++            rows.push(Row::Cancel);
++            if state.error.is_some() {
++                rows.push(Row::ClearError);
++            }
++            return rows;
++        }
++        let mut rows = vec![Row::Power, Row::Scan];
++        rows.extend(state.devices.iter().map(|d| Row::Device(d.path.clone())));
++        if state.devices.is_empty() {
++            rows.push(Row::Empty);
++        }
++        if state.error.is_some() {
++            rows.push(Row::ClearError);
++        }
++        rows
++    }
++
++    fn back(&mut self, state: &Snapshot, fx: &mut Outbox) {
++        if state.prompt.is_some() {
++            bluetooth::submit(reject_prompt(state));
++        } else if self.forget.take().is_none() && self.selected.take().is_none() {
++            bluetooth::submit(Command::CancelPairing);
++            bluetooth::submit(Command::Scan(false));
++            fx.pop();
++        }
++        self.rows.clear();
++        self.list.cursor = 0;
++    }
++
++    pub(crate) fn menu(
++        &mut self,
++        ev: MenuEvent,
++        ctx: &mut Ctx,
++        fx: &mut Outbox,
++    ) -> Option<MenuPulse> {
++        let state = bluetooth::snapshot();
++        self.sync(&state);
++        if self.editing {
++            if ctx.device.system_keyboard {
++                if matches!(ev, MenuEvent::Back | MenuEvent::Confirm) {
++                    self.editing = false;
++                }
++                return None;
++            }
++            let (msg, pulse) = self.keyboard.menu(ev);
++            return self.key_msg(msg).or(pulse);
++        }
++        if ev == MenuEvent::Back {
++            self.back(&state, fx);
++            return None;
++        }
++        let (msg, pulse) = self.list.menu(ev, self.rows.len());
++        self.activate(msg, pulse, &state)
++    }
++
++    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, _fx: &mut Outbox) -> bool {
++        let state = bluetooth::snapshot();
++        self.sync(&state);
++        if self.editing && !ctx.device.system_keyboard {
++            if !self.keyboard.covers(p) {
++                if p.press() {
++                    self.editing = false;
++                }
++                return true;
++            }
++            let (msg, _) = self.keyboard.pointer(p);
++            self.key_msg(msg);
++            return true;
++        }
++        let (msg, pulse) = self.list.pointer(p, self.rows.len());
++        if matches!(msg, ListMsg::None) && pulse.is_none() {
++            return false;
++        }
++        self.activate(msg, pulse, &state);
++        true
++    }
++
++    fn activate(
++        &mut self,
++        msg: ListMsg,
++        pulse: Option<MenuPulse>,
++        state: &Snapshot,
++    ) -> Option<MenuPulse> {
++        if matches!(msg, ListMsg::Adjust(_)) {
++            return Some(MenuPulse::Boundary);
++        }
++        if !matches!(msg, ListMsg::Activate) {
++            return pulse;
++        }
++        let Some(row) = self.rows.get(self.list.cursor).cloned() else {
++            return pulse;
++        };
++        if !self.spec(&row, state).enabled {
++            return Some(MenuPulse::Boundary);
++        }
++        let command = match row {
++            Row::Power => Some(Command::Power(!state.powered)),
++            Row::Scan => Some(Command::Scan(!state.discovering)),
++            Row::Device(path) => {
++                self.selected = Some(path);
++                None
++            }
++            Row::Connect(path) => Some(Command::Connect(path)),
++            Row::Disconnect(path) => Some(Command::Disconnect(path)),
++            Row::Pair(path) => Some(Command::Pair(path)),
++            Row::Forget(path) => {
++                self.forget = Some(path);
++                None
++            }
++            Row::ConfirmForget(path) => {
++                self.forget = None;
++                self.selected = None;
++                Some(Command::Forget(path))
++            }
++            Row::Cancel => {
++                if self.forget.take().is_none() {
++                    self.selected = None;
++                }
++                None
++            }
++            Row::Input => {
++                self.editing = true;
++                return pulse;
++            }
++            Row::Accept => state.prompt.as_ref().map(|p| Command::Reply {
++                id: p.id,
++                value: Some(if matches!(p.kind, PromptKind::Pin | PromptKind::Passkey) {
++                    self.input.clone()
++                } else {
++                    "yes".into()
++                }),
++            }),
++            Row::Reject => Some(reject_prompt(state)),
++            Row::ClearError => Some(Command::ClearError),
++            Row::Empty => None,
++        };
++        if let Some(command) = command {
++            bluetooth::submit(command);
++        }
++        self.rows.clear();
++        self.list.cursor = 0;
++        pulse
++    }
++
++    fn type_char(&mut self, ch: char) -> bool {
++        if !self.editing
++            || !ch.is_ascii()
++            || ch.is_control()
++            || (self.passkey && !ch.is_ascii_digit())
++            || self.input.len() + ch.len_utf8() > if self.passkey { 6 } else { 16 }
++        {
++            return false;
++        }
++        self.input.push(ch);
++        true
++    }
++
++    fn key_msg(&mut self, msg: KeyMsg) -> Option<MenuPulse> {
++        match msg {
++            KeyMsg::Type(ch) => Some(if self.type_char(ch) {
++                MenuPulse::Move
++            } else {
++                MenuPulse::Boundary
++            }),
++            KeyMsg::Backspace => {
++                self.input.pop();
++                Some(MenuPulse::Move)
++            }
++            KeyMsg::Done => {
++                self.editing = false;
++                Some(MenuPulse::Confirm)
++            }
++            KeyMsg::None => None,
++        }
++    }
++
++    pub(crate) fn text_input(&mut self, text: &str) {
++        for ch in text.chars() {
++            self.type_char(ch);
++        }
++    }
++    pub(crate) fn editing(&self) -> bool {
++        self.editing
++    }
++    pub(crate) fn edit_field(&self) -> Option<crate::screens::EditField> {
++        if !self.editing {
++            return None;
++        }
++        crate::screens::EditField::new(
++            if self.passkey { "Passkey" } else { "PIN" },
++            &self.input,
++            self.passkey,
++        )
++    }
++    pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
++        use crate::input::Key;
++        if !self.editing {
++            return false;
++        }
++        match key {
++            Key::Backspace => {
++                self.input.pop();
++                true
++            }
++            Key::Return | Key::Escape => {
++                self.editing = false;
++                true
++            }
++            _ => false,
++        }
++    }
++
++    pub(crate) fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
++        vec![
++            Hint::new(
++                HintKey::Confirm,
++                if self.editing { "Type" } else { "Choose" },
++            ),
++            Hint::new(HintKey::Back, if self.editing { "Done" } else { "Back" }),
++        ]
++    }
++
++    fn spec(&self, row: &Row, state: &Snapshot) -> RowSpec {
++        let ready = state.available && !state.busy;
++        match row {
++            Row::Power => RowSpec {
++                value: Some(if state.powered { "On" } else { "Off" }.into()),
++                ..RowSpec::action("Bluetooth", ready)
++            },
++            Row::Scan => RowSpec::action(
++                if state.discovering {
++                    "Stop searching"
++                } else {
++                    "Search for devices"
++                },
++                ready && state.powered,
++            ),
++            Row::Device(path) => state.devices.iter().find(|d| &d.path == path).map_or_else(
++                || RowSpec::action("Device unavailable", false),
++                |d| RowSpec {
++                    value: Some(device_status(d)),
++                    ..RowSpec::action(&d.name, true)
++                },
++            ),
++            Row::Connect(_) => RowSpec::action("Connect", ready && state.powered),
++            Row::Disconnect(_) => RowSpec::action("Disconnect", ready),
++            Row::Pair(_) => RowSpec::action("Pair and connect", ready && state.powered),
++            Row::Forget(_) => RowSpec::action("Forget device…", ready),
++            Row::ConfirmForget(_) => RowSpec::action("Forget device", ready),
++            Row::Cancel => RowSpec::action("Back", true),
++            Row::Input => RowSpec {
++                caret: self.editing,
++                ..RowSpec::field(
++                    if self.passkey { "Passkey" } else { "PIN" },
++                    self.input.clone(),
++                    "Enter the code from your device",
++                )
++            },
++            Row::Accept => RowSpec::action(
++                "Accept",
++                state.prompt.as_ref().is_some_and(|p| {
++                    !matches!(p.kind, PromptKind::Pin | PromptKind::Passkey)
++                        || !self.input.is_empty()
++                }),
++            ),
++            Row::Reject => RowSpec::action("Cancel pairing", true),
++            Row::ClearError => RowSpec::action("Dismiss error", true),
++            Row::Empty => RowSpec::action(
++                if state.discovering {
++                    "Searching… put your device in pairing mode"
++                } else {
++                    "No devices found"
++                },
++                false,
++            ),
++        }
++    }
++
++    fn detail(&self, state: &Snapshot) -> String {
++        if let Some(p) = &state.prompt {
++            return match &p.kind {
++                PromptKind::Confirm { passkey } => {
++                    format!("Does code {passkey:06} match on {}?", p.device)
++                }
++                PromptKind::Pin | PromptKind::Passkey => {
++                    format!("Enter the pairing code for {}.", p.device)
++                }
++                PromptKind::Display { code } => {
++                    format!("Enter {code} on {}, then press Enter.", p.device)
++                }
++                PromptKind::Authorize => format!("Allow {} to connect?", p.device),
++            };
++        }
++        if self.forget.is_some() {
++            return "Forget this device? You will need to pair it again.".into();
++        }
++        if let Some(error) = &state.error {
++            return error.clone();
++        }
++        if !state.available {
++            return "Bluetooth is unavailable. Check your adapter.".into();
++        }
++        if state.busy {
++            return "Working… confirm any pairing request on your device.".into();
++        }
++        if let Some(d) = self
++            .selected
++            .as_ref()
++            .and_then(|path| state.devices.iter().find(|d| &d.path == path))
++        {
++            return format!("{} · {} · {}", d.name, d.address, device_status(d));
++        }
++        "Put your device in pairing mode, then search for it here.".into()
++    }
++
++    pub(crate) fn render(
++        &mut self,
++        canvas: &Canvas,
++        rect: Rect,
++        k: f64,
++        dt: f64,
++        fonts: &Fonts,
++        ctx: &mut Ctx,
++    ) {
++        let state = bluetooth::snapshot();
++        self.sync(&state);
++        let seat = self
++            .keyboard
++            .seat(self.editing && !ctx.device.system_keyboard, dt);
++        let tray_h = (Keyboard::tray_height() + 12.0) * k * seat;
++        let specs: Vec<_> = self.rows.iter().map(|r| self.spec(r, &state)).collect();
++        self.list.render(
++            canvas,
++            ctx.ui,
++            Rect::from_ltrb(
++                rect.left,
++                rect.top + (48.0 * k) as f32,
++                rect.right,
++                rect.bottom - tray_h as f32,
++            ),
++            &specs,
++            fonts,
++            k,
++            dt,
++            !self.editing,
++        );
++        fonts.centered(
++            canvas,
++            &self.detail(&state),
++            W::Regular,
++            13.0 * k,
++            ctx.ui.fg(0.65),
++            f64::from(rect.center_x()),
++            f64::from(rect.top) + 6.0 * k,
++            f64::from(rect.width()) * 0.85,
++        );
++        if seat > 0.0 {
++            self.keyboard.render(
++                canvas,
++                ctx.ui,
++                fonts,
++                f64::from(rect.width()),
++                f64::from(rect.bottom),
++                seat,
++                k,
++            );
++        }
++    }
++}
++
++impl Drop for BluetoothScreen {
++    fn drop(&mut self) {
++        bluetooth::submit(Command::CancelPairing);
++        bluetooth::submit(Command::Scan(false));
++    }
++}
++
++fn device_status(device: &Device) -> String {
++    let status = if device.connected {
++        "Connected"
++    } else if device.paired {
++        "Paired"
++    } else {
++        "Not paired"
++    };
++    match device.battery {
++        Some(percent) => format!("{status} · {percent}%"),
++        None => status.into(),
++    }
++}
++
++fn reject_prompt(state: &Snapshot) -> Command {
++    match &state.prompt {
++        Some(prompt) if !matches!(prompt.kind, PromptKind::Display { .. }) => Command::Reply {
++            id: prompt.id,
++            value: None,
++        },
++        _ => Command::CancelPairing,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn state() -> Snapshot {
++        Snapshot {
++            available: true,
++            powered: true,
++            discovering: false,
++            busy: false,
++            devices: vec![],
++            prompt: None,
++            error: None,
++        }
++    }
++
++    fn device(path: &str) -> Device {
++        Device {
++            path: path.into(),
++            name: path.into(),
++            address: "00:11:22:33:44:55".into(),
++            paired: true,
++            connected: false,
++            trusted: true,
++            battery: Some(75),
++        }
++    }
++
++    #[test]
++    fn discovery_keeps_focus_on_the_same_device() {
++        let mut screen = BluetoothScreen::new();
++        let mut state = state();
++        state.devices = vec![device("a"), device("b")];
++        screen.sync(&state);
++        screen.list.cursor = 3;
++        state.devices.insert(0, device("c"));
++        screen.sync(&state);
++        assert_eq!(screen.rows[screen.list.cursor], Row::Device("b".into()));
++        state.devices.retain(|d| d.path != "b");
++        screen.sync(&state);
++        assert_eq!(screen.rows[screen.list.cursor], Row::Power);
++    }
++
++    #[test]
++    fn forgetting_requires_a_separate_confirmation() {
++        let mut screen = BluetoothScreen::new();
++        let mut state = state();
++        state.devices = vec![device("a")];
++        screen.selected = Some("a".into());
++        screen.sync(&state);
++        screen.list.cursor = 1;
++        screen.activate(ListMsg::Activate, None, &state);
++        assert_eq!(screen.forget.as_deref(), Some("a"));
++        screen.sync(&state);
++        assert_eq!(screen.rows[screen.list.cursor], Row::Cancel);
++        assert_eq!(screen.rows[1], Row::ConfirmForget("a".into()));
++    }
++
++    #[test]
++    fn passkey_input_only_accepts_six_digits() {
++        let mut screen = BluetoothScreen::new();
++        screen.editing = true;
++        screen.passkey = true;
++        screen.text_input("a12b345678");
++        assert_eq!(screen.input, "123456");
++        assert!(screen.edit_key(crate::input::Key::Backspace));
++        assert_eq!(screen.input, "12345");
++    }
++
++    #[test]
++    fn new_prompt_clears_previous_code_and_defaults_to_reject() {
++        let mut screen = BluetoothScreen::new();
++        screen.input = "secret".into();
++        screen.editing = true;
++        let mut state = state();
++        state.prompt = Some(pf_client_core::bluetooth::Prompt {
++            id: 9,
++            device: "Pad".into(),
++            kind: PromptKind::Confirm { passkey: 1234 },
++        });
++        screen.sync(&state);
++        assert!(screen.input.is_empty());
++        assert!(!screen.editing);
++        assert_eq!(screen.rows[screen.list.cursor], Row::Reject);
++    }
++
++    #[test]
++    fn display_code_cancellation_reaches_the_pairing_operation() {
++        let mut state = state();
++        state.prompt = Some(pf_client_core::bluetooth::Prompt {
++            id: 10,
++            device: "Keyboard".into(),
++            kind: PromptKind::Display {
++                code: "123456".into(),
++            },
++        });
++        assert!(matches!(reject_prompt(&state), Command::CancelPairing));
++    }
++
++    #[test]
++    fn pin_rejects_characters_bluez_cannot_accept() {
++        let mut screen = BluetoothScreen::new();
++        screen.editing = true;
++        screen.text_input("abé12\n");
++        assert_eq!(screen.input, "ab12");
++    }
++}
++
++impl crate::screens::ScreenView for BluetoothScreen {
++    fn menu(&mut self, ev: MenuEvent, ctx: &mut Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
++        BluetoothScreen::menu(self, ev, ctx, fx)
++    }
++    fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
++        BluetoothScreen::pointer(self, p, ctx, fx)
++    }
++    fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
++        BluetoothScreen::hints(self, ctx)
++    }
++    fn render(
++        &mut self,
++        canvas: &Canvas,
++        rect: Rect,
++        k: f64,
++        dt: f64,
++        fonts: &Fonts,
++        ctx: &mut Ctx,
++    ) {
++        BluetoothScreen::render(self, canvas, rect, k, dt, fonts, ctx)
++    }
++    fn title(&self) -> String {
++        "Bluetooth devices".into()
++    }
++    fn press(&mut self) {
++        self.list.dip();
++    }
++    fn pan(&mut self, p: Pointer) -> bool {
++        self.list.pan(p)
++    }
++    fn text_input(&mut self, text: &str) {
++        BluetoothScreen::text_input(self, text);
++    }
++    fn edit_key(&mut self, key: crate::input::Key, _ctx: &mut Ctx) -> bool {
++        BluetoothScreen::edit_key(self, key)
++    }
++    fn editing(&self) -> bool {
++        BluetoothScreen::editing(self)
++    }
++    fn edit_field(&self) -> Option<crate::screens::EditField> {
++        BluetoothScreen::edit_field(self)
++    }
++}
+diff --git a/crates/client/pf-console-ui/src/screens/controls.rs b/crates/client/pf-console-ui/src/screens/controls.rs
+index 5eb7a5ebd0d937fe3aab67e6eacbdc9c2f3e658d..6cc2fcdf87df72ae1d015ebb5bf6bcd59b79b621 100644
+--- a/crates/client/pf-console-ui/src/screens/controls.rs
++++ b/crates/client/pf-console-ui/src/screens/controls.rs
+@@ -328,7 +328,7 @@ impl ScreenView for ControlsScreen {
+ 
+         // With the trays on, the page runs on under the title and the legend and they blur
+         // it, as a list does; without them it fades at its own edges.
+-        let view = bleed_view(canvas, rect);
++        let view = bleed_view(canvas, ui, rect);
+         let paint = || {
+             let top = f64::from(rect.top) + 6.0 * k - self.flick.scroll;
+             fonts.draw(
+@@ -349,7 +349,7 @@ impl ScreenView for ControlsScreen {
+                 }
+             }
+         };
+-        if crate::blur::active() {
++        if crate::blur::active(ui) {
+             paint();
+         } else {
+             soft_scroll(canvas, ui, view, view, self.flick.scrolled(), k, paint);
+diff --git a/crates/client/pf-console-ui/src/screens/kiosk.rs b/crates/client/pf-console-ui/src/screens/kiosk.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..08f7f1248ef824c9a79fc4fa8dc76627a6e0a91c
+--- /dev/null
++++ b/crates/client/pf-console-ui/src/screens/kiosk.rs
+@@ -0,0 +1,370 @@
++//! Raspberry Pi status and remote access use the appliance helper.
++use crate::glyphs::{Hint, HintKey};
++use crate::pointer::Pointer;
++use crate::screens::{Ctx, Outbox, ScreenView};
++use crate::theme::{Fonts, W};
++use crate::widgets::{ListMsg, MenuList, RowSpec};
++use pf_client_core::kiosk::{Action, Request, Snapshot};
++use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
++use skia_safe::{Canvas, Rect};
++use std::time::{Duration, Instant};
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(crate) enum Page {
++    Ssh,
++    Information,
++}
++
++pub(crate) struct KioskScreen {
++    list: MenuList,
++    page: Page,
++    state: Snapshot,
++    request: Request,
++    refreshed: Instant,
++    password: Option<String>,
++    error: Option<String>,
++}
++impl KioskScreen {
++    pub(crate) fn new(page: Page) -> Self {
++        let mut request = Request::default();
++        request.start(Action::Status);
++        Self {
++            list: MenuList::new(),
++            page,
++            state: Snapshot::default(),
++            request,
++            refreshed: Instant::now(),
++            password: None,
++            error: None,
++        }
++    }
++    fn sync(&mut self) {
++        if let Some(result) = self.request.poll() {
++            self.refreshed = Instant::now();
++            match result {
++                Ok(mut state) => {
++                    if let Some(password) = state.password.take() {
++                        self.password = Some(password);
++                    }
++                    if !state.ssh_enabled {
++                        self.password = None;
++                    }
++                    self.state = state;
++                    self.error = None;
++                }
++                Err(error) => self.error = Some(error),
++            }
++        }
++        if self.refreshed.elapsed() >= Duration::from_secs(5) && !self.request.busy() {
++            self.request.start(Action::Status);
++        }
++    }
++    fn rows(&self) -> Vec<RowSpec> {
++        let info = |label: &str, value: String| RowSpec {
++            value: Some(value),
++            ..RowSpec::action(label, false)
++        };
++        if self.page == Page::Ssh {
++            let ready = self.state.available && !self.request.busy();
++            let mut rows = vec![
++                RowSpec {
++                    value: Some(if self.state.ssh_enabled { "On" } else { "Off" }.into()),
++                    ..RowSpec::action("SSH", ready)
++                },
++                RowSpec::action("Generate a new password", ready && self.state.ssh_enabled),
++            ];
++            if self.state.ssh_enabled {
++                rows.push(info("User", self.state.ssh_user.clone()));
++                for address in &self.state.ip_addresses {
++                    rows.push(RowSpec {
++                        header: Some("Connect"),
++                        ..RowSpec::action(ssh_command(&self.state, address), false)
++                    });
++                }
++                if let Some(password) = &self.password {
++                    rows.push(info("Password", password.clone()));
++                }
++            }
++            return rows;
++        }
++        let mut rows = vec![
++            info("Hostname", self.state.hostname.clone()),
++            info("Punktfunk", self.state.version.clone()),
++            info("Connection", self.state.connection.clone()),
++        ];
++        for address in &self.state.ip_addresses {
++            rows.push(info("IP address", address.clone()));
++        }
++        if self.state.ip_addresses.is_empty() {
++            rows.push(info("IP address", "Not connected".into()));
++        }
++        if let Some(temp) = self.state.temperature_c {
++            rows.push(info("Temperature", format!("{temp:.1} °C")));
++        }
++        let minutes = (self.state.uptime_seconds.max(0.0) / 60.0) as u64;
++        rows.push(info(
++            "Uptime",
++            format!("{} h {} min", minutes / 60, minutes % 60),
++        ));
++        rows.push(info(
++            "SSH",
++            if self.state.ssh_enabled { "On" } else { "Off" }.into(),
++        ));
++        rows
++    }
++    fn activate(&mut self, msg: ListMsg, pulse: Option<MenuPulse>) -> Option<MenuPulse> {
++        if matches!(msg, ListMsg::Adjust(_)) {
++            return Some(MenuPulse::Boundary);
++        }
++        if !matches!(msg, ListMsg::Activate) {
++            return pulse;
++        }
++        let rows = self.rows();
++        if !rows.get(self.list.cursor).is_some_and(|r| r.enabled) {
++            return Some(MenuPulse::Boundary);
++        }
++        let action = match self.list.cursor {
++            0 if self.state.ssh_enabled => Action::Disable,
++            0 => Action::Enable,
++            1 => Action::ResetPassword,
++            _ => return pulse,
++        };
++        if self.request.start(action) {
++            self.password = None;
++            self.error = None;
++        }
++        pulse
++    }
++    fn detail(&self) -> &str {
++        if let Some(error) = &self.error {
++            return error;
++        }
++        if self.request.busy() && !self.state.available {
++            return "Reading device status…";
++        }
++        if !self.state.available {
++            return "Device information is unavailable.";
++        }
++        if self.page == Page::Information {
++            return "Network and device status refresh automatically.";
++        }
++        if self.request.busy() {
++            return "Updating remote access…";
++        }
++        if self.password.is_some() {
++            return "Use this password to connect. It is hidden when you leave this screen.";
++        }
++        if self.state.ssh_enabled {
++            return "SSH is on. Generate a new password if you no longer have it.";
++        }
++        "Turn on SSH to connect from another computer on your network."
++    }
++}
++fn ssh_command(state: &Snapshot, address: &str) -> String {
++    if state.ssh_port == 22 {
++        format!("ssh {}@{address}", state.ssh_user)
++    } else {
++        format!("ssh -p {} {}@{address}", state.ssh_port, state.ssh_user)
++    }
++}
++impl ScreenView for KioskScreen {
++    fn menu(&mut self, ev: MenuEvent, _ctx: &mut Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
++        self.sync();
++        if ev == MenuEvent::Back {
++            self.password = None;
++            fx.pop();
++            return None;
++        }
++        let (msg, pulse) = self.list.menu(ev, self.rows().len());
++        self.activate(msg, pulse)
++    }
++    fn pointer(&mut self, p: Pointer, _ctx: &mut Ctx, _fx: &mut Outbox) -> bool {
++        self.sync();
++        let (msg, pulse) = self.list.pointer(p, self.rows().len());
++        if matches!(msg, ListMsg::None) && pulse.is_none() {
++            return false;
++        }
++        self.activate(msg, pulse);
++        true
++    }
++    fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
++        let mut hints = vec![Hint::new(HintKey::Back, "Back")];
++        if self.rows().get(self.list.cursor).is_some_and(|r| r.enabled) {
++            hints.insert(0, Hint::new(HintKey::Confirm, "Choose"));
++        }
++        hints
++    }
++    fn render(
++        &mut self,
++        canvas: &Canvas,
++        rect: Rect,
++        k: f64,
++        dt: f64,
++        fonts: &Fonts,
++        ctx: &mut Ctx,
++    ) {
++        self.sync();
++        let rows = self.rows();
++        self.list.cursor = self.list.cursor.min(rows.len().saturating_sub(1));
++        self.list.render(
++            canvas,
++            ctx.ui,
++            Rect::from_ltrb(
++                rect.left,
++                rect.top + (48.0 * k) as f32,
++                rect.right,
++                rect.bottom,
++            ),
++            &rows,
++            fonts,
++            k,
++            dt,
++            true,
++        );
++        fonts.centered(
++            canvas,
++            self.detail(),
++            W::Regular,
++            13.0 * k,
++            ctx.ui.fg(0.65),
++            f64::from(rect.center_x()),
++            f64::from(rect.top) + 6.0 * k,
++            f64::from(rect.width()) * 0.9,
++        );
++    }
++    fn title(&self) -> String {
++        match self.page {
++            Page::Ssh => "SSH",
++            Page::Information => "System information",
++        }
++        .into()
++    }
++    fn press(&mut self) {
++        self.list.dip();
++    }
++    fn pan(&mut self, p: Pointer) -> bool {
++        self.list.pan(p)
++    }
++    fn announcement(&self, _ctx: &Ctx) -> Option<String> {
++        self.rows().get(self.list.cursor).map(|row| {
++            format!(
++                "{}: {}",
++                row.label,
++                row.value.as_deref().unwrap_or_default()
++            )
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn connect_command_uses_reported_address_and_port() {
++        let mut state = Snapshot {
++            ssh_user: "punktfunk-admin".into(),
++            ssh_port: 22,
++            ..Default::default()
++        };
++        assert_eq!(
++            ssh_command(&state, "192.168.1.3"),
++            "ssh punktfunk-admin@192.168.1.3"
++        );
++        state.ssh_port = 2222;
++        assert_eq!(
++            ssh_command(&state, "192.168.1.3"),
++            "ssh -p 2222 punktfunk-admin@192.168.1.3"
++        );
++    }
++    #[test]
++    fn unavailable_controls_cannot_be_activated() {
++        let mut screen = KioskScreen {
++            list: MenuList::new(),
++            page: Page::Ssh,
++            state: Snapshot::default(),
++            request: Request::default(),
++            refreshed: Instant::now(),
++            password: None,
++            error: None,
++        };
++        assert!(screen.rows().iter().all(|row| !row.enabled));
++        screen.activate(ListMsg::Activate, None);
++        assert!(!screen.request.busy());
++        screen.state.available = true;
++        assert!(screen.rows()[0].enabled);
++        assert!(!screen.rows()[1].enabled);
++        screen.state.ssh_enabled = true;
++        assert!(screen.rows()[1].enabled);
++    }
++    #[test]
++    fn appliance_screens_render_connection_details() {
++        let fonts = crate::theme::build_fonts().unwrap();
++        let library = crate::library::LibraryShared::default();
++        let mut settings = pf_client_core::trust::Settings::default();
++        let mut ctx = Ctx::test(&mut settings, &library);
++        let password = "ABCDEFGHIJKLMNOPQRST";
++        for page in [Page::Ssh, Page::Information] {
++            let mut screen = KioskScreen {
++                list: MenuList::new(),
++                page,
++                state: Snapshot {
++                    available: true,
++                    hostname: "punktfunk-pi".into(),
++                    version: "v0.46.0-rpi5.2".into(),
++                    connection: "Wi-Fi: Living room wireless network (wlan0)".into(),
++                    ip_addresses: vec![
++                        "192.168.1.123".into(),
++                        "2001:db8:1234:5678:9abc:def0:1234:5678".into(),
++                    ],
++                    temperature_c: Some(51.2),
++                    uptime_seconds: 8123.0,
++                    ssh_enabled: true,
++                    ssh_user: "punktfunk-admin".into(),
++                    ssh_port: 22,
++                    ..Default::default()
++                },
++                request: Request::default(),
++                refreshed: Instant::now(),
++                password: Some(password.into()),
++                error: None,
++            };
++            let (w, h) = (1920, 1080);
++            let k = f64::from(h) / 800.0;
++            let rect = Rect::from_ltrb(0.0, 100.0, w as f32, h as f32 - 100.0);
++            let col = crate::widgets::column(ctx.ui, rect, k);
++            assert!(
++                f64::from(fonts.measure(password, W::Medium, 15.0 * k))
++                    < f64::from(col.width()) * 0.55,
++                "password must fit without truncation"
++            );
++            let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
++            for _ in 0..15 {
++                screen.refreshed = Instant::now();
++                surface
++                    .canvas()
++                    .clear(skia_safe::Color::from_rgb(18, 20, 28));
++                screen.render(surface.canvas(), rect, k, 1.0 / 15.0, &fonts, &mut ctx);
++            }
++            assert!(screen.list.row_rect(0).is_some());
++            if let Ok(dir) = std::env::var("PF_CONSOLE_DUMP") {
++                std::fs::create_dir_all(&dir).unwrap();
++                let png = surface
++                    .image_snapshot()
++                    .encode(None, skia_safe::EncodedImageFormat::PNG, 100)
++                    .unwrap();
++                let name = if page == Page::Ssh {
++                    "kiosk-ssh"
++                } else {
++                    "kiosk-information"
++                };
++                std::fs::write(format!("{dir}/{name}.png"), png.as_bytes()).unwrap();
++            }
++            let mut fx = Outbox::default();
++            screen.menu(MenuEvent::Back, &mut ctx, &mut fx);
++            assert!(
++                screen.password.is_none(),
++                "leaving hides generated credentials"
++            );
++        }
++    }
++}
+diff --git a/crates/client/pf-console-ui/src/screens/library.rs b/crates/client/pf-console-ui/src/screens/library.rs
+index 6e1a73cd4da1d3195a4a88cc774a9e8e25511688..57f3d01c9583daab95c37af7af60adb40c230862 100644
+--- a/crates/client/pf-console-ui/src/screens/library.rs
++++ b/crates/client/pf-console-ui/src/screens/library.rs
+@@ -948,7 +948,7 @@ impl LibraryScreen {
+         // With a band to treat them, the lines run on up under the chrome as well. A quiet
+         // shelf clips at its top: the Hosts row is drawn there.
+         let air = PLATE_AIR * k;
+-        let bleed = crate::blur::active();
++        let bleed = crate::blur::active(ui);
+         let top = if bleed && !(self.embedded && self.quiet) {
+             clip.top.min(rect.top)
+         } else {
+diff --git a/crates/client/pf-console-ui/src/screens/licenses.rs b/crates/client/pf-console-ui/src/screens/licenses.rs
+index 02ec7ac71206873a1c64bdb3548e0c2b8b3a5e51..e3e328188ee39255308d8d8d332bcdae6ac2c283 100644
+--- a/crates/client/pf-console-ui/src/screens/licenses.rs
++++ b/crates/client/pf-console-ui/src/screens/licenses.rs
+@@ -216,7 +216,7 @@ impl ScreenView for LicensesScreen {
+ 
+         // With the trays on, the text runs on under the title and the legend and they blur
+         // it, as a list does; without them it fades at its own edges.
+-        let view = bleed_view(canvas, rect);
++        let view = bleed_view(canvas, ui, rect);
+         let paint = || {
+             let top = f64::from(rect.top) - self.flick.scroll;
+             let first = self
+@@ -246,7 +246,7 @@ impl ScreenView for LicensesScreen {
+                 );
+             }
+         };
+-        if crate::blur::active() {
++        if crate::blur::active(ui) {
+             paint();
+         } else {
+             soft_scroll(canvas, ui, view, view, self.flick.scrolled(), k, paint);
+diff --git a/crates/client/pf-console-ui/src/screens/palette.rs b/crates/client/pf-console-ui/src/screens/palette.rs
+index 50193dfaf49964c1f6fd38aa3c1d2ff182d8ef38..6c4cef8c41e9c7555ff9c2b48509d4bc203a258e 100644
+--- a/crates/client/pf-console-ui/src/screens/palette.rs
++++ b/crates/client/pf-console-ui/src/screens/palette.rs
+@@ -162,7 +162,7 @@ impl ScreenView for PaletteScreen {
+         let air = (12.0 * k) as f32;
+         // The viewport reaches the layer's edges and pads back to `rect`, so cards run under
+         // the shell's trays and blur there instead of stopping short.
+-        let view = if crate::blur::active() {
++        let view = if crate::blur::active(ui) {
+             let clip = canvas.local_clip_bounds().unwrap_or(rect);
+             Rect::from_ltrb(
+                 rect.left,
+diff --git a/crates/client/pf-console-ui/src/screens/settings.rs b/crates/client/pf-console-ui/src/screens/settings.rs
+index d078c17b1cb00093beaa1fe63e756b0eba603eef..d7629f15b44760e13fdcbb5d958204b6beda1272 100644
+--- a/crates/client/pf-console-ui/src/screens/settings.rs
++++ b/crates/client/pf-console-ui/src/screens/settings.rs
+@@ -159,6 +159,10 @@ impl SettingsScreen {
+                 .1
+                 .iter()
+                 .copied()
++                .chain(
++                    (self.tab == 4 && !pf_client_core::kiosk::available())
++                        .then_some(RowId::Bluetooth),
++                )
+                 .filter(|id| row_on(*id, ctx.device.platform) && row_applies(*id, ctx))
+                 // The Mac's picker stands in for the toggle, which presets keep.
+                 .filter(|id| !(*id == RowId::Fullscreen && is_mac(ctx)));
+@@ -243,14 +247,22 @@ impl SettingsScreen {
+         self.list.row_rect(i)
+     }
+ 
++    fn tab_count(&self) -> usize {
++        if pf_client_core::kiosk::available() {
++            TABS.len()
++        } else {
++            PI_TAB
++        }
++    }
++
+     fn switch_tab(&mut self, delta: i32, ctx: &Ctx) -> Option<MenuPulse> {
+-        let n = TABS.len() as i32;
++        let n = self.tab_count() as i32;
+         self.show_tab((self.tab as i32 + delta).rem_euclid(n) as usize, ctx)
+     }
+ 
+     /// Park the outgoing tab's cursor, then jump. Pointer pills name a tab outright.
+     fn show_tab(&mut self, tab: usize, ctx: &Ctx) -> Option<MenuPulse> {
+-        if tab >= TABS.len() {
++        if tab >= self.tab_count() {
+             return None;
+         }
+         self.tab_cursors[self.tab] = self.list.cursor;
+@@ -364,6 +376,31 @@ impl SettingsScreen {
+                     ListMsg::None => pulse,
+                 };
+             }
++            RowId::Ssh | RowId::SystemInformation => {
++                return match msg {
++                    ListMsg::Activate => {
++                        let page = if focused == RowId::Ssh {
++                            super::kiosk::Page::Ssh
++                        } else {
++                            super::kiosk::Page::Information
++                        };
++                        fx.push(Screen::Kiosk(super::kiosk::KioskScreen::new(page)));
++                        pulse
++                    }
++                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
++                    ListMsg::None => pulse,
++                };
++            }
++            RowId::Bluetooth => {
++                return match msg {
++                    ListMsg::Activate => {
++                        fx.push(Screen::Bluetooth(super::bluetooth::BluetoothScreen::new()));
++                        pulse
++                    }
++                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
++                    ListMsg::None => pulse,
++                };
++            }
+             RowId::Controllers => {
+                 return match msg {
+                     ListMsg::Activate => {
+@@ -455,7 +492,10 @@ impl SettingsScreen {
+         let list_rect = self.list_rect(rect, k);
+         let col = column(ui, list_rect, k);
+         let inner = f64::from(col.left) + 16.0 * k;
+-        let labels: Vec<&str> = TABS.iter().map(|(name, _)| *name).collect();
++        let labels: Vec<&str> = TABS[..self.tab_count()]
++            .iter()
++            .map(|(name, _)| *name)
++            .collect();
+         self.strip.render(
+             canvas,
+             ui,
+@@ -648,7 +688,10 @@ impl ScreenView for SettingsScreen {
+                 vec![Hint::new(HintKey::Back, "Done")]
+             }
+             Some(
+-                RowId::Controllers
++                RowId::Bluetooth
++                | RowId::Ssh
++                | RowId::SystemInformation
++                | RowId::Controllers
+                 | RowId::StreamControls
+                 | RowId::Licenses
+                 | RowId::LibrarySections
+diff --git a/crates/client/pf-console-ui/src/screens/settings/rows.rs b/crates/client/pf-console-ui/src/screens/settings/rows.rs
+index a364b66cf5f469e81ed02f4cc4631b280c598776..5727f477523ab099af3b8544a3461a2552012bc2 100644
+--- a/crates/client/pf-console-ui/src/screens/settings/rows.rs
++++ b/crates/client/pf-console-ui/src/screens/settings/rows.rs
+@@ -131,6 +131,9 @@ pub enum RowId {
+     CursorGestures,
+     /// Action row: jumps to the Controllers tab.
+     Controllers,
++    Bluetooth,
++    Ssh,
++    SystemInformation,
+     /// Action row: the stream's keys, chords and gestures, read-only.
+     StreamControls,
+     /// Action row: asks the host to open the platform licences screen.
+@@ -460,7 +463,7 @@ pub(crate) fn reduce_ui_res(
+ // The sections, the rows a player touches most first and the [`advanced`] ones last. A child
+ // row sits right under the switch it dims or drops with. Presets is empty here: its rows come
+ // from the catalog.
+-pub(super) const TABS: [(&str, &[RowId]); 7] = [
++pub(super) const TABS: [(&str, &[RowId]); 8] = [
+     (
+         "General",
+         &[
+@@ -561,15 +564,20 @@ pub(super) const TABS: [(&str, &[RowId]); 7] = [
+         "About",
+         &[RowId::Version, RowId::StreamControls, RowId::Licenses],
+     ),
++    (
++        "Raspberry Pi",
++        &[RowId::Bluetooth, RowId::Ssh, RowId::SystemInformation],
++    ),
+ ];
+ 
+ /// The Presets section — catalog-built, not [`TABS`] rows.
+ pub(super) const PRESETS_TAB: usize = 5;
++pub(super) const PI_TAB: usize = 7;
+ 
+ /// Strip length for the shell's raster walk. `cfg(test)`: a shipping build
+ /// would warn it dead, and this crate treats warnings as errors.
+ #[cfg(test)]
+-pub(crate) const TAB_COUNT: usize = TABS.len();
++pub(crate) const TAB_COUNT: usize = PI_TAB;
+ 
+ /// Sizes by family; the Resolution row lists one family at a time.
+ use punktfunk_core::resolutions::{family_of, nearest_in, Family, SAFE_AREA_LABEL, SCREEN_LABEL};
+@@ -852,6 +860,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
+         // Offered wherever there is a second UI to fall back to: Android's touch home,
+         // webOS's cursor shell. `row_applies` still needs `fallback_ui` from the host.
+         RowId::GamepadUi | RowId::GamepadUiMode => &[Android, WebOS, Apple],
++        RowId::Bluetooth | RowId::Ssh | RowId::SystemInformation => &[Desktop],
+         // A pad list: real on a TV, and on Apple its Controllers screen.
+         RowId::Controllers => &[Android, WebOS, Apple],
+         // Apps a phone or TV can put in the background; `row_applies` drops the Mac.
+@@ -953,6 +962,8 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
+         {
+             !ctx.device.tv
+         }
++        RowId::Bluetooth => pf_client_core::bluetooth::snapshot().available,
++        RowId::Ssh | RowId::SystemInformation => pf_client_core::kiosk::available(),
+         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
+         RowId::PyroWaveQuality => pyrowave_rate(ctx),
+         // Needs `fallback_ui`; otherwise off strands the user with no UI.
+@@ -1129,7 +1140,9 @@ pub(super) fn row_icon(id: RowId) -> &'static str {
+         | RowId::PadType
+         | RowId::Sc2Passthrough
+         | RowId::DsCapture
++        | RowId::Bluetooth
+         | RowId::Controllers => "gamepad-2",
++        RowId::Ssh | RowId::SystemInformation => "info",
+         RowId::SystemButtons | RowId::GuideGesture => "house",
+         RowId::PhoneGyro => "rotate-cw",
+         RowId::SecondScreen | RowId::Screen | RowId::Screens => "monitor",
+@@ -1264,6 +1277,9 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec
+         RowId::NewPreset => {
+             return RowSpec::action("New preset\u{2026}", true);
+         }
++        RowId::Bluetooth => return RowSpec::action("Bluetooth devices", true),
++        RowId::Ssh => return RowSpec::action("SSH", true),
++        RowId::SystemInformation => return RowSpec::action("System information", true),
+         RowId::Controllers => return RowSpec::action("Controllers", true),
+         // The count is the tab's; `SettingsScreen::spec` writes it in.
+         RowId::AdvancedChanged => return RowSpec::action("Advanced settings changed", true),
+@@ -1570,6 +1586,9 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec
+         ),
+         RowId::Preset(_)
+         | RowId::NewPreset
++        | RowId::Bluetooth
++        | RowId::Ssh
++        | RowId::SystemInformation
+         | RowId::Controllers
+         | RowId::AdvancedChanged
+         | RowId::StreamControls
+@@ -1938,6 +1957,9 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
+                  The switch above turns it off altogether."
+             }
+         },
++        RowId::Bluetooth => "Pair, connect or forget Bluetooth devices.",
++        RowId::Ssh => "Turn remote access on or off and view connection details.",
++        RowId::SystemInformation => "View network addresses, connection and device status.",
+         RowId::Controllers => "The controllers connected here, their grants and a rumble test.",
+         RowId::StreamControls => {
+             "The keys, controller chords and gestures that work while you stream."
+@@ -2274,6 +2296,9 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
+         // Navigation rows: handled in `apply_row` before the settings path.
+         RowId::Preset(_)
+         | RowId::NewPreset
++        | RowId::Bluetooth
++        | RowId::Ssh
++        | RowId::SystemInformation
+         | RowId::Controllers
+         | RowId::AdvancedChanged
+         | RowId::StreamControls
+diff --git a/crates/client/pf-console-ui/src/screens/settings/tests.rs b/crates/client/pf-console-ui/src/screens/settings/tests.rs
+index 373e27019535b50585ab10c93a7fd3f2bf2ab3e5..4531ef1cc17471c503bdee6686e8c7d5cdf2852a 100644
+--- a/crates/client/pf-console-ui/src/screens/settings/tests.rs
++++ b/crates/client/pf-console-ui/src/screens/settings/tests.rs
+@@ -108,7 +108,7 @@ fn sections_match_the_shared_vectors() {
+         .iter()
+         .map(|t| t["name"].as_str().unwrap())
+         .collect();
+-    let got: Vec<&str> = TABS.iter().map(|(name, _)| *name).collect();
++    let got: Vec<&str> = TABS[..PI_TAB].iter().map(|(name, _)| *name).collect();
+     assert_eq!(got, want, "the sections' names and order");
+ }
+ 
+@@ -407,7 +407,7 @@ fn a_press_on_a_pill_selects_that_tab() {
+     let mut s = SettingsScreen::with_presets(Vec::new());
+     rendered(&mut s);
+     assert_eq!(s.tab, 0);
+-    for target in [3, 1, TABS.len() - 1, 0] {
++    for target in [3, 1, PI_TAB - 1, 0] {
+         let pill = s.strip.pill(target).expect("the strip drew every pill");
+         with_ctx(|ctx| {
+             let mut fx = Outbox::default();
+@@ -1435,6 +1435,9 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
+             RowId::Pad,
+             // A present Steam Controller 2 is captured; only Apple asks first.
+             RowId::Sc2Passthrough,
++            RowId::Bluetooth,
++            RowId::Ssh,
++            RowId::SystemInformation,
+         ]
+     );
+     // Every row reaches at least one platform: a row listed in a tab and offered nowhere
+@@ -1746,7 +1749,7 @@ fn every_row_has_exactly_one_tab() {
+             seen.push(*id);
+         }
+     }
+-    assert_eq!(seen.len(), 73, "{seen:?}");
++    assert_eq!(seen.len(), 76, "{seen:?}");
+     assert!(
+         !seen.contains(&RowId::AdvancedChanged),
+         "built per tab, never listed"
+@@ -1818,7 +1821,7 @@ fn shoulders_cycle_tabs_and_keep_each_cursor() {
+     s.menu(MenuEvent::JumpBack, &mut ctx, &mut fx);
+     assert_eq!((s.tab, s.list.cursor), (0, 3), "Stream kept its place");
+     s.menu(MenuEvent::JumpBack, &mut ctx, &mut fx);
+-    assert_eq!(s.tab, TABS.len() - 1, "About, the last");
++    assert_eq!(s.tab, PI_TAB - 1, "About, the last");
+     assert_eq!(s.list.cursor, 0);
+     s.menu(MenuEvent::JumpForward, &mut ctx, &mut fx);
+     assert_eq!(s.tab, 0);
+@@ -1841,11 +1844,7 @@ fn dpad_alone_reaches_every_tab() {
+     assert!(s.strip_focus, "switching keeps the strip focused");
+     s.menu(MenuEvent::Move(MenuDir::Left), &mut ctx, &mut fx);
+     s.menu(MenuEvent::Move(MenuDir::Left), &mut ctx, &mut fx);
+-    assert_eq!(
+-        s.tab,
+-        TABS.len() - 1,
+-        "the strip wraps like the shoulders do"
+-    );
++    assert_eq!(s.tab, PI_TAB - 1, "the strip wraps like the shoulders do");
+     s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
+     assert!(!s.strip_focus, "Down drops back into the list");
+     s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
+@@ -1968,7 +1967,7 @@ fn about_opens_the_stream_controls_where_the_client_has_them() {
+     let library = crate::library::LibraryShared::default();
+     let mut ctx = Ctx::test(&mut settings, &library);
+     let mut s = SettingsScreen::with_presets(Vec::new());
+-    s.tab = TABS.len() - 1;
++    s.tab = PI_TAB - 1;
+     let ids = s.row_ids(&ctx);
+     s.list.cursor = ids
+         .iter()
+@@ -2223,3 +2222,15 @@ fn the_licences_row_opens_the_console_screen_on_webos() {
+         if matches!(**b, Screen::Licenses(_))));
+     assert_eq!(fx.cmds, vec![crate::model::ConsoleCmd::LoadLicenses]);
+ }
++
++#[test]
++fn appliance_rows_live_only_in_the_raspberry_pi_section() {
++    assert_eq!(TABS[PI_TAB].0, "Raspberry Pi");
++    assert_eq!(
++        TABS[PI_TAB].1,
++        &[RowId::Bluetooth, RowId::Ssh, RowId::SystemInformation]
++    );
++    assert!(TABS[..PI_TAB].iter().all(|(_, rows)| !rows
++        .iter()
++        .any(|id| matches!(id, RowId::Bluetooth | RowId::Ssh | RowId::SystemInformation))));
++}
+diff --git a/crates/client/pf-console-ui/src/shell.rs b/crates/client/pf-console-ui/src/shell.rs
+index 09e6c8832e3262586b192710c5b72571aa3aa96b..e6c8b309c9e88f682bc619f5961cc05dd68aba55 100644
+--- a/crates/client/pf-console-ui/src/shell.rs
++++ b/crates/client/pf-console-ui/src/shell.rs
+@@ -325,6 +325,9 @@ pub(crate) struct Shell {
+     pub(crate) device: crate::screens::Device,
+     hosts: Vec<HostRow>,
+     hosts_gen: u64,
++    pub(crate) efficient_backdrop: bool,
++    pub(crate) tab_images_enabled: bool,
++    tab_images: render::TabImages,
+     /// The host was last told the input test is on.
+     pad_testing: bool,
+     /// The `host_sort` / `host_grouping` values `hosts` was last arranged by.
+@@ -452,6 +455,9 @@ impl Shell {
+             },
+             hosts: Vec::new(),
+             hosts_gen: u64::MAX,
++            efficient_backdrop: false,
++            tab_images_enabled: true,
++            tab_images: render::TabImages::default(),
+             hosts_order: (None, None),
+             pad_testing: false,
+             in_stream: false,
+@@ -945,8 +951,9 @@ impl Shell {
+     }
+ 
+     /// `root` becomes the stack; the current root parks and a pushed screen is dropped.
+-    /// What it can focus is unknown until it paints.
++    /// Focus targets and transition images belong to the new mount, never its predecessor.
+     fn mount(&mut self, to: Tab, root: Screen) {
++        self.tab_images.clear();
+         self.stack.truncate(1);
+         self.parked[self.tab.index()] = self.stack.pop();
+         self.stack.push(root);
+@@ -1725,14 +1732,21 @@ impl Shell {
+         }
+     }
+ 
++    /// Limit the shader target on bandwidth-limited GPUs without resizing the controls.
++    pub(crate) fn set_efficient_backdrop(&mut self, edge: f64) {
++        self.efficient_backdrop = true;
++        self.backdrop.reduced_edge = edge;
++    }
++
+     fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
+         // One clock read: the takeover's `draw_aurora` inherits it.
+         let t = self.field_clock(t);
+-        let reduced = crate::screens::settings::rows::reduce_ui_res(
+-            &self.settings,
+-            self.device.platform,
+-            self.device.fallback_ui,
+-        );
++        let reduced = self.efficient_backdrop
++            || crate::screens::settings::rows::reduce_ui_res(
++                &self.settings,
++                self.device.platform,
++                self.device.fallback_ui,
++            );
+         self.backdrop.draw(canvas, w, h, t, calm, reduced);
+     }
+ }
+diff --git a/crates/client/pf-console-ui/src/shell/backdrop.rs b/crates/client/pf-console-ui/src/shell/backdrop.rs
+index eefd3d40d1004f69fa8e3acb7a4e8b834b08e9ab..12d4c2a1ca09a974dbba4f191b41691f66c67a97 100644
+--- a/crates/client/pf-console-ui/src/shell/backdrop.rs
++++ b/crates/client/pf-console-ui/src/shell/backdrop.rs
+@@ -18,6 +18,8 @@ const FIELD_EDGE_REDUCED: f64 = 192.0;
+ pub(super) const FIELD_STEP: f64 = 0.04;
+ 
+ pub(super) struct Backdrop {
++    /// Long edge of the reduced shader target; controls keep their native viewport.
++    pub(super) reduced_edge: f64,
+     mesh: RuntimeEffect,
+     /// Palette id baked into `mesh`. [`Self::sync`] recompiles when
+     /// `settings.ui_palette` moves.
+@@ -48,6 +50,7 @@ impl Backdrop {
+     pub(super) fn new(palette_id: &str, bg_mix: f64) -> Result<Backdrop> {
+         let (mesh, mesh_lift, mesh_scrim, ink) = build_mesh(palette_id)?;
+         Ok(Backdrop {
++            reduced_edge: FIELD_EDGE_REDUCED,
+             mesh,
+             mesh_palette: palette_id.to_string(),
+             mesh_os: None,
+@@ -130,12 +133,11 @@ impl Backdrop {
+             })
+     }
+ 
+-    /// The field over `w`×`h` at clock `t`. The reduced interface takes a smaller buffer and
+-    /// one pass over the sphere.
++    /// Draw the field with a bounded shader target; the final blit covers the native canvas.
+     pub(super) fn draw(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64, reduced: bool) {
+         let mut cache = self.field.borrow_mut();
+         let (edge, passes) = if reduced {
+-            (FIELD_EDGE_REDUCED, 1.0)
++            (self.reduced_edge, 1.0)
+         } else {
+             (FIELD_EDGE, 2.0)
+         };
+@@ -201,6 +203,10 @@ impl Backdrop {
+         }
+         match cache {
+             Some(c) => {
++                // The field shader writes alpha 1 everywhere; replace the old background
++                // without loading it for a full-surface SrcOver blend.
++                let mut paint = crate::theme::shaded();
++                paint.set_blend_mode(skia_safe::BlendMode::Src);
+                 canvas.draw_image_rect_with_sampling_options(
+                     c.surface.image_snapshot(),
+                     None,
+@@ -209,7 +215,7 @@ impl Backdrop {
+                         skia_safe::FilterMode::Linear,
+                         skia_safe::MipmapMode::None,
+                     ),
+-                    &crate::theme::shaded(),
++                    &paint,
+                 );
+             }
+             // Stale with nothing cached means the shader rejected — the direct path's
+@@ -292,3 +298,56 @@ fn compile_mesh(
+         ink,
+     ))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn opaque_field_replacement_matches_src_over_pixel_for_pixel() {
++        let (w, h) = (384, 160);
++        let info = skia_safe::ImageInfo::new(
++            (w, h),
++            skia_safe::ColorType::RGBA8888,
++            skia_safe::AlphaType::Premul,
++            None,
++        );
++        for palette in ["violet", "paper"] {
++            let backdrop = Backdrop::new(palette, 0.0).unwrap();
++            for calm in [0.0, 1.0] {
++                let mut actual = skia_safe::surfaces::raster(&info, None, None).unwrap();
++                let mut reference = skia_safe::surfaces::raster(&info, None, None).unwrap();
++                let previous = Color4f::new(0.7, 0.1, 0.4, 0.5);
++                actual.canvas().clear(previous);
++                reference.canvas().clear(previous);
++                backdrop.draw(actual.canvas(), w as f64, h as f64, 1.0, calm, true);
++                let image = backdrop
++                    .field
++                    .borrow_mut()
++                    .as_mut()
++                    .unwrap()
++                    .surface
++                    .image_snapshot();
++                reference.canvas().draw_image_rect_with_sampling_options(
++                    image,
++                    None,
++                    Rect::from_wh(w as f32, h as f32),
++                    skia_safe::SamplingOptions::new(
++                        skia_safe::FilterMode::Linear,
++                        skia_safe::MipmapMode::None,
++                    ),
++                    &crate::theme::shaded(),
++                );
++                let mut a = vec![0; (w * h * 4) as usize];
++                let mut b = a.clone();
++                assert!(actual.read_pixels(&info, &mut a, (w * 4) as usize, (0, 0)));
++                assert!(reference.read_pixels(&info, &mut b, (w * 4) as usize, (0, 0)));
++                assert!(
++                    a == b,
++                    "{palette} calm={calm}: replacing the background changed pixels"
++                );
++                assert!(a.chunks_exact(4).all(|p| p[3] == 255));
++            }
++        }
++    }
++}
+diff --git a/crates/client/pf-console-ui/src/shell/render.rs b/crates/client/pf-console-ui/src/shell/render.rs
+index fa2efb933e6b8e3ab619f42d081533a26bec3696..176793b001c58e929021d7f2923aabf4e911f7f4 100644
+--- a/crates/client/pf-console-ui/src/shell/render.rs
++++ b/crates/client/pf-console-ui/src/shell/render.rs
+@@ -9,7 +9,7 @@ use crate::theme::{Fonts, Frame, PanelStroke, EDGE_INSET, W};
+ use crate::widgets::{text_tab, tray, Toward};
+ use pf_client_core::menu_nav::PadInfo;
+ use pf_client_core::trust;
+-use skia_safe::{Canvas, Picture, PictureRecorder, Rect};
++use skia_safe::{Canvas, Image, Picture, PictureRecorder, Point, Rect};
+ use std::time::Instant;
+ 
+ use super::{
+@@ -23,6 +23,11 @@ use crate::glyphs::{Hint, HintKey, HINT_PAD};
+ const STRIP_TOP: f64 = 32.0;
+ const STRIP_H: f64 = 36.0;
+ 
++/// Springs substep internally; only long pauses limit elapsed animation time.
++fn animation_dt(elapsed: f64) -> f64 {
++    elapsed.clamp(0.0, 0.25)
++}
++
+ impl Shell {
+     #[allow(clippy::too_many_arguments)]
+     /// Test helper: no insets, default scale. Hosts call [`Self::render_in`].
+@@ -63,7 +68,7 @@ impl Shell {
+         let dt = self
+             .last_frame
+             .replace(now)
+-            .map_or(1.0 / 60.0, |t| (now - t).as_secs_f64().clamp(0.0, 0.05));
++            .map_or(1.0 / 60.0, |t| animation_dt((now - t).as_secs_f64()));
+         #[cfg(test)]
+         let dt = match self.fake_clock.as_mut() {
+             Some((t, step)) => {
+@@ -87,6 +92,7 @@ impl Shell {
+         );
+         let side = f64::from(viewport.insets.left);
+         self.ui = self.ui.next(self.backdrop.ink, reduce, reduced_ui, side);
++        self.ui.skip_backdrop_blur = self.efficient_backdrop;
+         self.pads = pads.to_vec();
+         self.glyphs = glyph_style(self.input_source, pad_pref, self.device.platform);
+         if let Some(Screen::InputTest(test)) = self.stack.last_mut() {
+@@ -165,6 +171,19 @@ impl Shell {
+             (w - 2.0 * self.ui.edge(k) - chip_w - 12.0 * k).max(w * 0.35)
+         };
+         let games_ok = self.games_host().is_some();
++        let tab_images = matches!(self.motion, Motion::Tab { .. })
++            && self.tab_images_enabled
++            && record_content_layer(
++                true,
++                self.efficient_backdrop && !crate::blur::active(&self.ui),
++                canvas.image_info().color_type(),
++            )
++            && canvas.image_info().color_space().is_none();
++        if tab_images {
++            self.tab_images.begin(canvas, content, k);
++        } else {
++            self.tab_images.clear();
++        }
+         let (tab, strip_focus) = (self.tab, self.strip_focus);
+         // A takeover owns B/A while up: the screen's legend would name buttons it ignores.
+         let show_hints = self.takeover().is_none();
+@@ -194,6 +213,7 @@ impl Shell {
+             show_hints,
+             cheap: false,
+             root_targets: None,
++            tab_images: tab_images.then_some(&mut self.tab_images),
+         };
+         self.hint_rects.clear();
+         // Reduced motion keeps the crossfade (an instant swap loses the only spatial
+@@ -454,27 +474,146 @@ struct LayerEnv<'a> {
+     cheap: bool,
+     /// Focus targets the tab root placed, once its layer paints.
+     root_targets: Option<usize>,
++    tab_images: Option<&'a mut TabImages>,
++}
++
++/// Two native page images live only for one tab transition. Screen logic still runs;
++/// dynamic page content becomes live again when the spring settles. Chrome stays live.
++#[derive(Default)]
++pub(super) struct TabImages {
++    key: Option<(skia_safe::ISize, skia_safe::Matrix, Rect, f64)>,
++    pages: Vec<Option<(Image, Point)>>,
++    next: usize,
++}
++
++impl TabImages {
++    /// A new mount or a settled frame releases the previous transition's images.
++    pub(super) fn clear(&mut self) {
++        *self = Self::default();
++    }
++
++    /// Invalidate images when native geometry or the safe-area transform changes.
++    fn begin(&mut self, canvas: &Canvas, content: Rect, k: f64) {
++        let key = (
++            canvas.image_info().dimensions(),
++            canvas.local_to_device_as_3x3(),
++            content,
++            k,
++        );
++        if self.key.as_ref() != Some(&key) {
++            self.clear();
++            self.key = Some(key);
++        }
++        self.next = 0;
++    }
++
++    /// Rasterize a page once at native size, then translate its premultiplied pixels.
++    /// Allocation failures retain live picture replay with the same group opacity.
++    fn draw(&mut self, canvas: &Canvas, picture: &Picture, alpha: f64, dx: f64, dy: f64) {
++        let index = self.next;
++        self.next += 1;
++        if self.pages.len() <= index {
++            self.pages.push(None);
++        }
++        if self.pages[index].is_none() {
++            let bounds: skia_safe::IRect = skia_safe::RoundOut::round_out(&picture.cull_rect());
++            if bounds.width() > 0 && bounds.height() > 0 {
++                let info = skia_safe::ImageInfo::new(
++                    (bounds.width(), bounds.height()),
++                    canvas.image_info().color_type(),
++                    skia_safe::AlphaType::Premul,
++                    None,
++                );
++                if let Some(mut surface) = canvas.new_surface(&info, None) {
++                    surface.canvas().clear(skia_safe::Color::TRANSPARENT);
++                    surface
++                        .canvas()
++                        .translate((-bounds.left as f32, -bounds.top as f32));
++                    surface.canvas().draw_picture(picture, None, None);
++                    self.pages[index] = Some((
++                        surface.image_snapshot(),
++                        Point::new(bounds.left as f32, bounds.top as f32),
++                    ));
++                }
++            }
++        }
++        let matrix = canvas.local_to_device_as_3x3();
++        let zero = matrix.map_point((0.0, 0.0));
++        let moved = matrix.map_point((dx as f32, dy as f32));
++        canvas.save();
++        canvas.reset_matrix();
++        let mut paint = crate::theme::layer();
++        paint.set_alpha_f(alpha.clamp(0.0, 1.0) as f32);
++        let shift = skia_safe::Matrix::translate((moved.x - zero.x, moved.y - zero.y));
++        if let Some((image, origin)) = &self.pages[index] {
++            canvas.concat(&shift);
++            canvas.draw_image_with_sampling_options(
++                image,
++                *origin,
++                skia_safe::SamplingOptions::new(
++                    skia_safe::FilterMode::Linear,
++                    skia_safe::MipmapMode::None,
++                ),
++                Some(&paint),
++            );
++        } else {
++            canvas.draw_picture(picture, Some(&shift), Some(&paint));
++        }
++        canvas.restore();
++    }
+ }
+ 
+-/// Opens a draw at `alpha`: a layer when faded, a plain save when whole. False, and
+-/// nothing opened, when there is nothing to see; the caller restores only on true.
+-fn open_at(canvas: &Canvas, alpha: f64) -> bool {
++/// Opens a bounded fade or a plain save. Invisible content opens neither;
++/// the caller restores only on true. Unknown bounds preserve the canvas clip.
++fn open_at(canvas: &Canvas, alpha: f64, bounds: Option<Rect>) -> bool {
+     if alpha < 0.001 {
+         return false;
+     }
+     if alpha < 0.999 {
+-        crate::theme::save_layer_alpha(canvas, None, alpha as f32);
++        crate::theme::save_layer_alpha(canvas, bounds, alpha as f32);
+     } else {
+         canvas.save();
+     }
+     true
+ }
+ 
++/// Full-width chrome bands retain the safe-area margins and the legend's panel edges.
++fn chrome_bands(edges: Rect, h: f64, k: f64) -> (Rect, Rect) {
++    (
++        Rect::from_ltrb(edges.left, edges.top, edges.right, (TOP_BAND * k) as f32),
++        Rect::from_ltrb(
++            edges.left,
++            (h - BOTTOM_BAND * k) as f32,
++            edges.right,
++            edges.bottom,
++        ),
++    )
++}
++
++/// Recording has no surface or colour type; only surface-independent eight-bit content uses it.
++fn record_content_layer(layered: bool, efficient: bool, color_type: skia_safe::ColorType) -> bool {
++    layered
++        && efficient
++        && matches!(
++            color_type,
++            skia_safe::ColorType::RGBA8888 | skia_safe::ColorType::BGRA8888
++        )
++}
++
++/// The picture stores device coordinates. Its conservative bounds size the alpha layer.
++fn replay_content(canvas: &Canvas, picture: &Picture, alpha: f64) {
++    canvas.save();
++    canvas.reset_matrix();
++    let mut paint = crate::theme::layer();
++    paint.set_alpha_f(alpha.clamp(0.0, 1.0) as f32);
++    canvas.draw_picture(picture, None, Some(&paint));
++    canvas.restore();
++}
++
+ impl LayerEnv<'_> {
+-    /// One screen's content as a unit: fade, slide, scale about centre. The band and
+-    /// legend stay out of the layer; the returned [`Chrome`] draws them in place, so a
+-    /// tab switch or a push never moves the strip. A tab root records the focus targets
+-    /// it placed.
++    /// Transformed content, with chrome recorded separately in stationary device space.
++    /// Broadcom tab transitions reuse page images; navigation retains bounded live recording.
++    /// Other surfaces retain their backing surface and layer colour semantics.
+     #[allow(clippy::too_many_arguments)]
+     fn paint(
+         &mut self,
+@@ -485,30 +624,39 @@ impl LayerEnv<'_> {
+         scale: f64,
+         band: Band,
+     ) -> Chrome {
+-        let canvas = self.canvas;
+-        // Raise a layer only when alpha/scale/slide actually change. Unbounded
+-        // `save_layer` is a full-surface offscreen; Skia does not elide alpha ≥ 1.
+-        // Settled SrcOver draws are pixel-identical without the isolation.
++        let destination = self.canvas;
+         let layered = alpha < 0.999 || (scale - 1.0).abs() > 0.001 || dy.abs() > 0.001;
+-        if layered {
+-            crate::theme::save_layer_alpha(canvas, None, alpha.clamp(0.0, 1.0) as f32);
+-        } else {
+-            // Save anyway: the transform below is undone by the same `restore`.
+-            canvas.save();
+-        }
+-        // A list's own soft edges copy the surface, which has none of this layer: they
+-        // would blur the field behind it over the rows. Off for the transition.
+-        self.ui.in_layer.set(layered);
+         // Pinned chrome records over the whole canvas, past the safe area, so a band's
+         // scrim reaches the glass. Read before the slide moves the clip.
+-        let edges = canvas
++        let edges = destination
+             .local_clip_bounds()
+             .unwrap_or_else(|| Rect::from_wh(self.w as f32, self.h as f32));
+-        // It records in device space, as this canvas stands before the slide: a focus plate
+-        // handing off to or from it, and a blur, then read the rects every layer reads.
+-        let base = canvas.local_to_device();
+-        let device_edges = canvas.local_to_device_as_3x3().map_rect(edges).0;
+-        canvas.translate((dx as f32, dy as f32));
++        let base = destination.local_to_device();
++        let device_edges = destination.local_to_device_as_3x3().map_rect(edges).0;
++        let mut recorder = record_content_layer(
++            layered || self.tab_images.is_some(),
++            self.ui.skip_backdrop_blur && !crate::blur::active(self.ui),
++            destination.image_info().color_type(),
++        )
++        .then(PictureRecorder::new);
++        let canvas = if let Some(recorder) = recorder.as_mut() {
++            let canvas = recorder.begin_recording(device_edges, true);
++            canvas.set_matrix(&base);
++            canvas.save();
++            canvas
++        } else {
++            if layered {
++                crate::theme::save_layer_alpha(destination, None, alpha.clamp(0.0, 1.0) as f32);
++            } else {
++                destination.save();
++            }
++            destination
++        };
++        // Surface copies cannot see content inside either kind of transition layer.
++        self.ui.in_layer.set(layered || self.tab_images.is_some());
++        if self.tab_images.is_none() {
++            canvas.translate((dx as f32, dy as f32));
++        }
+         let (cx, cy) = ((self.w / 2.0) as f32, (self.h / 2.0) as f32);
+         canvas.translate((cx, cy));
+         canvas.scale((scale as f32, scale as f32));
+@@ -567,6 +715,16 @@ impl LayerEnv<'_> {
+             Vec::new()
+         };
+         canvas.restore();
++        if let Some(picture) = recorder
++            .as_mut()
++            .and_then(|recorder| recorder.finish_recording_as_picture(None))
++        {
++            if let Some(images) = self.tab_images.as_mut() {
++                images.draw(destination, &picture, alpha, dx, dy);
++            } else {
++                replay_content(destination, &picture, alpha);
++            }
++        }
+         self.ui.in_layer.set(false);
+         Chrome {
+             alpha,
+@@ -578,15 +736,16 @@ impl LayerEnv<'_> {
+         }
+     }
+ 
+-    /// The band and legend over every layer, drawn after content so a list scrolls up
+-    /// under them. The strip's strength is the sum of the layers asking for it, so two
+-    /// roots crossing hold it at full. Returns the last legend's hit-boxes.
++    /// Stationary chrome over the content. Titles and legends fade within their bands;
++    /// pinned recordings and the focus plate retain the full clip for their effects.
++    /// Crossing roots share one full-strength strip. Returns the last legend's hit-boxes.
+     fn chrome(&mut self, layers: &[Chrome]) -> Vec<(HintKey, Rect)> {
+         let canvas = self.canvas;
+         // Trays out to the screen's edges, past the safe area, behind the band and legend,
+         // reaching in as far as the screens' own pinned chrome: one ramp, never two stacked.
+         let (k, content) = (self.k, self.content);
+         let edges = canvas.local_clip_bounds().unwrap_or(content);
++        let (title_bounds, hint_bounds) = chrome_bands(edges, self.h, k);
+         let (into_top, into_bottom) = tray_reach(layers);
+         let top = Rect::from_ltrb(edges.left, edges.top, edges.right, content.top + into_top);
+         tray(canvas, self.ui, top, Toward::Top, k);
+@@ -597,7 +756,7 @@ impl LayerEnv<'_> {
+             let Some(pic) = &c.pinned_pic else {
+                 continue;
+             };
+-            if open_at(canvas, c.alpha) {
++            if open_at(canvas, c.alpha, None) {
+                 // Recorded in device space (`paint`).
+                 canvas.reset_matrix();
+                 canvas.draw_picture(pic, None, None);
+@@ -609,7 +768,7 @@ impl LayerEnv<'_> {
+             .filter(|c| c.band == Band::Strip)
+             .map(|c| c.alpha)
+             .sum();
+-        if open_at(canvas, strip.min(1.0)) {
++        if open_at(canvas, strip.min(1.0), None) {
+             self.draw_strip(canvas);
+             canvas.restore();
+         }
+@@ -617,7 +776,7 @@ impl LayerEnv<'_> {
+             let Some(title) = c.title.as_deref() else {
+                 continue;
+             };
+-            if open_at(canvas, c.alpha) {
++            if open_at(canvas, c.alpha, Some(title_bounds)) {
+                 let k = self.k;
+                 let (x, top) = (self.ui.edge(k), 18.0 * k);
+                 let size = 30.0 * k;
+@@ -636,7 +795,7 @@ impl LayerEnv<'_> {
+         }
+         let mut rects = Vec::new();
+         for c in layers.iter().filter(|c| !c.hints.is_empty()) {
+-            if open_at(canvas, c.alpha) {
++            if open_at(canvas, c.alpha, Some(hint_bounds)) {
+                 let (k, glyphs) = (self.k, self.glyphs);
+                 let (x, bottom) = (self.ui.edge(k) - HINT_PAD * k, self.h - 18.0 * k);
+                 let bar = hint_bar(canvas, self.ui, self.fonts, &c.hints, glyphs, x, bottom, k);
+@@ -770,6 +929,206 @@ mod glyph_style_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod chrome_layer_tests {
++    use super::*;
++
++    #[test]
++    fn content_recording_excludes_hdr_and_surface_dependent_paths() {
++        use skia_safe::ColorType::*;
++        for color in [RGBA8888, BGRA8888] {
++            assert!(record_content_layer(true, true, color));
++            assert!(!record_content_layer(false, true, color));
++            assert!(!record_content_layer(true, false, color));
++        }
++        for color in [RGBA1010102, BGRA1010102, RGBAF16, Unknown] {
++            assert!(!record_content_layer(true, true, color));
++        }
++    }
++
++    #[test]
++    fn recorded_content_preserves_shadows_transforms_insets_and_empty_draws() {
++        use skia_safe::{BlurStyle, Color4f, MaskFilter, RRect};
++        let (width, height) = (640, 400);
++        let info = skia_safe::ImageInfo::new(
++            (width, height),
++            skia_safe::ColorType::RGBA8888,
++            skia_safe::AlphaType::Premul,
++            None,
++        );
++        for empty in [false, true] {
++            for alpha in [0.0, 0.37, 1.0] {
++                let render = |recorded: bool, cached: bool| {
++                    let mut surface =
++                        skia_safe::surfaces::raster_n32_premul((width, height)).unwrap();
++                    let destination = surface.canvas();
++                    destination.clear(skia_safe::Color::from_rgb(29, 41, 58));
++                    destination.translate((23.5, 17.25));
++                    let base = destination.local_to_device();
++                    let edges = destination.local_clip_bounds().unwrap();
++                    let device_edges = destination.local_to_device_as_3x3().map_rect(edges).0;
++                    let mut recorder = recorded.then(PictureRecorder::new);
++                    let canvas = if let Some(recorder) = recorder.as_mut() {
++                        let canvas = recorder.begin_recording(device_edges, true);
++                        canvas.set_matrix(&base);
++                        canvas.save();
++                        canvas
++                    } else {
++                        crate::theme::save_layer_alpha(destination, None, alpha as f32);
++                        destination
++                    };
++                    canvas.translate((35.25, -4.75));
++                    canvas.scale((0.93, 0.93));
++                    if !empty {
++                        let rect = Rect::from_xywh(44.0, 50.0, 130.0, 64.0);
++                        let rounded = RRect::new_rect_xy(rect, 12.0, 12.0);
++                        let mut shadow = crate::theme::fill(Color4f::new(0.0, 0.0, 0.0, 0.5));
++                        shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 4.0, None));
++                        canvas.draw_rrect(rounded, &shadow);
++                        canvas.draw_rrect(
++                            rounded,
++                            &crate::theme::fill(Color4f::new(0.2, 0.6, 0.9, 0.8)),
++                        );
++                    }
++                    canvas.restore();
++                    if let Some(picture) = recorder
++                        .as_mut()
++                        .and_then(|recorder| recorder.finish_recording_as_picture(None))
++                    {
++                        let bounds = picture.cull_rect();
++                        assert!(bounds.width() * bounds.height() < (width * height) as f32 / 4.0);
++                        if cached {
++                            let mut images = TabImages::default();
++                            images.draw(destination, &picture, alpha, 0.0, 0.0);
++                        } else {
++                            replay_content(destination, &picture, alpha);
++                        }
++                        assert_eq!(destination.local_to_device(), base);
++                    }
++                    let mut pixels = vec![0; (width * height * 4) as usize];
++                    assert!(surface.read_pixels(&info, &mut pixels, (width * 4) as usize, (0, 0)));
++                    pixels
++                };
++                assert!(
++                    render(true, false) == render(false, false),
++                    "recording changes content pixels"
++                );
++                assert!(
++                    render(true, true)
++                        .iter()
++                        .zip(render(false, false))
++                        .all(|(a, b)| a.abs_diff(b) <= 1),
++                    "cached page changes pixels beyond alpha rounding"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn tab_images_expire_on_geometry_changes_and_new_mounts() {
++        let mut surface = skia_safe::surfaces::raster_n32_premul((160, 100)).unwrap();
++        let canvas = surface.canvas();
++        let content = Rect::from_wh(160.0, 100.0);
++        let mut recorder = PictureRecorder::new();
++        recorder.begin_recording(content, true).draw_rect(
++            Rect::from_xywh(10.0, 20.0, 30.0, 40.0),
++            &crate::theme::fill(skia_safe::Color4f::new(1.0, 0.0, 0.0, 1.0)),
++        );
++        let picture = recorder.finish_recording_as_picture(None).unwrap();
++        let mut images = TabImages::default();
++        images.begin(canvas, content, 1.0);
++        images.draw(canvas, &picture, 1.0, 0.0, 0.0);
++        let first = images.pages[0].as_ref().unwrap().0.unique_id();
++        images.begin(canvas, content, 1.0);
++        images.draw(canvas, &picture, 0.4, 20.0, 0.0);
++        assert_eq!(first, images.pages[0].as_ref().unwrap().0.unique_id());
++        images.begin(canvas, content, 1.5);
++        assert!(images.pages.is_empty());
++        images.draw(canvas, &picture, 1.0, 0.0, 0.0);
++        images.clear();
++        assert!(images.pages.is_empty());
++        assert!(images.key.is_none());
++    }
++
++    #[test]
++    fn navigation_keeps_wall_time_at_low_render_rates() {
++        for fps in [5, 10, 15, 60, 120] {
++            let dt = 1.0 / f64::from(fps);
++            let mut spring = crate::anim::Spring::rest(0.0);
++            let mut elapsed = 0.0;
++            while spring.pos < 0.95 && elapsed < 2.0 {
++                spring.step_spec(1.0, crate::anim::springs::NAV, animation_dt(dt));
++                elapsed += dt;
++            }
++            assert!(
++                elapsed <= 0.3 + dt,
++                "navigation slowed at {fps} fps: {elapsed}"
++            );
++        }
++    }
++
++    #[test]
++    fn bounded_title_and_hint_fades_preserve_pixels_with_insets() {
++        let fonts = crate::theme::build_fonts().unwrap();
++        let mut ui = Frame::default();
++        ui.skip_backdrop_blur = true;
++        let hints = [
++            Hint::new(HintKey::Confirm, "Choose"),
++            Hint::new(HintKey::Back, "Back"),
++        ];
++        for (width, height) in [(960, 540), (1920, 800)] {
++            let k = f64::from(height) / 800.0;
++            let h = f64::from(height - 34);
++            for style in [GlyphStyle::Keyboard, GlyphStyle::Shapes] {
++                let pixels = |bounded: bool| {
++                    let mut surface =
++                        skia_safe::surfaces::raster_n32_premul((width, height)).unwrap();
++                    let canvas = surface.canvas();
++                    canvas.clear(skia_safe::Color::from_rgb(29, 41, 58));
++                    canvas.translate((23.0, 17.0));
++                    let edges = canvas.local_clip_bounds().unwrap();
++                    let (title, legend) = chrome_bands(edges, h, k);
++                    fonts.begin_frame();
++                    assert!(open_at(canvas, 0.37, bounded.then_some(title)));
++                    fonts.heading(
++                        canvas,
++                        "Settings and connected devices",
++                        W::Bold,
++                        30.0 * k,
++                        ui.fg(1.0),
++                        ui.edge(k),
++                        18.0 * k,
++                        f64::from(width) * 0.6,
++                    );
++                    canvas.restore();
++                    assert!(open_at(canvas, 0.63, bounded.then_some(legend)));
++                    hint_bar(
++                        canvas,
++                        &ui,
++                        &fonts,
++                        &hints,
++                        style,
++                        ui.edge(k) - HINT_PAD * k,
++                        h - 18.0 * k,
++                        k,
++                    );
++                    canvas.restore();
++                    let info = skia_safe::ImageInfo::new(
++                        (width, height),
++                        skia_safe::ColorType::RGBA8888,
++                        skia_safe::AlphaType::Premul,
++                        None,
++                    );
++                    let mut pixels = vec![0; (width * height * 4) as usize];
++                    assert!(surface.read_pixels(&info, &mut pixels, (width * 4) as usize, (0, 0)));
++                    pixels
++                };
++                assert!(pixels(true) == pixels(false), "chrome bounds change pixels");
++            }
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tray_tests {
+     use super::*;
+diff --git a/crates/client/pf-console-ui/src/shell/tests.rs b/crates/client/pf-console-ui/src/shell/tests.rs
+index b0bbef8a24b2f49a1111f9d41081ce6863a5cbd4..abc3a155c6d65f3eec561823b2dd600b7ed5588d 100644
+--- a/crates/client/pf-console-ui/src/shell/tests.rs
++++ b/crates/client/pf-console-ui/src/shell/tests.rs
+@@ -1819,6 +1819,20 @@ fn the_backdrop_caches_its_field() {
+         s.backdrop.field.borrow().as_ref().map(|c| c.size),
+         Some((512, 320))
+     );
++    s.efficient_backdrop = true;
++    s.render(surface.canvas(), 1280, 800, &fonts, None, None, &pads);
++    assert_eq!(
++        s.backdrop.field.borrow().as_ref().map(|c| c.size),
++        Some((192, 120))
++    );
++    assert_eq!(s.last_full, (1280.0, 800.0));
++    s.set_efficient_backdrop(96.0);
++    s.render(surface.canvas(), 1280, 800, &fonts, None, None, &pads);
++    assert_eq!(
++        s.backdrop.field.borrow().as_ref().map(|c| c.size),
++        Some((96, 60))
++    );
++    assert_eq!(s.last_full, (1280.0, 800.0));
+ }
+ 
+ /// Bounding box of lit pixels: `(left, right, bottom)`. White ink on black, any channel.
+@@ -2694,3 +2708,41 @@ fn an_explainer_reaches_the_shells_tray_in() {
+     assert_eq!(pin.view().foot(&ctx), None);
+     assert_eq!(pin.pinned(1.0, &ctx), (0.0, 0.0));
+ }
++
++#[test]
++fn console_covers_transparent_pixels_during_navigation() {
++    let fonts = crate::theme::build_fonts().unwrap();
++    let (w, h) = (480, 300);
++    let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
++    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
++    s.efficient_backdrop = true;
++    let info = skia_safe::ImageInfo::new(
++        (w, h),
++        skia_safe::ColorType::RGBA8888,
++        skia_safe::AlphaType::Premul,
++        None,
++    );
++    let mut pixels = vec![0; (w * h * 4) as usize];
++    for step in 0..3 {
++        if step == 1 {
++            s.handle_menu(MenuEvent::Tertiary);
++        } else if step == 2 {
++            finish_motion(&mut s);
++        }
++        surface.canvas().clear(skia_safe::Color::TRANSPARENT);
++        s.render(
++            surface.canvas(),
++            w as u32,
++            h as u32,
++            &fonts,
++            None,
++            None,
++            &[],
++        );
++        assert!(surface.read_pixels(&info, &mut pixels, (w * 4) as usize, (0, 0)));
++        assert!(
++            pixels.chunks_exact(4).all(|p| p[3] == 255),
++            "transparent console pixel at step {step}"
++        );
++    }
++}
+diff --git a/crates/client/pf-console-ui/src/skia_overlay.rs b/crates/client/pf-console-ui/src/skia_overlay.rs
+index 4b5d4b7e2989d36a1c521207f86ab33b38114db8..5f684c1a5d14fc85e9b144e3efba1163049aed1a 100644
+--- a/crates/client/pf-console-ui/src/skia_overlay.rs
++++ b/crates/client/pf-console-ui/src/skia_overlay.rs
+@@ -26,6 +26,14 @@ use std::time::{Duration, Instant};
+ /// An idle console redraws at most this often. 30 Hz keeps the aurora moving.
+ const IDLE_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
+ 
++/// Keep the measured 192-pixel default and bound diagnostic backdrop overrides.
++fn rpi_field_edge(value: Option<&str>) -> u16 {
++    value
++        .and_then(|value| value.parse::<u16>().ok())
++        .filter(|edge| (64..=192).contains(edge))
++        .unwrap_or(192)
++}
++
+ /// Long enough to read the exit hint; the last `BANNER_FADE_S` fade out.
+ const BANNER_S: f64 = 6.0;
+ const BANNER_FADE_S: f64 = 0.6;
+@@ -39,16 +47,23 @@ struct Slot {
+     width: u32,
+     height: u32,
+     ten_bit: bool,
++    opaque: bool,
++    transfer_src: bool,
+ }
+ 
+ impl Slot {
++    /// Publish the image's actual usage so the presenter can choose a safe transfer.
+     fn frame(&self) -> OverlayFrame {
+         OverlayFrame {
++            opaque: self.opaque,
++            transfer_src: self.transfer_src,
+             image: self.image,
+             view: self.view,
+             format: self.format,
+             width: self.width,
+             height: self.height,
++            scissor_y: 0,
++            scissor_height: self.height,
+         }
+     }
+ }
+@@ -102,6 +117,7 @@ pub struct SkiaOverlay {
+     /// Slot of the last returned frame; the next render takes the other.
+     current: usize,
+     drawn: Drawn,
++    drawn_band: (u32, u32),
+     /// Stats OSD face: Geist, as the console.
+     font: Option<Font>,
+     fonts: Option<Fonts>,
+@@ -145,6 +161,7 @@ impl SkiaOverlay {
+             slots: [None, None],
+             current: 0,
+             drawn: Drawn::default(),
++            drawn_band: (0, 0),
+             font: None,
+             fonts: None,
+             shell: None,
+@@ -199,7 +216,28 @@ impl Drop for SkiaOverlay {
+ }
+ 
+ impl Overlay for SkiaOverlay {
++    /// Share the presenter's Vulkan device and select its backdrop rendering cost.
+     fn init(&mut self, shared: &SharedDevice) -> Result<()> {
++        // SAFETY: the shared instance owns this live physical-device handle.
++        let properties = unsafe {
++            shared
++                .instance
++                .get_physical_device_properties(shared.physical_device)
++        };
++        if let Some(shell) = self
++            .shell
++            .as_mut()
++            .filter(|_| properties.vendor_id == 0x14e4)
++        {
++            let edge = rpi_field_edge(std::env::var("PUNKTFUNK_RPI_FIELD_EDGE").ok().as_deref());
++            shell.set_efficient_backdrop(f64::from(edge));
++            shell.tab_images_enabled =
++                std::env::var("PUNKTFUNK_RPI_TAB_IMAGES").ok().as_deref() != Some("0");
++            tracing::info!(
++                edge,
++                "Broadcom GPU: cached backdrop with native-resolution controls"
++            );
++        }
+         // Skia resolves Vulkan entry points through us (same ash dispatch). The
+         // DirectContext bakes the table in `make_vulkan`; this closure dies with `init`.
+         let entry = shared.entry.clone();
+@@ -412,6 +450,14 @@ impl Overlay for SkiaOverlay {
+         }
+     }
+ 
++    fn redraw_due(&self) -> bool {
++        console_redraw_due(
++            self.console_visible(),
++            self.shell.as_ref().is_some_and(Shell::idle),
++            self.console_at.map(|at| at.elapsed()),
++        )
++    }
++
+     fn frame(&mut self, ctx: &FrameCtx) -> Result<Option<OverlayFrame>> {
+         // The window may have moved to another display since the last frame.
+         if let Some(shell) = &mut self.shell {
+@@ -420,10 +466,10 @@ impl Overlay for SkiaOverlay {
+         // Full-screen and opaque; the aurora animates every frame. Idle, the slot on glass
+         // is handed back until `IDLE_FRAME` passes, and the presenter skips its present.
+         if self.console_visible() {
+-            let idle = self.shell.as_ref().is_some_and(Shell::idle)
+-                && self.console_at.is_some_and(|t| t.elapsed() < IDLE_FRAME);
++            let idle = !self.redraw_due();
+             if let Some(slot) = self.slots[self.current].as_ref().filter(|s| {
+-                idle && (s.width, s.height, s.ten_bit) == (ctx.width, ctx.height, ctx.ten_bit)
++                idle && s.opaque
++                    && (s.width, s.height, s.ten_bit) == (ctx.width, ctx.height, ctx.ten_bit)
+             }) {
+                 return Ok(Some(slot.frame()));
+             }
+@@ -449,6 +495,7 @@ impl Overlay for SkiaOverlay {
+                 ctx.pad_pref,
+                 ctx.pads,
+             );
++            slot.opaque = true;
+             {
+                 // Queue external sync vs FFmpeg's pump-thread submits (same queue).
+                 let _q = gpu.queue_lock.guard();
+@@ -537,8 +584,17 @@ impl Overlay for SkiaOverlay {
+             ring: ring_key,
+         };
+         if want == self.drawn {
+-            return Ok(self.slots[self.current].as_ref().map(Slot::frame));
++            let (scissor_y, scissor_height) = self.drawn_band;
++            if scissor_height == 0 {
++                return Ok(None);
++            }
++            return Ok(self.slots[self.current].as_ref().map(|slot| OverlayFrame {
++                scissor_y,
++                scissor_height,
++                ..slot.frame()
++            }));
+         }
++        let mut damage = DamageBand::new(ctx.height, ctx.resizing || ring_key != 0);
+ 
+         // Other slot: the presenter may still be sampling this one (one frame in flight).
+         let next = 1 - self.current;
+@@ -546,6 +602,7 @@ impl Overlay for SkiaOverlay {
+         let gpu = self.gpu.as_mut().expect("init ran");
+         let slot = self.slots[next].as_mut().expect("just ensured");
+ 
++        slot.opaque = false;
+         let canvas = slot.surface.canvas();
+         canvas.clear(Color4f::new(0.0, 0.0, 0.0, 0.0));
+         // Size the face per drawer, don't scale the canvas: Skia hints at the
+@@ -562,7 +619,14 @@ impl Overlay for SkiaOverlay {
+         if let Some(stats) = &want.stats {
+             let osd_scale = scale * ctx.stats_scale.clamp(0.5, 4.0);
+             let size = (ctx.width, ctx.height);
+-            draw_osd_panel(canvas, font, stats, size, osd_scale, ctx.stats_corner);
++            damage.include(draw_osd_panel(
++                canvas,
++                font,
++                stats,
++                size,
++                osd_scale,
++                ctx.stats_corner,
++            ));
+         }
+         // Top-right, stacked in a fixed order, and top-left while the stats panel holds the
+         // top right: never under the panel or the bottom pill, even at stats Off. A host
+@@ -572,28 +636,39 @@ impl Overlay for SkiaOverlay {
+         if let Some(muted) = want.mic_notice {
+             let at = (ctx.width, row, left);
+             let text = punktfunk_core::client::mic_mute_label(muted);
+-            corner_pill(canvas, font, text, muted, at, scale);
++            damage.include(corner_pill(canvas, font, text, muted, at, scale));
+             row += 1;
+         }
+         if !want.audio_mute.is_empty() {
+             let at = (ctx.width, row, left);
+-            corner_pill(canvas, font, &want.audio_mute, true, at, scale);
++            damage.include(corner_pill(canvas, font, &want.audio_mute, true, at, scale));
+             row += 1;
+         }
+         // The access chip (preset label + countdown) stacks under them. A full-control
+         // permanent session has none.
+         if let Some(access) = &want.access {
+-            corner_pill(canvas, font, access, false, (ctx.width, row, left), scale);
++            damage.include(corner_pill(
++                canvas,
++                font,
++                access,
++                false,
++                (ctx.width, row, left),
++                scale,
++            ));
+         }
+         // Access toast outranks the capture hint for its few seconds.
+         if let Some(notice) = &want.notice {
+-            draw_hint_pill(canvas, font, notice, ctx.width, ctx.height, 1.0, scale);
++            damage.include(draw_hint_pill(
++                canvas, font, notice, ctx.width, ctx.height, 1.0, scale,
++            ));
+         } else if let Some(hint) = &want.hint {
+-            draw_hint_pill(canvas, font, hint, ctx.width, ctx.height, 1.0, scale);
++            damage.include(draw_hint_pill(
++                canvas, font, hint, ctx.width, ctx.height, 1.0, scale,
++            ));
+         } else if banner_step > 0 {
+             // The exit hint, fading out.
+             if let Some(text) = &self.banner_text {
+-                draw_hint_pill(
++                damage.include(draw_hint_pill(
+                     canvas,
+                     font,
+                     text,
+@@ -601,7 +676,7 @@ impl Overlay for SkiaOverlay {
+                     ctx.height,
+                     banner_alpha as f32,
+                     scale,
+-                );
++                ));
+             }
+         }
+ 
+@@ -632,12 +707,23 @@ impl Overlay for SkiaOverlay {
+ 
+         self.current = next;
+         self.drawn = want;
+-        Ok(Some(
+-            self.slots[next].as_ref().expect("just rendered").frame(),
+-        ))
++        self.drawn_band = damage.finish();
++        let (scissor_y, scissor_height) = self.drawn_band;
++        if scissor_height == 0 {
++            return Ok(None);
++        }
++        Ok(Some(OverlayFrame {
++            scissor_y,
++            scissor_height,
++            ..self.slots[next].as_ref().expect("just rendered").frame()
++        }))
+     }
+ }
+ 
++fn console_redraw_due(visible: bool, idle: bool, age: Option<Duration>) -> bool {
++    visible && (!idle || age.is_none_or(|age| age >= IDLE_FRAME))
++}
++
+ /// Seconds since the ring last drew (spring clock). Cap so a paused loop does not snap.
+ fn ring_dt(drawn_at: &mut Option<Instant>) -> f64 {
+     let now = Instant::now();
+@@ -747,6 +833,10 @@ impl SkiaOverlay {
+             )
+         }
+         .context("overlay image view")?;
++        let transfer_src =
++            image_info.image_usage_flags & avk::ImageUsageFlags::TRANSFER_SRC.as_raw() != 0
++                && image_info.sample_count == 1;
++        tracing::debug!(width, height, format = ?image_info.format, transfer_src, "console render target");
+         self.slots[i] = Some(Slot {
+             surface,
+             image,
+@@ -755,11 +845,41 @@ impl SkiaOverlay {
+             width,
+             height,
+             ten_bit,
++            opaque: false,
++            transfer_src,
+         });
+         Ok(())
+     }
+ }
+ 
++/// The vertical union of painted chrome, including one pixel for antialiasing.
++struct DamageBand {
++    height: u32,
++    top: u32,
++    bottom: u32,
++}
++
++impl DamageBand {
++    fn new(height: u32, full: bool) -> Self {
++        Self {
++            height,
++            top: if full { 0 } else { height },
++            bottom: if full { height } else { 0 },
++        }
++    }
++
++    fn include(&mut self, rect: Rect) {
++        let top = (rect.top - 1.0).floor().clamp(0.0, self.height as f32) as u32;
++        let bottom = (rect.bottom + 1.0).ceil().clamp(0.0, self.height as f32) as u32;
++        self.top = self.top.min(top);
++        self.bottom = self.bottom.max(bottom);
++    }
++
++    fn finish(self) -> (u32, u32) {
++        (self.top, self.bottom.saturating_sub(self.top))
++    }
++}
++
+ /// SDL scancode → [`Key`](crate::input::Key). `None` = unused; the run loop keeps it.
+ fn key_of(sc: sdl3::keyboard::Scancode) -> Option<crate::input::Key> {
+     use crate::input::Key as K;
+@@ -809,7 +929,7 @@ pub(crate) fn exit_hint(pad: bool) -> &'static str {
+     }
+ }
+ 
+-/// Stats OSD: translucent rounded panel in `corner`, one line each, painted by role.
++/// Paint the stats panel and return its bounds for the compositor scissor.
+ fn draw_osd_panel(
+     canvas: &Canvas,
+     base_font: &Font,
+@@ -817,7 +937,7 @@ fn draw_osd_panel(
+     (width, height): (u32, u32),
+     scale: f32,
+     corner: HudCorner,
+-) {
++) -> Rect {
+     // Width is linear in scale; measure once, then fit so Detailed-tier lines stay in-window.
+     let width_at = |s: f32| {
+         let font = chrome_font(base_font, s);
+@@ -866,6 +986,7 @@ fn draw_osd_panel(
+             &fill(role_color(line.role)),
+         );
+     }
++    panel
+ }
+ 
+ /// Headline bright, breakdowns softer, asides dimmer, warnings in status red.
+@@ -878,10 +999,7 @@ fn role_color(role: Role) -> Color4f {
+     }
+ }
+ 
+-/// A standing pill in a top corner, `row` pills down: words, led by an error-colour dot when
+-/// `dot`. `at` is the window width, the row and whether it sits top-left. Drawn from state,
+-/// not from the stats text, so it survives stats Off. Words, not a mute glyph Geist lacks.
+-/// Every pill is one line tall, so rows stack on one pitch.
++/// Paint a top-corner badge and return its bounds. Rows share one vertical pitch.
+ fn corner_pill(
+     canvas: &Canvas,
+     base_font: &Font,
+@@ -889,7 +1007,7 @@ fn corner_pill(
+     dot: bool,
+     (width, row, left): (u32, usize, bool),
+     scale: f32,
+-) {
++) -> Rect {
+     // Short; it fits any stream window, so take the display scale as-is.
+     let font = &chrome_font(base_font, scale);
+     let (_, metrics) = font.metrics();
+@@ -923,6 +1041,7 @@ fn corner_pill(
+         font,
+         &fill(Color4f::new(1.0, 1.0, 1.0, 0.92)),
+     );
++    Rect::from_xywh(x, y, w, h)
+ }
+ 
+ /// Mid-stream resize cover: full-screen scrim + spinner + "Resizing…". The overlay
+@@ -957,8 +1076,7 @@ fn draw_resize_scrim(
+     );
+ }
+ 
+-/// Capture hint / start banner: centered pill near the bottom. `scale` is the
+-/// display UI scale (size already rides in `font`).
++/// Paint a bottom hint or banner and return its bounds after fitting its text.
+ fn draw_hint_pill(
+     canvas: &Canvas,
+     base_font: &Font,
+@@ -967,7 +1085,7 @@ fn draw_hint_pill(
+     height: u32,
+     alpha: f32,
+     scale: f32,
+-) {
++) -> Rect {
+     // Capture hint already fills most of a 1280 px window at 100 %; fit to the
+     // window (4 % gutter) so 2× scale does not overrun both edges.
+     let pill_w =
+@@ -993,4 +1111,9 @@ fn draw_hint_pill(
+         font,
+         &fill(Color4f::new(1.0, 1.0, 1.0, 0.92 * alpha)),
+     );
++    Rect::from_xywh(x, y, w, h)
+ }
++
++#[cfg(test)]
++#[path = "skia_overlay_tests.rs"]
++mod tests;
+diff --git a/crates/client/pf-console-ui/src/skia_overlay_tests.rs b/crates/client/pf-console-ui/src/skia_overlay_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2423ce06159196640608d9b06573daa0cc77d86e
+--- /dev/null
++++ b/crates/client/pf-console-ui/src/skia_overlay_tests.rs
+@@ -0,0 +1,159 @@
++use super::*;
++
++fn stats() -> Vec<HudLine> {
++    [
++        "player 1",
++        "1920x1080@60 · HEVC 10-bit · v4l2-request · HDR→SDR",
++        "received 61 fps · decoded 61 · presented 60 · 17.0 Mb/s",
++        "host 0.9 ms · decode 17.1 ms · display 25.0 ms (avg)",
++        "lost 0.0% · skipped 0.0% · rtt 2.5 ms",
++        "host min/max 0.5/3.4 ms · display queue 6.3 + render 8.8 + compositor 9.9 ms",
++        "target 20 Mb/s",
++        "audio buffer 59 ms · a/v -2 ms",
++        "present: Immediate · vrr no",
++    ]
++    .into_iter()
++    .map(|text| HudLine {
++        role: Role::Primary,
++        text: text.into(),
++    })
++    .collect()
++}
++
++fn assert_pixels_in_band(surface: &mut Surface, (y, height): (u32, u32)) {
++    let (w, h) = (surface.width(), surface.height());
++    assert!(y + height <= h as u32);
++    let info = skia_safe::ImageInfo::new_n32_premul((w, h), None);
++    let mut pixels = vec![0u8; (w * h * 4) as usize];
++    assert!(surface.read_pixels(&info, &mut pixels, (w * 4) as usize, (0, 0)));
++    let mut painted = false;
++    for (row, bytes) in pixels.chunks_exact((w * 4) as usize).enumerate() {
++        if bytes.iter().any(|b| *b != 0) {
++            painted = true;
++            assert!(
++                (y..y + height).contains(&(row as u32)),
++                "painted row {row} outside {y}..{}",
++                y + height
++            );
++        }
++    }
++    assert!(painted);
++}
++
++#[test]
++fn stats_damage_contains_raster_at_every_corner_and_scale() {
++    let fonts = crate::theme::build_fonts().unwrap();
++    let font = fonts.font(W::Regular, 14.0);
++    for (width, height) in [(1920, 1080), (800, 600)] {
++        for corner in HudCorner::ALL {
++            // UI and stats scales multiply; their joint range is 0.25 through 16.
++            for scale in [0.25, 1.0, 4.0, 16.0] {
++                let mut surface = skia_safe::surfaces::raster_n32_premul((width, height)).unwrap();
++                surface.canvas().clear(skia_safe::Color::TRANSPARENT);
++                let rect = draw_osd_panel(
++                    surface.canvas(),
++                    &font,
++                    &stats(),
++                    (width as u32, height as u32),
++                    scale,
++                    corner,
++                );
++                let mut damage = DamageBand::new(height as u32, false);
++                damage.include(rect);
++                let band = damage.finish();
++                assert_pixels_in_band(&mut surface, band);
++                if width == 1920 && scale == 1.0 {
++                    assert!(
++                        band.1 < height as u32 / 2,
++                        "stats must not blend the full screen"
++                    );
++                    assert_eq!(band.0 > height as u32 / 2, corner.bottom());
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn notices_and_bottom_stats_share_their_painted_band() {
++    let fonts = crate::theme::build_fonts().unwrap();
++    let font = fonts.font(W::Regular, 14.0);
++    for scale in [0.5, 1.0, 4.0] {
++        let mut surface = skia_safe::surfaces::raster_n32_premul((1920, 1080)).unwrap();
++        surface.canvas().clear(skia_safe::Color::TRANSPARENT);
++        let canvas = surface.canvas();
++        let mut damage = DamageBand::new(1080, false);
++        damage.include(draw_osd_panel(
++            canvas,
++            &font,
++            &stats(),
++            (1920, 1080),
++            scale,
++            HudCorner::BottomRight,
++        ));
++        for (row, text) in ["Microphone muted", "Audio muted", "Access: 25 minutes"]
++            .into_iter()
++            .enumerate()
++        {
++            damage.include(corner_pill(
++                canvas,
++                &font,
++                text,
++                true,
++                (1920, row, false),
++                scale,
++            ));
++        }
++        damage.include(draw_hint_pill(
++            canvas,
++            &font,
++            exit_hint(true),
++            1920,
++            1080,
++            1.0,
++            scale,
++        ));
++        assert_pixels_in_band(&mut surface, damage.finish());
++    }
++}
++
++#[test]
++fn fullscreen_chrome_keeps_full_damage() {
++    let mut damage = DamageBand::new(1080, true);
++    damage.include(Rect::from_xywh(10.0, 10.0, 100.0, 100.0));
++    assert_eq!(damage.finish(), (0, 1080));
++}
++
++#[test]
++fn empty_or_offscreen_chrome_has_no_render_area() {
++    assert_eq!(DamageBand::new(1080, false).finish().1, 0);
++    for y in [-100.0, 1200.0] {
++        let mut damage = DamageBand::new(1080, false);
++        damage.include(Rect::from_xywh(0.0, y, 20.0, 20.0));
++        assert_eq!(damage.finish().1, 0);
++    }
++}
++
++#[test]
++fn console_redraw_deadline_stops_idle_followups() {
++    assert!(console_redraw_due(true, false, Some(Duration::ZERO)));
++    assert!(console_redraw_due(true, true, None));
++    assert!(!console_redraw_due(
++        true,
++        true,
++        Some(IDLE_FRAME - Duration::from_nanos(1))
++    ));
++    assert!(console_redraw_due(true, true, Some(IDLE_FRAME)));
++    // A freshly rendered idle frame resets its deadline, even with spare credit.
++    assert!(!console_redraw_due(true, true, Some(Duration::ZERO)));
++    assert!(!console_redraw_due(false, false, None));
++}
++#[test]
++fn rpi_backdrop_override_is_bounded() {
++    for value in [None, Some("0"), Some("NaN"), Some("193"), Some("-1")] {
++        assert_eq!(super::rpi_field_edge(value), 192);
++    }
++    for edge in [64, 96, 128, 192] {
++        assert_eq!(super::rpi_field_edge(Some(&edge.to_string())), edge);
++    }
++}
+diff --git a/crates/client/pf-console-ui/src/theme.rs b/crates/client/pf-console-ui/src/theme.rs
+index 72926790465ffcce2268aa6ebe84b63a6e9e736b..449942da8c777705fba5a69ea2459bad4f572b80 100644
+--- a/crates/client/pf-console-ui/src/theme.rs
++++ b/crates/client/pf-console-ui/src/theme.rs
+@@ -288,9 +288,10 @@ pub struct Frame {
+     /// Travel suppressed this frame. Callers keep the state change and drop the glide.
+     /// Never used to skip a haptic: the pulse replaces the motion.
+     pub reduce_motion: bool,
+-    /// The reduced interface: a TV-class GPU. Passes that read back what is already drawn
+-    /// (a backdrop blur) break a tiled GPU's render pass and are skipped.
++    /// The reduced interface resolution selected for this device.
+     pub reduced_ui: bool,
++    /// Skip backdrop copies and blur passes on bandwidth-limited GPUs.
++    pub skip_backdrop_blur: bool,
+     /// The safe area's left inset, px ([`Frame::edge`]).
+     pub side_inset: f64,
+     /// The shell is painting a screen into a transition layer. A copy of the surface cannot
+@@ -312,6 +313,7 @@ impl Frame {
+             ink,
+             reduce_motion,
+             reduced_ui,
++            skip_backdrop_blur: false,
+             side_inset,
+             in_layer: Cell::new(false),
+             el: crate::el::Ledger::default(),
+diff --git a/crates/client/pf-console-ui/src/widgets/list.rs b/crates/client/pf-console-ui/src/widgets/list.rs
+index 2d1127ebf25d59612bbfe61c3416943ce231406e..38670ae159d340402ec62352af50d8eae40bc14d 100644
+--- a/crates/client/pf-console-ui/src/widgets/list.rs
++++ b/crates/client/pf-console-ui/src/widgets/list.rs
+@@ -464,8 +464,8 @@ const SOFT_EDGE: f64 = 40.0;
+ /// The viewport a page scrolls in: out to the layer's top and bottom while the trays can
+ /// blur what runs past `rect`, so the page fades under the chrome as a list does, else
+ /// `rect` itself.
+-pub fn bleed_view(canvas: &Canvas, rect: Rect) -> Rect {
+-    if !crate::blur::active() {
++pub fn bleed_view(canvas: &Canvas, ui: &Frame, rect: Rect) -> Rect {
++    if !crate::blur::active(ui) {
+         return rect;
+     }
+     let clip = canvas.local_clip_bounds().unwrap_or(rect);
+@@ -477,9 +477,8 @@ pub fn bleed_view(canvas: &Canvas, rect: Rect) -> Rect {
+     )
+ }
+ 
+-/// Paints a scroller through `paint` inside `view`, with soft edges where content hides
+-/// past `rect`: `scrolled` is its offset and reach. A scroller at rest on its top keeps a
+-/// crisp top; pinned text past it sits on the field, never on a row.
++/// Paints a scroller inside `view`. Bandwidth-limited GPUs clip without an offscreen;
++/// other devices fade content past `rect` according to its offset and reach.
+ pub fn soft_scroll(
+     canvas: &Canvas,
+     ui: &Frame,
+@@ -489,6 +488,13 @@ pub fn soft_scroll(
+     k: f64,
+     paint: impl FnOnce(),
+ ) {
++    if ui.skip_backdrop_blur && !crate::blur::active(ui) {
++        canvas.save();
++        canvas.clip_rect(view, None, false);
++        paint();
++        canvas.restore();
++        return;
++    }
+     let soft = (SOFT_EDGE * k) as f32;
+     let above = (offset / soft).clamp(0.0, 1.0);
+     let below = ((max - offset) / soft).clamp(0.0, 1.0);
+@@ -1017,7 +1023,7 @@ impl MenuList {
+         let air = (PLATE_AIR * k) as f32;
+         // Bleeding, the viewport reaches the layer's edges and pads back to `rect`; else it
+         // holds the plate's outset. Without a band to treat them, rows stay in their rect.
+-        let bleed = self.bleed && crate::blur::active();
++        let bleed = self.bleed && crate::blur::active(ui);
+         let view = if bleed {
+             let clip = canvas.local_clip_bounds().unwrap_or(rect);
+             Rect::from_ltrb(
+@@ -1586,6 +1592,37 @@ fn chevron(canvas: &Canvas, ui: &Frame, x: f64, cy: f64, r: f64, left: bool, alp
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn bandwidth_limited_scroll_clips_without_a_fade() {
++        let mut surface = skia_safe::surfaces::raster_n32_premul((32, 32)).unwrap();
++        let ui = Frame {
++            skip_backdrop_blur: true,
++            ..Frame::default()
++        };
++        let view = Rect::from_xywh(4.0, 4.0, 24.0, 24.0);
++        let canvas = surface.canvas();
++        canvas.clear(skia_safe::Color::BLACK);
++        let saves = canvas.save_count();
++        soft_scroll(canvas, &ui, view, view, (50.0, 100.0), 1.0, || {
++            canvas.draw_rect(
++                Rect::from_wh(32.0, 32.0),
++                &crate::theme::fill(skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0)),
++            );
++        });
++        assert_eq!(canvas.save_count(), saves);
++        let bytes = read_back(&mut surface, 32, 32);
++        for y in 0..32 {
++            for x in 0..32 {
++                let want = if (4..28).contains(&x) && (4..28).contains(&y) {
++                    255
++                } else {
++                    0
++                };
++                assert_eq!(bytes[(y * 32 + x) * 4], want, "pixel {x},{y}");
++            }
++        }
++    }
++
+     #[test]
+     fn menu_list_moves_and_recoils() {
+         let mut l = MenuList::new();
