@@ -245,6 +245,8 @@ unchanged. Other GPUs retain the high-order filter ladder.
 
 The console omits progressive backdrop blur and scroll fade layers on Broadcom.
 Scroll contents remain clipped to their viewport, with text at native resolution.
+Opaque console frames replace the entire output without clearing or blending an
+underlying picture. Transparent streaming overlays retain their existing path.
 The kiosk selects an eight-bit SDR swapchain; HDR-to-SDR conversion remains a
 separate workload requiring physical performance checks.
 
@@ -259,6 +261,8 @@ testing reproduced compositor restarts while scrolling the home screen with a
 controller. After the cursor fix, three measurements showed stable 60 page flips
 per second and the user confirmed smooth scrolling without further restarts.
 That evidence belongs to the tested image; new builds require fresh acceptance.
+Hardware display planes remain available: disabling the faulty cursor plane does
+not require `WESTON_FORCE_RENDERER`, which also disables efficient scanout paths.
 
 See [fork maintenance](rpi5-fork.md) for build and release checks.
 

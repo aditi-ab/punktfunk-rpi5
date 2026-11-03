@@ -15,6 +15,7 @@ weston = root / "usr/lib/aarch64-linux-gnu/libweston-14/drm-backend.so"
 assert hashlib.sha256(weston.read_bytes()).hexdigest() == "9de49e163c8396e4de8a9dc6b7d747e978cada844553c1a951d8fa2707e7f91f", "Missing verified Weston cursor fix"
 assert weston.with_name(weston.name + ".punktfunk-original").is_file()
 assert "Environment=WESTON_DRM_DISABLE_CURSOR_PLANE=1" in (root / "etc/systemd/system/punktfunk-weston.service").read_text()
+assert "WESTON_FORCE_RENDERER=" not in (root / "etc/systemd/system/punktfunk-weston.service").read_text()
 unit = (root / "etc/systemd/system/punktfunk-kiosk.service").read_text()
 for value in ("PUNKTFUNK_DECODER=v4l2-request", "PUNKTFUNK_PRESENT_MODE=immediate",
               "PUNKTFUNK_SWAPCHAIN_IMAGES=8", "PUNKTFUNK_SDR_8BIT=1", "--browse --fullscreen"):

@@ -17,7 +17,6 @@ StandardError=journal
 UtmpIdentifier=tty1
 EnvironmentFile=/etc/default/punktfunk
 Environment=WESTON_DRM_DISABLE_CURSOR_PLANE=1
-Environment=WESTON_FORCE_RENDERER=1
 ExecStart=/usr/bin/env XDG_RUNTIME_DIR=/run/punktfunk HOME=/data /usr/bin/weston --backend=drm-backend.so --shell=kiosk-shell.so --socket=/run/punktfunk/wayland-0 --idle-time=0 --log=/data/logs/weston.log
 Restart=on-failure
 RestartSec=2
