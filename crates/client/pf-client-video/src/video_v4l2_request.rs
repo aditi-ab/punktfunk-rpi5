@@ -437,7 +437,7 @@ impl V4l2RequestDecoder {
                 anyhow::ensure!(accepted, "decode packet was not accepted");
             }
             let flags = if input.is_none() || synchronous {
-                ffi::AV_CODEC_RECEIVE_FRAME_FLAG_SYNCHRONOUS
+                ffi::AV_CODEC_RECEIVE_FRAME_FLAG_SYNCHRONOUS as u32
             } else {
                 0
             };
