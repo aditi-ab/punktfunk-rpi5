@@ -546,9 +546,9 @@ struct PreparedContent {
     alpha: f64,
 }
 
-/// Finish independent layers before the native target starts, avoiding parent store/load passes.
+/// Finish integer-bounded layers before native composition to avoid parent store/load passes.
 fn prepare_content(canvas: &Canvas, picture: Picture, alpha: f64) -> PreparedContent {
-    let bounds = picture.cull_rect().round_out();
+    let bounds: skia_safe::IRect = skia_safe::RoundOut::round_out(&picture.cull_rect());
     let image = (bounds.width() > 0 && bounds.height() > 0)
         .then(|| {
             let info = skia_safe::ImageInfo::new(
