@@ -180,7 +180,7 @@ impl Shell {
             )
             && canvas.image_info().color_space().is_none();
         if tab_images {
-            self.tab_images.begin(canvas, content, k);
+            self.tab_images.begin(canvas, content, k, self.glyphs);
         } else {
             self.tab_images.clear();
         }
@@ -477,11 +477,11 @@ struct LayerEnv<'a> {
     tab_images: Option<&'a mut TabImages>,
 }
 
-/// Two native page images live only for one tab transition. Screen logic still runs;
-/// dynamic page content becomes live again when the spring settles. Chrome stays live.
+/// Native page and footer images live only for one tab transition. Screen logic still runs;
+/// content becomes live again when the spring settles. The main tab strip stays live.
 #[derive(Default)]
 pub(super) struct TabImages {
-    key: Option<(skia_safe::ISize, skia_safe::Matrix, Rect, f64)>,
+    key: Option<(skia_safe::ISize, skia_safe::Matrix, Rect, f64, GlyphStyle)>,
     pages: Vec<Option<(Image, Point)>>,
     next: usize,
 }
@@ -492,13 +492,14 @@ impl TabImages {
         *self = Self::default();
     }
 
-    /// Invalidate images when native geometry or the safe-area transform changes.
-    fn begin(&mut self, canvas: &Canvas, content: Rect, k: f64) {
+    /// Invalidate images when native geometry, safe-area transform or input glyphs change.
+    fn begin(&mut self, canvas: &Canvas, content: Rect, k: f64, glyphs: GlyphStyle) {
         let key = (
             canvas.image_info().dimensions(),
             canvas.local_to_device_as_3x3(),
             content,
             k,
+            glyphs,
         );
         if self.key.as_ref() != Some(&key) {
             self.clear();
@@ -512,8 +513,22 @@ impl TabImages {
     fn draw(&mut self, canvas: &Canvas, picture: &Picture, alpha: f64, dx: f64, dy: f64) {
         let index = self.next;
         self.next += 1;
+        self.draw_at(index, canvas, picture, alpha, dx, dy);
+    }
+
+    /// Fixed page, pinned-control and hint slots cannot alias when one layer is absent.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_at(
+        &mut self,
+        index: usize,
+        canvas: &Canvas,
+        picture: &Picture,
+        alpha: f64,
+        dx: f64,
+        dy: f64,
+    ) {
         if self.pages.len() <= index {
-            self.pages.push(None);
+            self.pages.resize_with(index + 1, || None);
         }
         if self.pages[index].is_none() {
             let bounds: skia_safe::IRect = skia_safe::RoundOut::round_out(&picture.cull_rect());
@@ -742,7 +757,7 @@ impl LayerEnv<'_> {
     }
 
     /// Stationary chrome over the content. Titles and legends fade within their bands;
-    /// Surface-independent pinned controls fade within their recorded effect bounds.
+    /// Tab transitions reuse page chrome images; other fades use conservative effect bounds.
     /// Crossing roots share one full-strength strip. Returns the last legend's hit-boxes.
     fn chrome(&mut self, layers: &[Chrome]) -> Vec<(HintKey, Rect)> {
         let canvas = self.canvas;
@@ -757,14 +772,16 @@ impl LayerEnv<'_> {
         let foot = content.bottom - into_bottom;
         let bottom = Rect::from_ltrb(edges.left, foot, edges.right, edges.bottom);
         tray(canvas, self.ui, bottom, Toward::Bottom, k);
-        for c in layers {
+        for (index, c) in layers.iter().enumerate() {
             let Some(pic) = &c.pinned_pic else {
                 continue;
             };
             if c.alpha < 0.001 {
                 continue;
             }
-            if record_content_layer(
+            if let Some(images) = self.tab_images.as_mut() {
+                images.draw_at(2 + index, canvas, pic, c.alpha, 0.0, 0.0);
+            } else if record_content_layer(
                 c.alpha < 0.999,
                 self.ui.skip_backdrop_blur && !crate::blur::active(self.ui),
                 canvas.image_info().color_type(),
@@ -808,8 +825,31 @@ impl LayerEnv<'_> {
             }
         }
         let mut rects = Vec::new();
-        for c in layers.iter().filter(|c| !c.hints.is_empty()) {
-            if open_at(canvas, c.alpha, Some(hint_bounds)) {
+        for (index, c) in layers
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.hints.is_empty())
+        {
+            if let Some(images) = self.tab_images.as_mut() {
+                let mut recorder = PictureRecorder::new();
+                let rc = recorder
+                    .begin_recording(canvas.local_to_device_as_3x3().map_rect(edges).0, true);
+                rc.set_matrix(&canvas.local_to_device());
+                let bar = hint_bar(
+                    rc,
+                    self.ui,
+                    self.fonts,
+                    &c.hints,
+                    self.glyphs,
+                    self.ui.edge(self.k) - HINT_PAD * self.k,
+                    self.h - 18.0 * self.k,
+                    self.k,
+                );
+                if let Some(pic) = recorder.finish_recording_as_picture(None) {
+                    images.draw_at(4 + index, canvas, &pic, c.alpha, 0.0, 0.0);
+                }
+                rects = bar.rects;
+            } else if open_at(canvas, c.alpha, Some(hint_bounds)) {
                 let (k, glyphs) = (self.k, self.glyphs);
                 let (x, bottom) = (self.ui.edge(k) - HINT_PAD * k, self.h - 18.0 * k);
                 let bar = hint_bar(canvas, self.ui, self.fonts, &c.hints, glyphs, x, bottom, k);
@@ -1081,13 +1121,13 @@ mod chrome_layer_tests {
         );
         let picture = recorder.finish_recording_as_picture(None).unwrap();
         let mut images = TabImages::default();
-        images.begin(canvas, content, 1.0);
+        images.begin(canvas, content, 1.0, GlyphStyle::Keyboard);
         images.draw(canvas, &picture, 1.0, 0.0, 0.0);
         let first = images.pages[0].as_ref().unwrap().0.unique_id();
-        images.begin(canvas, content, 1.0);
+        images.begin(canvas, content, 1.0, GlyphStyle::Keyboard);
         images.draw(canvas, &picture, 0.4, 20.0, 0.0);
         assert_eq!(first, images.pages[0].as_ref().unwrap().0.unique_id());
-        images.begin(canvas, content, 1.5);
+        images.begin(canvas, content, 1.5, GlyphStyle::Keyboard);
         assert!(images.pages.is_empty());
         images.draw(canvas, &picture, 1.0, 0.0, 0.0);
         images.clear();
@@ -1125,7 +1165,7 @@ mod chrome_layer_tests {
             let k = f64::from(height) / 800.0;
             let h = f64::from(height - 34);
             for style in [GlyphStyle::Keyboard, GlyphStyle::Shapes] {
-                let pixels = |bounded: bool| {
+                let pixels = |bounded: bool, cached: bool| {
                     let mut surface =
                         skia_safe::surfaces::raster_n32_premul((width, height)).unwrap();
                     let canvas = surface.canvas();
@@ -1146,9 +1186,20 @@ mod chrome_layer_tests {
                         f64::from(width) * 0.6,
                     );
                     canvas.restore();
-                    assert!(open_at(canvas, 0.63, bounded.then_some(legend)));
+                    let mut recorder = cached.then(PictureRecorder::new);
+                    let hint_canvas = if let Some(recorder) = recorder.as_mut() {
+                        let recorded = recorder.begin_recording(
+                            canvas.local_to_device_as_3x3().map_rect(edges).0,
+                            true,
+                        );
+                        recorded.set_matrix(&canvas.local_to_device());
+                        recorded
+                    } else {
+                        assert!(open_at(canvas, 0.63, bounded.then_some(legend)));
+                        canvas
+                    };
                     hint_bar(
-                        canvas,
+                        hint_canvas,
                         &ui,
                         &fonts,
                         &hints,
@@ -1157,7 +1208,12 @@ mod chrome_layer_tests {
                         h - 18.0 * k,
                         k,
                     );
-                    canvas.restore();
+                    if let Some(recorder) = recorder.as_mut() {
+                        let picture = recorder.finish_recording_as_picture(None).unwrap();
+                        TabImages::default().draw_at(4, canvas, &picture, 0.63, 0.0, 0.0);
+                    } else {
+                        canvas.restore();
+                    }
                     let info = skia_safe::ImageInfo::new(
                         (width, height),
                         skia_safe::ColorType::RGBA8888,
@@ -1168,7 +1224,17 @@ mod chrome_layer_tests {
                     assert!(surface.read_pixels(&info, &mut pixels, (width * 4) as usize, (0, 0)));
                     pixels
                 };
-                assert!(pixels(true) == pixels(false), "chrome bounds change pixels");
+                assert!(
+                    pixels(true, false) == pixels(false, false),
+                    "chrome bounds change pixels"
+                );
+                assert!(
+                    pixels(true, true)
+                        .iter()
+                        .zip(pixels(false, false))
+                        .all(|(a, b)| a.abs_diff(b) <= 1),
+                    "cached hint changes pixels beyond alpha rounding"
+                );
             }
         }
     }
