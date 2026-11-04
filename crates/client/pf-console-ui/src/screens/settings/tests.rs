@@ -1438,6 +1438,7 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::Bluetooth,
             RowId::Ssh,
             RowId::SystemInformation,
+            RowId::VirtualHere,
         ]
     );
     // Every row reaches at least one platform: a row listed in a tab and offered nowhere
@@ -1749,7 +1750,7 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 76, "{seen:?}");
+    assert_eq!(seen.len(), 77, "{seen:?}");
     assert!(
         !seen.contains(&RowId::AdvancedChanged),
         "built per tab, never listed"
