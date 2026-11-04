@@ -173,6 +173,7 @@ impl Shell {
         let games_ok = self.games_host().is_some();
         let tab_images = matches!(self.motion, Motion::Tab { .. })
             && self.tab_images_enabled
+            && !self.tab_images_live
             && record_content_layer(
                 true,
                 self.efficient_backdrop && !crate::blur::active(&self.ui),

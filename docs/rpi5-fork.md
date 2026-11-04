@@ -140,8 +140,9 @@ Broadcom SDR tab changes rasterize each page once, then slide and fade those nat
 images. Page content resumes live rendering when the transition settles; input,
 screen state and the main tab strip continue updating throughout. Pinned controls
 and hint bars share the transition's image cache to avoid extra transparency passes.
-New tab mounts
-and geometry changes discard the images. Navigation within a tab retains live rendering.
+New tab mounts and geometry changes discard the images. Accepted focus, press or
+text input resumes live rendering for the rest of the transition. Navigation within
+a tab retains live rendering.
 `PUNKTFUNK_RPI_TAB_IMAGES=0` selects live page rendering during tab changes.
 Pinned controls use conservative recording bounds for their SDR fades on Broadcom,
 including shadows, instead of allocating a full-screen transparency layer.

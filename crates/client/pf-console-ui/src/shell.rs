@@ -327,6 +327,8 @@ pub(crate) struct Shell {
     hosts_gen: u64,
     pub(crate) efficient_backdrop: bool,
     pub(crate) tab_images_enabled: bool,
+    /// Accepted input resumes live focus/press animations until the next tab mount.
+    tab_images_live: bool,
     tab_images: render::TabImages,
     /// The host was last told the input test is on.
     pad_testing: bool,
@@ -457,6 +459,7 @@ impl Shell {
             hosts_gen: u64::MAX,
             efficient_backdrop: false,
             tab_images_enabled: true,
+            tab_images_live: false,
             tab_images: render::TabImages::default(),
             hosts_order: (None, None),
             pad_testing: false,
@@ -954,6 +957,7 @@ impl Shell {
     /// Focus targets and transition images belong to the new mount, never its predecessor.
     fn mount(&mut self, to: Tab, root: Screen) {
         self.tab_images.clear();
+        self.tab_images_live = false;
         self.stack.truncate(1);
         self.parked[self.tab.index()] = self.stack.pop();
         self.stack.push(root);
@@ -1148,6 +1152,7 @@ impl Shell {
         if self.takeover().is_some() {
             return;
         }
+        self.tab_images_live = true;
         if self.strip_focus && self.stack.len() == 1 {
             self.strip.press();
         } else if let Some(s) = self.stack.last_mut() {
@@ -1194,6 +1199,9 @@ impl Shell {
                 return None;
             }
         }
+        // The slide may still be running when input opens. Keep the resulting
+        // focus/press animation live instead of retaining its first image.
+        self.tab_images_live = true;
         if let Some(pulse) = self.tab_menu(ev) {
             return pulse;
         }
@@ -1399,6 +1407,7 @@ impl Shell {
         self.last_input = Instant::now();
         self.input_source = Some(crate::console::InputSource::Keys);
         if self.editing() {
+            self.tab_images_live = true;
             let (mut ctx, top) = self.ctx_and_top();
             if top.view_mut().edit_key(key, &mut ctx) {
                 return true;
@@ -1430,6 +1439,7 @@ impl Shell {
 
     pub(crate) fn text_input(&mut self, text: &str) {
         self.last_input = Instant::now();
+        self.tab_images_live = true;
         if let Some(top) = self.stack.last_mut() {
             top.view_mut().text_input(text);
         }

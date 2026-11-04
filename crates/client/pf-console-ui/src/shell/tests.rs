@@ -1541,6 +1541,37 @@ fn frame(s: &mut Shell) {
     s.render(surface.canvas(), 480, 300, &fonts, None, None, &pads);
 }
 
+#[test]
+fn tab_input_resumes_live_focus_until_the_next_mount() {
+    let (mut s, _, _) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::JumpForward);
+    assert_eq!(s.tab, Tab::Games);
+    assert!(!s.tab_images_live);
+
+    s.handle_menu(MenuEvent::Move(MenuDir::Down));
+    assert!(
+        !s.tab_images_live,
+        "blocked input must keep the transition cache"
+    );
+    let Motion::Tab { spring, .. } = &mut s.motion else {
+        panic!("tab slide must still be running");
+    };
+    spring.pos = (NAV_INPUT_OPENS + 1.0) * 0.5;
+    s.handle_menu(MenuEvent::Move(MenuDir::Down));
+    assert!(
+        s.tab_images_live,
+        "accepted focus changes need live rendering"
+    );
+    frame(&mut s);
+    assert!(s.tab_images_live, "one frame must not freeze focus again");
+    s.handle_menu(MenuEvent::JumpForward);
+    assert_eq!(s.tab, Tab::Players);
+    assert!(
+        !s.tab_images_live,
+        "the next mount gets a fresh transition cache"
+    );
+}
+
 /// The shape of a double-card report: a tab switch into Games, Down onto the Desktops
 /// tile, and the plate a shift off the tile it rests on. Through the shell, with its clock,
 /// its tab slide and a TV's scale, the library tree's plate must sit on that tile.
