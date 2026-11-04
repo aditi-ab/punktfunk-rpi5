@@ -18,6 +18,13 @@ loader.exec_module(control)
 
 
 class KioskControlTests(unittest.TestCase):
+    def test_virtualhere_stop_finishes_before_the_helper_timeout(self):
+        unit = (Path(__file__).parent / "runtime/punktfunk-virtualhere.service").read_text()
+        values = dict(line.split("=", 1) for line in unit.splitlines() if "=" in line)
+        self.assertLess(int(values["TimeoutStopSec"]), 15)
+        self.assertEqual(values["Type"], "simple")
+        self.assertNotIn(" -b", values["ExecStart"])
+
     def test_virtualhere_download_is_atomic_and_does_not_enable_sharing(self):
         payload = b"reviewed ARM64 server"
         with tempfile.TemporaryDirectory() as directory:
