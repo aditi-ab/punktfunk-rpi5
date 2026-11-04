@@ -26,4 +26,9 @@ install -m 0644 \
     "${prefix}/"
 ln -sfn "${prefix}/punktfunk" "${link_dir}/punktfunk"
 ln -sfn "${prefix}/punktfunk-session" "${link_dir}/punktfunk-session"
+# Migrate only our kiosk's old default. Staged installs and custom timings stay intact.
+if [ "${prefix}" = /opt/punktfunk-rpi5 ] && [ -f /etc/punktfunk-kiosk-release ] &&
+    [ -f /etc/xdg/weston/weston.ini ]; then
+    sed -i 's/^repaint-window=12$/repaint-window=16/' /etc/xdg/weston/weston.ini
+fi
 printf 'Installed Punktfunk RPi5 in %s\n' "${prefix}"

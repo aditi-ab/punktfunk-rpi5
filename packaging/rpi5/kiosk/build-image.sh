@@ -153,7 +153,7 @@ EOF
 install -d "$root/etc/xdg/weston" "$units/punktfunk-pipewire.service.d" "$root/etc/pipewire/pipewire.conf.d"
 cat >"$root/etc/xdg/weston/weston.ini" <<'EOF'
 [core]
-repaint-window=12
+repaint-window=16
 shell=kiosk-shell.so
 idle-time=0
 require-input=false

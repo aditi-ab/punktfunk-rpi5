@@ -27,7 +27,7 @@ assert settings["codec"] == "hevc"
 binary = (root / "opt/punktfunk-rpi5/punktfunk-session").read_bytes()
 assert b"v4l2-request" in binary
 assert b"Broadcom GPU: cached backdrop with native-resolution controls" in binary
-assert "repaint-window=12" in (root / "etc/xdg/weston/weston.ini").read_text()
+assert "repaint-window=16" in (root / "etc/xdg/weston/weston.ini").read_text()
 assert (root / "usr/lib/aarch64-linux-gnu/dri/v3d_dri.so").is_file(), "Weston needs the Pi OpenGL driver as well as Vulkan"
 assert (root / "boot/firmware/kernel_2712.img").is_file()
 assert (root / "boot/firmware/bcm2712-rpi-5-b.dtb").is_file()

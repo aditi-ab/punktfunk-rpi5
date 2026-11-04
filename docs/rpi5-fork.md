@@ -132,9 +132,9 @@ Run parser regression tests with
 
 For Wayland pacing comparisons, `PUNKTFUNK_WAYLAND_FRAME_DEPTH=1|2` selects the
 pending callback limit. The kiosk uses two; the generic presenter defaults to one.
-On Broadcom GPUs the animated background uses a 192-pixel shader target long edge;
+On Broadcom GPUs the animated background uses a 96-pixel shader target long edge;
 text, controls and transition layers retain the native viewport. For comparisons,
-`PUNKTFUNK_RPI_FIELD_EDGE=96` selects a smaller background target. Diagnostic
+`PUNKTFUNK_RPI_FIELD_EDGE=192` restores the larger background target for comparison. Diagnostic
 values from 64 through 192 are accepted; invalid values use the default.
 Broadcom SDR tab changes rasterize each page once, then slide and fade those native
 images. Page content resumes live rendering when the transition settles; input,
@@ -152,6 +152,13 @@ increase memory contention and reduce presentation throughput at high output
 resolutions, so the default remains one thread.
 The decoder's DEBUG timing separates codec work, SAND transfer and pixel copying
 from the pre-decode queue delay included in streaming statistics.
+
+The kiosk gives Weston a maximum repaint window of 16 ms. At 3840×1600/60, the
+previous 12 ms window periodically missed presentation deadlines even after the
+menu's GPU work was reduced. The larger window restored near-native delivery in
+automated tab tests. Bundle installation migrates the managed kiosk's old 12 ms
+default; custom timings and staged installations remain unchanged. Restart Weston
+or reboot to load the updated timing.
 
 For captures, Weston provides `weston-screenshooter` when started with `--debug`.
 Enable that only for a diagnostic session, run the capture as the kiosk user with

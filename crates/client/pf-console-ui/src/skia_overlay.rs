@@ -26,12 +26,12 @@ use std::time::{Duration, Instant};
 /// An idle console redraws at most this often. 30 Hz keeps the aurora moving.
 const IDLE_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
-/// Keep the measured 192-pixel default and bound diagnostic backdrop overrides.
+/// Bound the backdrop cost while keeping controls at the native output resolution.
 fn rpi_field_edge(value: Option<&str>) -> u16 {
     value
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|edge| (64..=192).contains(edge))
-        .unwrap_or(192)
+        .unwrap_or(96)
 }
 
 /// Long enough to read the exit hint; the last `BANNER_FADE_S` fade out.
