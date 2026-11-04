@@ -17,7 +17,11 @@ with tempfile.TemporaryDirectory(prefix='punktfunk-replay-') as tmp:
             if not re.fullmatch('[0-9a-f]{40}', commit):
                 raise ValueError('invalid commit')
             if commit not in fetched:
-                subprocess.run(['git', '-C', tmp, 'fetch', '-q', '--depth=1', 'origin', commit], check=True)
+                # This short-lived repository needs no background maintenance.
+                # A detached GC can prune .git/shallow while the next fetch reads it.
+                subprocess.run(['git', '-C', tmp, '-c', 'maintenance.auto=false',
+                                '-c', 'gc.auto=0', 'fetch', '-q', '--depth=1',
+                                'origin', commit], check=True)
                 fetched.add(commit)
         subprocess.run(['python', str(root / 'tools/patchset.py'), 'verify',
                         '--source', tmp, '--snapshot', path.parent.name], check=True)
