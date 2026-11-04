@@ -1,0 +1,2406 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 137ed2fef2a2fe895f7ee8c6d5cddc66e7322108..d735e4d56f5df2174b50f499e243fb1bf293bf3b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -517,7 +517,7 @@ dependencies = [
+  "regex",
+  "rustc-hash",
+  "shlex 2.0.1",
+- "syn 3.0.6",
++ "syn 2.0.119",
+ ]
+ 
+ [[package]]
+@@ -1373,7 +1373,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+ dependencies = [
+  "libc",
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -1433,6 +1433,20 @@ dependencies = [
+  "rayon",
+ ]
+ 
++[[package]]
++name = "ffmpeg-sys-next"
++version = "9.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9b939bf79dd5949412a4b81cfe21a07f48ea21b47fcbb5f57816c8c2de5ae30b"
++dependencies = [
++ "bindgen 0.72.1",
++ "cc",
++ "libc",
++ "num_cpus",
++ "pkg-config",
++ "vcpkg",
++]
++
+ [[package]]
+ name = "fiat-crypto"
+ version = "0.2.9"
+@@ -1839,7 +1853,7 @@ dependencies = [
+  "gobject-sys",
+  "libc",
+  "system-deps 9.0.0",
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -3028,6 +3042,16 @@ dependencies = [
+  "libm",
+ ]
+ 
++[[package]]
++name = "num_cpus"
++version = "1.17.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
++dependencies = [
++ "hermit-abi",
++ "libc",
++]
++
+ [[package]]
+ name = "num_enum"
+ version = "0.7.6"
+@@ -3354,6 +3378,7 @@ dependencies = [
+  "serde_json",
+  "sha2 0.11.0",
+  "socket2",
++ "tokio",
+  "tracing",
+  "tracing-log",
+  "tracing-subscriber",
+@@ -3372,6 +3397,7 @@ dependencies = [
+  "anyhow",
+  "ash",
+  "cfg_aliases 0.2.2",
++ "ffmpeg-sys-next",
+  "libc",
+  "libloading 0.9.0",
+  "openh264",
+@@ -4465,7 +4491,7 @@ dependencies = [
+  "once_cell",
+  "socket2",
+  "tracing",
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -4851,7 +4877,7 @@ dependencies = [
+  "errno",
+  "libc",
+  "linux-raw-sys",
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -4910,7 +4936,7 @@ dependencies = [
+  "security-framework",
+  "security-framework-sys",
+  "webpki-root-certs",
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -5675,7 +5701,7 @@ dependencies = [
+  "getrandom 0.3.4",
+  "once_cell",
+  "rustix",
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -6516,7 +6542,7 @@ version = "0.1.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+ dependencies = [
+- "windows-sys 0.52.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index d150d841b9e939a5689ae5bea5e2ba3af3f96684..bc38020fce5a4eab3908276f674a8d5defb26a68 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -104,7 +104,7 @@ edition = "2024"
+ rust-version = "1.85"
+ license = "MIT OR Apache-2.0"
+ authors = ["unom"]
+-repository = "https://git.unom.io/unom/punktfunk"
++repository = "https://github.com/aditi-ab/punktfunk-rpi5"
+ 
+ # Pins every member must share. A member adds `optional` and its own features on top; cargo
+ # unions them with the entry's.
+diff --git a/clients/session/Cargo.toml b/clients/session/Cargo.toml
+index 900cee3e0edb5379b553dd60053c49cb7bd254fd..b338f0fdd918ced16a0509350df1fd9c8783ad67 100644
+--- a/clients/session/Cargo.toml
++++ b/clients/session/Cargo.toml
+@@ -24,6 +24,11 @@ pyrowave = ["pf-client-core/pyrowave", "pf-presenter/pyrowave"]
+ # (`--no-default-features`) is the ~15 MB-smaller power-user build: same streaming,
+ # stats on stdout only.
+ ui = ["dep:pf-console-ui", "dep:serde_json"]
++# Raspberry Pi 5 release decoder; excluded from upstream-compatible builds.
++rpi5-v4l2-request = [
++    "pf-client-core/rpi5-v4l2-request",
++    "pf-presenter/rpi5-v4l2-request",
++]
+ # Same Linux+Windows gating as the rest of the client stack; elsewhere this is a stub
+ # binary.
+ [target.'cfg(any(target_os = "linux", windows))'.dependencies]
+diff --git a/crates/client/pf-client-core/Cargo.toml b/crates/client/pf-client-core/Cargo.toml
+index 84cbc47bff23e3306d645303fdb929a2844c9b02..69b30fc29d5e1b1e06a2a291bbb2f833feae0117 100644
+--- a/crates/client/pf-client-core/Cargo.toml
++++ b/crates/client/pf-client-core/Cargo.toml
+@@ -86,15 +86,15 @@ tracing-log = { version = "0.2", optional = true }
+ rand = "0.10"
+ 
+ # Gamepads: capture + feedback (full DualSense fidelity — touchpad/motion/triggers/LEDs
+-# need the hidapi driver). Linux links the system SDL3; Windows builds it from source
+-# (no system SDL3 there — same choice as clients/windows).
++# need the hidapi driver). Build SDL3 from source for the portable Pi runtime
++# as well as Windows, independent of distribution SDL versions.
+ [target.'cfg(target_os = "linux")'.dependencies]
+ # `v0_3_49` for `Buffer::requested` — the graph's per-cycle frame ask, without which the
+ # playback callback can only size writes from the buffer CEILING (quantum-limit, ~170 ms).
+ # Pure cfg gate; needs libpipewire ≥ 0.3.49 (2022-03) at runtime, which every ship target
+ # (SteamOS, flatpak runtimes, Arch, Ubuntu ≥ 22.10) clears.
+ pipewire = { version = "0.10", features = ["v0_3_49"], optional = true }
+-sdl3 = { version = "0.20", features = ["hidapi"], optional = true }
++sdl3 = { version = "0.20", features = ["hidapi", "build-from-source"], optional = true }
+ # Audio-thread priority (`audio_rt`): one blocking D-Bus call per boosted thread — the Realtime
+ # PORTAL (session bus) inside a flatpak, where the sandbox's PID namespace makes a direct rtkit
+ # call unresolvable, and rtkit (system bus) outside one. The same zbus, features and backend
+@@ -114,6 +114,8 @@ x11rb = { version = "0.14", default-features = false, optional = true }
+ # and a listener that never accepts (a desktop's idle Xwayland socket) would park the watcher.
+ socket2 = { version = "0.6", optional = true }
+ 
++tokio = { version = "1", features = ["time"], optional = true }
++
+ [target.'cfg(windows)'.dependencies]
+ wasapi = { version = "0.25", optional = true }
+ # Pad-audio correlation (pad_audio.rs): the HID devnode's ContainerID and a render endpoint's
+@@ -164,13 +166,14 @@ async-channel = { version = "2", optional = true }
+ # `features = ["desktop"]`: clients/cli, clients/windows, clients/session, crates/client/pf-presenter.
+ # The two that want the portable half — crates/client/pf-console-ui, clients/android/native — say
+ # nothing, which is the point.
++rpi5-v4l2-request = ["desktop", "pf-client-video/rpi5-v4l2-request"]
+ default = ["desktop", "pyrowave"]
+ desktop = [
+     "punktfunk-core/ureq-tls",
+     "dep:pf-client-video", "pf-client-video/desktop", "dep:async-channel",
+     "dep:libc", "dep:opus", "discovery", "dep:ureq", "dep:pf-update-check", "dep:rustls",
+     "dep:tracing-subscriber", "dep:tracing-log",
+-    "dep:pipewire", "dep:sdl3", "dep:zbus", "dep:x11rb", "dep:socket2",
++    "dep:pipewire", "dep:sdl3", "dep:zbus", "dep:tokio", "dep:x11rb", "dep:socket2",
+     "dep:pf-dmabuf",
+     "dep:wasapi", "dep:winreg", "dep:windows", "d3d11va",
+ ]
+diff --git a/crates/client/pf-client-core/src/session.rs b/crates/client/pf-client-core/src/session.rs
+index f5c761c706bf6102cf75b2cffd456b084bf4ddfc..dfc8190420fd841be20097cd9c02e6bc85025adc 100644
+--- a/crates/client/pf-client-core/src/session.rs
++++ b/crates/client/pf-client-core/src/session.rs
+@@ -10,7 +10,7 @@
+ //! audio plane in `audio` / `design/hi-res-audio.md`.
+ 
+ use crate::audio;
+-use crate::video::{DecodedFrame, DecodedImage, Decoder};
++use crate::video::{DecodeBatch, DecodeMetadata, DecodedFrame, DecodedImage, Decoder};
+ use punktfunk_core::client::{ConnectParams, Decoded, NativeClient};
+ use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+ pub use punktfunk_core::reject::WAKE_SETTLE;
+@@ -1079,8 +1079,8 @@ pub fn start_screen(
+     }
+ }
+ 
+-/// Pull, decode and hand on one further screen's frames. A decoder opens at the first frame
+-/// and at each new format; a lost picture asks the host for a keyframe on that screen alone.
++/// Decode a further screen with each picture's original timestamps across delayed output.
++/// A missing decoder or decode fault asks for a keyframe on this screen alone.
+ fn screen_pump(
+     connector: &NativeClient,
+     screen: u8,
+@@ -1096,7 +1096,18 @@ fn screen_pump(
+     while !stop.load(Ordering::SeqCst) {
+         let frame = match connector.next_screen_frame(screen, Duration::from_millis(20)) {
+             Ok(frame) => frame,
+-            Err(PunktfunkError::NoFrame) => continue,
++            Err(PunktfunkError::NoFrame) => {
++                if let Some(dec) = decoder.as_mut() {
++                    match dec.drain_tagged() {
++                        Ok(batch) => hand_screen_batch(dec, batch, frame_tx),
++                        Err(_) => connector.request_screen_keyframe(screen),
++                    }
++                    if dec.take_keyframe_request() {
++                        connector.request_screen_keyframe(screen);
++                    }
++                }
++                continue;
++            }
+             Err(_) => return,
+         };
+         let changed = frame
+@@ -1125,17 +1136,18 @@ fn screen_pump(
+         let Some(dec) = decoder.as_mut() else {
+             continue;
+         };
+-        match dec.decode_au(frame.data, frame.flags, frame.complete) {
+-            Ok(Some(image)) => {
+-                wait_hw_done(dec, &hw_done_of(&image));
+-                let _ = frame_tx.force_send(DecodedFrame {
+-                    pts_ns: frame.pts_ns,
+-                    decoded_ns: now_ns(),
+-                    repeat: false,
+-                    image,
+-                });
+-            }
+-            Ok(None) => {}
++        let metadata = DecodeMetadata {
++            pts_ns: frame.pts_ns,
++            received_ns: if frame.received_ns > 0 {
++                frame.received_ns
++            } else {
++                now_ns()
++            },
++            flags: frame.flags,
++            recovery_generation: 0,
++        };
++        match dec.decode_tagged_au(frame.data, frame.complete, metadata) {
++            Ok(batch) => hand_screen_batch(dec, batch, frame_tx),
+             Err(e) => {
+                 tracing::debug!(error = %e, screen, "screen decode error (asking for a keyframe)");
+                 connector.request_screen_keyframe(screen);
+@@ -1147,6 +1159,22 @@ fn screen_pump(
+     }
+ }
+ 
++fn hand_screen_batch(
++    decoder: &mut Decoder,
++    batch: DecodeBatch,
++    frames: &async_channel::Sender<DecodedFrame>,
++) {
++    for output in batch.images {
++        wait_hw_done(decoder, &hw_done_of(&output.image));
++        let _ = frames.force_send(DecodedFrame {
++            pts_ns: output.metadata.pts_ns,
++            decoded_ns: now_ns(),
++            repeat: false,
++            image: output.image,
++        });
++    }
++}
++
+ /// The session thread: dial, open the decoder and the plane threads, run [`Pump`] until
+ /// the session ends, then send exactly one terminal event.
+ fn pump(
+@@ -1332,9 +1360,8 @@ struct Pump {
+ }
+ 
+ impl Pump {
+-    /// Pull, decode and hand on frames until the session ends. `Some` is the reason the
+-    /// user reads. Each pass ends with the host-timing drain and the 1-second window,
+-    /// unless its AU was dropped before decode. Loss recovery ticks in core's own pump.
++    /// Pull AUs and hand on completed pictures until the session ends. Idle polls drain
++    /// buffered pictures after the decoder's grace period; core owns loss recovery ticks.
+     fn run(&mut self) -> Option<String> {
+         let wake = self.connector.clone();
+         self.decoder
+@@ -1382,7 +1409,23 @@ impl Pump {
+                     Pass::Skip => continue,
+                     Pass::End(end) => return end,
+                 },
+-                Err(PunktfunkError::NoFrame) => {}
++                Err(PunktfunkError::NoFrame) => {
++                    match self.decoder.drain_tagged() {
++                        Ok(batch) => self.on_batch(batch),
++                        Err(e) => {
++                            let codec = self.connector.video_format().codec;
++                            if let Some(ev) = exhausted(&e, codec, self.advertised_codecs) {
++                                if let Pass::End(end) = self.fall_back(ev) {
++                                    return end;
++                                }
++                            }
++                            self.connector.recovery_on_no_output();
++                        }
++                    }
++                    if let Pass::End(end) = self.after_decode() {
++                        return end;
++                    }
++                }
+                 Err(PunktfunkError::Closed) => return self.on_closed(),
+                 Err(e) => {
+                     tracing::warn!(error = %e, "session pump failed");
+@@ -1450,8 +1493,8 @@ impl Pump {
+         });
+     }
+ 
+-    /// One AU off the wire: order it, decode it, then demote or ask for a keyframe as
+-    /// the decoder says.
++    /// Admit one AU with its atomic recovery generation, then process completed pictures
++    /// with the timestamps and flags their decoder retained.
+     fn on_frame(&mut self, frame: Frame) -> Pass {
+         if let Some(format) = frame.new_format {
+             self.codec_ask = None;
+@@ -1476,10 +1519,12 @@ impl Pump {
+         };
+         // A straggler a reference codec rewinds on, or a partial a newer frame beat, is
+         // dropped before decode; a gap arms the freeze and core asks for the range.
+-        if !self
+-            .connector
+-            .recovery_on_frame(&frame, self.decoder.decode_order())
+-        {
++        let (admission, recovery_generation) = self.connector.recovery_on_au_with_generation(
++            frame.frame_index,
++            frame.complete,
++            self.decoder.decode_order(),
++        );
++        if !admission.admit {
+             return Pass::Skip;
+         }
+         if let Some(d) = self.au_dump.as_mut() {
+@@ -1489,13 +1534,23 @@ impl Pump {
+         }
+         let mut frame = frame;
+         let data = std::mem::take(&mut frame.data);
+-        let decoded = self.decoder.decode_au(data, frame.flags, frame.complete);
++        let metadata = DecodeMetadata {
++            pts_ns: frame.pts_ns,
++            received_ns,
++            flags: frame.flags,
++            recovery_generation,
++        };
++        let decoded = self
++            .decoder
++            .decode_tagged_au(data, frame.complete, metadata);
+         self.lend_au_memory();
+         match decoded {
+-            Ok(Some(image)) => self.on_decoded(image, &frame, received_ns),
+-            // No output under one-in/one-out LOW_DELAY means wedged on missing
+-            // references with no reassembler drop. Three in a row ask for an IDR.
+-            Ok(None) => self.connector.recovery_on_no_output(),
++            Ok(batch) => {
++                if batch.images.is_empty() && !batch.priming {
++                    self.connector.recovery_on_no_output();
++                }
++                self.on_batch(batch);
++            }
+             Err(e) => {
+                 // Last rung gone for this codec. Feeding more AUs would freeze the
+                 // screen forever. End; the terminal event carries the retry.
+@@ -1591,25 +1646,41 @@ impl Pump {
+         Pass::Drain
+     }
+ 
+-    /// A decoded picture: settle the freeze gate, then hand the previous frame in flight
+-    /// on before this one is handed on or queued.
+-    fn on_decoded(&mut self, image: DecodedImage, frame: &Frame, received_ns: u64) {
++    fn on_batch(&mut self, batch: DecodeBatch) {
++        for output in batch.images {
++            self.on_decoded(output.image, output.metadata, output.delayed);
++        }
++    }
++
++    /// Settle recovery with this picture's input flags, then hand it on with its timestamps.
++    fn on_decoded(&mut self, image: DecodedImage, metadata: DecodeMetadata, delayed: bool) {
+         let evidence = image.anchor_evidence();
+         if evidence == punktfunk_core::reanchor::AnchorEvidence::ReferencesDamaged
+-            && frame.flags & punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR != 0
++            && metadata.flags & punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR != 0
+         {
+             tracing::debug!(
+                 "refused a host recovery anchor: this AU predicts from a picture this decoder \
+                  had to conceal — holding for a real IDR"
+             );
+         }
+-        let shown = self.connector.recovery_on_decoded(Decoded {
+-            flags: frame.flags,
++        let decoded = Decoded {
++            flags: metadata.flags,
+             keyframe: image.is_keyframe(),
+             evidence,
+             local: image.local_recovery(),
+             decode_order: image.decode_order(),
+-        });
++        };
++        let shown = if delayed {
++            let Some(shown) = self
++                .connector
++                .recovery_on_decoded_at_generation(decoded, metadata.recovery_generation)
++            else {
++                return;
++            };
++            shown
++        } else {
++            self.connector.recovery_on_decoded(decoded)
++        };
+         // A heal by intra refresh: the planner's damaged-chain marks are stale from
+         // here, or every later host anchor is refused until an IDR.
+         if shown.forgive_chain {
+@@ -1639,10 +1710,10 @@ impl Pump {
+         }
+         let next = InFlight {
+             hw: hw_fence,
+-            received_ns,
+-            pts_ns: frame.pts_ns,
++            received_ns: metadata.received_ns,
++            pts_ns: metadata.pts_ns,
+             repeat: self.marks_repeats
+-                && frame.flags & punktfunk_core::packet::USER_FLAG_REPEAT != 0,
++                && metadata.flags & punktfunk_core::packet::USER_FLAG_REPEAT != 0,
+             image: present.then_some(image),
+         };
+         // This AU is submitted; the one before it goes on first, in order.
+@@ -1898,6 +1969,19 @@ fn codec_fallback_event(
+     }
+ }
+ 
++/// Reconcile timeline positions already emitted by drought PLC with the next received packet.
++/// Returns `(still_missing, discard_received_packet)`. PLC already advances decoder state, so a
++/// delayed packet in a covered timeline position must not be decoded or queued a second time.
++fn reconcile_drought(covered_arrivals: &mut u32, drought_frames: u32, missing: u32) -> (u32, bool) {
++    *covered_arrivals = (*covered_arrivals).saturating_add(drought_frames);
++    let covered_missing = (*covered_arrivals).min(missing);
++    *covered_arrivals -= covered_missing;
++    let still_missing = missing - covered_missing;
++    let discard_received_packet = *covered_arrivals > 0;
++    *covered_arrivals = (*covered_arrivals).saturating_sub(u32::from(discard_received_packet));
++    (still_missing, discard_received_packet)
++}
++
+ /// Dedicated audio thread: owns decoder, scratch, and PipeWire player, and blocks
+ /// on `next_audio` (the plane's single consumer). Decoded chunks are Vecs recycled
+ /// from the player's pool — steady state allocates nothing. A muted stream still
+@@ -2032,6 +2116,8 @@ fn play_audio(
+     // Drought concealment. A seq gap is concealed when a later packet
+     // arrives; when the wire goes quiet nothing arrives to reveal it.
+     let mut drought = playout.drought();
++    // Delayed arrivals must not replay timeline positions already emitted by PLC.
++    let mut covered_arrivals = 0u32;
+     let mut last_packet = std::time::Instant::now();
+     // Playback vitals ~every 10 s on wall clock, plus a one-shot quantum
+     // line the first time the callback has published one.
+@@ -2081,13 +2167,18 @@ fn play_audio(
+             // The host moved the format: this plane ends and the next opens with it.
+             Ok(pkt) if pkt.new_format.is_some() => return Some(pkt),
+             Ok(pkt) => {
++                let (missing_to_conceal, discard_packet) = reconcile_drought(
++                    &mut covered_arrivals,
++                    drought.packet(),
++                    gaps.missing_before(pkt.seq),
++                );
+                 // Place this frame against the picture before it is queued:
+                 // `buffered_ahead` is everything that must still play first.
+                 let depth = sync_cell.depth();
+                 // Published even with sync off — ring depth is what makes a
+                 // "too much latency" report triageable.
+                 buffer_ms_out.store(fmt.samples_ms(depth), Ordering::Relaxed);
+-                if av_sync_enabled {
++                if av_sync_enabled && !discard_packet {
+                     let ve2e = video_e2e.load(Ordering::Relaxed);
+                     let o = punktfunk_core::audio::AvSyncObservation {
+                         pts_ns: pkt.pts_ns,
+@@ -2103,19 +2194,18 @@ fn play_audio(
+                     av_offset_out.store(av.offset_ms() as i64, Ordering::Relaxed);
+                 }
+                 last_packet = std::time::Instant::now();
+-                // Anything the drought path already covered is audio the stream
+-                // now has; concealing it again would insert samples it never
+-                // carried and push everything after them later.
+-                let already = drought.packet();
+                 // Conceal a seq gap before decoding the arrival. Opus interpolates
+                 // from decoder state; PCM repeats-and-fades — lossless has nothing
+                 // to interpolate from. Gap arithmetic is codec-independent.
+-                for _ in 0..gaps.missing_before(pkt.seq).saturating_sub(already) {
++                for _ in 0..missing_to_conceal {
+                     match dec.conceal(frame_samples, &mut pcm) {
+                         Ok(n) if n > 0 => queue(&player, &pcm[..n * ch]),
+                         _ => break,
+                     }
+                 }
++                if discard_packet {
++                    continue;
++                }
+                 match dec.decode(&pkt.data, &mut pcm) {
+                     // Empty payload: the last frame stays the concealment unit.
+                     Ok(0) => {}
+@@ -2167,6 +2257,34 @@ fn parse_debug_reconfigure(s: &str) -> Option<(Mode, Duration)> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn delayed_audio_covered_by_drought_plc_is_not_queued_twice() {
++        let mut covered = 0;
++        // Four synthesized frames followed by the same four delayed packets.
++        for expected_remaining in (0..4).rev() {
++            let (missing, discard) =
++                reconcile_drought(&mut covered, if expected_remaining == 3 { 4 } else { 0 }, 0);
++            assert_eq!(missing, 0);
++            assert!(discard);
++            assert_eq!(covered, expected_remaining);
++        }
++        // The first packet beyond the concealed span is playable again.
++        assert_eq!(reconcile_drought(&mut covered, 0, 0), (0, false));
++    }
++
++    #[test]
++    fn sequence_gaps_consume_concealed_timeline_before_new_plc() {
++        let mut covered = 0;
++        // Three of five concealed positions were truly lost. The arriving packet and the
++        // following packet occupy the remaining two positions and must be discarded.
++        assert_eq!(reconcile_drought(&mut covered, 5, 3), (0, true));
++        assert_eq!(covered, 1);
++        assert_eq!(reconcile_drought(&mut covered, 0, 0), (0, true));
++        assert_eq!(covered, 0);
++        // A gap larger than the concealed span still asks the decoder for the remainder.
++        assert_eq!(reconcile_drought(&mut covered, 2, 5), (3, false));
++    }
++
+     /// Every spelling the env-var doc promises has to land on the right side of
+     /// `CLIENT_CAP_AUDIO_HIRES`.
+     #[test]
+diff --git a/crates/client/pf-client-video/Cargo.toml b/crates/client/pf-client-video/Cargo.toml
+index 7271b609161f837840bf78a045ccce0f23c0c866..aba7bf5815dcba845ffb17f91211e885b277b35e 100644
+--- a/crates/client/pf-client-video/Cargo.toml
++++ b/crates/client/pf-client-video/Cargo.toml
+@@ -21,6 +21,8 @@ ash = { workspace = true, optional = true }
+ punktfunk-core = { path = "../../core/punktfunk-core" }
+ 
+ [target.'cfg(any(target_os = "linux", windows))'.dependencies]
++# Raspberry Pi HEVC request decoder and NEON SAND transfer.
++ffmpeg-sys-next = { version = "9", optional = true }
+ # Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
+ # WP-2, AV1 by M7): auto's TOP rung on both desktop OSes since M9 — for every codec it
+ # speaks, AV1 included — also pinnable via `PUNKTFUNK_DECODER=native-vulkan` —
+@@ -156,6 +158,7 @@ pf-v4l2dec = { path = "../../codec/pf-v4l2dec", features = ["testing"] }
+ [features]
+ # `desktop` is the Linux/Windows decode ladder; pf-client-core's `desktop` turns it on. ON by
+ # default. Without it this crate is the four modules Android links.
++rpi5-v4l2-request = ["desktop", "dep:ffmpeg-sys-next"]
+ default = ["desktop", "pyrowave"]
+ desktop = [
+     "dep:pf-vkdecode", "dep:pf-bitstream", "dep:openh264", "dep:rav1d", "dep:libc",
+diff --git a/crates/client/pf-client-video/src/lib.rs b/crates/client/pf-client-video/src/lib.rs
+index 9fa1f0c22d14eb3151e5079dc9454857532151d7..1ff9947a43a1cceac89bf519b47632443535824a 100644
+--- a/crates/client/pf-client-video/src/lib.rs
++++ b/crates/client/pf-client-video/src/lib.rs
+@@ -96,3 +96,7 @@ pub mod video_d3d11_native;
+     feature = "pyrowave"
+ ))]
+ pub mod video_pyrowave;
++
++// Raspberry Pi HEVC through the bundled FFmpeg request decoder.
++#[cfg(all(desktop, target_os = "linux", feature = "rpi5-v4l2-request"))]
++pub mod video_v4l2_request;
+diff --git a/crates/client/pf-client-video/src/video.rs b/crates/client/pf-client-video/src/video.rs
+index 75ad40e5b6de50ecdf6ee51853f0a14676c8eced..0b41ecf5b39a8d9750c8eb9a16344631badb3d0d 100644
+--- a/crates/client/pf-client-video/src/video.rs
++++ b/crates/client/pf-client-video/src/video.rs
+@@ -67,6 +67,26 @@ pub struct DecodedFrame {
+     pub image: DecodedImage,
+ }
+ 
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct DecodeMetadata {
++    pub pts_ns: u64,
++    pub received_ns: u64,
++    pub flags: u32,
++    pub recovery_generation: u64,
++}
++
++pub struct TaggedImage {
++    pub image: DecodedImage,
++    pub metadata: DecodeMetadata,
++    pub delayed: bool,
++}
++
++#[derive(Default)]
++pub struct DecodeBatch {
++    pub images: Vec<TaggedImage>,
++    pub priming: bool,
++}
++
+ /// Re-export so the presenter names every frame type through `video::`.
+ #[cfg(windows)]
+ pub use crate::video_d3d11::{
+@@ -77,6 +97,9 @@ pub use crate::video_d3d11::{
+ pub enum DecodedImage {
+     /// Tightly-packed 8-bit I420 for the presenter's planar CSC upload.
+     Cpu(CpuPlanarFrame),
++    /// Pi HEVC output after NEON SAND detiling.
++    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++    V4l2Planar(CpuPlanarFrame),
+     /// A hardware picture as dma-bufs: a VAAPI DRM-PRIME export or a V4L2
+     /// CAPTURE buffer. [`DmabufFrame::path`] names which for `stats:`.
+     #[cfg(target_os = "linux")]
+@@ -236,6 +259,8 @@ impl DecodedImage {
+     pub fn is_keyframe(&self) -> bool {
+         match self {
+             DecodedImage::Cpu(f) => f.keyframe,
++            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++            DecodedImage::V4l2Planar(f) => f.keyframe,
+             #[cfg(target_os = "linux")]
+             DecodedImage::NativeDmabuf(f) => f.keyframe,
+             #[cfg(windows)]
+@@ -292,6 +317,8 @@ impl DecodedImage {
+     pub fn dimensions(&self) -> (u32, u32) {
+         match self {
+             DecodedImage::Cpu(f) => (f.width, f.height),
++            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++            DecodedImage::V4l2Planar(f) => (f.width, f.height),
+             #[cfg(target_os = "linux")]
+             DecodedImage::NativeDmabuf(f) => (f.width, f.height),
+             #[cfg(windows)]
+@@ -308,6 +335,8 @@ impl DecodedImage {
+     pub fn path_label(&self) -> &'static str {
+         match self {
+             DecodedImage::Cpu(f) => f.path,
++            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++            DecodedImage::V4l2Planar(_) => "v4l2-request",
+             #[cfg(target_os = "linux")]
+             DecodedImage::NativeDmabuf(f) => f.path,
+             #[cfg(windows)]
+@@ -350,6 +379,51 @@ pub struct CpuPlanarFrame {
+ }
+ 
+ impl CpuPlanarFrame {
++    #[cfg(any(test, all(target_os = "linux", feature = "rpi5-v4l2-request")))]
++    pub(crate) fn packed_layout(width: u32, height: u32) -> Result<([usize; 3], usize)> {
++        anyhow::ensure!(width > 0 && height > 0, "empty picture {width}x{height}");
++        let (cw, ch) = Self::chroma_dims(width, height);
++        let y = width
++            .checked_mul(height)
++            .context("I420 luma size overflow")? as usize;
++        let c = cw.checked_mul(ch).context("I420 chroma size overflow")? as usize;
++        let cr = y.checked_add(c).context("I420 plane offset overflow")?;
++        let total = cr.checked_add(c).context("I420 buffer size overflow")?;
++        anyhow::ensure!(
++            total <= isize::MAX as usize,
++            "I420 buffer exceeds allocation limit"
++        );
++        Ok(([0, y, cr], total))
++    }
++
++    /// Take one packed I420 allocation without copying its planes.
++    #[cfg(any(test, all(target_os = "linux", feature = "rpi5-v4l2-request")))]
++    pub(crate) fn from_packed(
++        width: u32,
++        height: u32,
++        data: Vec<u8>,
++        color: ColorDesc,
++        keyframe: bool,
++        recovery: punktfunk_core::reanchor::LocalRecovery,
++        path: &'static str,
++    ) -> Result<Self> {
++        let (offsets, total) = Self::packed_layout(width, height)?;
++        anyhow::ensure!(
++            data.len() == total,
++            "I420 buffer length disagrees with dimensions"
++        );
++        Ok(Self {
++            width,
++            height,
++            data,
++            offsets,
++            color,
++            keyframe,
++            recovery,
++            path,
++        })
++    }
++
+     /// Chroma plane size for 4:2:0, rounding up — an odd luma dimension still
+     /// has a chroma sample covering its last row/column.
+     pub fn chroma_dims(width: u32, height: u32) -> (u32, u32) {
+@@ -753,6 +827,10 @@ fn build_rung(
+         }
+         #[cfg(target_os = "linux")]
+         NativeRung::V4l2 => Box::new(crate::video_v4l2::NativeV4l2Decoder::new(wire, stream)?),
++        #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++        NativeRung::V4l2Request => {
++            Box::new(crate::video_v4l2_request::V4l2RequestDecoder::new(wire)?)
++        }
+         other => bail!("{} is not a hardware rung on this OS", other.name()),
+     };
+     tracing::info!(
+@@ -1133,18 +1211,52 @@ impl Decoder {
+         )
+     }
+ 
++    /// Feed an AU with the metadata its eventual pictures must retain.
++    pub fn decode_tagged_au(
++        &mut self,
++        au: punktfunk_core::au::AuBuf,
++        complete: bool,
++        metadata: DecodeMetadata,
++    ) -> Result<DecodeBatch> {
++        let mut priming = false;
++        let batch = self.feed(
++            |rung| {
++                let batch = rung.decode_tagged_au(au, complete, metadata)?;
++                priming = batch.priming;
++                Ok((!batch.images.is_empty()).then_some(batch))
++            },
++            complete,
++        )?;
++        Ok(batch.unwrap_or(DecodeBatch {
++            images: Vec::new(),
++            priming,
++        }))
++    }
++
++    /// Finish buffered pictures when input pauses without flushing reference frames.
++    pub fn drain_tagged(&mut self) -> Result<DecodeBatch> {
++        Ok(self
++            .feed(
++                |rung| {
++                    let batch = rung.drain_tagged()?;
++                    Ok((!batch.images.is_empty()).then_some(batch))
++                },
++                true,
++            )?
++            .unwrap_or_default())
++    }
++
+     /// Memory the rung reads AUs from in place, for the session to lend; `None` = the heap.
+     pub fn au_memory(&self) -> Option<std::sync::Arc<dyn punktfunk_core::au::AuMemory>> {
+         self.rung.au_memory()
+     }
+ 
+-    /// Run one decode through the rung, counting a picture as a handover for the
+-    /// retiring rung.
+-    fn feed(
++    /// Run a decode operation through the rung. Successful output advances retirement.
++    fn feed<T>(
+         &mut self,
+-        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<DecodedImage>>,
++        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<T>>,
+         complete: bool,
+-    ) -> Result<Option<DecodedImage>> {
++    ) -> Result<Option<T>> {
+         let out = self.decode_frame_inner(feed, complete);
+         if let (Ok(Some(_)), Some(r)) = (&out, self.retiring.as_mut()) {
+             r.1 += 1;
+@@ -1155,11 +1267,11 @@ impl Decoder {
+         out
+     }
+ 
+-    fn decode_frame_inner(
++    fn decode_frame_inner<T>(
+         &mut self,
+-        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<DecodedImage>>,
++        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<T>>,
+         complete: bool,
+-    ) -> Result<Option<DecodedImage>> {
++    ) -> Result<Option<T>> {
+         let result = feed(self.rung.as_mut());
+         // PyroWave and the CPU rung have nothing below them: their error is the pump's.
+         let Some(from) = self.rung.id().filter(|r| *r != NativeRung::Software) else {
+@@ -1211,6 +1323,67 @@ mod tests {
+     use super::*;
+     use crate::video_caps::tests::decode_device;
+ 
++    #[test]
++    fn packed_frame_keeps_allocation_planes_and_metadata() {
++        let color = ColorDesc {
++            primaries: 9,
++            transfer: 16,
++            matrix: 9,
++            full_range: true,
++        };
++        let recovery = punktfunk_core::reanchor::LocalRecovery {
++            sei_here: true,
++            is_recovery_point: true,
++        };
++        // Include odd dimensions and widths with a partial 128-byte SAND stripe.
++        for (width, height) in [(5, 3), (130, 4), (2560, 1440)] {
++            let (offsets, total) = CpuPlanarFrame::packed_layout(width, height).unwrap();
++            let data: Vec<u8> = (0..total).map(|i| i as u8).collect();
++            let address = data.as_ptr();
++            let frame = CpuPlanarFrame::from_packed(
++                width,
++                height,
++                data,
++                color,
++                true,
++                recovery,
++                "test-packed",
++            )
++            .unwrap();
++            assert_eq!(frame.data.as_ptr(), address);
++            assert_eq!(frame.offsets, offsets);
++            assert_eq!(frame.color, color);
++            assert!(frame.keyframe);
++            assert_eq!(frame.path, "test-packed");
++            assert_eq!(frame.recovery, recovery);
++            assert_eq!(frame.plane(2).last(), Some(&((total - 1) as u8)));
++        }
++    }
++
++    #[test]
++    fn packed_frame_refuses_invalid_geometry_or_length() {
++        assert!(CpuPlanarFrame::packed_layout(0, 2).is_err());
++        assert!(CpuPlanarFrame::packed_layout(u32::MAX, 2).is_err());
++        let color = ColorDesc {
++            primaries: 1,
++            transfer: 1,
++            matrix: 1,
++            full_range: false,
++        };
++        for length in [11, 13] {
++            assert!(CpuPlanarFrame::from_packed(
++                4,
++                2,
++                vec![0; length],
++                color,
++                false,
++                punktfunk_core::reanchor::LocalRecovery::NONE,
++                "test"
++            )
++            .is_err());
++        }
++    }
++
+     /// A new format rebuilds onto a rung for its codec. One nothing here decodes leaves the
+     /// decoder as it was, with the typed refusal the pump turns into a codec ask.
+     #[test]
+diff --git a/crates/client/pf-client-video/src/video_caps.rs b/crates/client/pf-client-video/src/video_caps.rs
+index c47f952de5de5a0d8f6c469e5e45e89c345f3a83..66e0271b8a1cf49424c5225831a644ed4036add4 100644
+--- a/crates/client/pf-client-video/src/video_caps.rs
++++ b/crates/client/pf-client-video/src/video_caps.rs
+@@ -28,13 +28,34 @@ pub(crate) fn v4l2_auto_ok(vk: Option<&VulkanDecodeDevice>) -> bool {
+ pub struct V4l2Summary {
+     /// Codecs a decoder node takes and returns as an importable picture.
+     pub codecs: u8,
+-    /// Subset of `codecs` with a linear 10-bit picture format.
++    /// Subset of `codecs` with a 10-bit decode path the presenter can consume.
+     pub ten_bit: u8,
+ }
+ 
+-/// What the V4L2 rung adds for this presenter. A device with Vulkan Video
+-/// never needs it, so its video nodes (cameras among them) stay unopened.
+-fn v4l2_summary(vk: Option<&VulkanDecodeDevice>) -> V4l2Summary {
++/// What the selected V4L2 rung can deliver. The Pi FFmpeg pin uploads planar
++/// pixels and accepts Main10 independently of native dma-buf import support.
++fn v4l2_summary(vk: Option<&VulkanDecodeDevice>, decoder_pref: &str) -> V4l2Summary {
++    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++    {
++        let pin = resolve_decoder_pref(
++            std::env::var("PUNKTFUNK_DECODER").ok().as_deref(),
++            decoder_pref,
++        );
++        if let Some(summary) = rpi_request_summary(&pin, || {
++            let Ok(nodes) = std::fs::read_dir("/sys/class/video4linux") else {
++                return false;
++            };
++            nodes.flatten().any(|node| {
++                std::fs::read_to_string(node.path().join("name"))
++                    .is_ok_and(|name| name.trim() == "rpi-hevc-dec")
++                    && pf_v4l2::Node::open(&std::path::Path::new("/dev").join(node.file_name()))
++                        .is_ok()
++            })
++        }) {
++            return summary;
++        }
++    }
++    let _ = decoder_pref;
+     #[cfg(target_os = "linux")]
+     if v4l2_auto_ok(vk) && !vk.is_some_and(|v| v.video_decode) {
+         return crate::video_v4l2::caps().summary();
+@@ -43,6 +64,16 @@ fn v4l2_summary(vk: Option<&VulkanDecodeDevice>) -> V4l2Summary {
+     V4l2Summary::default()
+ }
+ 
++/// The FFmpeg pin supports Main10 through NEON transfer on an accessible Pi
++/// HEVC device. Other pins keep the native driver's format-based capability probe.
++#[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++fn rpi_request_summary(pin: &str, available: impl FnOnce() -> bool) -> Option<V4l2Summary> {
++    (pin == crate::video_v4l2_request::DECODER_PIN && available()).then_some(V4l2Summary {
++        codecs: punktfunk_core::quic::CODEC_HEVC,
++        ten_bit: punktfunk_core::quic::CODEC_HEVC,
++    })
++}
++
+ /// One decode rung, named so evidence, admission and the ladder share one
+ /// vocabulary on every OS.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -55,6 +86,9 @@ pub enum NativeRung {
+     Vaapi,
+     /// A V4L2 decoder node, stateful or stateless (`video_v4l2`, Linux).
+     V4l2,
++    /// Bundled FFmpeg Pi HEVC request decoder, selected explicitly.
++    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++    V4l2Request,
+     /// openh264 + rav1d (`video_software`).
+     Software,
+ }
+@@ -67,6 +101,8 @@ impl NativeRung {
+             NativeRung::D3d11va => ("native-d3d11va", "native D3D11VA"),
+             NativeRung::Vaapi => ("native-vaapi", "native VAAPI"),
+             NativeRung::V4l2 => ("native-v4l2", "native V4L2"),
++            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++            NativeRung::V4l2Request => ("v4l2-request", "Pi V4L2 Request"),
+             NativeRung::Software => ("software", "software"),
+         }
+     }
+@@ -340,7 +376,8 @@ pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
+ /// Does the Hello offer AV1 on this device? [`av1_hardware_decodable`] or a V4L2 node
+ /// that takes AV1 — the answer a settings UI must show.
+ pub fn av1_advertised(vk: Option<&VulkanDecodeDevice>) -> bool {
+-    av1_hardware_decodable(vk) || v4l2_summary(vk).codecs & punktfunk_core::quic::CODEC_AV1 != 0
++    av1_hardware_decodable(vk)
++        || v4l2_summary(vk, "auto").codecs & punktfunk_core::quic::CODEC_AV1 != 0
+ }
+ 
+ /// Can this client decode 4:4:4 HEVC — the promise `VIDEO_CAP_444` makes.
+@@ -446,7 +483,12 @@ pub fn ten_bit_decodable(
+     decoder_pref: &str,
+     preferred_codec: u8,
+ ) -> bool {
+-    ten_bit_decodable_with(vk, decoder_pref, preferred_codec, v4l2_summary(vk))
++    ten_bit_decodable_with(
++        vk,
++        decoder_pref,
++        preferred_codec,
++        v4l2_summary(vk, decoder_pref),
++    )
+ }
+ 
+ /// [`ten_bit_decodable`] over an explicit V4L2 answer; tests need no device node.
+@@ -500,7 +542,7 @@ pub fn video_caps_for(
+ /// codecs `decoder_pref` makes unreachable. Advertisement only: `resolve_codec`
+ /// never auto-picks PyroWave.
+ pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>, decoder_pref: &str) -> u8 {
+-    let v4l2 = v4l2_summary(vk);
++    let v4l2 = v4l2_summary(vk, decoder_pref);
+     let bits = decodable_codecs_with(vk, decoder_pref, v4l2);
+     tracing::info!(
+         vulkan = format_args!(
+@@ -992,6 +1034,32 @@ pub(crate) mod tests {
+         assert!(!av1_hardware_decodable(Some(&dev)));
+     }
+ 
++    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++    #[test]
++    fn pi_request_pin_advertises_main10_without_dmabuf_import() {
++        if std::env::var_os("PUNKTFUNK_DECODER").is_some() {
++            return;
++        }
++        let summary = rpi_request_summary("v4l2-request", || true).unwrap();
++        let mut pi = decode_device(0x14e4, "V3D");
++        pi.video_decode = false;
++        pi.dmabuf_import = false;
++        assert_ne!(
++            decodable_codecs_with(Some(&pi), "v4l2-request", summary) & CODEC_HEVC,
++            0
++        );
++        assert!(ten_bit_decodable_with(
++            Some(&pi),
++            "v4l2-request",
++            CODEC_HEVC,
++            summary
++        ));
++        assert!(rpi_request_summary("v4l2-request", || false).is_none());
++        for pin in ["auto", "native-v4l2", "software"] {
++            assert!(rpi_request_summary(pin, || panic!("must not probe another pin")).is_none());
++        }
++    }
++
+     /// HEVC has no CPU rung, so it is advertised only where hardware decodes
+     /// it: Vulkan, the platform rung, or a V4L2 node. An ARM board with none
+     /// of them starts on H.264 instead of re-dialling.
+diff --git a/crates/client/pf-client-video/src/video_ladder.rs b/crates/client/pf-client-video/src/video_ladder.rs
+index fbd18b9f0bb84fe857cae31d1994ee440026bf75..9879d703332d126c10c40338e480630c625255b2 100644
+--- a/crates/client/pf-client-video/src/video_ladder.rs
++++ b/crates/client/pf-client-video/src/video_ladder.rs
+@@ -39,7 +39,13 @@ impl Os {
+     /// The rungs a stored preference can pin here.
+     fn pins(self) -> &'static [NativeRung] {
+         match self {
+-            Os::Linux => &[NativeRung::Vulkan, NativeRung::Vaapi, NativeRung::V4l2],
++            Os::Linux => &[
++                NativeRung::Vulkan,
++                NativeRung::Vaapi,
++                NativeRung::V4l2,
++                #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++                NativeRung::V4l2Request,
++            ],
+             Os::Windows => &[NativeRung::Vulkan, NativeRung::D3d11va],
+         }
+     }
+@@ -345,6 +351,26 @@ pub(crate) mod tests {
+         }
+     }
+ 
++    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++    #[test]
++    fn pi_request_pin_precedes_native_rungs_without_changing_auto() {
++        let steps = ladder(Os::Linux, "v4l2-request", CODEC_HEVC, None);
++        assert_eq!(steps.first(), Some(&Step::Pin(NativeRung::V4l2Request)));
++        assert_eq!(
++            steps
++                .iter()
++                .filter(|s| s.rung() == Some(NativeRung::V4l2Request))
++                .count(),
++            1
++        );
++        assert!(steps.iter().any(|s| s.rung() == Some(NativeRung::V4l2)));
++        for pref in ["auto", "software", "native-v4l2"] {
++            assert!(ladder(Os::Linux, pref, CODEC_HEVC, None)
++                .iter()
++                .all(|s| s.rung() != Some(NativeRung::V4l2Request)));
++        }
++    }
++
+     fn rows() -> Vec<Row> {
+         let lines = ORDER.lines().map(str::trim).filter(|l| !l.is_empty());
+         let rows: Vec<Row> = lines.skip(1).map(Row::parse).collect();
+diff --git a/crates/client/pf-client-video/src/video_rung.rs b/crates/client/pf-client-video/src/video_rung.rs
+index 979bc27ceff2414f3f5be6e3a90b522c9b0367d5..1d986c0308854363a2cde742f7f91ddfffcb557e 100644
+--- a/crates/client/pf-client-video/src/video_rung.rs
++++ b/crates/client/pf-client-video/src/video_rung.rs
+@@ -11,7 +11,7 @@ use anyhow::Result;
+ use punktfunk_core::au::{AuBuf, AuMemory};
+ use std::sync::Arc;
+ 
+-use crate::video::DecodedImage;
++use crate::video::{DecodeBatch, DecodeMetadata, DecodedImage, TaggedImage};
+ use crate::video_caps::NativeRung;
+ use crate::video_software::SoftwareDecoder;
+ use crate::video_types::DecodeHealth;
+@@ -43,6 +43,30 @@ pub(crate) trait Rung {
+         self.decode(&au, user_flags, complete)
+     }
+ 
++    fn decode_tagged_au(
++        &mut self,
++        au: AuBuf,
++        complete: bool,
++        metadata: DecodeMetadata,
++    ) -> Result<DecodeBatch> {
++        Ok(DecodeBatch {
++            images: self
++                .decode_au(au, metadata.flags, complete)?
++                .into_iter()
++                .map(|image| TaggedImage {
++                    image,
++                    metadata,
++                    delayed: false,
++                })
++                .collect(),
++            priming: false,
++        })
++    }
++
++    fn drain_tagged(&mut self) -> Result<DecodeBatch> {
++        Ok(DecodeBatch::default())
++    }
++
+     /// Memory this rung reads AUs from in place, for the session to lend; `None` = the
+     /// heap. A resize can replace it.
+     fn au_memory(&self) -> Option<Arc<dyn AuMemory>> {
+@@ -278,3 +302,95 @@ impl Rung for SoftwareDecoder {
+         Ok(Self::decode(self, au)?.map(DecodedImage::Cpu))
+     }
+ }
++
++#[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
++impl Rung for crate::video_v4l2_request::V4l2RequestDecoder {
++    fn id(&self) -> Option<NativeRung> {
++        Some(NativeRung::V4l2Request)
++    }
++
++    fn name(&self) -> &'static str {
++        Self::name(self)
++    }
++
++    fn decode(&mut self, au: &[u8], _: u32, _: bool) -> Result<Option<DecodedImage>> {
++        Ok(Self::decode(self, au)?.map(DecodedImage::V4l2Planar))
++    }
++
++    fn decode_tagged_au(
++        &mut self,
++        au: AuBuf,
++        _: bool,
++        metadata: DecodeMetadata,
++    ) -> Result<DecodeBatch> {
++        Self::decode_tagged(self, Some((&au, metadata)))
++    }
++
++    fn drain_tagged(&mut self) -> Result<DecodeBatch> {
++        Self::decode_tagged(self, None)
++    }
++}
++
++#[cfg(test)]
++mod tagged_tests {
++    use super::*;
++    use crate::video::{ColorDesc, CpuPlanarFrame};
++
++    struct Synchronous;
++
++    impl Rung for Synchronous {
++        fn id(&self) -> Option<NativeRung> {
++            None
++        }
++        fn name(&self) -> &'static str {
++            "test"
++        }
++        fn decode(
++            &mut self,
++            au: &[u8],
++            flags: u32,
++            complete: bool,
++        ) -> Result<Option<DecodedImage>> {
++            anyhow::ensure!(
++                au == [9] && flags == 7 && complete,
++                "unexpected synchronous input"
++            );
++            Ok(Some(DecodedImage::Cpu(CpuPlanarFrame::from_i420(
++                2,
++                2,
++                [&[1, 2, 3, 4], &[5], &[6]],
++                [2, 1, 1],
++                ColorDesc {
++                    primaries: 1,
++                    transfer: 1,
++                    matrix: 1,
++                    full_range: false,
++                },
++                false,
++                punktfunk_core::reanchor::LocalRecovery::NONE,
++            )?)))
++        }
++    }
++
++    #[test]
++    fn synchronous_adapter_preserves_current_metadata_and_errors() {
++        let metadata = DecodeMetadata {
++            pts_ns: 12,
++            received_ns: 15,
++            flags: 7,
++            recovery_generation: 4,
++        };
++        let mut rung = Synchronous;
++        let batch = rung
++            .decode_tagged_au(vec![9].into(), true, metadata)
++            .unwrap();
++        assert_eq!(batch.images.len(), 1);
++        assert_eq!(batch.images[0].metadata, metadata);
++        assert!(!batch.images[0].delayed);
++        assert!(!batch.priming);
++        assert!(rung.drain_tagged().unwrap().images.is_empty());
++        assert!(rung
++            .decode_tagged_au(vec![8].into(), true, metadata)
++            .is_err());
++    }
++}
+diff --git a/crates/client/pf-client-video/src/video_v4l2_request.rs b/crates/client/pf-client-video/src/video_v4l2_request.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b4b99eb74258653ee55365c9b5e06c77fd5c6215
+--- /dev/null
++++ b/crates/client/pf-client-video/src/video_v4l2_request.rs
+@@ -0,0 +1,1017 @@
++//! Raspberry Pi HEVC decode through FFmpeg's V4L2 Request API.
++//!
++//! The Pi decoder produces Broadcom SAND DMA-BUFs. V3DV cannot import that modifier
++//! through Vulkan, so the Raspberry Pi FFmpeg fork's NEON transfer converts SAND to
++//! planar 8/10-bit samples. Ten-bit samples are rounded to eight bits for the
++//! existing I420 Vulkan upload path; stream colour metadata stays attached.
++
++use crate::video::{CpuPlanarFrame, DecodeBatch, DecodeMetadata, DecodedImage, TaggedImage};
++use crate::video_color::ColorDesc;
++use anyhow::{bail, Result};
++use ffmpeg_sys_next as ffi;
++use std::collections::VecDeque;
++use std::ffi::c_void;
++use std::ffi::CStr;
++use std::os::raw::c_char;
++use std::ptr;
++use std::slice;
++use std::time::{Duration, Instant};
++
++pub const DECODER_PIN: &str = "v4l2-request";
++// FFmpeg 6 exposed this as AV_FRAME_FLAG_KEY. Keep the ABI-stable bit value
++// locally so the client still compiles against older development headers used
++// for non-Pi test builds.
++const FRAME_FLAG_KEY: i32 = 1 << 1;
++const MAX_PENDING: usize = 8;
++const IDLE_DRAIN_AFTER: Duration = Duration::from_millis(50);
++
++fn idle_drain_due(last_input: Option<Instant>, now: Instant) -> bool {
++    last_input.is_some_and(|at| now.saturating_duration_since(at) >= IDLE_DRAIN_AFTER)
++}
++
++struct InputLedger {
++    pending: VecDeque<(i64, DecodeMetadata)>,
++    next: i64,
++    accepted: usize,
++    yielded: bool,
++    delay: usize,
++}
++
++impl InputLedger {
++    fn new(delay: usize) -> Self {
++        Self {
++            pending: VecDeque::with_capacity(MAX_PENDING),
++            next: 1,
++            accepted: 0,
++            yielded: false,
++            delay,
++        }
++    }
++
++    fn token(&self) -> Result<i64> {
++        anyhow::ensure!(
++            self.pending.len() < MAX_PENDING && self.next < i64::MAX,
++            "decode metadata queue exhausted"
++        );
++        Ok(self.next)
++    }
++
++    fn accept(&mut self, metadata: DecodeMetadata) {
++        self.pending.push_back((self.next, metadata));
++        self.next += 1;
++        self.accepted = self.accepted.saturating_add(1);
++    }
++
++    fn take(&mut self, token: i64) -> Result<DecodeMetadata> {
++        let index = self
++            .pending
++            .iter()
++            .position(|(id, _)| *id == token)
++            .ok_or_else(|| anyhow::anyhow!("decoded frame has no accepted input token"))?;
++        self.yielded = true;
++        Ok(self.pending.remove(index).unwrap().1)
++    }
++
++    fn priming(&self) -> bool {
++        !self.yielded && self.accepted > 0 && self.accepted <= self.delay
++    }
++
++    fn reset(&mut self) {
++        self.pending.clear();
++        self.accepted = 0;
++        self.yielded = false;
++    }
++}
++
++#[derive(Default)]
++struct DecodeSample {
++    phases: [Duration; 4], // Codec, SAND transfer, owned pixel copy, whole call.
++    frames: u64,
++}
++
++struct DecodeTiming {
++    started: Instant,
++    calls: u64,
++    frames: u64,
++    sums: [Duration; 4],
++    peaks: [Duration; 4],
++}
++
++impl DecodeTiming {
++    fn new(started: Instant) -> Self {
++        Self {
++            started,
++            calls: 0,
++            frames: 0,
++            sums: [Duration::ZERO; 4],
++            peaks: [Duration::ZERO; 4],
++        }
++    }
++
++    fn add(&mut self, sample: DecodeSample, now: Instant) -> Option<Self> {
++        self.calls += 1;
++        self.frames += sample.frames;
++        for (i, duration) in sample.phases.into_iter().enumerate() {
++            self.sums[i] += duration;
++            self.peaks[i] = self.peaks[i].max(duration);
++        }
++        (now.duration_since(self.started) >= Duration::from_secs(1))
++            .then(|| std::mem::replace(self, Self::new(now)))
++    }
++
++    fn mean_us(&self, phase: usize) -> f64 {
++        self.sums[phase].as_secs_f64() * 1_000_000.0 / self.calls as f64
++    }
++}
++
++struct AvBuffer(*mut ffi::AVBufferRef);
++
++impl AvBuffer {
++    unsafe fn from_raw(value: *mut ffi::AVBufferRef) -> Result<Self> {
++        if value.is_null() {
++            bail!("FFmpeg returned a null hardware device");
++        }
++        Ok(Self(value))
++    }
++}
++
++impl Drop for AvBuffer {
++    fn drop(&mut self) {
++        unsafe { ffi::av_buffer_unref(&mut self.0) };
++    }
++}
++
++unsafe impl Send for AvBuffer {}
++
++struct PackedTransfer<'a> {
++    frame: *mut ffi::AVFrame,
++    _bytes: &'a mut [u8],
++}
++
++unsafe extern "C" fn borrowed_pixels(_opaque: *mut c_void, _data: *mut u8) {}
++
++impl<'a> PackedTransfer<'a> {
++    // SAFETY: frame is exclusively borrowed until this guard drops; FFmpeg's
++    // synchronous transfer does not retain the destination buffer reference.
++    unsafe fn new(
++        frame: *mut ffi::AVFrame,
++        bytes: &'a mut [u8],
++        width: u32,
++        height: u32,
++    ) -> Result<Self> {
++        let (offsets, total) = CpuPlanarFrame::packed_layout(width, height)?;
++        anyhow::ensure!(
++            bytes.len() == total,
++            "packed transfer buffer length mismatch"
++        );
++        anyhow::ensure!(
++            width <= i32::MAX as u32 && height <= i32::MAX as u32,
++            "packed transfer dimensions exceed FFmpeg limits"
++        );
++        let data = bytes.as_mut_ptr();
++        let guard = Self {
++            frame,
++            _bytes: bytes,
++        };
++        unsafe {
++            ffi::av_frame_unref(frame);
++            (*frame).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
++            (*frame).width = width as i32;
++            (*frame).height = height as i32;
++            (*frame).buf[0] =
++                ffi::av_buffer_create(data, total, Some(borrowed_pixels), ptr::null_mut(), 0);
++            anyhow::ensure!(
++                !(*frame).buf[0].is_null(),
++                "allocate packed transfer buffer reference"
++            );
++            for (i, offset) in offsets.into_iter().enumerate() {
++                (*frame).data[i] = data.add(offset);
++                (*frame).linesize[i] = if i == 0 { width } else { width.div_ceil(2) } as i32;
++            }
++        }
++        Ok(guard)
++    }
++}
++
++impl Drop for PackedTransfer<'_> {
++    fn drop(&mut self) {
++        // The Vec owns the pixels. Clear all FFmpeg references before its borrow ends.
++        unsafe { ffi::av_frame_unref(self.frame) };
++    }
++}
++
++fn direct_transfer_dimensions(width: i32, height: i32, crop: [usize; 4]) -> bool {
++    width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0 && crop == [0; 4]
++}
++
++unsafe extern "C" fn pick_drm_prime(
++    _ctx: *mut ffi::AVCodecContext,
++    mut formats: *const ffi::AVPixelFormat,
++) -> ffi::AVPixelFormat {
++    unsafe {
++        while *formats != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
++            if *formats == ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME {
++                return *formats;
++            }
++            formats = formats.add(1);
++        }
++    }
++    ffi::AVPixelFormat::AV_PIX_FMT_NONE
++}
++
++pub struct V4l2RequestDecoder {
++    ctx: *mut ffi::AVCodecContext,
++    _hw_device: AvBuffer,
++    packet: *mut ffi::AVPacket,
++    frame: *mut ffi::AVFrame,
++    planar: *mut ffi::AVFrame,
++    timing: Option<DecodeTiming>,
++    direct_transfer: bool,
++    inputs: InputLedger,
++    last_input: Option<Instant>,
++}
++
++unsafe impl Send for V4l2RequestDecoder {}
++
++impl V4l2RequestDecoder {
++    pub fn new(wire_codec: u8) -> Result<Self> {
++        if wire_codec != punktfunk_core::quic::CODEC_HEVC {
++            bail!("V4L2 Request is available only for HEVC on Raspberry Pi 5");
++        }
++        unsafe {
++            let mut raw_device = ptr::null_mut();
++            let status = ffi::av_hwdevice_ctx_create(
++                &mut raw_device,
++                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM,
++                ptr::null(),
++                ptr::null_mut(),
++                0,
++            );
++            if status < 0 {
++                return Err(av_error("DRM hardware device creation", status));
++            }
++            let hw_device = AvBuffer::from_raw(raw_device)?;
++            let codec = ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_HEVC);
++            if codec.is_null() {
++                bail!("the bundled FFmpeg has no HEVC decoder");
++            }
++            let mut ctx = ffi::avcodec_alloc_context3(codec);
++            if ctx.is_null() {
++                bail!("allocate HEVC decoder context");
++            }
++            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.0);
++            (*ctx).get_format = Some(pick_drm_prime);
++            let threads = if std::env::var("PUNKTFUNK_RPI_DECODE_THREADS").as_deref() == Ok("2") {
++                2
++            } else {
++                1
++            };
++            if threads == 1 {
++                (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
++            } else {
++                (*ctx).flags &= !(ffi::AV_CODEC_FLAG_LOW_DELAY as i32);
++            }
++            (*ctx).thread_count = threads;
++            (*ctx).thread_type = ffi::FF_THREAD_FRAME as i32;
++            (*ctx).extra_hw_frames = 4;
++            let status = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
++            if status < 0 {
++                ffi::avcodec_free_context(&mut ctx);
++                return Err(av_error("opening the V4L2 Request HEVC decoder", status));
++            }
++            let packet = ffi::av_packet_alloc();
++            let frame = ffi::av_frame_alloc();
++            let planar = ffi::av_frame_alloc();
++            if packet.is_null() || frame.is_null() || planar.is_null() {
++                let mut packet = packet;
++                let mut frame = frame;
++                let mut planar = planar;
++                ffi::av_packet_free(&mut packet);
++                ffi::av_frame_free(&mut frame);
++                ffi::av_frame_free(&mut planar);
++                ffi::avcodec_free_context(&mut ctx);
++                bail!("allocate FFmpeg packet/frame storage");
++            }
++            (*planar).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
++            let delay = if (*ctx).active_thread_type & ffi::FF_THREAD_FRAME as i32 != 0 {
++                1
++            } else {
++                0
++            };
++            tracing::info!(
++                threads = (*ctx).thread_count,
++                delay,
++                "V4L2 Request decode pipeline configured"
++            );
++            Ok(Self {
++                ctx,
++                _hw_device: hw_device,
++                packet,
++                frame,
++                planar,
++                timing: None,
++                direct_transfer: std::env::var("PUNKTFUNK_RPI_DIRECT_TRANSFER").as_deref()
++                    != Ok("0"),
++                inputs: InputLedger::new(delay),
++                last_input: None,
++            })
++        }
++    }
++
++    pub fn name(&self) -> &'static str {
++        DECODER_PIN
++    }
++
++    pub fn decode(&mut self, au: &[u8]) -> Result<Option<CpuPlanarFrame>> {
++        let batch = self.decode_tagged_mode(Some((au, DecodeMetadata::default())), true)?;
++        anyhow::ensure!(
++            batch.images.len() <= 1,
++            "untagged decode returned multiple pictures"
++        );
++        Ok(batch
++            .images
++            .into_iter()
++            .next()
++            .map(|output| match output.image {
++                DecodedImage::V4l2Planar(frame) => frame,
++                _ => unreachable!(),
++            }))
++    }
++
++    pub fn decode_tagged(&mut self, input: Option<(&[u8], DecodeMetadata)>) -> Result<DecodeBatch> {
++        self.decode_tagged_mode(input, false)
++    }
++
++    fn decode_tagged_mode(
++        &mut self,
++        input: Option<(&[u8], DecodeMetadata)>,
++        synchronous: bool,
++    ) -> Result<DecodeBatch> {
++        if input.is_none()
++            && (self.inputs.pending.is_empty() || !idle_drain_due(self.last_input, Instant::now()))
++        {
++            return Ok(DecodeBatch::default());
++        }
++        let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
++        let mut sample = started.map(|_| DecodeSample::default());
++        if started.is_none() {
++            self.timing = None;
++        }
++        let result = self.decode_tagged_inner(input, sample.as_mut(), synchronous);
++        if result.is_err() {
++            unsafe {
++                ffi::av_packet_unref(self.packet);
++                ffi::av_frame_unref(self.frame);
++                ffi::avcodec_flush_buffers(self.ctx);
++            }
++            self.inputs.reset();
++            self.last_input = None;
++        }
++        if let (Some(at), Some(mut sample)) = (started, sample) {
++            let now = Instant::now();
++            sample.phases[3] = now.duration_since(at);
++            let timing = self.timing.get_or_insert_with(|| DecodeTiming::new(at));
++            if let Some(window) = timing.add(sample, now) {
++                tracing::debug!(
++                    calls = window.calls,
++                    frames = window.frames,
++                    window_ms = now.duration_since(window.started).as_millis() as u64,
++                    codec_mean_us = window.mean_us(0),
++                    codec_max_us = window.peaks[0].as_micros() as u64,
++                    transfer_mean_us = window.mean_us(1),
++                    transfer_max_us = window.peaks[1].as_micros() as u64,
++                    copy_mean_us = window.mean_us(2),
++                    copy_max_us = window.peaks[2].as_micros() as u64,
++                    total_mean_us = window.mean_us(3),
++                    total_max_us = window.peaks[3].as_micros() as u64,
++                    "V4L2 Request decode timing per call"
++                );
++            }
++        }
++        result
++    }
++
++    fn decode_tagged_inner(
++        &mut self,
++        input: Option<(&[u8], DecodeMetadata)>,
++        mut timing: Option<&mut DecodeSample>,
++        synchronous: bool,
++    ) -> Result<DecodeBatch> {
++        let mut batch = DecodeBatch::default();
++        unsafe {
++            if let Some((au, metadata)) = input {
++                let token = self.inputs.token()?;
++                let size = i32::try_from(au.len())
++                    .map_err(|_| anyhow::anyhow!("decode packet exceeds FFmpeg size limit"))?;
++                let status = ffi::av_new_packet(self.packet, size);
++                if status < 0 {
++                    return Err(av_error("allocate decode packet", status));
++                }
++                ptr::copy_nonoverlapping(au.as_ptr(), (*self.packet).data, au.len());
++                (*self.packet).pts = token;
++                (*self.packet).dts = token;
++                let mut accepted = false;
++                for attempt in 0..2 {
++                    let at = timing.as_ref().map(|_| Instant::now());
++                    let status = ffi::avcodec_send_packet(self.ctx, self.packet);
++                    if let (Some(at), Some(sample)) = (at, timing.as_mut()) {
++                        sample.phases[0] += at.elapsed();
++                    }
++                    if status == -libc::EAGAIN && attempt == 0 {
++                        self.receive_tagged(&mut batch, 0, timing.as_deref_mut())?;
++                        anyhow::ensure!(
++                            !batch.images.is_empty(),
++                            "decode send and receive both need input"
++                        );
++                        continue;
++                    }
++                    if status < 0 {
++                        return Err(av_error("submit decode packet", status));
++                    }
++                    self.inputs.accept(metadata);
++                    self.last_input = Some(Instant::now());
++                    accepted = true;
++                    break;
++                }
++                ffi::av_packet_unref(self.packet);
++                anyhow::ensure!(accepted, "decode packet was not accepted");
++            }
++            let flags = if input.is_none() || synchronous {
++                ffi::AV_CODEC_RECEIVE_FRAME_FLAG_SYNCHRONOUS as u32
++            } else {
++                0
++            };
++            self.receive_tagged(&mut batch, flags, timing)?;
++        }
++        anyhow::ensure!(
++            input.is_some() || !batch.images.is_empty() || self.inputs.pending.is_empty(),
++            "idle decode drain returned no pending picture"
++        );
++        batch.priming = input.is_some() && batch.images.is_empty() && self.inputs.priming();
++        Ok(batch)
++    }
++
++    unsafe fn receive_tagged(
++        &mut self,
++        batch: &mut DecodeBatch,
++        flags: u32,
++        mut timing: Option<&mut DecodeSample>,
++    ) -> Result<()> {
++        unsafe {
++            loop {
++                let at = timing.as_ref().map(|_| Instant::now());
++                let status = ffi::avcodec_receive_frame_flags(self.ctx, self.frame, flags);
++                if let (Some(at), Some(sample)) = (at, timing.as_mut()) {
++                    sample.phases[0] += at.elapsed();
++                }
++                if status == -libc::EAGAIN {
++                    return Ok(());
++                }
++                if status < 0 {
++                    return Err(av_error("receive decoded frame", status));
++                }
++                let decoded = (|| {
++                    anyhow::ensure!(
++                        batch.images.len() < MAX_PENDING,
++                        "decode output batch exceeded limit"
++                    );
++                    let metadata = self.inputs.take((*self.frame).pts)?;
++                    let image = DecodedImage::V4l2Planar(self.planar_frame(timing.as_deref_mut())?);
++                    Ok(TaggedImage {
++                        image,
++                        metadata,
++                        delayed: self.inputs.delay > 0,
++                    })
++                })();
++                ffi::av_frame_unref(self.frame);
++                batch.images.push(decoded?);
++                if let Some(sample) = timing.as_mut() {
++                    sample.frames += 1;
++                }
++            }
++        }
++    }
++
++    unsafe fn planar_frame(
++        &mut self,
++        mut timing: Option<&mut DecodeSample>,
++    ) -> Result<CpuPlanarFrame> {
++        unsafe {
++            if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32 {
++                bail!("V4L2 Request returned a non-DRM frame");
++            }
++            if (*self.frame).hw_frames_ctx.is_null() {
++                bail!("missing hardware frame context for SAND transfer");
++            }
++            let mut formats = ptr::null_mut();
++            let status = ffi::av_hwframe_transfer_get_formats(
++                (*self.frame).hw_frames_ctx,
++                ffi::AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_FROM,
++                &mut formats,
++                0,
++            );
++            if status < 0 {
++                return Err(av_error("query SAND transfer formats", status));
++            }
++            let mut format = ffi::AVPixelFormat::AV_PIX_FMT_NONE;
++            let mut candidate = formats;
++            while !candidate.is_null() && *candidate != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
++                if matches!(
++                    *candidate,
++                    ffi::AVPixelFormat::AV_PIX_FMT_YUV420P
++                        | ffi::AVPixelFormat::AV_PIX_FMT_YUV420P10LE
++                ) {
++                    format = *candidate;
++                    break;
++                }
++                candidate = candidate.add(1);
++            }
++            ffi::av_free(formats.cast());
++            if format == ffi::AVPixelFormat::AV_PIX_FMT_NONE {
++                bail!("no supported planar SAND transfer format");
++            }
++            let ten_bit = format == ffi::AVPixelFormat::AV_PIX_FMT_YUV420P10LE;
++            if self.direct_transfer
++                && !ten_bit
++                && direct_transfer_dimensions(
++                    (*self.frame).width,
++                    (*self.frame).height,
++                    [
++                        (*self.frame).crop_left,
++                        (*self.frame).crop_top,
++                        (*self.frame).crop_right,
++                        (*self.frame).crop_bottom,
++                    ],
++                )
++            {
++                match self.packed_frame(timing.as_deref_mut()) {
++                    Ok(frame) => return Ok(frame),
++                    Err(error) => {
++                        self.direct_transfer = false;
++                        tracing::warn!(%error, "packed SAND transfer disabled; using planar copy");
++                    }
++                }
++            }
++            if (*self.planar).buf[0].is_null()
++                || (*self.planar).width != (*self.frame).width
++                || (*self.planar).height != (*self.frame).height
++                || (*self.planar).format != format as i32
++            {
++                ffi::av_frame_unref(self.planar);
++                (*self.planar).format = format as i32;
++                (*self.planar).width = (*self.frame).width;
++                (*self.planar).height = (*self.frame).height;
++                let status = ffi::av_frame_get_buffer(self.planar, 64);
++                if status < 0 {
++                    return Err(av_error("allocating the planar transfer frame", status));
++                }
++                tracing::info!(
++                    input_bits = if ten_bit { 10 } else { 8 },
++                    output_bits = 8,
++                    width = (*self.planar).width,
++                    height = (*self.planar).height,
++                    "SAND planar transfer configured"
++                );
++            }
++            let status = ffi::av_frame_make_writable(self.planar);
++            if status < 0 {
++                return Err(av_error(
++                    "making the planar transfer frame writable",
++                    status,
++                ));
++            }
++            let transfer_started = timing.as_ref().map(|_| Instant::now());
++            let status = ffi::av_hwframe_transfer_data(self.planar, self.frame, 0);
++            if let (Some(at), Some(sample)) = (transfer_started, timing.as_mut()) {
++                sample.phases[1] += at.elapsed();
++            }
++            if status < 0 {
++                return Err(av_error("transfer SAND output to planar samples", status));
++            }
++
++            let copy_started = timing.as_ref().map(|_| Instant::now());
++            let width = (*self.planar).width as u32;
++            let height = (*self.planar).height as u32;
++            let (chroma_width, chroma_height) = CpuPlanarFrame::chroma_dims(width, height);
++            let dimensions = [
++                (width, height),
++                (chroma_width, chroma_height),
++                (chroma_width, chroma_height),
++            ];
++            let mut planes: [&[u8]; 3] = [&[]; 3];
++            let mut strides = [0usize; 3];
++            for index in 0..3 {
++                if (*self.planar).data[index].is_null() || (*self.planar).linesize[index] <= 0 {
++                    bail!("planar transfer returned an invalid plane {index}");
++                }
++                let stride = (*self.planar).linesize[index] as usize;
++                let rows = dimensions[index].1 as usize;
++                let row_bytes = dimensions[index].0 as usize * if ten_bit { 2 } else { 1 };
++                if rows == 0 || row_bytes == 0 || stride < row_bytes {
++                    bail!("invalid planar transfer dimensions or stride");
++                }
++                strides[index] = stride;
++                planes[index] = slice::from_raw_parts(
++                    (*self.planar).data[index],
++                    (rows - 1) * stride + row_bytes,
++                );
++            }
++            let color = ColorDesc {
++                primaries: (*self.frame).color_primaries as u8,
++                transfer: (*self.frame).color_trc as u8,
++                matrix: (*self.frame).colorspace as u8,
++                full_range: (*self.frame).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG,
++            };
++            let keyframe = (*self.frame).flags & FRAME_FLAG_KEY != 0
++                || (*self.frame).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I;
++            let recovery = punktfunk_core::reanchor::LocalRecovery::NONE;
++            let copied = if ten_bit {
++                let (offsets, total) = CpuPlanarFrame::packed_layout(width, height)?;
++                let mut data = vec![0; total];
++                for index in 0..3 {
++                    let end = offsets.get(index + 1).copied().unwrap_or(total);
++                    downshift_10bit_into(
++                        planes[index],
++                        strides[index],
++                        dimensions[index].0 as usize,
++                        dimensions[index].1 as usize,
++                        &mut data[offsets[index]..end],
++                    )?;
++                }
++                CpuPlanarFrame::from_packed(
++                    width, height, data, color, keyframe, recovery, "software",
++                )
++            } else {
++                CpuPlanarFrame::from_i420(width, height, planes, strides, color, keyframe, recovery)
++            };
++            if let (Some(at), Some(sample)) = (copy_started, timing.as_mut()) {
++                sample.phases[2] += at.elapsed();
++            }
++            copied
++        }
++    }
++
++    unsafe fn packed_frame(
++        &mut self,
++        mut timing: Option<&mut DecodeSample>,
++    ) -> Result<CpuPlanarFrame> {
++        unsafe {
++            let width = (*self.frame).width as u32;
++            let height = (*self.frame).height as u32;
++            let (_, total) = CpuPlanarFrame::packed_layout(width, height)?;
++            let copy_started = timing.as_ref().map(|_| Instant::now());
++            let mut data = vec![0; total];
++            let destination = PackedTransfer::new(self.planar, &mut data, width, height)?;
++            if let (Some(at), Some(sample)) = (copy_started, timing.as_mut()) {
++                sample.phases[2] += at.elapsed();
++            }
++            let transfer_started = timing.as_ref().map(|_| Instant::now());
++            let status = ffi::av_hwframe_transfer_data(destination.frame, self.frame, 0);
++            if let (Some(at), Some(sample)) = (transfer_started, timing.as_mut()) {
++                sample.phases[1] += at.elapsed();
++            }
++            if status < 0 {
++                return Err(av_error("transfer SAND output to packed samples", status));
++            }
++            anyhow::ensure!(
++                (*destination.frame).width == width as i32
++                    && (*destination.frame).height == height as i32
++                    && (*destination.frame).format == ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32,
++                "packed transfer changed picture layout"
++            );
++            let (offsets, _) = CpuPlanarFrame::packed_layout(width, height)?;
++            let base = destination._bytes.as_ptr();
++            for (i, offset) in offsets.into_iter().enumerate() {
++                anyhow::ensure!(
++                    (*destination.frame).data[i].cast_const() == base.add(offset)
++                        && (*destination.frame).linesize[i]
++                            == if i == 0 { width } else { width / 2 } as i32,
++                    "packed transfer changed plane {i} layout"
++                );
++            }
++            drop(destination);
++            CpuPlanarFrame::from_packed(
++                width,
++                height,
++                data,
++                ColorDesc {
++                    primaries: (*self.frame).color_primaries as u8,
++                    transfer: (*self.frame).color_trc as u8,
++                    matrix: (*self.frame).colorspace as u8,
++                    full_range: (*self.frame).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG,
++                },
++                (*self.frame).flags & FRAME_FLAG_KEY != 0
++                    || (*self.frame).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I,
++                punktfunk_core::reanchor::LocalRecovery::NONE,
++                "software",
++            )
++        }
++    }
++}
++
++fn downshift_10bit_into(
++    source: &[u8],
++    stride: usize,
++    width: usize,
++    height: usize,
++    target: &mut [u8],
++) -> Result<()> {
++    let row_bytes = width
++        .checked_mul(2)
++        .ok_or_else(|| anyhow::anyhow!("ten-bit row size overflow"))?;
++    let required = height
++        .checked_sub(1)
++        .and_then(|rows| rows.checked_mul(stride))
++        .and_then(|size| size.checked_add(row_bytes));
++    anyhow::ensure!(
++        width > 0
++            && stride >= row_bytes
++            && required.is_some_and(|size| size <= source.len())
++            && width.checked_mul(height) == Some(target.len()),
++        "invalid ten-bit plane layout"
++    );
++    for row in 0..height {
++        let source = &source[row * stride..row * stride + row_bytes];
++        let target = &mut target[row * width..(row + 1) * width];
++        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
++        // SAFETY: AArch64 supplies NEON; complete eight-sample chunks fit both slices.
++        let done = unsafe { downshift_10bit_neon(source, target) };
++        #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
++        let done = 0;
++        for (sample, output) in source[done * 2..].chunks_exact(2).zip(&mut target[done..]) {
++            let value = u16::from_le_bytes([sample[0], sample[1]]);
++            *output = ((u32::from(value) + 2) >> 2).min(255) as u8;
++        }
++    }
++    Ok(())
++}
++
++#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
++#[target_feature(enable = "neon")]
++unsafe fn downshift_10bit_neon(source: &[u8], target: &mut [u8]) -> usize {
++    use std::arch::aarch64::{vld1q_u8, vqrshrn_n_u16, vreinterpretq_u16_u8, vst1_u8};
++    let chunks = (source.len() / 16).min(target.len() / 8);
++    for chunk in 0..chunks {
++        // SAFETY: each chunk reads 16 valid bytes and writes eight. Byte loads
++        // accept unaligned planes; rounded saturating narrowing matches the scalar path.
++        unsafe {
++            let samples = vreinterpretq_u16_u8(vld1q_u8(source.as_ptr().add(chunk * 16)));
++            vst1_u8(
++                target.as_mut_ptr().add(chunk * 8),
++                vqrshrn_n_u16::<2>(samples),
++            );
++        }
++    }
++    chunks * 8
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{
++        direct_transfer_dimensions, downshift_10bit_into, idle_drain_due, DecodeSample,
++        DecodeTiming, InputLedger, PackedTransfer, MAX_PENDING,
++    };
++    use crate::video::DecodeMetadata;
++    use ffmpeg_sys_next as ffi;
++    use std::time::{Duration, Instant};
++
++    #[test]
++    fn delayed_outputs_match_accepted_inputs_not_the_latest_packet() {
++        let mut inputs = InputLedger::new(1);
++        let first = DecodeMetadata {
++            pts_ns: 100,
++            received_ns: 110,
++            flags: 7,
++            recovery_generation: 3,
++        };
++        let second = DecodeMetadata {
++            pts_ns: 200,
++            received_ns: 220,
++            flags: 8,
++            recovery_generation: 4,
++        };
++        let token = inputs.token().unwrap();
++        assert_eq!(inputs.token().unwrap(), token);
++        inputs.accept(first);
++        assert!(inputs.priming());
++        let next = inputs.token().unwrap();
++        inputs.accept(second);
++        assert!(!inputs.priming());
++        assert_eq!(inputs.take(next).unwrap(), second);
++        assert_eq!(inputs.take(token).unwrap(), first);
++        assert!(inputs.take(token).is_err());
++        assert!(!inputs.priming());
++    }
++
++    #[test]
++    fn metadata_and_priming_are_bounded_and_reset_discards_old_tokens() {
++        let mut inputs = InputLedger::new(1);
++        assert!(!inputs.priming());
++        for _ in 0..MAX_PENDING {
++            assert!(inputs.token().is_ok());
++            inputs.accept(DecodeMetadata::default());
++        }
++        assert!(inputs.token().is_err());
++        assert!(!inputs.priming());
++        inputs.reset();
++        assert!(inputs.pending.is_empty());
++        assert!(!inputs.priming());
++        assert!(inputs.take(1).is_err());
++        assert_eq!(inputs.token().unwrap(), MAX_PENDING as i64 + 1);
++        inputs.accept(DecodeMetadata::default());
++        assert!(inputs.priming());
++        let mut single = InputLedger::new(0);
++        single.accept(DecodeMetadata::default());
++        assert!(!single.priming());
++    }
++
++    #[test]
++    fn idle_drain_preserves_regular_cadence_but_releases_an_isolated_frame() {
++        let start = Instant::now();
++        assert!(!idle_drain_due(None, start));
++        for period in [8, 17] {
++            let mut last = start;
++            for _ in 0..120 {
++                let arrival = last + Duration::from_millis(period);
++                assert!(!idle_drain_due(Some(last), arrival));
++                last = arrival;
++            }
++            assert!(!idle_drain_due(
++                Some(last),
++                last + Duration::from_millis(49)
++            ));
++            assert!(idle_drain_due(Some(last), last + Duration::from_millis(50)));
++            assert!(idle_drain_due(Some(last), last + Duration::from_millis(70)));
++        }
++    }
++
++    #[test]
++    fn direct_transfer_requires_even_uncropped_dimensions() {
++        assert!(direct_transfer_dimensions(130, 4, [0; 4]));
++        assert!(direct_transfer_dimensions(3840, 2160, [0; 4]));
++        for (w, h) in [(0, 4), (-2, 4), (130, 0), (129, 4), (130, 3)] {
++            assert!(!direct_transfer_dimensions(w, h, [0; 4]));
++        }
++        for i in 0..4 {
++            let mut crop = [0; 4];
++            crop[i] = 2;
++            assert!(!direct_transfer_dimensions(130, 4, crop));
++        }
++    }
++
++    #[test]
++    fn packed_transfer_releases_references_on_success_and_error() {
++        unsafe {
++            let mut frame = ffi::av_frame_alloc();
++            assert!(!frame.is_null());
++            let mut data = vec![0; 130 * 4 * 3 / 2];
++            let address = data.as_ptr();
++            {
++                let destination = PackedTransfer::new(frame, &mut data, 130, 4).unwrap();
++                assert_eq!(ffi::av_buffer_get_ref_count((*frame).buf[0]), 1);
++                for (i, length) in [520, 130, 130].into_iter().enumerate() {
++                    std::ptr::write_bytes((*destination.frame).data[i], (i + 1) as u8, length);
++                }
++            }
++            assert!((*frame).buf[0].is_null());
++            assert!((*frame).data[0].is_null());
++            assert_eq!(data.as_ptr(), address);
++            assert!(data[..520].iter().all(|&v| v == 1));
++            assert!(data[520..650].iter().all(|&v| v == 2));
++            assert!(data[650..].iter().all(|&v| v == 3));
++            let fail = |bytes: &mut [u8]| -> anyhow::Result<()> {
++                let _destination = PackedTransfer::new(frame, bytes, 130, 4)?;
++                anyhow::bail!("injected transfer failure");
++            };
++            assert!(fail(&mut data).is_err());
++            assert!((*frame).buf[0].is_null());
++            assert!((*frame).data[0].is_null());
++            data.fill(7);
++            assert_eq!(data[779], 7);
++            assert!(PackedTransfer::new(frame, &mut data[..779], 130, 4).is_err());
++            ffi::av_frame_free(&mut frame);
++        }
++    }
++
++    #[test]
++    fn timing_counts_empty_calls_and_resets_after_each_window() {
++        let at = Instant::now();
++        let mut timing = DecodeTiming::new(at);
++        let sample = |frames, us| DecodeSample {
++            phases: [Duration::from_micros(us); 4],
++            frames,
++        };
++        assert!(timing.add(sample(0, 10), at).is_none());
++        let report = timing
++            .add(sample(2, 30), at + Duration::from_secs(1))
++            .unwrap();
++        assert_eq!((report.calls, report.frames), (2, 2));
++        assert_eq!(report.mean_us(0), 20.0);
++        assert_eq!(report.peaks[0], Duration::from_micros(30));
++        assert_eq!((timing.calls, timing.frames), (0, 0));
++        assert!(timing
++            .add(sample(1, 5), at + Duration::from_millis(1500))
++            .is_none());
++        let report = timing
++            .add(sample(1, 7), at + Duration::from_secs(2))
++            .unwrap();
++        assert_eq!(report.mean_us(3), 6.0);
++        assert_eq!(report.peaks[3], Duration::from_micros(7));
++    }
++
++    #[test]
++    fn ten_bit_downshift_matches_every_u16_value() {
++        let input: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
++        let mut output = vec![0; 65536];
++        downshift_10bit_into(&input, input.len(), output.len(), 1, &mut output).unwrap();
++        for (value, actual) in output.into_iter().enumerate() {
++            assert_eq!(
++                actual,
++                (((value as u32 + 2) >> 2).min(255)) as u8,
++                "sample {value}"
++            );
++        }
++    }
++
++    #[test]
++    fn ten_bit_downshift_handles_unaligned_padded_rows_and_vector_tails() {
++        for width in [1, 3, 7, 8, 9, 15, 17, 130] {
++            let height = 3;
++            let stride = width * 2 + 3;
++            let mut input = vec![0xaa; 1 + (height - 1) * stride + width * 2];
++            let mut expected = Vec::new();
++            for row in 0..height {
++                for column in 0..width {
++                    let value = ((row * width + column) * 911 + 31) as u16;
++                    let at = 1 + row * stride + column * 2;
++                    input[at..at + 2].copy_from_slice(&value.to_le_bytes());
++                    expected.push(((u32::from(value) + 2) >> 2).min(255) as u8);
++                }
++            }
++            let mut output = vec![0x55; 2 + width * height];
++            downshift_10bit_into(
++                &input[1..],
++                stride,
++                width,
++                height,
++                &mut output[1..1 + width * height],
++            )
++            .unwrap();
++            assert_eq!(&output[1..1 + width * height], expected.as_slice());
++            assert_eq!((output[0], output[1 + width * height]), (0x55, 0x55));
++        }
++    }
++
++    #[test]
++    fn ten_bit_downshift_rejects_short_planes_and_invalid_geometry() {
++        let mut output = [0; 8];
++        for (stride, width, height) in [
++            (7, 4, 2),
++            (8, 0, 2),
++            (8, 4, 0),
++            (8, usize::MAX, 2),
++            (usize::MAX, 4, 3),
++        ] {
++            assert!(downshift_10bit_into(&[0; 16], stride, width, height, &mut output).is_err());
++        }
++        assert!(downshift_10bit_into(&[0; 15], 8, 4, 2, &mut output).is_err());
++        assert!(downshift_10bit_into(&[0; 16], 8, 4, 2, &mut output[..7]).is_err());
++    }
++
++    #[test]
++    fn ten_bit_transfer_preserves_range_rounding_and_row_padding() {
++        let samples = [0u16, 64, 512, 940, 1023, 65535, 1, 2, 3, 4, 1022];
++        let bytes: Vec<u8> = samples
++            .iter()
++            .flat_map(|value| value.to_le_bytes())
++            .collect();
++        let mut output = vec![0; 10];
++        downshift_10bit_into(&bytes, 12, 5, 2, &mut output).unwrap();
++        assert_eq!(output, [0, 16, 128, 235, 255, 0, 1, 1, 1, 255]);
++    }
++}
++
++impl Drop for V4l2RequestDecoder {
++    fn drop(&mut self) {
++        unsafe {
++            ffi::av_packet_free(&mut self.packet);
++            ffi::av_frame_free(&mut self.frame);
++            ffi::av_frame_free(&mut self.planar);
++            ffi::avcodec_free_context(&mut self.ctx);
++        }
++    }
++}
++
++fn av_error(operation: &str, status: i32) -> anyhow::Error {
++    let mut buffer = [0 as c_char; 128];
++    let message = unsafe {
++        if ffi::av_strerror(status, buffer.as_mut_ptr(), buffer.len()) == 0 {
++            CStr::from_ptr(buffer.as_ptr())
++                .to_string_lossy()
++                .into_owned()
++        } else {
++            format!("FFmpeg error {status}")
++        }
++    };
++    anyhow::anyhow!("{operation}: {message}")
++}
+diff --git a/crates/core/punktfunk-core/src/client/mod.rs b/crates/core/punktfunk-core/src/client/mod.rs
+index 3dccbdebbe74334242ee8fd9e57a86d257798d5c..1a618259f6986e92599249c93445fb4e499a6f7e 100644
+--- a/crates/core/punktfunk-core/src/client/mod.rs
++++ b/crates/core/punktfunk-core/src/client/mod.rs
+@@ -1028,20 +1028,34 @@ impl NativeClient {
+             .admit
+     }
+ 
+-    /// [`recovery_on_frame`](Self::recovery_on_frame) by index, with the gap ahead of the AU
+-    /// for the receiver rule. Report a sliced AU once, on its first part: parts repeat the
+-    /// index.
++    /// Admit an AU by index and report its preceding gap. Sliced AUs report only their first part.
+     pub fn recovery_on_au(&self, index: u32, complete: bool, decode_order: u64) -> Arrival {
+-        let arrived = RecoveryEvent::Arrived {
++        self.recovery_on_au_with_generation(index, complete, decode_order)
++            .0
++    }
++
++    /// Admit an AU and capture its resulting loss generation under the same lock.
++    pub fn recovery_on_au_with_generation(
++        &self,
++        index: u32,
++        complete: bool,
++        decode_order: u64,
++    ) -> (Arrival, u64) {
++        let (step, generation) = recovery_admission_generation(
++            &self.shared.recovery,
++            self.shared.frames_dropped.load(Ordering::Relaxed),
+             index,
+             complete,
+             decode_order,
+-        };
+-        let step = self.recovery_step(arrived, true);
+-        Arrival {
+-            admit: step.admit,
+-            gap: step.gap,
+-        }
++        );
++        send_recovery(&self.shared, step.ask);
++        (
++            Arrival {
++                admit: step.admit,
++                gap: step.gap,
++            },
++            generation,
++        )
+     }
+ 
+     /// One decoded picture: whether to show it, and whether the lift came from an
+@@ -1054,6 +1068,25 @@ impl NativeClient {
+         }
+     }
+ 
++    /// Check a buffered picture's loss generation and apply its recovery marks under one lock.
++    pub fn recovery_on_decoded_at_generation(
++        &self,
++        decoded: Decoded,
++        generation: u64,
++    ) -> Option<Shown> {
++        let step = decoded_recovery_at_generation(
++            &self.shared.recovery,
++            self.shared.frames_dropped.load(Ordering::Relaxed),
++            decoded,
++            generation,
++        )?;
++        send_recovery(&self.shared, step.ask);
++        Some(Shown {
++            hold: step.hold,
++            forgive_chain: step.forgive_chain,
++        })
++    }
++
+     /// One AU produced no picture: a wedged decoder with no reassembler drop. Three in a
+     /// row arm the freeze and ask for an IDR.
+     pub fn recovery_on_no_output(&self) {
+@@ -2445,3 +2478,102 @@ mod keep_awake_tests {
+         assert!(!holds_screen_awake(false, long));
+     }
+ }
++
++fn recovery_admission_generation(
++    recovery: &Mutex<RecoveryDriver>,
++    dropped: u64,
++    index: u32,
++    complete: bool,
++    decode_order: u64,
++) -> (recovery::RecoveryStep, u64) {
++    let mut recovery = recovery.lock().unwrap();
++    recovery.engage(dropped);
++    let step = recovery.step(
++        RecoveryEvent::Arrived {
++            index,
++            complete,
++            decode_order,
++        },
++        Instant::now(),
++    );
++    (step, recovery.arms())
++}
++
++fn decoded_recovery_at_generation(
++    recovery: &Mutex<RecoveryDriver>,
++    dropped: u64,
++    decoded: Decoded,
++    generation: u64,
++) -> Option<recovery::RecoveryStep> {
++    let mut recovery = recovery.lock().unwrap();
++    recovery.engage(dropped);
++    if recovery.arms() != generation {
++        return None;
++    }
++    Some(recovery.step(RecoveryEvent::Decoded(decoded), Instant::now()))
++}
++
++#[cfg(test)]
++mod delayed_recovery_tests {
++    use super::*;
++
++    #[test]
++    fn loss_after_admission_keeps_the_original_input_generation() {
++        let recovery = Mutex::new(RecoveryDriver::default());
++        let (admission, generation) = recovery_admission_generation(&recovery, 0, 10, true, 0);
++        assert!(admission.admit);
++        recovery
++            .lock()
++            .unwrap()
++            .step(RecoveryEvent::Lost, Instant::now());
++        assert_ne!(recovery.lock().unwrap().arms(), generation);
++        let old_keyframe = Decoded {
++            flags: crate::packet::USER_FLAG_RECOVERY_ANCHOR,
++            keyframe: true,
++            evidence: crate::reanchor::AnchorEvidence::Unavailable,
++            local: crate::reanchor::LocalRecovery::NONE,
++            decode_order: None,
++        };
++        assert!(decoded_recovery_at_generation(&recovery, 0, old_keyframe, generation).is_none());
++    }
++
++    #[test]
++    fn gap_admission_returns_its_newly_armed_generation() {
++        let recovery = Mutex::new(RecoveryDriver::default());
++        let (_, before_gap) = recovery_admission_generation(&recovery, 0, 10, true, 0);
++        let (admission, after_gap) = recovery_admission_generation(&recovery, 0, 12, true, 1);
++        assert!(admission.admit);
++        assert_eq!(admission.gap, 1);
++        assert_ne!(after_gap, before_gap);
++        assert_eq!(after_gap, recovery.lock().unwrap().arms());
++    }
++
++    #[test]
++    fn delayed_keyframe_cannot_heal_loss_armed_while_waiting_for_recovery_lock() {
++        let recovery = Arc::new(Mutex::new(RecoveryDriver::default()));
++        let mut held = recovery.lock().unwrap();
++        held.engage(0);
++        let before_loss = held.arms();
++        let decoded = Decoded {
++            flags: 0,
++            keyframe: true,
++            evidence: crate::reanchor::AnchorEvidence::Unavailable,
++            local: crate::reanchor::LocalRecovery::NONE,
++            decode_order: None,
++        };
++        let pending = recovery.clone();
++        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
++        let worker = std::thread::spawn(move || {
++            ready_tx.send(()).unwrap();
++            decoded_recovery_at_generation(&pending, 0, decoded, before_loss)
++        });
++        ready_rx.recv().unwrap();
++        held.step(RecoveryEvent::Lost, Instant::now());
++        let after_loss = held.arms();
++        assert_ne!(before_loss, after_loss);
++        drop(held);
++        assert!(worker.join().unwrap().is_none());
++        let current = decoded_recovery_at_generation(&recovery, 0, decoded, after_loss).unwrap();
++        assert!(!current.hold);
++    }
++}
