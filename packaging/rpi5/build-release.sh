@@ -46,7 +46,6 @@ if [[ "${working_tree}" == --working-tree ]]; then
     fi
 fi
 
-python3 -m unittest discover -s "${source_tree}/packaging/rpi5/kiosk"
 git clone --filter=blob:none https://github.com/jc-kynesim/rpi-ffmpeg.git "${ffmpeg_source}"
 git -C "${ffmpeg_source}" checkout --detach "${ffmpeg_ref}"
 

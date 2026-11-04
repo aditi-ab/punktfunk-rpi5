@@ -112,7 +112,7 @@ It keeps existing app-owned files. Subsequent compatible app updates use the men
 The app bundle does not replace these privileged helpers; changes to the runtime
 contract require a separately reviewed kiosk-tools or OS upgrade.
 
-Run the helper regression checks on Linux with:
+Run the helper regression checks on Linux with Python 3.12 or later:
 
 ```sh
 python3 -m unittest discover -s packaging/rpi5/kiosk

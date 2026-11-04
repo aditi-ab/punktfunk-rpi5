@@ -18,6 +18,8 @@ cache=${PUNKTFUNK_IMAGE_CACHE:-/root/.cache/punktfunk-raspios}
 output="$output_dir/punktfunk-${tag#v}-kiosk.img"
 [[ ! -e "$output.xz" ]] || die "Output already exists: $output"
 for command in curl xz sfdisk losetup resize2fs e2fsck fsck.vfat python3; do require_command "$command"; done
+python3 -c 'import tarfile; assert hasattr(tarfile, "data_filter"), "Image checks need Python 3.12 or later"'
+python3 -m unittest discover -s "$here"
 mkdir -p "$cache" "$output_dir"
 if [[ ! -f "$cache/base.img.xz" ]]; then
     curl -fL --retry 3 "$base_url" -o "$cache/base.img.xz.tmp"
