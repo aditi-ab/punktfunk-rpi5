@@ -1,0 +1,67 @@
+{
+  "cadence": {
+    "crtc": 2,
+    "duration_s": 20.41158599999835,
+    "deliveries": 777,
+    "delivery_fps": 38.0666156956183,
+    "frame_interval_p95_ms": 33.34200000244891,
+    "frame_interval_max_ms": 50.011999999696855,
+    "switches": 34,
+    "first_300ms_fps": 32.05882352941177,
+    "first_300ms_frame_counts": [
+      8,
+      10,
+      10,
+      10,
+      9,
+      10,
+      10,
+      9,
+      9,
+      10,
+      10,
+      9,
+      9,
+      10,
+      10,
+      10,
+      9,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      9,
+      10,
+      10,
+      10,
+      9,
+      9,
+      9,
+      10,
+      9
+    ],
+    "transition_max_gap_ms": 74.39100000192411
+  },
+  "engine_busy_percent": {
+    "punktfunk-kiosk.service": {
+      "cache_clean": 0.0,
+      "csd": 0.0,
+      "cpu": 0.0,
+      "render": 92.4,
+      "bin": 7.4,
+      "tfu": 0.0
+    },
+    "punktfunk-weston.service": {
+      "cache_clean": 0.0,
+      "csd": 0.0,
+      "cpu": 0.0,
+      "render": 0.0,
+      "bin": 0.0,
+      "tfu": 0.0
+    }
+  }
+}

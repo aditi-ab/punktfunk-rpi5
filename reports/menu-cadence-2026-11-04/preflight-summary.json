@@ -1,0 +1,33 @@
+{
+  "phase": "preflight",
+  "output": "3840x1600@60",
+  "installed_source": "be02c98a1712a04ddf478b9f271f3e22211928c2",
+  "field_edge": 96,
+  "repaint_window_ms": 16,
+  "results": [
+    {
+      "pair": "Hosts ↔ Games",
+      "before_transition_fps": 27.058823529411768,
+      "after_transition_fps": 59.21568627450981,
+      "before_p95_ms": 50.01099999935832,
+      "after_p95_ms": 16.674000002240064,
+      "switches": 34
+    },
+    {
+      "pair": "Games ↔ Controllers",
+      "before_transition_fps": 32.05882352941177,
+      "after_transition_fps": 59.70588235294118,
+      "before_p95_ms": 33.34200000244891,
+      "after_p95_ms": 16.673999998602085,
+      "switches": 34
+    },
+    {
+      "pair": "Controllers ↔ Settings",
+      "before_transition_fps": 23.529411764705884,
+      "after_transition_fps": 58.62745098039216,
+      "before_p95_ms": 50.011999999696855,
+      "after_p95_ms": 16.674000002240064,
+      "switches": 34
+    }
+  ]
+}
