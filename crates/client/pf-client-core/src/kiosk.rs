@@ -14,6 +14,8 @@ pub enum Action {
     InstallVirtualHere,
     EnableVirtualHere,
     DisableVirtualHere,
+    CheckUpdate,
+    InstallUpdate,
 }
 impl Action {
     fn argument(self) -> &'static str {
@@ -25,6 +27,8 @@ impl Action {
             Self::InstallVirtualHere => "virtualhere-install",
             Self::EnableVirtualHere => "virtualhere-enable",
             Self::DisableVirtualHere => "virtualhere-disable",
+            Self::CheckUpdate => "update-check",
+            Self::InstallUpdate => "update-install",
         }
     }
 }
@@ -48,6 +52,12 @@ pub struct Snapshot {
     pub virtualhere_installed: bool,
     pub virtualhere_running: bool,
     pub virtualhere_license_saved: bool,
+    pub update_supported: bool,
+    pub update_available: bool,
+    pub update_version: String,
+    pub update_phase: String,
+    pub update_message: String,
+    pub os_version: String,
 }
 
 pub fn available() -> bool {
@@ -114,7 +124,7 @@ fn run(action: Action) -> Result<Snapshot, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| "Device controls are unavailable.".to_string())?;
-    let timeout = if action == Action::InstallVirtualHere {
+    let timeout = if matches!(action, Action::InstallVirtualHere | Action::CheckUpdate) {
         180
     } else {
         30

@@ -77,3 +77,43 @@ controls can become unavailable while the PC owns that USB device.
 Vendor documentation: [server and licensing](https://www.virtualhere.com/usb_server_software),
 [license purchase](https://www.virtualhere.com/purchase),
 [client download](https://www.virtualhere.com/usb_client_software).
+
+## App updates
+
+**Settings > Raspberry Pi > Punktfunk updates** checks the latest stable GitHub
+release. Choose **Install app update** to download the portable bundle and restart
+Punktfunk. Pairings, settings, SSH credentials and VirtualHere licensing stay in
+`/data`; the kernel, firmware, Weston and OS packages are not replaced.
+
+Each release includes the app archive, its checksum and an `.update.json` manifest.
+The updater checks the release identity, archive size, SHA-256 and kiosk runtime
+contract before unpacking. The current contract is `raspios-trixie-arm64-v1`;
+change it when an app needs incompatible OS dependencies. Releases requiring a
+different contract are rejected without stopping the installed app.
+
+Versions live under `/opt/punktfunk-releases`. An atomic symlink selects the active
+app. The previous version remains available; a failed startup restores it. Startup
+health means the same process stays alive for 20 seconds, not that playback or
+navigation has been visually tested. Boot recovery restores the previous version
+if power fails during activation. Do not remove retained versions during an update.
+
+Existing Trixie kiosk installations can add the updater once over SSH without
+reflashing. From a checkout of the desired fork release, run on the Pi:
+
+```sh
+sudo bash packaging/rpi5/kiosk/install-kiosk-tools.sh
+sudo /usr/libexec/punktfunk/kiosk-control update-check
+sudo /usr/libexec/punktfunk/kiosk-control update-install
+```
+
+The setup installs kiosk helpers and services, migrates the app directory when
+needed, and protects root service state below a root-owned sticky `/data` directory.
+It keeps existing app-owned files. Subsequent compatible app updates use the menu.
+The app bundle does not replace these privileged helpers; changes to the runtime
+contract require a separately reviewed kiosk-tools or OS upgrade.
+
+Run the helper regression checks on Linux with:
+
+```sh
+python3 -m unittest discover -s packaging/rpi5/kiosk
+```

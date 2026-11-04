@@ -11,6 +11,11 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+if [ "${prefix}" = /opt/punktfunk-rpi5 ] && [ -f /etc/punktfunk-kiosk-runtime ]; then
+    printf 'Use Settings > Raspberry Pi > Punktfunk updates on this kiosk.\n' >&2
+    exit 1
+fi
+
 install -d -m 0755 "${prefix}" "${prefix}/lib" "${link_dir}"
 install -m 0755 "${source_dir}/punktfunk" "${source_dir}/punktfunk-session" "${prefix}/"
 cp -a "${source_dir}/lib/." "${prefix}/lib/"

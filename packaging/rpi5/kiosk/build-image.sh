@@ -81,8 +81,9 @@ rm -rf "$root/var/lib/apt/lists/"*
 tar -xzf "$bundle" -C "$work/bundle" --strip-components=1
 [[ $(cat "$work/bundle/build-version") == "${tag#v}" ]] || die 'Bundle version does not match release tag.'
 [[ $(cat "$work/bundle/fork-commit") == "$release_commit" ]] || die 'Bundle commit does not match release tag.'
-install -d "$root/opt/punktfunk-rpi5"
-cp -a "$work/bundle/." "$root/opt/punktfunk-rpi5/"
+install -d "$root/opt/punktfunk-releases/${tag#v}"
+cp -a "$work/bundle/." "$root/opt/punktfunk-releases/${tag#v}/"
+ln -s "punktfunk-releases/${tag#v}" "$root/opt/punktfunk-rpi5"
 if ! run id punktfunk >/dev/null 2>&1; then
     run useradd --system --user-group --home-dir /data --shell /usr/sbin/nologin punktfunk
 fi
@@ -90,6 +91,8 @@ run usermod -a -G video,render,input,audio,netdev,bluetooth punktfunk
 install -d "$root/data/.config/punktfunk" "$root/data/cache" "$root/data/state" "$root/data/logs"
 install -m 0600 "$here/runtime/client-gtk-settings.json" "$root/data/.config/punktfunk/"
 run chown -R punktfunk:punktfunk /data
+run install -d -o root -g punktfunk -m 1775 /data
+run install -d -o root -g root -m 0700 /data/punktfunk-update /data/virtualhere
 # Public appliances have no provisioned remote account or password login.
 run passwd --lock root
 run passwd --lock punktfunk
@@ -101,6 +104,14 @@ install -D -m 0644 "$here/runtime/kiosk-ssh.conf" "$root/etc/ssh/sshd_config.d/0
 sed -i 's/\r$//' "$root/usr/libexec/punktfunk/kiosk-control" "$root/etc/sudoers.d/punktfunk-kiosk" "$root/etc/ssh/sshd_config.d/00-punktfunk.conf"
 install -m 0644 "$here/runtime/punktfunk-virtualhere.service" "$root/etc/systemd/system/punktfunk-virtualhere.service"
 sed -i 's/\r$//' "$root/etc/systemd/system/punktfunk-virtualhere.service"
+install -m 0755 "$here/runtime/kiosk-update" "$root/usr/libexec/punktfunk/kiosk-update"
+printf 'raspios-trixie-arm64-v1\n' >"$root/etc/punktfunk-kiosk-runtime"
+for unit in punktfunk-update.service punktfunk-update-recovery.service; do
+    install -m 0644 "$here/runtime/$unit" "$root/etc/systemd/system/$unit"
+    sed -i 's/\r$//' "$root/etc/systemd/system/$unit"
+done
+install -D -m 0644 "$here/runtime/kiosk-update.conf" "$root/etc/systemd/system/punktfunk-kiosk.service.d/update.conf"
+sed -i 's/\r$//' "$root/usr/libexec/punktfunk/kiosk-update" "$root/etc/systemd/system/punktfunk-kiosk.service.d/update.conf"
 run visudo --check --file /etc/sudoers.d/punktfunk-kiosk
 run install -d -m 0755 /run/sshd
 run ssh-keygen -A
@@ -218,7 +229,7 @@ run ldd /opt/punktfunk-rpi5/punktfunk-session >"$work/linkage.txt"
 ! grep -q 'not found' "$work/linkage.txt" || { cat "$work/linkage.txt"; die 'Missing session library'; }
 run ldd -r /usr/lib/aarch64-linux-gnu/libweston-14/drm-backend.so >"$work/weston-linkage.txt"
 ! grep -E 'not found|undefined symbol' "$work/weston-linkage.txt" || die 'Weston module linkage failed.'
-run systemd-analyze verify punktfunk-session.target punktfunk-kiosk.service
+run systemd-analyze verify punktfunk-session.target punktfunk-kiosk.service punktfunk-update.service
 install -d "$root/etc/ssh"
 find "$root/etc/ssh" -maxdepth 1 -type f -name 'ssh_host_*_key*' -delete
 python3 "$here/verify-image.py" "$root" "$tag" "$release_commit"

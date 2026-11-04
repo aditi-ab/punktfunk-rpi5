@@ -1,0 +1,382 @@
+#!/usr/bin/python3 -I
+"""Install compatible public app bundles without changing the kiosk OS."""
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+REPO = "aditi-ab/punktfunk-rpi5"
+API = f"https://api.github.com/repos/{REPO}/releases/latest"
+RUNTIME = Path("/etc/punktfunk-kiosk-runtime")
+PREFIX = Path("/opt/punktfunk-rpi5")
+RELEASES = Path("/opt/punktfunk-releases")
+STATE = Path("/data/punktfunk-update/state.json")
+LOCK = Path("/run/punktfunk-update.lock")
+SERVICE = "punktfunk-kiosk.service"
+WORKER = "punktfunk-update.service"
+BUSY = {"queued", "downloading", "verifying", "switching", "testing"}
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"}
+
+
+def version(value):
+    """Only release tags with a numeric upstream version and Pi revision are accepted."""
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)-rpi5\.(\d+)", value)
+    if not match:
+        raise RuntimeError("This is not a Raspberry Pi release.")
+    return tuple(map(int, match.groups()))
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def save(state):
+    """Flush state before switching the app so boot recovery can restore its predecessor."""
+    STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    STATE.parent.chmod(0o700)
+    state["updated_at"] = time.time()
+    with tempfile.NamedTemporaryFile(mode="w", dir=STATE.parent, delete=False) as out:
+        temporary = Path(out.name)
+        json.dump(state, out)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(temporary, STATE)
+    sync_dir(STATE.parent)
+
+
+def sync_dir(path):
+    with contextlib.ExitStack() as stack:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        stack.callback(os.close, fd)
+        os.fsync(fd)
+
+
+def command(*args, required=True, timeout=15):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                            check=False, cwd="/", env=ENV)
+    if required and result.returncode:
+        raise RuntimeError("Couldn't start or stop Punktfunk. Check the system log.")
+    return result
+
+
+@contextlib.contextmanager
+def locked():
+    with LOCK.open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("An update operation is already running.") from None
+        yield
+
+
+def fetch(url, limit, output=None):
+    """Bound HTTPS downloads by size and elapsed time; no release-supplied URLs are used."""
+    request = urllib.request.Request(url, headers={"User-Agent": "Punktfunk-RPi5-Updater"})
+    digest = hashlib.sha256()
+    body = bytearray()
+    size = 0
+    deadline = time.monotonic() + (300 if output else 30)
+    with urllib.request.urlopen(request, timeout=15) as response:
+        if not response.geturl().startswith("https://"):
+            raise RuntimeError("The update download used an insecure connection.")
+        while block := response.read(65536):
+            size += len(block)
+            if size > limit or time.monotonic() > deadline:
+                raise RuntimeError("The update download didn't finish. Try again.")
+            digest.update(block)
+            if output is None:
+                body.extend(block)
+            else:
+                output.write(block)
+    return (bytes(body), size, digest.hexdigest())
+
+
+def asset_url(tag, name):
+    version(tag)
+    return f"https://github.com/{REPO}/releases/download/{tag}/{name}"
+
+
+def validate_manifest(data, tag):
+    """The package must match this OS ABI, release tag and archive name."""
+    ver = tag.removeprefix("v")
+    version(ver)
+    archive = f"punktfunk-{ver}-linux-arm64.tar.gz"
+    if (data.get("format") != 1 or data.get("version") != ver or
+            data.get("archive") != archive or data.get("platform") != "rpi5-arm64"):
+        raise RuntimeError("The release has an invalid app update package.")
+    if data.get("runtime") != RUNTIME.read_text().strip():
+        raise RuntimeError("This release needs a newer kiosk OS. The installed app was kept.")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(data.get("sha256", ""))):
+        raise RuntimeError("The release checksum is invalid.")
+    if not re.fullmatch(r"[0-9a-f]{40}", str(data.get("commit", ""))):
+        raise RuntimeError("The release source identifier is invalid.")
+    if type(data.get("size")) is not int or not 0 < data["size"] <= 512 * 1024 * 1024:
+        raise RuntimeError("The update package size is invalid.")
+    return data
+
+
+def installed():
+    return (PREFIX / "build-version").read_text().strip()
+
+
+def status():
+    state = read_json(STATE)
+    current = installed()
+    candidate = state.get("candidate", {})
+    offered = candidate.get("version", state.get("latest", ""))
+    return {"update_supported": True, "update_version": offered,
+            "update_available": bool(offered and version(offered) > version(current)),
+            "update_phase": state.get("phase", "idle"),
+            "update_message": state.get("message", "Choose Check for updates."),
+            "os_version": "Raspberry Pi OS · Debian 13 (64-bit)"}
+
+
+def check():
+    """Only published stable releases can offer an app update."""
+    with locked():
+        state = read_json(STATE)
+        if state.get("phase") in BUSY:
+            raise RuntimeError("An update is already running.")
+        release = json.loads(fetch(API, 1024 * 1024)[0])
+        tag = release.get("tag_name", "")
+        if release.get("draft") or release.get("prerelease"):
+            raise RuntimeError("No stable update is available.")
+        if version(tag) <= version(installed()):
+            save({"phase": "idle", "latest": installed(), "message": "Punktfunk is up to date."})
+            return
+        name = f"punktfunk-{tag.removeprefix('v')}-linux-arm64.tar.gz.update.json"
+        if name not in {asset.get("name") for asset in release.get("assets", [])}:
+            raise RuntimeError("This release has no app update package. Try again later.")
+        candidate = validate_manifest(json.loads(fetch(asset_url(tag, name), 16384)[0]), tag)
+        save({"phase": "ready", "candidate": candidate,
+              "message": "An app update is available. Your settings will be kept."})
+
+
+def start():
+    with locked():
+        state = read_json(STATE)
+        if state.get("phase") != "ready" or not status()["update_available"]:
+            raise RuntimeError("Check for updates before installing.")
+        state.update(phase="queued", message="Preparing the app update…")
+        save(state)
+    try:
+        command("/usr/bin/systemctl", "start", WORKER)
+    except Exception:
+        with locked():
+            state = read_json(STATE)
+            state.update(phase="error", message="Couldn't start the updater. Try again.")
+            save(state)
+        raise
+
+
+def release_path(value):
+    path = Path(value)
+    if path.parent != RELEASES or path.is_symlink():
+        raise RuntimeError("The installed app layout needs repair before updating.")
+    version(path.name)
+    return path
+
+
+def activate(target):
+    """Switch a single symlink; complete app versions stay on disk for rollback."""
+    release_path(str(target))
+    if not PREFIX.is_symlink():
+        raise RuntimeError("The kiosk needs the updater setup before installing app updates.")
+    temporary = PREFIX.with_name(PREFIX.name + ".next")
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(target)
+    os.replace(temporary, PREFIX)
+    sync_dir(PREFIX.parent)
+
+
+def sync_tree(target):
+    """Persist the new app before the journal can mark its switch complete."""
+    for directory, _, files in os.walk(target, topdown=False):
+        for name in files:
+            path = Path(directory) / name
+            if not path.is_symlink():
+                with path.open("rb") as source:
+                    os.fsync(source.fileno())
+        sync_dir(Path(directory))
+
+
+def validate_app(path, candidate):
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError("The app package directory is invalid.")
+    if ((path / "build-version").read_text().strip() != candidate["version"] or
+            (path / "fork-commit").read_text().strip() != candidate["commit"]):
+        raise RuntimeError("The downloaded app doesn't match its release.")
+    for name in ("punktfunk", "punktfunk-session"):
+        binary = path / name
+        if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
+            raise RuntimeError("The app package is incomplete.")
+        linked = command("/usr/bin/ldd", str(binary), required=False)
+        if linked.returncode or "not found" in linked.stdout:
+            raise RuntimeError("This app needs system libraries that aren't installed.")
+    command(str(path / "punktfunk"), "--help")
+
+
+def public_app_modes(path):
+    """Private staging uses umask 077; installed code must remain readable by the kiosk user."""
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError("The app package directory is invalid.")
+    for directory, _, files in os.walk(path):
+        Path(directory).chmod(0o755)
+        for name in files:
+            item = Path(directory) / name
+            if not item.is_symlink():
+                item.chmod(0o755 if item.stat().st_mode & 0o100 else 0o644)
+
+
+def healthy(target):
+    """Require the new executable to keep one live service process for twenty seconds."""
+    pid = None
+    for _ in range(20):
+        result = command("/usr/bin/systemctl", "show", SERVICE, "-p", "MainPID", "--value")
+        current = result.stdout.strip()
+        if not current.isdigit() or current == "0" or (pid is not None and current != pid):
+            return False
+        if Path(f"/proc/{current}/exe").resolve() != target / "punktfunk-session":
+            return False
+        pid = current
+        time.sleep(1)
+    return True
+
+
+def restore(state):
+    previous = release_path(state["previous"])
+    if not previous.is_dir():
+        raise RuntimeError("The previous app version is missing. Use SSH to repair the installation.")
+    command("/usr/bin/systemctl", "stop", SERVICE, required=False)
+    activate(previous)
+    command("/usr/bin/systemctl", "start", SERVICE)
+
+
+def worker():
+    """Download and verify before stopping the app; restore it after a failed start."""
+    with locked():
+        state = read_json(STATE)
+        switched = False
+        try:
+            candidate = validate_manifest(state["candidate"], "v" + state["candidate"]["version"])
+            if platform.machine() != "aarch64" or version(candidate["version"]) <= version(installed()):
+                raise RuntimeError("This app update isn't compatible with the installed version.")
+            previous = release_path(str(PREFIX.resolve()))
+            if not PREFIX.is_symlink() or not previous.is_dir():
+                raise RuntimeError("The kiosk needs the updater setup first.")
+            RELEASES.mkdir(parents=True, exist_ok=True)
+            if shutil.disk_usage(RELEASES).free < 2 * 1024**3:
+                raise RuntimeError("Free at least 2 GB before updating Punktfunk.")
+            state.update(phase="downloading", message="Downloading Punktfunk…", previous=str(previous))
+            save(state)
+            with tempfile.TemporaryDirectory(prefix=".update-", dir=RELEASES) as temporary:
+                temporary = Path(temporary)
+                archive = temporary / "app.tar.gz"
+                with archive.open("wb") as output:
+                    _, size, digest = fetch(asset_url("v" + candidate["version"], candidate["archive"]),
+                                            candidate["size"], output)
+                if size != candidate["size"] or digest != candidate["sha256"]:
+                    raise RuntimeError("The app download failed its checksum. Try again.")
+                state.update(phase="verifying", message="Verifying the app package…")
+                save(state)
+                with tarfile.open(archive) as package:
+                    members, expanded = [], 0
+                    for member in package:
+                        expanded += member.size
+                        if expanded > 2 * 1024**3 or len(members) >= 10000:
+                            raise RuntimeError("The unpacked app package is too large.")
+                        members.append(member)
+                    package.extractall(temporary / "unpacked", members=members, filter="data")
+                unpacked = temporary / "unpacked" / candidate["archive"].removesuffix(".tar.gz")
+                public_app_modes(unpacked)
+                validate_app(unpacked, candidate)
+                target = RELEASES / candidate["version"]
+                if target.exists():
+                    validate_app(target, candidate)
+                else:
+                    os.replace(unpacked, target)
+                    sync_tree(target)
+                    sync_dir(RELEASES)
+            state.update(phase="switching", message="Restarting Punktfunk…")
+            save(state)
+            switched = True
+            command("/usr/bin/systemctl", "stop", SERVICE)
+            activate(target)
+            command("/usr/bin/systemctl", "start", SERVICE)
+            state.update(phase="testing", message="Checking that Punktfunk stays running…")
+            save(state)
+            if not healthy(target):
+                raise RuntimeError("The new app didn't stay running. The previous version was restored.")
+            state.update(phase="done", message="Punktfunk was updated. Your settings were kept.")
+            save(state)
+        except Exception as error:
+            if switched:
+                try:
+                    restore(state)
+                except Exception:
+                    state.update(phase="error", message="The update and automatic restore couldn't start. Use SSH to repair Punktfunk.")
+                    save(state)
+                    raise
+            state.update(phase="error", message=str(error) if isinstance(error, RuntimeError)
+                         else "Couldn't complete the update. The installed app was kept.")
+            save(state)
+            raise
+
+
+def recover():
+    """An interrupted switch is rolled back before the app starts at boot."""
+    with locked():
+        state = read_json(STATE)
+        if state.get("phase") in {"switching", "testing"}:
+            previous = release_path(state["previous"])
+            if not previous.is_dir():
+                raise RuntimeError("The previous app version is missing.")
+            activate(previous)
+        if state.get("phase") in BUSY:
+            state.update(phase="error", message="An interrupted update was cancelled. Check for updates to retry.")
+            save(state)
+
+
+def cleanup():
+    """A killed worker restores the old app even when the device stays powered on."""
+    with locked():
+        state = read_json(STATE)
+        if state.get("phase") in {"switching", "testing"}:
+            restore(state)
+        if state.get("phase") in BUSY:
+            state.update(phase="error", message="The update was interrupted. The previous app was kept.")
+            save(state)
+
+
+def main(argv):
+    if len(argv) != 1 or argv[0] not in {"status", "check", "start", "worker", "recover", "cleanup"} or os.geteuid() != 0:
+        print(json.dumps({"error": "Unknown or unavailable update action."}))
+        return 1
+    os.umask(0o077)
+    try:
+        if argv[0] != "status":
+            {"check": check, "start": start, "worker": worker, "recover": recover, "cleanup": cleanup}[argv[0]]()
+        print(json.dumps(status()))
+        return 0
+    except Exception as error:
+        print(json.dumps({"error": str(error) if isinstance(error, RuntimeError)
+                          else "Couldn't check or install the update. Check your network and try again."}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

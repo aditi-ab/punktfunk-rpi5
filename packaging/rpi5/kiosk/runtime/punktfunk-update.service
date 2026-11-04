@@ -1,0 +1,13 @@
+[Unit]
+Description=Install a compatible Punktfunk app update
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=/usr/libexec/punktfunk/kiosk-update worker
+ExecStopPost=/usr/libexec/punktfunk/kiosk-update cleanup
+RuntimeMaxSec=15min
+MemoryMax=512M
+Nice=10
+TimeoutStopSec=45
+UMask=0077

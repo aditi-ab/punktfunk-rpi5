@@ -15,6 +15,7 @@ pub(crate) enum Page {
     Information,
     VirtualHere,
     VirtualHereLicense,
+    Update,
 }
 
 pub(crate) struct KioskScreen {
@@ -69,6 +70,33 @@ impl KioskScreen {
             value: Some(value),
             ..RowSpec::action(label, false)
         };
+        if self.page == Page::Update {
+            let busy = matches!(
+                self.state.update_phase.as_str(),
+                "queued" | "downloading" | "verifying" | "switching" | "testing"
+            );
+            let ready = self.state.available
+                && self.state.update_supported
+                && !self.request.busy()
+                && !busy;
+            return vec![
+                RowSpec::action("Check for updates", ready),
+                RowSpec::action(
+                    "Install app update",
+                    ready && self.state.update_available && self.state.update_phase == "ready",
+                ),
+                info("Installed", self.state.version.clone()),
+                info(
+                    "Available",
+                    if self.state.update_version.is_empty() {
+                        "Not checked".into()
+                    } else {
+                        self.state.update_version.clone()
+                    },
+                ),
+                info("Kiosk OS", self.state.os_version.clone()),
+            ];
+        }
         if self.page == Page::VirtualHereLicense {
             return vec![
                 RowSpec::action("1. Open VirtualHere Client on your gaming PC", false),
@@ -153,6 +181,7 @@ impl KioskScreen {
         let mut rows = vec![
             info("Hostname", self.state.hostname.clone()),
             info("Punktfunk", self.state.version.clone()),
+            info("Kiosk OS", self.state.os_version.clone()),
             info("Connection", self.state.connection.clone()),
         ];
         for address in &self.state.ip_addresses {
@@ -186,7 +215,13 @@ impl KioskScreen {
         if !rows.get(self.list.cursor).is_some_and(|r| r.enabled) {
             return Some(MenuPulse::Boundary);
         }
-        let action = if self.page == Page::VirtualHere {
+        let action = if self.page == Page::Update {
+            match self.list.cursor {
+                0 => Action::CheckUpdate,
+                1 => Action::InstallUpdate,
+                _ => return pulse,
+            }
+        } else if self.page == Page::VirtualHere {
             match self.list.cursor {
                 0 => Action::InstallVirtualHere,
                 1 if self.state.virtualhere_running => Action::DisableVirtualHere,
@@ -224,6 +259,15 @@ impl KioskScreen {
         }
         if self.page == Page::VirtualHereLicense {
             return "One USB device is free. Buy a license at virtualhere.com for more devices.";
+        }
+        if self.page == Page::Update {
+            if !self.state.update_supported {
+                return "The kiosk needs updater setup before it can install app updates.";
+            }
+            if self.request.action() == Some(Action::CheckUpdate) {
+                return "Checking GitHub for a compatible app update…";
+            }
+            return &self.state.update_message;
         }
         if self.page == Page::VirtualHere {
             if !self.state.virtualhere_supported {
@@ -338,6 +382,7 @@ impl ScreenView for KioskScreen {
             Page::Information => "System information",
             Page::VirtualHere => "VirtualHere",
             Page::VirtualHereLicense => "VirtualHere license",
+            Page::Update => "Punktfunk updates",
         }
         .into()
     }
@@ -418,6 +463,17 @@ mod tests {
             !screen.request.busy(),
             "license help does not start sharing"
         );
+        screen.page = Page::Update;
+        assert!(!screen.rows()[0].enabled);
+        screen.state.update_supported = true;
+        assert!(screen.rows()[0].enabled);
+        assert!(!screen.rows()[1].enabled);
+        screen.state.update_available = true;
+        screen.state.update_phase = "ready".into();
+        assert!(screen.rows()[1].enabled);
+        screen.state.update_phase = "downloading".into();
+        assert!(!screen.rows()[0].enabled);
+        assert!(!screen.rows()[1].enabled);
     }
     #[test]
     fn appliance_screens_render_connection_details() {
@@ -431,6 +487,7 @@ mod tests {
             Page::Information,
             Page::VirtualHere,
             Page::VirtualHereLicense,
+            Page::Update,
         ] {
             let mut screen = KioskScreen {
                 list: MenuList::new(),
@@ -451,6 +508,14 @@ mod tests {
                     ssh_port: 22,
                     virtualhere_supported: true,
                     virtualhere_installed: true,
+                    update_supported: true,
+                    update_available: true,
+                    update_phase: "ready".into(),
+                    update_version: "0.46.0-rpi5.29".into(),
+                    update_message:
+                        "An app update is available. Punktfunk restarts; your settings are kept."
+                            .into(),
+                    os_version: "Raspberry Pi OS · Debian 13 (64-bit)".into(),
                     ..Default::default()
                 },
                 request: Request::default(),
@@ -487,6 +552,7 @@ mod tests {
                     Page::Information => "kiosk-information",
                     Page::VirtualHere => "kiosk-virtualhere",
                     Page::VirtualHereLicense => "kiosk-virtualhere-license",
+                    Page::Update => "kiosk-update",
                 };
                 std::fs::write(format!("{dir}/{name}.png"), png.as_bytes()).unwrap();
             }

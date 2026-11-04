@@ -4,6 +4,10 @@ crates/install/punktfunk-setup/tests/golden/** -text
 
 # Release scripts are mounted directly into Linux containers from Windows.
 packaging/rpi5/*.sh text eol=lf
+packaging/rpi5/kiosk/*.sh text eol=lf
+packaging/rpi5/kiosk/runtime/kiosk-control text eol=lf
+packaging/rpi5/kiosk/runtime/kiosk-update text eol=lf
+packaging/rpi5/kiosk/runtime/kiosk-sudoers text eol=lf
 # The shared contract vectors are generated and compared byte for byte by tests that also run on
 # Windows, so they keep LF there too.
 clients/shared/*.json -text

@@ -1,8 +1,12 @@
 # Punktfunk for Raspberry Pi 5
 
-This standalone ARM64 bundle targets 64-bit Raspberry Pi OS Bookworm and
-compatible newer Linux distributions on Raspberry Pi 5. A complete bootable
+This standalone ARM64 bundle targets 64-bit Raspberry Pi OS Trixie on
+Raspberry Pi 5. A complete bootable
 kiosk image is also available from the matching GitHub release.
+
+On a kiosk with the updater installed, use **Settings > Raspberry Pi > Punktfunk
+updates**. It installs this app bundle without changing the OS or your settings.
+The manual installer below is for installations without the kiosk updater.
 
 Install the system runtime first:
 

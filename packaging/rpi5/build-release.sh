@@ -46,6 +46,7 @@ if [[ "${working_tree}" == --working-tree ]]; then
     fi
 fi
 
+python3 -m unittest discover -s "${source_tree}/packaging/rpi5/kiosk"
 git clone --filter=blob:none https://github.com/jc-kynesim/rpi-ffmpeg.git "${ffmpeg_source}"
 git -C "${ffmpeg_source}" checkout --detach "${ffmpeg_ref}"
 
@@ -162,3 +163,6 @@ tar --sort=name --mtime="@$(git -C "${repo_root}" show -s --format=%ct "${source
     sha256sum "$(basename "${archive}")" >"$(basename "${archive}").sha256"
 )
 printf 'Built %s\n' "${archive}"
+if [[ -z "${working_tree}" ]]; then
+    python3 "${repo_root}/packaging/rpi5/write-update-manifest.py" "${archive}" "${tag}" "${release_commit}"
+fi

@@ -1439,6 +1439,7 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::Ssh,
             RowId::SystemInformation,
             RowId::VirtualHere,
+            RowId::AppUpdate,
         ]
     );
     // Every row reaches at least one platform: a row listed in a tab and offered nowhere
@@ -1750,7 +1751,7 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 77, "{seen:?}");
+    assert_eq!(seen.len(), 78, "{seen:?}");
     assert!(
         !seen.contains(&RowId::AdvancedChanged),
         "built per tab, never listed"
@@ -2233,13 +2234,18 @@ fn appliance_rows_live_only_in_the_raspberry_pi_section() {
             RowId::Bluetooth,
             RowId::Ssh,
             RowId::SystemInformation,
-            RowId::VirtualHere
+            RowId::VirtualHere,
+            RowId::AppUpdate
         ]
     );
     assert!(TABS[..PI_TAB]
         .iter()
         .all(|(_, rows)| !rows.iter().any(|id| matches!(
             id,
-            RowId::Bluetooth | RowId::Ssh | RowId::SystemInformation | RowId::VirtualHere
+            RowId::Bluetooth
+                | RowId::Ssh
+                | RowId::SystemInformation
+                | RowId::VirtualHere
+                | RowId::AppUpdate
         ))));
 }

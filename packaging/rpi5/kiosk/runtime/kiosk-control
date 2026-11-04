@@ -18,6 +18,8 @@ import urllib.request
 ADMIN = "punktfunk-admin"
 ACTIONS = {"status", "ssh-enable", "ssh-disable", "ssh-reset-password"}
 ACTIONS |= {"virtualhere-install", "virtualhere-enable", "virtualhere-disable"}
+ACTIONS |= {"update-check", "update-install"}
+UPDATER = Path("/usr/libexec/punktfunk/kiosk-update")
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"}
 VH_BINARY = Path("/opt/virtualhere/vhusbdarm64")
 VH_CONFIG = Path("/data/virtualhere/config.ini")
@@ -26,10 +28,10 @@ VH_URL = "https://www.virtualhere.com/sites/default/files/usbserver/vhusbdarm64"
 VH_SHA256 = "09deced5586ed37b8b3db7a6187d84029f65d487c3c2b24a949b993b3d582077"
 
 
-def command(*args, input=None, required=True):
-    """Keep credentials on stdin and service output out of menu errors."""
+def command(*args, input=None, required=True, timeout=15):
+    """Bound service operations and keep credentials off process arguments."""
     result = subprocess.run(args, input=input, text=True, capture_output=True,
-                            timeout=15, cwd="/", env=ENV, check=False)
+                            timeout=timeout, cwd="/", env=ENV, check=False)
     if required and result.returncode:
         raise RuntimeError("Couldn't change the service. Try again.")
     return result
@@ -48,7 +50,7 @@ def active():
 
 
 def status():
-    """Return network and service state without exposing credentials."""
+    """Report the installed app separately from the OS without exposing credentials."""
     addresses = []
     try:
         links = json.loads(command("/usr/sbin/ip", "-j", "address", "show", "up",
@@ -81,11 +83,25 @@ def status():
     except (ValueError, IndexError):
         uptime = 0
     return {"available": True, "hostname": socket.gethostname(),
-            "version": release.get("RELEASE_TAG", "Unknown"),
+            "version": read("/opt/punktfunk-rpi5/build-version", release.get("RELEASE_TAG", "Unknown")),
             "ip_addresses": addresses, "connection": connection,
             "temperature_c": temperature, "uptime_seconds": uptime,
             "ssh_enabled": active(), "ssh_user": ADMIN, "ssh_port": 22,
-            **virtualhere_status()}
+            **virtualhere_status(), **update_status()}
+
+
+def update_status():
+    if not UPDATER.is_file():
+        return {}
+    try:
+        result = command(str(UPDATER), "status", required=False)
+        if result.returncode == 0:
+            value = json.loads(result.stdout)
+            if isinstance(value, dict):
+                return value
+        return {"update_message": "Update status is unavailable."}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {"update_message": "Update status is unavailable."}
 
 
 def virtualhere_status():
@@ -167,9 +183,15 @@ def password():
 
 
 def change(action):
-    """Serialize service changes and roll back unsuccessful SSH setup."""
+    """Serialize menu changes; app installation runs in its own system service."""
     with open("/run/punktfunk-kiosk-control.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if action.startswith("update-"):
+            result = command(str(UPDATER), "check" if action == "update-check" else "start",
+                             required=False, timeout=75)
+            if result.returncode:
+                raise RuntimeError(json.loads(result.stdout).get("error", "Couldn't update Punktfunk."))
+            return None
         if action.startswith("virtualhere-"):
             change_virtualhere(action)
             return None

@@ -54,7 +54,17 @@ vh_service = root / "etc/systemd/system/punktfunk-virtualhere.service"
 assert "-c /data/virtualhere/config.ini" in vh_service.read_text()
 assert (root / "etc/ssl/certs/ca-certificates.crt").is_file(), "HTTPS downloads need trusted certificates"
 assert not (root / "opt/virtualhere/vhusbdarm64").exists(), "VirtualHere installs on demand"
-assert not (root / "data/virtualhere").exists(), "Public images must not contain USB server licenses"
+assert not (root / "data/virtualhere/config.ini").exists(), "Public images must not contain USB server licenses"
+assert (root / "data").stat().st_uid == 0 and (root / "data").stat().st_mode & 0o1000
+for directory in ("virtualhere", "punktfunk-update"):
+    private = root / "data" / directory
+    assert private.stat().st_uid == 0 and private.stat().st_mode & 0o777 == 0o700
+assert (root / "opt/punktfunk-rpi5").is_symlink()
+assert (root / "etc/punktfunk-kiosk-runtime").read_text().strip() == "raspios-trixie-arm64-v1"
+assert (root / "usr/libexec/punktfunk/kiosk-update").stat().st_uid == 0
+assert "punktfunk-update-recovery.service" in (root / "etc/systemd/system/punktfunk-kiosk.service.d/update.conf").read_text()
+assert "kiosk-control update-check" in sudoers.read_text()
+assert "kiosk-control update-install" in sudoers.read_text()
 assert not (root / "etc/systemd/system/multi-user.target.wants/punktfunk-virtualhere.service").exists()
 ssh_config = (root / "etc/ssh/sshd_config.d/00-punktfunk.conf").read_text()
 for setting in ("PermitRootLogin no", "PermitEmptyPasswords no", "AllowUsers punktfunk-admin"):

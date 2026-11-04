@@ -135,6 +135,7 @@ pub enum RowId {
     Ssh,
     SystemInformation,
     VirtualHere,
+    AppUpdate,
     /// Action row: the stream's keys, chords and gestures, read-only.
     StreamControls,
     /// Action row: asks the host to open the platform licences screen.
@@ -572,6 +573,7 @@ pub(super) const TABS: [(&str, &[RowId]); 8] = [
             RowId::Ssh,
             RowId::SystemInformation,
             RowId::VirtualHere,
+            RowId::AppUpdate,
         ],
     ),
 ];
@@ -866,7 +868,11 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         // Offered wherever there is a second UI to fall back to: Android's touch home,
         // webOS's cursor shell. `row_applies` still needs `fallback_ui` from the host.
         RowId::GamepadUi | RowId::GamepadUiMode => &[Android, WebOS, Apple],
-        RowId::Bluetooth | RowId::Ssh | RowId::SystemInformation | RowId::VirtualHere => &[Desktop],
+        RowId::Bluetooth
+        | RowId::Ssh
+        | RowId::SystemInformation
+        | RowId::VirtualHere
+        | RowId::AppUpdate => &[Desktop],
         // A pad list: real on a TV, and on Apple its Controllers screen.
         RowId::Controllers => &[Android, WebOS, Apple],
         // Apps a phone or TV can put in the background; `row_applies` drops the Mac.
@@ -969,7 +975,7 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
             !ctx.device.tv
         }
         RowId::Bluetooth => pf_client_core::bluetooth::snapshot().available,
-        RowId::Ssh | RowId::SystemInformation | RowId::VirtualHere => {
+        RowId::Ssh | RowId::SystemInformation | RowId::VirtualHere | RowId::AppUpdate => {
             pf_client_core::kiosk::available()
         }
         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
@@ -1150,7 +1156,7 @@ pub(super) fn row_icon(id: RowId) -> &'static str {
         | RowId::DsCapture
         | RowId::Bluetooth
         | RowId::Controllers => "gamepad-2",
-        RowId::Ssh | RowId::SystemInformation | RowId::VirtualHere => "info",
+        RowId::Ssh | RowId::SystemInformation | RowId::VirtualHere | RowId::AppUpdate => "info",
         RowId::SystemButtons | RowId::GuideGesture => "house",
         RowId::PhoneGyro => "rotate-cw",
         RowId::SecondScreen | RowId::Screen | RowId::Screens => "monitor",
@@ -1286,6 +1292,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             return RowSpec::action("New preset\u{2026}", true);
         }
         RowId::Bluetooth => return RowSpec::action("Bluetooth devices", true),
+        RowId::AppUpdate => return RowSpec::action("Punktfunk updates", true),
         RowId::VirtualHere => return RowSpec::action("VirtualHere", true),
         RowId::Ssh => return RowSpec::action("SSH", true),
         RowId::SystemInformation => return RowSpec::action("System information", true),
@@ -1599,6 +1606,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         | RowId::Ssh
         | RowId::SystemInformation
         | RowId::VirtualHere
+        | RowId::AppUpdate
         | RowId::Controllers
         | RowId::AdvancedChanged
         | RowId::StreamControls
@@ -1968,6 +1976,7 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             }
         },
         RowId::Bluetooth => "Pair, connect or forget Bluetooth devices.",
+        RowId::AppUpdate => "Update the app from GitHub while keeping your settings and kiosk OS.",
         RowId::VirtualHere => "Install VirtualHere to share USB devices with your gaming PC.",
         RowId::Ssh => "Turn remote access on or off and view connection details.",
         RowId::SystemInformation => "View network addresses, connection and device status.",
@@ -2311,6 +2320,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         | RowId::Ssh
         | RowId::SystemInformation
         | RowId::VirtualHere
+        | RowId::AppUpdate
         | RowId::Controllers
         | RowId::AdvancedChanged
         | RowId::StreamControls

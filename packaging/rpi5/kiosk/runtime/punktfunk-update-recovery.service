@@ -1,0 +1,10 @@
+[Unit]
+Description=Recover an interrupted Punktfunk app update
+After=local-fs.target
+Before=punktfunk-kiosk.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/punktfunk/kiosk-update recover
+RemainAfterExit=yes
+UMask=0077
