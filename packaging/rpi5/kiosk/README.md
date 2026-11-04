@@ -43,3 +43,37 @@ manual dispatch retries an existing tag. Assets go to that tag's release, creati
 a draft if needed. Release notes must distinguish offline build checks from physical
 Pi 5 testing. Boot, controller navigation and sustained HEVC playback remain
 unverified until tested on hardware; an image may be published with that limitation.
+
+## VirtualHere USB sharing
+
+Under **Settings > Raspberry Pi > VirtualHere**, choose **Download and install**.
+The kiosk downloads the generic ARM64 server directly from VirtualHere over HTTPS
+and checks its pinned SHA-256 before installation. No VirtualHere binary or license
+is redistributed in the image. If the vendor replaces the download, installation
+stops with an update message instead of running an unreviewed binary.
+
+Turn **USB sharing** on after installation. Sharing stays off until enabled and
+then starts automatically on reboot. Install VirtualHere Client on the gaming PC;
+it discovers the Pi on the same LAN. For routed networks, add the displayed Pi IP
+as a hub in VirtualHere Client (TCP port 7575). Turning sharing off releases devices
+and disables automatic startup.
+
+The generic server shares one USB device free of charge. More simultaneous devices
+require a VirtualHere license. Free use needs the graphical PC client; running
+the client as a service or using the console-only client requires a licensed
+server. The optimized Raspberry Pi build requires a license
+and is not installed by this action. Follow **License setup** in the Pi menu: in
+VirtualHere Client on the PC, right-click **USB Servers** (called **USB Hubs** in older clients),
+choose **License > Enter License(s)** and paste the purchased key. The server stores it in `/data/virtualhere/config.ini`,
+accessible only to root. **Key saved** confirms storage, not license validity;
+VirtualHere Client reports activation errors. Licenses survive reboots and
+Punktfunk bundle updates. Keep your purchase email before reflashing the SD card.
+
+Enable the VirtualHere plugin on the Punktfunk host to attach and release selected
+USB devices with streaming sessions. For a controller passed through VirtualHere,
+turn off Punktfunk's **Forward controllers** to avoid duplicate input. Local Pi
+controls can become unavailable while the PC owns that USB device.
+
+Vendor documentation: [server and licensing](https://www.virtualhere.com/usb_server_software),
+[license purchase](https://www.virtualhere.com/purchase),
+[client download](https://www.virtualhere.com/usb_client_software).

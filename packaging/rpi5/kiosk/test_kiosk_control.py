@@ -4,10 +4,12 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import hashlib
+import tempfile
 from pathlib import Path
 from subprocess import CompletedProcess
 import unittest
-from unittest.mock import patch, mock_open
+from unittest.mock import patch, mock_open, MagicMock
 
 loader = importlib.machinery.SourceFileLoader("kiosk_control", str(Path(__file__).parent / "runtime/kiosk-control"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -16,6 +18,69 @@ loader.exec_module(control)
 
 
 class KioskControlTests(unittest.TestCase):
+    def test_virtualhere_download_is_atomic_and_does_not_enable_sharing(self):
+        payload = b"reviewed ARM64 server"
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "virtualhere/server"
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.geturl.return_value = control.VH_URL
+            response.read.side_effect = [payload, b""]
+            with patch.object(control, "VH_BINARY", binary), patch.object(control, "VH_SHA256", hashlib.sha256(payload).hexdigest()), patch.object(control.urllib.request, "urlopen", return_value=response), patch.object(control, "command") as command:
+                control.change_virtualhere("virtualhere-install")
+                self.assertEqual(binary.read_bytes(), payload)
+                self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+                command.assert_not_called()
+                control.install_virtualhere()
+                self.assertEqual(response.read.call_count, 2)
+
+    def test_virtualhere_rejects_changed_download_and_cleans_temporary_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "server"
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.geturl.return_value = control.VH_URL
+            response.read.side_effect = [b"unexpected", b""]
+            with patch.object(control, "VH_BINARY", binary), patch.object(control.urllib.request, "urlopen", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, "changed its download"):
+                    control.install_virtualhere()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_virtualhere_rejects_redirects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.geturl.return_value = "http://example.com/server"
+            with patch.object(control, "VH_BINARY", Path(directory) / "server"), patch.object(control.urllib.request, "urlopen", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, "location changed"):
+                    control.install_virtualhere()
+                response.read.assert_not_called()
+
+    def test_virtualhere_preserves_license_and_disable_does_not_remove_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "server"
+            binary.touch()
+            config = Path(directory) / "private/config.ini"
+            with patch.object(control, "VH_BINARY", binary), patch.object(control, "VH_CONFIG", config), patch.object(control, "command", return_value=CompletedProcess([], 0, "", "")) as command:
+                control.change_virtualhere("virtualhere-enable")
+                self.assertEqual(config.parent.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+                config.write_text("License=SECRET\n")
+                control.change_virtualhere("virtualhere-enable")
+                control.change_virtualhere("virtualhere-disable")
+                self.assertEqual(config.read_text(), "License=SECRET\n")
+                state = control.virtualhere_status()
+                self.assertTrue(state["virtualhere_license_saved"])
+                self.assertNotIn("SECRET", json.dumps(state))
+                command.assert_any_call("/usr/bin/systemctl", "disable", "--now", control.VH_UNIT)
+
+    def test_virtualhere_cannot_start_before_installation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(control, "VH_BINARY", Path(directory) / "absent"), patch.object(control, "command") as command:
+                with self.assertRaisesRegex(RuntimeError, "Install VirtualHere"):
+                    control.change_virtualhere("virtualhere-enable")
+                command.assert_not_called()
+
     def invoke(self, args):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -64,7 +129,7 @@ class KioskControlTests(unittest.TestCase):
 
     def test_subprocess_stderr_never_leaks(self):
         with patch.object(control.subprocess, "run", return_value=CompletedProcess([], 1, "", "SECRET")):
-            with self.assertRaisesRegex(RuntimeError, "Couldn't change SSH") as error:
+            with self.assertRaisesRegex(RuntimeError, "Couldn't change the service") as error:
                 control.command("/usr/sbin/chpasswd", input="SECRET")
         self.assertNotIn("SECRET", str(error.exception))
 

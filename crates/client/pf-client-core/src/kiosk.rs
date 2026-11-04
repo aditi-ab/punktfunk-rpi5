@@ -11,6 +11,9 @@ pub enum Action {
     Enable,
     Disable,
     ResetPassword,
+    InstallVirtualHere,
+    EnableVirtualHere,
+    DisableVirtualHere,
 }
 impl Action {
     fn argument(self) -> &'static str {
@@ -19,6 +22,9 @@ impl Action {
             Self::Enable => "ssh-enable",
             Self::Disable => "ssh-disable",
             Self::ResetPassword => "ssh-reset-password",
+            Self::InstallVirtualHere => "virtualhere-install",
+            Self::EnableVirtualHere => "virtualhere-enable",
+            Self::DisableVirtualHere => "virtualhere-disable",
         }
     }
 }
@@ -38,6 +44,10 @@ pub struct Snapshot {
     pub ssh_port: u16,
     pub password: Option<String>,
     pub error: Option<String>,
+    pub virtualhere_supported: bool,
+    pub virtualhere_installed: bool,
+    pub virtualhere_running: bool,
+    pub virtualhere_license_saved: bool,
 }
 
 pub fn available() -> bool {
@@ -49,10 +59,14 @@ pub fn available() -> bool {
 #[derive(Default)]
 pub struct Request {
     pending: Option<Receiver<Result<Snapshot, String>>>,
+    action: Option<Action>,
 }
 impl Request {
     pub fn busy(&self) -> bool {
         self.pending.is_some()
+    }
+    pub fn action(&self) -> Option<Action> {
+        self.action
     }
     pub fn start(&mut self, action: Action) -> bool {
         if self.busy() {
@@ -60,6 +74,7 @@ impl Request {
         }
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
+        self.action = Some(action);
         std::thread::spawn(move || {
             let _ = tx.send(run(action));
         });
@@ -73,6 +88,7 @@ impl Request {
             Err(_) => Err("Couldn't read the device status. Try again.".into()),
         };
         self.pending = None;
+        self.action = None;
         Some(result)
     }
 }
@@ -84,7 +100,7 @@ fn parse(bytes: &[u8], success: bool) -> Result<Snapshot, String> {
         return Err(error.clone());
     }
     if !success {
-        return Err("Couldn't change remote access. Try again.".into());
+        return Err("Couldn't change device settings. Try again.".into());
     }
     Ok(state)
 }
@@ -98,7 +114,12 @@ fn run(action: Action) -> Result<Snapshot, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| "Device controls are unavailable.".to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let timeout = if action == Action::InstallVirtualHere {
+        180
+    } else {
+        30
+    };
+    let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,

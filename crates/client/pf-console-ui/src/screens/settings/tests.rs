@@ -2228,9 +2228,17 @@ fn appliance_rows_live_only_in_the_raspberry_pi_section() {
     assert_eq!(TABS[PI_TAB].0, "Raspberry Pi");
     assert_eq!(
         TABS[PI_TAB].1,
-        &[RowId::Bluetooth, RowId::Ssh, RowId::SystemInformation]
+        &[
+            RowId::Bluetooth,
+            RowId::Ssh,
+            RowId::SystemInformation,
+            RowId::VirtualHere
+        ]
     );
-    assert!(TABS[..PI_TAB].iter().all(|(_, rows)| !rows
+    assert!(TABS[..PI_TAB]
         .iter()
-        .any(|id| matches!(id, RowId::Bluetooth | RowId::Ssh | RowId::SystemInformation))));
+        .all(|(_, rows)| !rows.iter().any(|id| matches!(
+            id,
+            RowId::Bluetooth | RowId::Ssh | RowId::SystemInformation | RowId::VirtualHere
+        ))));
 }

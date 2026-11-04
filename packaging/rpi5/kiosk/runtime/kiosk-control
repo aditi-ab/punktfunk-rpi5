@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -I
 """Fixed appliance operations for the controller settings menu."""
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,18 +10,28 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
 
 ADMIN = "punktfunk-admin"
 ACTIONS = {"status", "ssh-enable", "ssh-disable", "ssh-reset-password"}
+ACTIONS |= {"virtualhere-install", "virtualhere-enable", "virtualhere-disable"}
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"}
+VH_BINARY = Path("/opt/virtualhere/vhusbdarm64")
+VH_CONFIG = Path("/data/virtualhere/config.ini")
+VH_UNIT = "punktfunk-virtualhere.service"
+VH_URL = "https://www.virtualhere.com/sites/default/files/usbserver/vhusbdarm64"
+VH_SHA256 = "09deced5586ed37b8b3db7a6187d84029f65d487c3c2b24a949b993b3d582077"
 
 
 def command(*args, input=None, required=True):
-    """Keep credentials on stdin and command failures out of the menu response."""
+    """Keep credentials on stdin and service output out of menu errors."""
     result = subprocess.run(args, input=input, text=True, capture_output=True,
                             timeout=15, cwd="/", env=ENV, check=False)
     if required and result.returncode:
-        raise RuntimeError("Couldn't change SSH. Try again.")
+        raise RuntimeError("Couldn't change the service. Try again.")
     return result
 
 
@@ -37,7 +48,7 @@ def active():
 
 
 def status():
-    """Report addresses and appliance state without reading authentication data."""
+    """Return network and service state without exposing credentials."""
     addresses = []
     try:
         links = json.loads(command("/usr/sbin/ip", "-j", "address", "show", "up",
@@ -73,7 +84,73 @@ def status():
             "version": release.get("RELEASE_TAG", "Unknown"),
             "ip_addresses": addresses, "connection": connection,
             "temperature_c": temperature, "uptime_seconds": uptime,
-            "ssh_enabled": active(), "ssh_user": ADMIN, "ssh_port": 22}
+            "ssh_enabled": active(), "ssh_user": ADMIN, "ssh_port": 22,
+            **virtualhere_status()}
+
+
+def virtualhere_status():
+    """Report service state and key presence, never the license contents."""
+    installed = VH_BINARY.is_file()
+    running = installed and command("/usr/bin/systemctl", "is-active", "--quiet",
+                                    VH_UNIT, required=False).returncode == 0
+    saved = any(line.partition("=")[0].strip().lower() == "license" and
+                line.partition("=")[2].strip()
+                for line in read(VH_CONFIG).splitlines())
+    return {"virtualhere_supported": True, "virtualhere_installed": installed,
+            "virtualhere_running": bool(running), "virtualhere_license_saved": saved}
+
+
+def install_virtualhere():
+    """Install only the reviewed ARM64 binary; incomplete downloads never replace it."""
+    if VH_BINARY.is_file():
+        return
+    VH_BINARY.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    temporary = None
+    try:
+        deadline = time.monotonic() + 90
+        with urllib.request.urlopen(VH_URL, timeout=20) as response:
+            if response.geturl() != VH_URL:
+                raise RuntimeError("The download location changed. Update the kiosk image.")
+            digest = hashlib.sha256()
+            size = 0
+            with tempfile.NamedTemporaryFile(dir=VH_BINARY.parent, delete=False) as output:
+                temporary = Path(output.name)
+                while True:
+                    block = response.read(65536)
+                    if not block:
+                        break
+                    size += len(block)
+                    if size > 16 * 1024 * 1024 or time.monotonic() > deadline:
+                        raise RuntimeError("The VirtualHere download didn't finish. Try again.")
+                    digest.update(block)
+                    output.write(block)
+                output.flush()
+                os.fsync(output.fileno())
+            if digest.hexdigest() != VH_SHA256:
+                raise RuntimeError("VirtualHere changed its download. Update the kiosk image before installing.")
+            temporary.chmod(0o755)
+            os.replace(temporary, VH_BINARY)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def change_virtualhere(action):
+    """Installation leaves USB sharing off; enabling persists across reboots."""
+    if action == "virtualhere-install":
+        install_virtualhere()
+    elif action == "virtualhere-disable":
+        command("/usr/bin/systemctl", "disable", "--now", VH_UNIT)
+    else:
+        if not VH_BINARY.is_file():
+            raise RuntimeError("Install VirtualHere before turning it on.")
+        VH_CONFIG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        VH_CONFIG.parent.chmod(0o700)
+        if not VH_CONFIG.exists():
+            with VH_CONFIG.open("x") as config:
+                config.write("ServerName=Punktfunk Raspberry Pi\n")
+            VH_CONFIG.chmod(0o600)
+        command("/usr/bin/systemctl", "enable", "--now", VH_UNIT)
 
 
 def password():
@@ -90,9 +167,12 @@ def password():
 
 
 def change(action):
-    """Serialize mutations; a failed enable leaves no listening SSH service."""
+    """Serialize service changes and roll back unsuccessful SSH setup."""
     with open("/run/punktfunk-kiosk-control.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if action.startswith("virtualhere-"):
+            change_virtualhere(action)
+            return None
         if action == "ssh-disable":
             command("/usr/bin/systemctl", "disable", "--now", "ssh.service", "ssh.socket")
             try:
@@ -131,7 +211,7 @@ def main(argv):
             result["password"] = value
         print(json.dumps(result))
         return 0
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, urllib.error.URLError) as error:
         message = str(error) if isinstance(error, RuntimeError) else "Couldn't read or change appliance settings. Try again."
         print(json.dumps({"error": message}))
         return 1

@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 pub(crate) enum Page {
     Ssh,
     Information,
+    VirtualHere,
+    VirtualHereLicense,
 }
 
 pub(crate) struct KioskScreen {
@@ -39,6 +41,7 @@ impl KioskScreen {
         }
     }
     fn sync(&mut self) {
+        let action = self.request.action();
         if let Some(result) = self.request.poll() {
             self.refreshed = Instant::now();
             match result {
@@ -50,7 +53,9 @@ impl KioskScreen {
                         self.password = None;
                     }
                     self.state = state;
-                    self.error = None;
+                    if action != Some(Action::Status) {
+                        self.error = None;
+                    }
                 }
                 Err(error) => self.error = Some(error),
             }
@@ -64,6 +69,64 @@ impl KioskScreen {
             value: Some(value),
             ..RowSpec::action(label, false)
         };
+        if self.page == Page::VirtualHereLicense {
+            return vec![
+                RowSpec::action("1. Open VirtualHere Client on your gaming PC", false),
+                RowSpec::action("2. Right-click USB Servers and choose License", false),
+                RowSpec::action("3. Choose Enter License(s) and paste your key", false),
+                RowSpec::action("Free mode needs the graphical PC client", false),
+                info(
+                    "License",
+                    if self.state.virtualhere_license_saved {
+                        "Key saved on this Pi"
+                    } else {
+                        "No key saved"
+                    }
+                    .into(),
+                ),
+            ];
+        }
+        if self.page == Page::VirtualHere {
+            let ready =
+                self.state.available && self.state.virtualhere_supported && !self.request.busy();
+            let mut rows = vec![
+                RowSpec::action(
+                    if self.state.virtualhere_installed {
+                        "Installed"
+                    } else {
+                        "Download and install"
+                    },
+                    ready && !self.state.virtualhere_installed,
+                ),
+                RowSpec {
+                    value: Some(
+                        if self.state.virtualhere_running {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                        .into(),
+                    ),
+                    ..RowSpec::action("USB sharing", ready && self.state.virtualhere_installed)
+                },
+                RowSpec {
+                    value: Some(
+                        if self.state.virtualhere_license_saved {
+                            "Key saved"
+                        } else {
+                            "Free: one USB device"
+                        }
+                        .into(),
+                    ),
+                    ..RowSpec::action("License setup", true)
+                },
+            ];
+            for address in &self.state.ip_addresses {
+                rows.push(info("Server address", address.clone()));
+            }
+            rows.push(info("Port", "7575".into()));
+            return rows;
+        }
         if self.page == Page::Ssh {
             let ready = self.state.available && !self.request.busy();
             let mut rows = vec![
@@ -123,11 +186,25 @@ impl KioskScreen {
         if !rows.get(self.list.cursor).is_some_and(|r| r.enabled) {
             return Some(MenuPulse::Boundary);
         }
-        let action = match self.list.cursor {
-            0 if self.state.ssh_enabled => Action::Disable,
-            0 => Action::Enable,
-            1 => Action::ResetPassword,
-            _ => return pulse,
+        let action = if self.page == Page::VirtualHere {
+            match self.list.cursor {
+                0 => Action::InstallVirtualHere,
+                1 if self.state.virtualhere_running => Action::DisableVirtualHere,
+                1 => Action::EnableVirtualHere,
+                2 => {
+                    self.page = Page::VirtualHereLicense;
+                    self.list = MenuList::new();
+                    return pulse;
+                }
+                _ => return pulse,
+            }
+        } else {
+            match self.list.cursor {
+                0 if self.state.ssh_enabled => Action::Disable,
+                0 => Action::Enable,
+                1 => Action::ResetPassword,
+                _ => return pulse,
+            }
         };
         if self.request.start(action) {
             self.password = None;
@@ -144,6 +221,24 @@ impl KioskScreen {
         }
         if !self.state.available {
             return "Device information is unavailable.";
+        }
+        if self.page == Page::VirtualHereLicense {
+            return "One USB device is free. Buy a license at virtualhere.com for more devices.";
+        }
+        if self.page == Page::VirtualHere {
+            if !self.state.virtualhere_supported {
+                return "Update the kiosk image to install VirtualHere.";
+            }
+            if self.request.action() == Some(Action::InstallVirtualHere) {
+                return "Downloading and installing VirtualHere… This may take up to two minutes.";
+            }
+            if matches!(
+                self.request.action(),
+                Some(Action::EnableVirtualHere | Action::DisableVirtualHere)
+            ) {
+                return "Updating VirtualHere… This may take up to two minutes.";
+            }
+            return "Downloads from virtualhere.com. Turn on USB sharing, then connect using VirtualHere Client on your PC.";
         }
         if self.page == Page::Information {
             return "Network and device status refresh automatically.";
@@ -171,6 +266,11 @@ impl ScreenView for KioskScreen {
     fn menu(&mut self, ev: MenuEvent, _ctx: &mut Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
         self.sync();
         if ev == MenuEvent::Back {
+            if self.page == Page::VirtualHereLicense {
+                self.page = Page::VirtualHere;
+                self.list = MenuList::new();
+                return None;
+            }
             self.password = None;
             fx.pop();
             return None;
@@ -236,6 +336,8 @@ impl ScreenView for KioskScreen {
         match self.page {
             Page::Ssh => "SSH",
             Page::Information => "System information",
+            Page::VirtualHere => "VirtualHere",
+            Page::VirtualHereLicense => "VirtualHere license",
         }
         .into()
     }
@@ -295,6 +397,27 @@ mod tests {
         assert!(!screen.rows()[1].enabled);
         screen.state.ssh_enabled = true;
         assert!(screen.rows()[1].enabled);
+        screen.page = Page::VirtualHere;
+        assert!(
+            !screen.rows()[0].enabled,
+            "older helpers cannot install USB sharing"
+        );
+        screen.state.virtualhere_supported = true;
+        assert!(screen.rows()[0].enabled);
+        assert!(
+            !screen.rows()[1].enabled,
+            "sharing needs an installed server"
+        );
+        screen.state.virtualhere_installed = true;
+        assert!(!screen.rows()[0].enabled);
+        assert!(screen.rows()[1].enabled);
+        screen.list.cursor = 2;
+        screen.activate(ListMsg::Activate, None);
+        assert!(screen.page == Page::VirtualHereLicense);
+        assert!(
+            !screen.request.busy(),
+            "license help does not start sharing"
+        );
     }
     #[test]
     fn appliance_screens_render_connection_details() {
@@ -303,7 +426,12 @@ mod tests {
         let mut settings = pf_client_core::trust::Settings::default();
         let mut ctx = Ctx::test(&mut settings, &library);
         let password = "ABCDEFGHIJKLMNOPQRST";
-        for page in [Page::Ssh, Page::Information] {
+        for page in [
+            Page::Ssh,
+            Page::Information,
+            Page::VirtualHere,
+            Page::VirtualHereLicense,
+        ] {
             let mut screen = KioskScreen {
                 list: MenuList::new(),
                 page,
@@ -321,6 +449,8 @@ mod tests {
                     ssh_enabled: true,
                     ssh_user: "punktfunk-admin".into(),
                     ssh_port: 22,
+                    virtualhere_supported: true,
+                    virtualhere_installed: true,
                     ..Default::default()
                 },
                 request: Request::default(),
@@ -352,15 +482,20 @@ mod tests {
                     .image_snapshot()
                     .encode(None, skia_safe::EncodedImageFormat::PNG, 100)
                     .unwrap();
-                let name = if page == Page::Ssh {
-                    "kiosk-ssh"
-                } else {
-                    "kiosk-information"
+                let name = match page {
+                    Page::Ssh => "kiosk-ssh",
+                    Page::Information => "kiosk-information",
+                    Page::VirtualHere => "kiosk-virtualhere",
+                    Page::VirtualHereLicense => "kiosk-virtualhere-license",
                 };
                 std::fs::write(format!("{dir}/{name}.png"), png.as_bytes()).unwrap();
             }
             let mut fx = Outbox::default();
             screen.menu(MenuEvent::Back, &mut ctx, &mut fx);
+            if page == Page::VirtualHereLicense {
+                assert!(screen.page == Page::VirtualHere);
+                screen.menu(MenuEvent::Back, &mut ctx, &mut fx);
+            }
             assert!(
                 screen.password.is_none(),
                 "leaving hides generated credentials"

@@ -74,7 +74,7 @@ run apt-get install -y --no-install-recommends \
     libfontconfig1 libfreetype6 libopus0 libasound2t64 libpipewire-0.3-0 \
     libva-drm2 libva-x11-2 libdrm2 libgbm1 libstdc++6 libudev1 \
     pipewire wireplumber libspa-0.2-bluetooth rtkit dbus libpam-systemd network-manager bluez v4l-utils \
-    openssh-server sudo python3 iproute2
+    openssh-server sudo python3 iproute2 ca-certificates
 run apt-get clean
 bash "$here/install-weston-cursor-backend.sh" "$root"
 rm -rf "$root/var/lib/apt/lists/"*
@@ -99,6 +99,8 @@ install -D -m 0755 "$here/runtime/kiosk-control" "$root/usr/libexec/punktfunk/ki
 install -D -m 0440 "$here/runtime/kiosk-sudoers" "$root/etc/sudoers.d/punktfunk-kiosk"
 install -D -m 0644 "$here/runtime/kiosk-ssh.conf" "$root/etc/ssh/sshd_config.d/00-punktfunk.conf"
 sed -i 's/\r$//' "$root/usr/libexec/punktfunk/kiosk-control" "$root/etc/sudoers.d/punktfunk-kiosk" "$root/etc/ssh/sshd_config.d/00-punktfunk.conf"
+install -m 0644 "$here/runtime/punktfunk-virtualhere.service" "$root/etc/systemd/system/punktfunk-virtualhere.service"
+sed -i 's/\r$//' "$root/etc/systemd/system/punktfunk-virtualhere.service"
 run visudo --check --file /etc/sudoers.d/punktfunk-kiosk
 run install -d -m 0755 /run/sshd
 run ssh-keygen -A

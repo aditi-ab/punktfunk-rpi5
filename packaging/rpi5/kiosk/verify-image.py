@@ -48,6 +48,14 @@ assert control.read_text().startswith("#!/usr/bin/python3 -I\n")
 sudoers = root / "etc/sudoers.d/punktfunk-kiosk"
 assert sudoers.stat().st_mode & 0o777 == 0o440
 assert "kiosk-control ssh-enable" in sudoers.read_text()
+for action in ("install", "enable", "disable"):
+    assert f"kiosk-control virtualhere-{action}" in sudoers.read_text()
+vh_service = root / "etc/systemd/system/punktfunk-virtualhere.service"
+assert "-c /data/virtualhere/config.ini" in vh_service.read_text()
+assert (root / "etc/ssl/certs/ca-certificates.crt").is_file(), "HTTPS downloads need trusted certificates"
+assert not (root / "opt/virtualhere/vhusbdarm64").exists(), "VirtualHere installs on demand"
+assert not (root / "data/virtualhere").exists(), "Public images must not contain USB server licenses"
+assert not (root / "etc/systemd/system/multi-user.target.wants/punktfunk-virtualhere.service").exists()
 ssh_config = (root / "etc/ssh/sshd_config.d/00-punktfunk.conf").read_text()
 for setting in ("PermitRootLogin no", "PermitEmptyPasswords no", "AllowUsers punktfunk-admin"):
     assert setting in ssh_config

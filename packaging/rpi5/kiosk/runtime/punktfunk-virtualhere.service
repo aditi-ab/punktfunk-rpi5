@@ -1,0 +1,17 @@
+[Unit]
+Description=VirtualHere USB sharing for Punktfunk
+After=network.target
+ConditionPathIsExecutable=/opt/virtualhere/vhusbdarm64
+
+[Service]
+Type=simple
+ExecStart=/opt/virtualhere/vhusbdarm64 -c /data/virtualhere/config.ini
+UMask=0077
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

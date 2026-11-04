@@ -376,10 +376,12 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
-            RowId::Ssh | RowId::SystemInformation => {
+            RowId::Ssh | RowId::SystemInformation | RowId::VirtualHere => {
                 return match msg {
                     ListMsg::Activate => {
-                        let page = if focused == RowId::Ssh {
+                        let page = if focused == RowId::VirtualHere {
+                            super::kiosk::Page::VirtualHere
+                        } else if focused == RowId::Ssh {
                             super::kiosk::Page::Ssh
                         } else {
                             super::kiosk::Page::Information
